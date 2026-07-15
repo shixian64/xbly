@@ -23,6 +23,7 @@
 | [08_RP_VERIFY_BYPASS_ANALYSIS.md](./08_RP_VERIFY_BYPASS_ANALYSIS.md) | 实名链路与绕过面分析（含实测） |
 | [09_GUEST_CAPABILITY_MATRIX.md](./09_GUEST_CAPABILITY_MATRIX.md) | 游客/未登录能力矩阵与协议可落地性 |
 | [10_PROTOCOL_CLIENT.md](./10_PROTOCOL_CLIENT.md) | **全功能协议客户端**落地说明 |
+| [11_FEATURE_REALNAME_AND_COVERAGE.md](./11_FEATURE_REALNAME_AND_COVERAGE.md) | 实名门槛功能 / 其他功能 / 协议覆盖评估 |
 | [bbw_protocol/README.md](./bbw_protocol/README.md) | 协议库使用手册 |
 | [DEEP_DIVE.md](./DEEP_DIVE.md) | 早期深挖报告（保留，内容已并入 01/02/04） |
 
