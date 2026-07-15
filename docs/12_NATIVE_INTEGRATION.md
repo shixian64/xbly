@@ -2,7 +2,8 @@
 
 **最后更新：** 2026-07-15  
 **代码：** `bbw_protocol/adapters/`（核） + `bbw_web/`（多用户 Web，独立模块）  
-**前提：** HTTP 业务核 `bbw_protocol` 已覆盖 402 actions；本页只补 **SDK 边车**。  
+**前提：** HTTP 业务核 `bbw_protocol` 的 catalog 覆盖 v154 活跃 398 actions（历史并集 405）；本页只补 **SDK 边车**。
+
 **隔离：** 协议核无 Cookie/web_sid；多用户只在 `bbw_web.store`。
 
 ---
@@ -64,6 +65,7 @@ python -m bbw_protocol.cli native-status
 python -m bbw_protocol.cli im-tim --prefer local
 python -m bbw_protocol.cli im-rong
 python -m bbw_protocol.cli pay-coin --channel wechat --coin-id 1
+python -m bbw_protocol.cli pay-vip --channel wechat --level vip --vipid 5
 python -m bbw_protocol.cli face-status
 ```
 
@@ -88,10 +90,10 @@ python -m bbw_web --port 8765
 
 ### IM
 
-- 本地 UserSig：`sign.gen_user_sig`（APK 硬编码 SECRETKEY）— **仅 BFF/本机**。
-- 服务端：`tximsign.php`；登录响应 `userSign`。
+- 本地 UserSig：`sign.gen_user_sig`（APK 硬编码 SECRETKEY）— **仅 CLI / 显式 Lab 研究使用**；产品 Web 不隐式回退到本地签名。
+- 服务端：`tximsign.php`；登录响应 `userSign`；产品 Web 默认且强制使用该路径。
 - 融云：`APP_KEY=m7ua80gbmo0km` + `userregister.php`。
-- 实时收发：浏览器加载 `@tencentcloud/chat` 或融云 Web SDK，用 BFF 凭证 `login`。
+- 实时收发：由受信任宿主提供固定版本 `@tencentcloud/chat` 或融云 Web SDK，再用 BFF 凭证 `login`。
 
 ### 刷脸
 

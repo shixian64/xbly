@@ -73,8 +73,18 @@ class ImAdapter:
             source="local",
         )
 
-    def tim_server(self, uid: Optional[str] = None) -> TimCredentials:
-        """Prefer server tximsign.php when available; fall back to local on failure."""
+    def tim_server(
+        self,
+        uid: Optional[str] = None,
+        *,
+        allow_local_fallback: bool = True,
+    ) -> TimCredentials:
+        """Fetch a server-issued UserSig, optionally falling back to local signing.
+
+        Product Web routes disable the fallback so the APK-derived signing secret is
+        never used implicitly.  CLI/lab callers may still opt into the historical
+        fallback when they are explicitly operating in the research environment.
+        """
         user_id = uid or self.app.session.uid
         if not user_id:
             raise ValueError("uid empty; login first")
@@ -104,14 +114,20 @@ class ImAdapter:
                 user_sig=str(sig),
                 source="server",
             )
-        return self.tim_local(user_id)
+        if allow_local_fallback:
+            return self.tim_local(user_id)
+        raise RuntimeError("server did not return a usable TIM UserSig")
 
     def tim_login_payload(
-        self, prefer: str = "local", uid: Optional[str] = None
+        self,
+        prefer: str = "local",
+        uid: Optional[str] = None,
+        *,
+        allow_local_fallback: bool = True,
     ) -> Dict[str, Any]:
         """Ready for frontend: {SDKAppID, userID, userSig, source}."""
         if prefer == "server":
-            cred = self.tim_server(uid)
+            cred = self.tim_server(uid, allow_local_fallback=allow_local_fallback)
         else:
             cred = self.tim_local(uid)
         out = cred.web_login_options()
@@ -168,9 +184,17 @@ class ImAdapter:
             message=msg.strip(),
         )
 
-    def bootstrap(self, prefer_tim: str = "local") -> Dict[str, Any]:
+    def bootstrap(
+        self,
+        prefer_tim: str = "local",
+        *,
+        allow_local_fallback: bool = True,
+    ) -> Dict[str, Any]:
         """One-shot IM credentials for Web shell cold start."""
-        tim = self.tim_login_payload(prefer=prefer_tim)
+        tim = self.tim_login_payload(
+            prefer=prefer_tim,
+            allow_local_fallback=allow_local_fallback,
+        )
         rong = self.rong_register()
         return {
             "tim": tim,

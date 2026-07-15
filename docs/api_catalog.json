@@ -1,9 +1,11 @@
 {
   "counts": {
-    "do": 312,
+    "do": 314,
     "short_startHttp": 95,
-    "full_urls": 326,
-    "all_actions": 403,
+    "dynamic_do_reconciled": 2,
+    "full_urls": 328,
+    "all_actions": 405,
+    "active_in_v154": 398,
     "deprecated": 7,
     "new_in_v154": 1
   },
@@ -377,6 +379,7 @@
     "auth": [
       "SaveRPVerifyInfo",
       "SigninOneKeyLogin",
+      "SigninOneKeyLogin1",
       "applyManualVerify",
       "compareUniqueToken",
       "findpassword",
@@ -386,6 +389,7 @@
       "logout",
       "moyuansignin",
       "saveUniqueToken",
+      "signin0",
       "signup",
       "signupwx",
       "smsVerify0",
@@ -453,6 +457,7 @@
     "ReportViolationWithMultiImage",
     "SaveRPVerifyInfo",
     "SigninOneKeyLogin",
+    "SigninOneKeyLogin1",
     "SvipTry",
     "SystemMessage",
     "Tuijiannew",
@@ -703,6 +708,7 @@
     "setMessageRestore",
     "setReferral",
     "setprivatesetting",
+    "signin0",
     "signup",
     "signupwx",
     "smsVerify0",
@@ -881,6 +887,7 @@
     "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=Payunifiedorder2svipXBXX&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=Payunifiedorder2vipXBXX&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=SigninOneKeyLogin&m=socialchat",
+    "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=SigninOneKeyLogin1&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=SvipTry&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=Tuijiannew&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=UpdateOnline0&m=socialchat",
@@ -1107,6 +1114,7 @@
     "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=setMessageRestore&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=setReferral&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=setprivatesetting&m=socialchat",
+    "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=signin0&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=signup&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=signupwx&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=smsVerify0&m=socialchat",
@@ -1166,12 +1174,18 @@
     "https://redis.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=xiaobeisignout&m=rediscache",
     "https://redis.banghua.xin:8080/"
   ],
+  "dynamic_do_actions": [
+    "SigninOneKeyLogin1",
+    "signin0"
+  ],
+  "dynamic_do_note": "v154 登录流程运行时拼接 do=；仅扫描明文 URL/startHttp 字面量会漏掉这两个仍在使用的 action，已人工按当前调用链补录。",
   "method_hints": {},
   "apk_version": {
     "previous": 148,
     "current": 154,
     "source_apk": "xbly.apk",
-    "compared_against": "beibeiwu.apk"
+    "compared_against": "beibeiwu.apk",
+    "catalog_scope": "405 为 v154 活跃 action 与 7 个 v148 历史下线 action 的并集；当前 v154 活跃数为 398。"
   },
   "deprecated_actions": {
     "since_apk": 154,

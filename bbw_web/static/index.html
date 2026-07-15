@@ -1,91 +1,101 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="UTF-8" />
+  <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#fafafa" />
+  <meta name="theme-color" content="#f8f5ff" />
+  <meta name="color-scheme" content="light" />
   <title>小贝乐园</title>
   <link rel="stylesheet" href="/static/app.css" />
 </head>
 <body>
-  <div id="toast" class="toast hide"></div>
+  <div id="toast" class="toast hide" role="status" aria-live="polite" aria-atomic="true"></div>
 
-  <!-- LOGIN -->
-  <div id="screen-login" class="screen">
-    <div class="login-wrap">
-      <div class="brand">
-        <div class="brand-mark">贝</div>
-        <h1>小贝乐园</h1>
-        <p>Web 客户端 · 与 App 同一套协议</p>
+  <main id="screen-login" class="login-screen">
+    <section class="login-card" aria-labelledby="login-title">
+      <div class="login-brand">
+        <div>
+          <p class="eyebrow">WELCOME BACK</p>
+          <h1 id="login-title">回到小贝乐园</h1>
+          <p>发现新朋友，分享此刻的快乐。</p>
+        </div>
       </div>
-      <div class="login-box">
-        <div class="tabs" id="login-tabs">
-          <button type="button" class="on" data-m="password">密码</button>
-          <button type="button" data-m="onekey">一键</button>
-          <button type="button" data-m="sms">短信</button>
+
+      <form id="login-form" class="login-form" novalidate>
+        <div class="segmented" id="login-tabs" role="tablist" aria-label="登录方式">
+          <button type="button" class="on" role="tab" aria-selected="true" data-mode="password">密码登录</button>
+          <button type="button" role="tab" aria-selected="false" data-mode="sms">短信登录</button>
         </div>
-        <label>手机号</label>
-        <input id="phone" type="tel" inputmode="numeric" placeholder="11 位手机号" autocomplete="username" />
-        <div id="box-pass">
-          <label>密码</label>
-          <input id="pass" type="password" placeholder="登录密码" autocomplete="current-password" />
+
+        <div class="field">
+          <label for="phone">手机号</label>
+          <input id="phone" name="phone" type="tel" inputmode="numeric" autocomplete="username" maxlength="18" placeholder="请输入手机号" required />
         </div>
-        <div id="box-sms" class="hide">
-          <label>验证码</label>
-          <div class="inline">
-            <input id="code" inputmode="numeric" placeholder="短信验证码" />
-            <button type="button" class="btn ghost" id="btn-sms">获取</button>
+
+        <div class="field" id="password-field">
+          <label for="password">密码</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" placeholder="请输入登录密码" />
+        </div>
+
+        <div class="field hide" id="sms-field">
+          <label for="sms-code">短信验证码</label>
+          <div class="input-action">
+            <input id="sms-code" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="8" placeholder="请输入验证码" />
+            <button type="button" class="btn secondary" id="send-sms">获取验证码</button>
           </div>
         </div>
-        <button type="button" class="btn primary full" id="btn-login">登录</button>
-        <p class="muted center" id="login-msg"></p>
-      </div>
-    </div>
-  </div>
 
-  <!-- APP -->
-  <div id="screen-app" class="screen hide">
-    <aside class="sidebar" id="sidebar">
+        <button type="submit" class="btn primary full login-submit" id="login-submit">登录</button>
+        <p id="login-message" class="form-message" role="alert"></p>
+      </form>
+      <p class="login-note">登录即表示你同意遵守社区礼仪，共同维护友善交流环境。</p>
+    </section>
+  </main>
+
+  <div id="screen-app" class="app-shell hide">
+    <aside class="sidebar" id="sidebar" aria-label="主导航">
       <div class="side-brand">
-        <div class="brand-mark sm">贝</div>
         <div>
-          <div class="side-title">小贝乐园</div>
-          <div class="side-sub" id="side-sub">—</div>
+          <strong>小贝乐园</strong>
+          <span>让相遇更有趣</span>
         </div>
+        <button type="button" class="utility-btn side-close mobile-only" id="close-menu">关闭</button>
       </div>
-      <nav class="side-nav" id="side-nav"></nav>
-      <button type="button" class="btn ghost full" id="btn-logout-side">退出</button>
+
+      <nav id="primary-nav" class="nav-list" aria-label="主要功能"></nav>
+
+      <div class="nav-section">
+        <p>更多服务</p>
+        <nav id="secondary-nav" class="nav-list secondary-nav" aria-label="更多服务"></nav>
+      </div>
+
+      <div class="side-account">
+        <div class="avatar avatar-sm" id="side-avatar" aria-hidden="true">游</div>
+        <div class="side-account-copy">
+          <strong id="side-name">游客</strong>
+          <span id="side-meta">尚未登录</span>
+        </div>
+        <button type="button" class="utility-btn" id="logout-side">退出</button>
+      </div>
     </aside>
 
-    <div class="main">
-      <header class="top">
-        <button type="button" class="icon-only mobile-only" id="btn-menu" aria-label="菜单">☰</button>
-        <div>
-          <div class="top-title" id="page-title">首页</div>
-          <div class="top-sub" id="page-sub"></div>
+    <div class="drawer-mask hide" id="drawer-mask" aria-hidden="true"></div>
+
+    <div class="app-main">
+      <header class="topbar">
+        <button type="button" class="utility-btn mobile-only" id="open-menu" aria-controls="sidebar" aria-expanded="false">菜单</button>
+        <div class="topbar-copy">
+          <h1 id="page-title">身边</h1>
+          <p id="page-subtitle">看看此刻谁也在这里</p>
         </div>
-        <button type="button" class="icon-only" id="btn-reload" title="刷新">↻</button>
+        <button type="button" class="utility-btn" id="reload-page">刷新</button>
       </header>
 
-      <div class="content" id="content">
-        <!-- pages injected / toggled -->
-        <section class="page on" data-p="home"></section>
-        <section class="page" data-p="square"></section>
-        <section class="page" data-p="match"></section>
-        <section class="page" data-p="social"></section>
-        <section class="page" data-p="room"></section>
-        <section class="page" data-p="msg"></section>
-        <section class="page" data-p="wallet"></section>
-        <section class="page" data-p="tasks"></section>
-        <section class="page" data-p="me"></section>
-        <section class="page" data-p="lab"></section>
-      </div>
+      <main id="page-root" class="page-root" tabindex="-1" aria-live="polite"></main>
     </div>
 
-    <nav class="bottom mobile-only" id="bottom-nav"></nav>
+    <nav id="bottom-nav" class="bottom-nav mobile-only" aria-label="底部主导航"></nav>
   </div>
-
-  <div id="drawer-mask" class="drawer-mask hide"></div>
 
   <script src="/static/app.js"></script>
 </body>

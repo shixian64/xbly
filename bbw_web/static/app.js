@@ -1,1067 +1,1454 @@
-/* 小贝乐园 Web App — 全功能 · 简洁 · 响应式 */
+"use strict";
 
-const NAV = [
-  { id: "home", name: "首页", ico: "⌂", short: true },
-  { id: "square", name: "广场", ico: "◈", short: true },
-  { id: "match", name: "匹配", ico: "✦", short: true },
-  { id: "social", name: "社交", ico: "☺", short: true },
-  { id: "room", name: "房间", ico: "♪", short: false },
-  { id: "msg", name: "消息", ico: "✎", short: true },
-  { id: "wallet", name: "钱包", ico: "¥", short: false },
-  { id: "tasks", name: "任务", ico: "✓", short: false },
-  { id: "me", name: "我的", ico: "●", short: true },
-  { id: "lab", name: "协议台", ico: "⚙", short: false },
+const PRIMARY_NAV = [
+  { id: "nearby", name: "身边", desc: "看看此刻谁也在这里" },
+  { id: "msg", name: "消息", desc: "和心动的人继续聊聊" },
+  { id: "match", name: "匹配", desc: "开启一次新的相遇" },
+  { id: "moments", name: "动态", desc: "发现话题与新鲜故事" },
+  { id: "me", name: "我的", desc: "资料、礼仪与个人服务" },
 ];
 
+const SECONDARY_NAV = [
+  { id: "social", name: "社交关系", desc: "关注、粉丝与好友" },
+  { id: "room", name: "语音房间", desc: "房间榜与点歌" },
+  { id: "wallet", name: "钱包会员", desc: "乐园币、会员与礼物" },
+  { id: "tasks", name: "成长任务", desc: "完成任务领取奖励" },
+];
+
+const LAB_NAV = { id: "lab", name: "协议台", desc: "仅限已启用的调试环境" };
+
 const S = {
-  sid: localStorage.getItem("bbw_sid") || "",
   user: null,
-  page: "home",
+  authenticated: false,
+  route: "nearby",
   loginMode: "password",
+  labEnabled: false,
+  routeController: null,
+  routeSeq: 0,
   socialTab: "follows",
-  tim: null,
   chat: null,
+  imHandler: null,
+  imConnected: false,
+  imMessages: [],
+  smsTimer: null,
+  presenceTimer: null,
+  serverHeartbeat: false,
 };
 
 const $ = (id) => document.getElementById(id);
-const esc = (s) =>
-  String(s ?? "")
+const root = () => $("page-root");
+
+const esc = (value) =>
+  String(value ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 
-function toast(msg, ms = 2200) {
-  const t = $("toast");
-  t.textContent = msg;
-  t.classList.remove("hide");
-  clearTimeout(toast._t);
-  toast._t = setTimeout(() => t.classList.add("hide"), ms);
+function firstChar(value, fallback = "贝") {
+  return Array.from(String(value || fallback))[0] || fallback;
 }
 
-function setSid(sid) {
-  S.sid = sid || "";
-  if (sid) localStorage.setItem("bbw_sid", sid);
-  else localStorage.removeItem("bbw_sid");
-}
-
-async function api(path, opts = {}) {
-  const headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
-  if (S.sid) headers["X-BBW-SID"] = S.sid;
-  const res = await fetch(path, { credentials: "include", ...opts, headers });
-  let data;
+function mediaUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
   try {
-    data = JSON.parse(await res.text());
+    const url = new URL(raw, location.origin);
+    if (url.protocol === "http:" || url.protocol === "https:") return url.href;
+    if (url.protocol === "data:" && /^data:image\//i.test(raw)) return raw;
   } catch {
-    data = { ok: false, error: "bad json", status: res.status };
+    return "";
   }
-  if (data.web_sid) setSid(data.web_sid);
-
-  // session expired / unauthorized
-  const code = String(data.code || "");
-  const errAct = data.error && data.error.action;
-  if (
-    (res.status === 401 || code === "700" || errAct === "relogin") &&
-    !String(path).includes("/auth/")
-  ) {
-    setSid("");
-    S.user = null;
-    showLogin(true);
-    const msg =
-      (data.error && data.error.title) ||
-      data.message ||
-      "登录已失效，请重新登录";
-    toast(msg);
-  }
-  return { status: res.status, data };
+  return "";
 }
 
-/** Product toast from envelope.error */
-function toastEnv(data, fallback) {
-  if (data && data.error) {
-    toast(data.error.title + (data.error.detail ? " · " + data.error.detail : ""));
+function toast(message, type = "info", ms = 2600) {
+  const el = $("toast");
+  el.textContent = String(message || "操作完成");
+  el.classList.toggle("error", type === "error");
+  el.classList.remove("hide");
+  clearTimeout(toast._timer);
+  toast._timer = setTimeout(() => el.classList.add("hide"), ms);
+}
+
+function errorInfo(data, fallback = "请求未成功") {
+  if (!data) return { title: fallback, detail: "请稍后重试" };
+  if (typeof data.error === "string") {
+    return { title: data.error || fallback, detail: data.message || "" };
+  }
+  if (data.error && typeof data.error === "object") {
+    return {
+      title: data.error.title || data.error.message || data.message || fallback,
+      detail: data.error.detail || data.error.message || data.message || "",
+      action: data.error.action || "",
+    };
+  }
+  return {
+    title: data.message || fallback,
+    detail: data.detail || "",
+    action: "",
+  };
+}
+
+function toastEnv(data, success = "操作完成") {
+  if (data && data.ok) {
+    toast(data.message || success);
+    return true;
+  }
+  const info = errorInfo(data);
+  toast(info.title, "error", 3400);
+  return false;
+}
+
+class AuthExpiredError extends Error {}
+
+async function api(path, options = {}) {
+  const {
+    timeout = 12000,
+    authOptional = false,
+    signal: outerSignal,
+    headers: customHeaders = {},
+    ...fetchOptions
+  } = options;
+  const controller = new AbortController();
+  let timedOut = false;
+  const onOuterAbort = () => controller.abort(outerSignal && outerSignal.reason);
+  if (outerSignal) {
+    if (outerSignal.aborted) controller.abort(outerSignal.reason);
+    else outerSignal.addEventListener("abort", onOuterAbort, { once: true });
+  }
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeout);
+
+  const headers = { Accept: "application/json", ...customHeaders };
+  if (fetchOptions.body != null && !headers["Content-Type"] && !headers["content-type"]) {
+    headers["Content-Type"] = "application/json";
+  }
+
+  try {
+    const response = await fetch(path, {
+      credentials: "include",
+      ...fetchOptions,
+      headers,
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    let data = {};
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        throw new Error(`服务返回了无法识别的内容（HTTP ${response.status}）`);
+      }
+    }
+
+    if (response.status === 401 && !authOptional && !path.includes("/api/auth/")) {
+      S.authenticated = false;
+      S.user = null;
+      void cleanupIM();
+      showLogin(true, true);
+      toast("登录已失效，请重新登录", "error");
+      throw new AuthExpiredError("登录已失效");
+    }
+    return { status: response.status, data, ok: response.ok };
+  } catch (error) {
+    if (error instanceof AuthExpiredError) throw error;
+    if (controller.signal.aborted) {
+      if (outerSignal && outerSignal.aborted) throw new DOMException("Aborted", "AbortError");
+      if (timedOut) throw new Error("请求超时，请检查网络后重试");
+      throw new DOMException("Aborted", "AbortError");
+    }
+    if (error instanceof TypeError) throw new Error("网络连接失败，请稍后重试");
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    if (outerSignal) outerSignal.removeEventListener("abort", onOuterAbort);
+  }
+}
+
+async function withPending(button, task) {
+  if (!button || button.dataset.pending === "true") return;
+  button.dataset.pending = "true";
+  button.disabled = true;
+  button.classList.add("pending");
+  button.setAttribute("aria-busy", "true");
+  try {
+    return await task();
+  } catch (error) {
+    if (error && error.name === "AbortError") return;
+    if (!(error instanceof AuthExpiredError)) toast(error.message || String(error), "error", 3600);
+  } finally {
+    if (button.isConnected) {
+      button.dataset.pending = "false";
+      button.classList.remove("pending");
+      button.removeAttribute("aria-busy");
+      button.disabled = button.dataset.locked === "true";
+    }
+  }
+}
+
+function showLogin(show, clearSecrets = false) {
+  $("screen-login").classList.toggle("hide", !show);
+  $("screen-app").classList.toggle("hide", show);
+  if (show) closeDrawer();
+  if (clearSecrets) {
+    $("password").value = "";
+    $("sms-code").value = "";
+  }
+  if (show) setTimeout(() => $("phone").focus(), 0);
+}
+
+function applyUser(user) {
+  S.user = user || null;
+  if (!user) {
+    $("side-name").textContent = "游客";
+    $("side-meta").textContent = "尚未登录";
+    $("side-avatar").textContent = "游";
     return;
   }
-  if (data && data.message) {
-    toast(data.message);
-    return;
+  const name = user.nickname || user.name || "乐园用户";
+  const uid = user.uid || user.id || "—";
+  $("side-name").textContent = name;
+  $("side-meta").textContent = `UID ${uid} · ${user.is_realname ? "已实名" : "未实名"}`;
+  $("side-avatar").textContent = firstChar(name, "贝");
+}
+
+function setLoginMode(mode) {
+  S.loginMode = mode === "sms" ? "sms" : "password";
+  $("password-field").classList.toggle("hide", S.loginMode !== "password");
+  $("sms-field").classList.toggle("hide", S.loginMode !== "sms");
+  $("login-tabs").querySelectorAll("[data-mode]").forEach((button) => {
+    const on = button.dataset.mode === S.loginMode;
+    button.classList.toggle("on", on);
+    button.setAttribute("aria-selected", String(on));
+  });
+}
+
+function navItems() {
+  return [...PRIMARY_NAV, ...SECONDARY_NAV, ...(S.labEnabled ? [LAB_NAV] : [])];
+}
+
+function isRouteAllowed(id) {
+  return navItems().some((item) => item.id === id);
+}
+
+function navButton(item, bottom = false) {
+  if (bottom) {
+    return `<button type="button" class="bottom-item${S.route === item.id ? " on" : ""}" data-route="${item.id}" aria-label="${esc(
+      item.name
+    )}" ${S.route === item.id ? 'aria-current="page"' : ""}>
+      <span>${item.name}</span>
+    </button>`;
   }
-  toast(fallback || "完成");
-}
-
-function emptyBox(title, detail, action) {
-  let btn = "";
-  if (action === "realname")
-    btn = `<p class="muted" style="margin-top:.5rem">请打开官方 App 完成刷脸实名后再试。</p>`;
-  if (action === "buy_card")
-    btn = `<button type="button" class="btn primary" data-go="match" style="margin-top:.5rem">去匹配/买卡</button>`;
-  if (action === "wallet")
-    btn = `<button type="button" class="btn primary" data-go="wallet" style="margin-top:.5rem">去钱包</button>`;
-  if (action === "relogin")
-    btn = `<p class="muted" style="margin-top:.5rem">请重新登录</p>`;
-  return `<div class="empty"><div style="font-weight:600;margin-bottom:.25rem">${esc(
-    title || "暂无内容"
-  )}</div><div class="muted">${esc(detail || "")}</div>${btn}</div>`;
-}
-
-function showLogin(on) {
-  $("screen-login").classList.toggle("hide", !on);
-  $("screen-app").classList.toggle("hide", on);
-}
-
-function applyUser(u) {
-  S.user = u || null;
-  if (!u) return;
-  const nick = u.nickname || "游客";
-  const line = `${nick} · ${u.uid || "—"} · ${u.is_realname ? "已实名" : "未实名"}`;
-  $("side-sub").textContent = line;
-  $("page-sub").textContent = line;
+  return `<button type="button" class="nav-item${S.route === item.id ? " on" : ""}" data-route="${item.id}" ${
+    S.route === item.id ? 'aria-current="page"' : ""
+  }>
+    <span>${item.name}</span>
+  </button>`;
 }
 
 function buildNav() {
-  const side = $("side-nav");
-  const bottom = $("bottom-nav");
-  side.innerHTML = NAV.map(
-    (n) =>
-      `<button type="button" class="nav-item${n.id === S.page ? " on" : ""}" data-nav="${n.id}">
-        <span class="ico">${n.ico}</span><span>${n.name}</span>
-      </button>`
-  ).join("");
-  const mobile = NAV.filter((n) => n.short);
-  bottom.innerHTML = mobile
-    .map(
-      (n) =>
-        `<button type="button" class="${n.id === S.page ? "on" : ""}" data-nav="${n.id}">
-          <span class="ico">${n.ico}</span>${n.name}
-        </button>`
-    )
-    .join("");
-  document.querySelectorAll("[data-nav]").forEach((b) => {
-    b.onclick = () => {
-      closeDrawer();
-      go(b.dataset.nav);
-    };
+  $("primary-nav").innerHTML = PRIMARY_NAV.map((item) => navButton(item)).join("");
+  const secondary = [...SECONDARY_NAV, ...(S.labEnabled ? [LAB_NAV] : [])];
+  $("secondary-nav").innerHTML = secondary.map((item) => navButton(item)).join("");
+  $("bottom-nav").innerHTML = PRIMARY_NAV.map((item) => navButton(item, true)).join("");
+}
+
+function syncNav() {
+  document.querySelectorAll("[data-route]").forEach((button) => {
+    const on = button.dataset.route === S.route;
+    button.classList.toggle("on", on);
+    if (on) button.setAttribute("aria-current", "page");
+    else button.removeAttribute("aria-current");
   });
+  const nav = navItems().find((item) => item.id === S.route) || PRIMARY_NAV[0];
+  $("page-title").textContent = nav.name;
+  $("page-subtitle").textContent = nav.desc;
 }
 
-function closeDrawer() {
-  $("sidebar").classList.remove("open");
-  $("drawer-mask").classList.add("hide");
-}
-
-function go(id) {
-  S.page = id;
-  document.querySelectorAll(".page").forEach((p) => p.classList.toggle("on", p.dataset.p === id));
-  document.querySelectorAll("[data-nav]").forEach((b) => {
-    b.classList.toggle("on", b.dataset.nav === id);
-  });
-  const nav = NAV.find((n) => n.id === id);
-  $("page-title").textContent = nav ? nav.name : id;
-  renderPage(id);
-}
-
-/* ---------- helpers UI (DTO only — no bare JSON on product pages) ---------- */
-function person(item) {
-  if (!item || typeof item !== "object") {
-    return `<div class="row-card"><div class="meta"><div class="n">${esc(item)}</div></div></div>`;
-  }
-  // prefer normalized DTO fields
-  const id = item.id || item.uid || "";
-  const nick = item.nickname || "用户";
-  const sub = item.subtitle || [id && `uid ${id}`, item.role, item.city].filter(Boolean).join(" · ");
-  const av = item.avatar
-    ? `<img class="av" src="${esc(item.avatar)}" alt="" style="object-fit:cover;padding:0" onerror="this.outerHTML='<div class=av>${esc(
-        String(nick).slice(0, 1)
-      )}</div>'" />`
-    : `<div class="av">${esc(String(nick).slice(0, 1))}</div>`;
-  return `<div class="row-card">
-    ${av}
-    <div class="meta"><div class="n">${esc(nick)}</div><div class="s">${esc(sub || "—")}</div></div>
-    ${id ? `<button type="button" class="btn ghost" data-f="${esc(id)}">关注</button>` : ""}
-  </div>`;
-}
-
-/** Render items[] from product envelope; never dump raw JSON on main pages */
-function listHtml(list, emptyTitle = "暂无数据", emptyDetail = "") {
-  const items = Array.isArray(list) ? list : list && list.items;
-  if (!items || !items.length) {
-    return emptyBox(emptyTitle, emptyDetail || "换个时间再试试");
-  }
-  return `<div class="list">${items.map(person).join("")}</div>`;
-}
-
-function renderEnvelopeList(data, emptyTitle) {
-  if (data && data.error) {
-    return emptyBox(data.error.title, data.error.detail, data.error.action);
-  }
-  if (data && data.empty) {
-    return emptyBox(
-      data.empty_title || emptyTitle || "暂无",
-      data.empty_detail || "",
-      data.empty_action
-    );
-  }
-  const items = (data && (data.items || data.list)) || [];
-  return listHtml(items, emptyTitle || "暂无数据");
-}
-
-function bindFollow(root) {
-  root.querySelectorAll("[data-f]").forEach((b) => {
-    b.onclick = async () => {
-      const { data } = await api("/api/social/follow", {
-        method: "POST",
-        body: JSON.stringify({ uid: b.dataset.f }),
-      });
-      toast(data.message || (data.ok ? "已关注" : "失败"));
-    };
-  });
-}
-
-function field(obj, keys, fb = "—") {
-  if (!obj || typeof obj !== "object") return fb;
-  for (const k of keys) if (obj[k] != null && obj[k] !== "") return obj[k];
-  for (const v of Object.values(obj)) {
-    if (v && typeof v === "object" && !Array.isArray(v)) {
-      for (const k of keys) if (v[k] != null && v[k] !== "") return v[k];
-    }
-  }
-  return fb;
-}
-
-function short(o) {
-  if (o == null) return "—";
-  if (typeof o !== "object") return String(o);
-  try {
-    const s = JSON.stringify(o);
-    return s.length > 20 ? s.slice(0, 18) + "…" : s;
-  } catch {
-    return "—";
-  }
-}
-
-function pageEl(id) {
-  return document.querySelector(`.page[data-p="${id}"]`);
-}
-
-/* ---------- pages ---------- */
-async function renderPage(id) {
-  const el = pageEl(id);
-  if (!el) return;
-  el.innerHTML = `<div class="empty">加载中…</div>`;
-  try {
-    if (id === "home") await pageHome(el);
-    else if (id === "square") await pageSquare(el);
-    else if (id === "match") await pageMatch(el);
-    else if (id === "social") await pageSocial(el);
-    else if (id === "room") await pageRoom(el);
-    else if (id === "msg") await pageMsg(el);
-    else if (id === "wallet") await pageWallet(el);
-    else if (id === "tasks") await pageTasks(el);
-    else if (id === "me") await pageMe(el);
-    else if (id === "lab") pageLab(el);
-  } catch (e) {
-    el.innerHTML = `<div class="empty">${esc(e)}</div>`;
-  }
-}
-
-async function pageHome(el) {
-  const { data } = await api("/api/home");
-  if (data.user) applyUser(data.user);
-  const nick = data.user?.nickname || "游客";
-  const hb = data.heartbeat?.running ? `在线 · 心跳 ${data.heartbeat.ticks || 0}` : "心跳未开启";
-  el.innerHTML = `
-    <div class="hero">
-      <div>你好，<b>${esc(nick)}</b></div>
-      <div class="muted" style="margin-top:.35rem">${esc(hb)} · 币 ${esc(
-    data.user?.money ?? 0
-  )} · ${data.user?.is_realname ? "已实名" : "未实名"}</div>
-    </div>
-    <div class="h">快捷</div>
-    <div class="chip-row">
-      ${["match", "social", "wallet", "tasks", "room", "msg"]
-        .map((id) => {
-          const n = NAV.find((x) => x.id === id);
-          return `<button type="button" class="chip" data-go="${id}">${n.ico} ${n.name}</button>`;
-        })
-        .join("")}
-    </div>
-    <div class="h">推荐</div>
-    <div id="home-rec"></div>
-    <div class="h">礼物</div>
-    <div class="scroll-x" id="home-gifts"></div>`;
-  el.querySelectorAll("[data-go]").forEach((b) => (b.onclick = () => go(b.dataset.go)));
-  // empty-state action buttons
-  el.addEventListener("click", (ev) => {
-    const t = ev.target.closest("[data-go]");
-    if (t && t.dataset.go) go(t.dataset.go);
-  });
-  const recBox = el.querySelector("#home-rec");
-  recBox.innerHTML = renderEnvelopeList(data.recommend, "暂无推荐");
-  bindFollow(recBox);
-  const gifts = (data.gifts && (data.gifts.items || data.gifts.list)) || [];
-  el.querySelector("#home-gifts").innerHTML = gifts.length
-    ? gifts
-        .slice(0, 24)
-        .map((g) => {
-          const name = g.name || "礼物";
-          const price = g.price || "";
-          return `<div class="pill">🎁<div>${esc(name)}</div><div class="muted">${esc(price)}</div></div>`;
-        })
-        .join("")
-    : emptyBox("暂无礼物", "礼物列表为空或暂时无法解析");
-}
-
-async function pageSquare(el) {
-  el.innerHTML = `
-    <div class="h">发现</div>
-    <div class="actions">
-      <button type="button" class="action" id="sq-rec"><span class="t">刷新推荐</span><span class="d">Tuijiannew</span></button>
-      <button type="button" class="action" id="sq-slide"><span class="t">幻灯片</span><span class="d">getSlide</span></button>
-    </div>
-    <div class="h">话题</div>
-    <div class="inline">
-      <input id="topic-q" placeholder="搜索话题关键词" />
-      <button type="button" class="btn primary" id="btn-topic">搜索</button>
-    </div>
-    <div id="sq-list" class="stack" style="margin-top:.65rem"></div>
-    <div class="h">创建话题</div>
-    <div class="inline">
-      <input id="topic-new" placeholder="话题名" />
-      <button type="button" class="btn ghost" id="btn-topic-new">创建</button>
-    </div>
-    <pre class="code" id="sq-out" style="margin-top:.65rem"></pre>`;
-  const out = (d) => {
-    el.querySelector("#sq-out").textContent = JSON.stringify(d, null, 2).slice(0, 3500);
-  };
-  const loadRec = async () => {
-    const { data } = await api("/api/recommend");
-    const box = el.querySelector("#sq-list");
-    box.innerHTML = renderEnvelopeList(data, "暂无推荐");
-    bindFollow(box);
-    out(data);
-  };
-  el.querySelector("#sq-rec").onclick = loadRec;
-  el.querySelector("#sq-slide").onclick = async () => {
-    const { data } = await api("/api/slide");
-    el.querySelector("#sq-list").innerHTML = renderEnvelopeList(data, "暂无幻灯");
-    out(data);
-  };
-  el.querySelector("#btn-topic").onclick = async () => {
-    const q = el.querySelector("#topic-q").value.trim();
-    const { data } = await api("/api/topics?q=" + encodeURIComponent(q));
-    el.querySelector("#sq-list").innerHTML = renderEnvelopeList(data, "暂无话题");
-    out(data);
-  };
-  el.querySelector("#btn-topic-new").onclick = async () => {
-    const topic = el.querySelector("#topic-new").value.trim();
-    if (!topic) return toast("输入话题");
-    const { data } = await api("/api/topics/create", {
-      method: "POST",
-      body: JSON.stringify({ topic }),
-    });
-    toast(data.message || String(data.ok));
-    out(data);
-  };
-  loadRec();
-}
-
-async function pageMatch(el) {
-  const { data } = await api("/api/match/status");
-  if (data.user) applyUser(data.user);
-  const d = (data.display || data.status?.display || {});
-  el.innerHTML = `
-    <div class="stats">
-      <div class="stat"><div class="v">${esc(d.online ?? "—")}</div><div class="l">在线免费</div></div>
-      <div class="stat"><div class="v">${esc(d.local ?? "—")}</div><div class="l">同城免费</div></div>
-      <div class="stat"><div class="v">${esc(d.card ?? "—")}</div><div class="l">匹配卡</div></div>
-      <div class="stat"><div class="v">${esc(d.money ?? data.user?.money ?? 0)}</div><div class="l">乐园币</div></div>
-    </div>
-    <div class="h">开始匹配</div>
-    <div class="actions">
-      <button type="button" class="action" data-m="online"><span class="t">在线匹配</span><span class="d">需实名 · 优先用免费次数</span></button>
-      <button type="button" class="action" data-m="local"><span class="t">同城匹配</span><span class="d">需实名 · 可能消耗匹配卡</span></button>
-      <button type="button" class="action" data-m="pick"><span class="t">捡漂流瓶</span><span class="d">随机捞一条留言</span></button>
-      <button type="button" class="action" data-m="throw"><span class="t">扔漂流瓶</span><span class="d">写下想说的话</span></button>
-      <button type="button" class="action" data-m="users"><span class="t">在线列表</span><span class="d">看看谁在匹配池</span></button>
-      <button type="button" class="action" data-m="card"><span class="t">乐园币买卡</span><span class="d">消耗乐园币购买匹配卡</span></button>
-    </div>
-    <div class="h">约会</div>
-    <div class="inline">
-      <input id="dating-body" placeholder="约会说明（简要）" />
-      <button type="button" class="btn ghost" id="btn-dating">发布</button>
-    </div>
-    <div class="h">结果</div>
-    <div id="match-out">${emptyBox("点上方按钮开始", "匹配结果会显示在这里")}</div>`;
-  const box = el.querySelector("#match-out");
-  const run = async (path, body = {}) => {
-    box.innerHTML = emptyBox("请稍候", "正在请求…");
-    const { data: res } = await api(path, { method: "POST", body: JSON.stringify(body) });
-    toastEnv(res, res.ok ? "完成" : "未成功");
-    box.innerHTML = renderEnvelopeList(res, "没有结果");
-    bindFollow(box);
-    // refresh counters after attempt
-    const st = await api("/api/match/status");
-    if (st.data.display) {
-      /* soft refresh page counters without full remount if still on match */
-    }
-  };
-  el.querySelectorAll("[data-m]").forEach((b) => {
-    b.onclick = async () => {
-      const m = b.dataset.m;
-      if (m === "online") return run("/api/match/online");
-      if (m === "local") return run("/api/match/local");
-      if (m === "pick") return run("/api/match/bottle-pick");
-      if (m === "throw") {
-        const content = prompt("漂流瓶内容", "你好，很高兴认识你");
-        if (content == null) return;
-        return run("/api/match/bottle-throw", { content, message: content, text: content });
-      }
-      if (m === "users") {
-        const { data: res } = await api("/api/match/online-users");
-        box.innerHTML = renderEnvelopeList(res, "暂无在线用户");
-        bindFollow(box);
-        return;
-      }
-      if (m === "card") {
-        const { data: res } = await api("/api/pay/card", {
-          method: "POST",
-          body: JSON.stringify({ card_id: "1" }),
-        });
-        toastEnv(res, res.ok ? "购买已提交" : "购买失败");
-        box.innerHTML = res.ok
-          ? emptyBox("购买请求已发送", "请下拉刷新匹配状态查看卡数")
-          : emptyBox(
-              (res.error && res.error.title) || "购买失败",
-              (res.error && res.error.detail) || res.message || "",
-              res.error && res.error.action
-            );
-        go("match");
-      }
-    };
-  });
-  el.querySelector("#btn-dating").onclick = async () => {
-    const text = el.querySelector("#dating-body").value.trim();
-    run("/api/match/dating-publish", { content: text, message: text, text });
-  };
-}
-
-async function pageSocial(el) {
-  el.innerHTML = `
-    <div class="inline">
-      <input id="s-uid" placeholder="对方 uid" />
-      <button type="button" class="btn primary" id="s-follow">关注</button>
-      <button type="button" class="btn ghost" id="s-un">取关</button>
-      <button type="button" class="btn ghost" id="s-view">资料</button>
-    </div>
-    <div class="tabs" style="margin-top:.75rem" id="s-tabs">
-      <button type="button" class="on" data-st="follows">关注</button>
-      <button type="button" data-st="fans">粉丝</button>
-      <button type="button" data-st="apply">好友申请</button>
-      <button type="button" data-st="black">黑名单</button>
-    </div>
-    <div id="s-list" style="margin-top:.65rem"></div>
-    <div class="h">用户卡片</div>
-    <div id="s-user"></div>
-    <div class="h">举报</div>
-    <div class="inline">
-      <input id="s-report-id" placeholder="itemid" />
-      <input id="s-report-reason" placeholder="原因" value="web" />
-      <button type="button" class="btn ghost" id="s-report">举报</button>
-    </div>`;
-  const load = async () => {
-    const map = {
-      follows: "/api/social/follows",
-      fans: "/api/social/fans",
-      apply: "/api/social/friend-apply",
-      black: "/api/social/blacklist",
-    };
-    const { data } = await api(map[S.socialTab] || map.follows);
-    const box = el.querySelector("#s-list");
-    box.innerHTML = renderEnvelopeList(data, "列表为空");
-    bindFollow(box);
-  };
-  el.querySelectorAll("#s-tabs button").forEach((b) => {
-    b.onclick = () => {
-      el.querySelectorAll("#s-tabs button").forEach((x) => x.classList.remove("on"));
-      b.classList.add("on");
-      S.socialTab = b.dataset.st;
-      load();
-    };
-  });
-  el.querySelector("#s-follow").onclick = async () => {
-    const uid = el.querySelector("#s-uid").value.trim();
-    if (!uid) return toast("填写 uid");
-    const { data } = await api("/api/social/follow", {
-      method: "POST",
-      body: JSON.stringify({ uid }),
-    });
-    toastEnv(data, data.ok ? "已关注" : "关注失败");
-    load();
-  };
-  el.querySelector("#s-un").onclick = async () => {
-    const uid = el.querySelector("#s-uid").value.trim();
-    const { data } = await api("/api/social/unfollow", {
-      method: "POST",
-      body: JSON.stringify({ uid }),
-    });
-    toastEnv(data);
-    load();
-  };
-  el.querySelector("#s-view").onclick = async () => {
-    const uid = el.querySelector("#s-uid").value.trim();
-    if (!uid) return toast("填写 uid");
-    const { data } = await api("/api/profile/user?uid=" + encodeURIComponent(uid));
-    const box = el.querySelector("#s-user");
-    box.innerHTML = renderEnvelopeList(data, "未找到用户");
-    bindFollow(box);
-  };
-  el.querySelector("#s-report").onclick = async () => {
-    const { data } = await api("/api/social/report", {
-      method: "POST",
-      body: JSON.stringify({
-        type: "user",
-        itemid: el.querySelector("#s-report-id").value.trim(),
-        reason: el.querySelector("#s-report-reason").value.trim() || "web",
-      }),
-    });
-    toast(data.message || String(data.ok));
-  };
-  load();
-}
-
-async function pageRoom(el) {
-  el.innerHTML = `
-    <div class="actions">
-      <button type="button" class="action" id="r-top"><span class="t">房间榜</span><span class="d">getRoomTop</span></button>
-      <button type="button" class="action" id="r-auth"><span class="t">房间权限</span><span class="d">getRoomAuth</span></button>
-    </div>
-    <div class="h">创建房间</div>
-    <div class="inline">
-      <input id="r-type" value="处CP" />
-      <button type="button" class="btn primary" id="r-create">创建</button>
-    </div>
-    <div class="h">点歌 / KTV</div>
-    <div class="inline">
-      <input id="r-kw" placeholder="歌名关键词" />
-      <button type="button" class="btn ghost" id="r-ktv">搜索</button>
-    </div>
-    <div class="h">RTC Token</div>
-    <div class="inline">
-      <input id="r-ch" placeholder="channel" />
-      <button type="button" class="btn ghost" id="r-rtc">获取</button>
-    </div>
-    <pre class="code" id="r-out" style="margin-top:.75rem"></pre>
-    <div id="r-list" style="margin-top:.65rem"></div>`;
-  const out = (d) => {
-    el.querySelector("#r-out").textContent = JSON.stringify(d, null, 2).slice(0, 4000);
-  };
-  el.querySelector("#r-top").onclick = async () => {
-    const { data } = await api("/api/room/top");
-    out(data);
-    const box = el.querySelector("#r-list");
-    box.innerHTML = listHtml(data.list, "无榜单");
-  };
-  el.querySelector("#r-auth").onclick = async () => {
-    const { data } = await api("/api/room/auth");
-    out(data);
-  };
-  el.querySelector("#r-create").onclick = async () => {
-    const { data } = await api("/api/room/create", {
-      method: "POST",
-      body: JSON.stringify({ type: el.querySelector("#r-type").value || "处CP" }),
-    });
-    toast(data.message || String(data.ok));
-    out(data);
-  };
-  el.querySelector("#r-ktv").onclick = async () => {
-    const { data } = await api("/api/room/ktv-search", {
-      method: "POST",
-      body: JSON.stringify({ q: el.querySelector("#r-kw").value }),
-    });
-    out(data);
-    el.querySelector("#r-list").innerHTML = listHtml(data.list, "无结果");
-  };
-  el.querySelector("#r-rtc").onclick = async () => {
-    const { data } = await api("/api/room/rtc-token", {
-      method: "POST",
-      body: JSON.stringify({ channel: el.querySelector("#r-ch").value }),
-    });
-    out(data);
-  };
-}
-
-async function pageMsg(el) {
-  el.innerHTML = `
-    <div class="card">
-      <div><b>即时消息</b></div>
-      <p class="muted">协议提供 TIM UserSig / 融云 token。浏览器可尝试 CDN 登录；生产建议 npm @tencentcloud/chat。</p>
-      <div class="inline">
-        <button type="button" class="btn primary" id="im-tim">获取 TIM 凭证</button>
-        <button type="button" class="btn ghost" id="im-rong">融云 token</button>
-      </div>
-      <div id="im-info" class="muted" style="margin-top:.5rem">—</div>
-    </div>
-    <div class="h">发送（需 TIM 已登录）</div>
-    <div class="inline"><input id="im-peer" placeholder="对端 userID" /></div>
-    <div class="inline">
-      <input id="im-text" placeholder="消息" />
-      <button type="button" class="btn primary" id="im-send" disabled>发送</button>
-    </div>
-    <div class="chat" id="im-log"></div>
-    <pre class="code" id="im-json"></pre>`;
-  const log = (t, sys) => {
-    const d = document.createElement("div");
-    d.className = sys ? "sys" : "";
-    d.textContent = t;
-    el.querySelector("#im-log").appendChild(d);
-  };
-  el.querySelector("#im-tim").onclick = async () => {
-    const { data } = await api("/api/im/tim?prefer=local");
-    S.tim = data;
-    el.querySelector("#im-info").innerHTML = data.ok
-      ? `SDKAppID <b>${esc(data.SDKAppID)}</b> · user <b>${esc(data.userID)}</b> · ${esc(data.source || "")}`
-      : esc(data.error || "失败");
-    el.querySelector("#im-json").textContent = JSON.stringify(
-      { SDKAppID: data.SDKAppID, userID: data.userID, userSig: (data.userSig || "").slice(0, 48) + "…" },
-      null,
-      2
-    );
-    log("已获取 UserSig", true);
-    await connectTim(data, log, el);
-  };
-  el.querySelector("#im-rong").onclick = async () => {
-    const { data } = await api("/api/im/rong");
-    el.querySelector("#im-json").textContent = JSON.stringify(data, null, 2);
-    toast(data.ok ? "已返回" : data.message || "可能为占位 token");
-  };
-  el.querySelector("#im-send").onclick = async () => {
-    if (!S.chat || !window.TIM) return toast("未连接 TIM");
-    const to = el.querySelector("#im-peer").value.trim();
-    const text = el.querySelector("#im-text").value.trim() || "hello";
-    if (!to) return toast("对端 uid");
-    try {
-      const msg = S.chat.createTextMessage({
-        to,
-        conversationType: TIM.TYPES.CONV_C2C,
-        payload: { text },
-      });
-      await S.chat.sendMessage(msg);
-      log("我: " + text);
-      el.querySelector("#im-text").value = "";
-    } catch (e) {
-      log("发送失败 " + e, true);
-    }
-  };
-}
-
-async function connectTim(cred, log, el) {
-  if (!cred?.userSig) return;
-  if (!window.TIM) {
-    log("加载 TIM SDK…", true);
-    try {
-      await new Promise((resolve, reject) => {
-        const s = document.createElement("script");
-        s.src = "https://web.sdk.qcloud.com/im/demo/latest/tim-js.js";
-        s.onload = resolve;
-        s.onerror = () => reject(new Error("CDN 失败"));
-        document.head.appendChild(s);
-      });
-    } catch (e) {
-      log(String(e.message || e), true);
-      return;
-    }
-  }
-  if (!window.TIM) {
-    log("无全局 TIM，请用凭证自建前端", true);
-    return;
-  }
-  try {
-    S.chat = TIM.create({ SDKAppID: cred.SDKAppID });
-    S.chat.setLogLevel(1);
-    S.chat.on(TIM.EVENT.MESSAGE_RECEIVED, (ev) => {
-      (ev.data || []).forEach((m) => log((m.from || "?") + ": " + ((m.payload && m.payload.text) || "[消息]")));
-    });
-    await S.chat.login({ userID: cred.userID, userSig: cred.userSig });
-    log("TIM 登录成功", true);
-    el.querySelector("#im-send").disabled = false;
-    toast("消息通道已连接");
-  } catch (e) {
-    log("TIM 失败: " + e, true);
-  }
-}
-
-async function pageWallet(el) {
-  const { data } = await api("/api/wallet");
-  if (data.user) applyUser(data.user);
-  el.innerHTML = `
-    <div class="stats">
-      <div class="stat"><div class="v">${esc(data.user?.money ?? 0)}</div><div class="l">乐园币</div></div>
-      <div class="stat"><div class="v">${esc(data.user?.vip ?? 0)}</div><div class="l">VIP</div></div>
-      <div class="stat"><div class="v">${esc(data.user?.svip ?? 0)}</div><div class="l">SVIP</div></div>
-      <div class="stat"><div class="v">${data.user?.is_realname ? "是" : "否"}</div><div class="l">实名</div></div>
-    </div>
-    <div class="h">会员</div>
-    <div class="inline">
-      <button type="button" class="btn ghost" id="w-svip">SVIP 试用</button>
-      <button type="button" class="btn ghost" id="w-ex">余额兑 VIP</button>
-    </div>
-    <div class="h">充值下单</div>
-    <div class="inline">
-      <select id="w-ch"><option value="wechat">微信</option><option value="alipay">支付宝</option></select>
-      <input id="w-coin" value="1" style="max-width:88px" />
-      <button type="button" class="btn primary" id="w-pay">充币订单</button>
-      <button type="button" class="btn ghost" id="w-vip">VIP 订单</button>
-    </div>
-    <p class="muted">下单 ≠ 到账。官方收银受包名/商户绑定限制。</p>
-    <div class="h">提现（需实名）</div>
-    <div class="inline">
-      <input id="w-alipay" placeholder="支付宝账号" />
-      <input id="w-name" placeholder="姓名" />
-      <input id="w-amt" placeholder="金额" style="max-width:100px" />
-      <button type="button" class="btn ghost" id="w-wd">提现</button>
-    </div>
-    <div class="h">我的礼物</div>
-    <div id="w-gifts"></div>
-    <pre class="code" id="w-out" style="margin-top:.65rem"></pre>`;
-  const out = (d) => {
-    el.querySelector("#w-out").textContent = JSON.stringify(d, null, 2).slice(0, 3500);
-  };
-  el.querySelector("#w-gifts").innerHTML = renderEnvelopeList(data.my_gifts, "背包暂无礼物");
-  el.querySelector("#w-svip").onclick = async () => {
-    const { data: d } = await api("/api/wallet/svip-try", { method: "POST", body: "{}" });
-    toastEnv(d);
-    out(d);
-  };
-  el.querySelector("#w-ex").onclick = async () => {
-    const { data: d } = await api("/api/wallet/exchange-vip", {
-      method: "POST",
-      body: JSON.stringify({ vip_id: 5 }),
-    });
-    toastEnv(d);
-    out(d);
-  };
-  el.querySelector("#w-pay").onclick = async () => {
-    const { data: d } = await api("/api/pay/coin", {
-      method: "POST",
-      body: JSON.stringify({
-        channel: el.querySelector("#w-ch").value,
-        coin_id: el.querySelector("#w-coin").value || "1",
-      }),
-    });
-    toast(
-      d.ok
-        ? d.product_notice || "订单参数已生成（尚未支付到账）"
-        : (d.error && d.error.title) || d.message || "下单失败"
-    );
-    out(d);
-  };
-  el.querySelector("#w-vip").onclick = async () => {
-    const { data: d } = await api("/api/pay/vip", {
-      method: "POST",
-      body: JSON.stringify({ channel: el.querySelector("#w-ch").value, level: "vip" }),
-    });
-    toast(d.ok ? d.product_notice || "VIP 订单参数已生成" : d.message || "失败");
-    out(d);
-  };
-  el.querySelector("#w-wd").onclick = async () => {
-    const { data: d } = await api("/api/wallet/withdraw", {
-      method: "POST",
-      body: JSON.stringify({
-        alipay: el.querySelector("#w-alipay").value,
-        name: el.querySelector("#w-name").value,
-        amount: el.querySelector("#w-amt").value,
-      }),
-    });
-    toastEnv(d);
-    out(d);
-  };
-}
-
-async function pageTasks(el) {
-  el.innerHTML = `
-    <button type="button" class="btn ghost full" id="t-load">刷新任务</button>
-    <div id="t-list" style="margin-top:.65rem"></div>
-    <div class="inline" style="margin-top:.65rem">
-      <input id="t-id" placeholder="任务 id" />
-      <button type="button" class="btn primary" id="t-recv">领取</button>
-    </div>
-    <p class="muted">进度由服务端统计；未达标领取通常无效。</p>
-    <pre class="code" id="t-out"></pre>`;
-  const load = async () => {
-    const { data } = await api("/api/tasks");
-    const list = data.items || [];
-    el.querySelector("#t-out").textContent = list.length
-      ? `共 ${list.length} 个任务`
-      : "暂无任务数据";
-    if (!list.length) {
-      el.querySelector("#t-list").innerHTML = emptyBox("暂无任务", "没有可展示的任务，或账号暂不可见");
-      return;
-    }
-    el.querySelector("#t-list").innerHTML = list
-      .map((t) => {
-        const id = t.id || "";
-        const title = t.title || "任务";
-        const prog = t.progress_text || "";
-        const st = t.status_text || "";
-        const can = t.can_receive;
-        return `<div class="row-card">
-          <div class="meta"><div class="n">${esc(title)}</div>
-          <div class="s">${esc(prog)} · ${esc(st)}${id ? " · id " + esc(id) : ""}</div></div>
-          <button type="button" class="btn ${can ? "primary" : "ghost"}" data-tid="${esc(
-          id
-        )}" ${can ? "" : "title=进度未完成也可尝试领取"}">领取</button>
-        </div>`;
-      })
-      .join("");
-    el.querySelectorAll("[data-tid]").forEach((b) => {
-      b.onclick = () => {
-        el.querySelector("#t-id").value = b.dataset.tid;
-        el.querySelector("#t-recv").click();
-      };
-    });
-  };
-  el.querySelector("#t-load").onclick = load;
-  el.querySelector("#t-recv").onclick = async () => {
-    const id = el.querySelector("#t-id").value.trim();
-    if (!id) return toast("任务 id");
-    const { data } = await api("/api/tasks/receive", {
-      method: "POST",
-      body: JSON.stringify({ id }),
-    });
-    toastEnv(data);
-    load();
-  };
-  load();
-}
-
-async function pageMe(el) {
-  const { data } = await api("/api/profile/me");
-  if (data.user) applyUser(data.user);
-  const u = data.user || S.user || {};
-  el.innerHTML = `
-    <div class="card me-head">
-      <div class="av" style="width:52px;height:52px;font-size:1.2rem">${esc((u.nickname || "游").slice(0, 1))}</div>
-      <div>
-        <div style="font-weight:700;font-size:1.1rem">${esc(u.nickname || "—")}</div>
-        <div class="muted">uid ${esc(u.uid || "—")} · ${u.is_realname ? "已实名" : "未实名"} · 币 ${esc(u.money ?? 0)}</div>
-      </div>
-    </div>
-    <div class="menu" style="margin-top:.75rem">
-      <button type="button" data-mp="profile"><span>完整资料</span><span class="arrow">›</span></button>
-      <button type="button" data-mp="nick"><span>修改昵称</span><span class="arrow">›</span></button>
-      <button type="button" data-mp="face"><span>实名说明</span><span class="arrow">›</span></button>
-      <button type="button" data-mp="eti"><span>礼仪分</span><span class="arrow">›</span></button>
-      <button type="button" data-mp="ref"><span>推荐码</span><span class="arrow">›</span></button>
-    </div>
-    <button type="button" class="btn danger full" id="btn-logout" style="margin-top:1rem">退出登录</button>
-    <div id="me-panel" class="panel"></div>`;
-  el.querySelector("#btn-logout").onclick = logout;
-  const panel = el.querySelector("#me-panel");
-  el.querySelectorAll("[data-mp]").forEach((b) => {
-    b.onclick = async () => {
-      const k = b.dataset.mp;
-      if (k === "profile") {
-        panel.innerHTML = `<pre class="code">${esc(JSON.stringify(data, null, 2).slice(0, 4500))}</pre>`;
-      }
-      if (k === "nick") {
-        panel.innerHTML = `
-          <div class="card">
-            <p class="muted">未实名会 403。实名后受改名次数限制。</p>
-            <input id="nick-v" placeholder="新昵称" />
-            <button type="button" class="btn primary full" id="nick-go" style="margin-top:.5rem">提交</button>
-            <pre class="code" id="nick-o" style="margin-top:.5rem"></pre>
-          </div>`;
-        panel.querySelector("#nick-go").onclick = async () => {
-          const { data: d } = await api("/api/profile/nick", {
-            method: "POST",
-            body: JSON.stringify({ name: panel.querySelector("#nick-v").value.trim() }),
-          });
-          panel.querySelector("#nick-o").textContent = JSON.stringify(d, null, 2);
-          toast(d.message || String(d.ok));
-          if (d.user) applyUser(d.user);
-        };
-      }
-      if (k === "face") {
-        const { data: d } = await api("/api/face/status");
-        panel.innerHTML = `<div class="card"><p class="muted">活体需阿里云 ZIM，建议官方 App 完成实名。</p>
-          <pre class="code">${esc(JSON.stringify(d, null, 2))}</pre></div>`;
-      }
-      if (k === "eti") {
-        const { data: d } = await api("/api/profile/etiquette");
-        panel.innerHTML = `<pre class="code">${esc(JSON.stringify(d, null, 2))}</pre>`;
-      }
-      if (k === "ref") {
-        panel.innerHTML = `
-          <div class="card">
-            <button type="button" class="btn ghost full" id="ref-get">查看推荐码</button>
-            <div class="inline" style="margin-top:.5rem">
-              <input id="ref-v" placeholder="设置推荐码" />
-              <button type="button" class="btn primary" id="ref-set">设置</button>
-            </div>
-            <pre class="code" id="ref-o" style="margin-top:.5rem"></pre>
-          </div>`;
-        panel.querySelector("#ref-get").onclick = async () => {
-          const { data: d } = await api("/api/referral");
-          panel.querySelector("#ref-o").textContent = JSON.stringify(d, null, 2);
-        };
-        panel.querySelector("#ref-set").onclick = async () => {
-          const { data: d } = await api("/api/referral/set", {
-            method: "POST",
-            body: JSON.stringify({ referral: panel.querySelector("#ref-v").value }),
-          });
-          toast(d.message || String(d.ok));
-          panel.querySelector("#ref-o").textContent = JSON.stringify(d, null, 2);
-        };
-      }
-    };
-  });
-}
-
-function pageLab(el) {
-  el.innerHTML = `
-    <div class="card">
-      <p class="muted">任意业务 action（与 APK startHttp 同源）。约 400+ 接口。</p>
-      <label>action</label>
-      <input id="lab-a" placeholder="getGiftList" />
-      <label>params JSON</label>
-      <textarea id="lab-p" rows="4">{}</textarea>
-      <div class="inline" style="margin-top:.55rem">
-        <button type="button" class="btn primary" id="lab-go">调用</button>
-        <button type="button" class="btn ghost" id="lab-redis">redis 调用</button>
-        <button type="button" class="btn ghost" id="lab-acts">列出 actions</button>
-      </div>
-      <pre class="code" id="lab-o" style="margin-top:.65rem"></pre>
-    </div>`;
-  const out = (d) => {
-    el.querySelector("#lab-o").textContent = JSON.stringify(d, null, 2).slice(0, 6000);
-  };
-  el.querySelector("#lab-go").onclick = async () => {
-    let params = {};
-    try {
-      params = JSON.parse(el.querySelector("#lab-p").value || "{}");
-    } catch {
-      return toast("JSON 无效");
-    }
-    const { data } = await api("/api/call", {
-      method: "POST",
-      body: JSON.stringify({ action: el.querySelector("#lab-a").value.trim(), params }),
-    });
-    out(data);
-  };
-  el.querySelector("#lab-redis").onclick = async () => {
-    let params = {};
-    try {
-      params = JSON.parse(el.querySelector("#lab-p").value || "{}");
-    } catch {
-      return toast("JSON 无效");
-    }
-    const { data } = await api("/api/call-redis", {
-      method: "POST",
-      body: JSON.stringify({ action: el.querySelector("#lab-a").value.trim(), params }),
-    });
-    out(data);
-  };
-  el.querySelector("#lab-acts").onclick = async () => {
-    const { data } = await api("/api/actions");
-    out(data);
-  };
-}
-
-/* ---------- auth ---------- */
-async function logout() {
-  await api("/api/auth/logout", { method: "POST", body: "{}" });
-  setSid("");
-  S.user = null;
-  showLogin(true);
-  toast("已退出");
-}
-
-$("login-tabs").onclick = (e) => {
-  const b = e.target.closest("button[data-m]");
-  if (!b) return;
-  [...$("login-tabs").children].forEach((x) => x.classList.remove("on"));
-  b.classList.add("on");
-  S.loginMode = b.dataset.m;
-  $("box-pass").classList.toggle("hide", S.loginMode !== "password");
-  $("box-sms").classList.toggle("hide", S.loginMode !== "sms");
-};
-
-$("btn-sms").onclick = async () => {
-  const phone = $("phone").value.trim();
-  if (!phone) return toast("请输入手机号");
-  const { data } = await api("/api/auth/sms-send", {
-    method: "POST",
-    body: JSON.stringify({ phone }),
-  });
-  toast(data.message || (data.ok ? "已发送" : "发送失败"));
-};
-
-$("btn-login").onclick = async () => {
-  const phone = $("phone").value.trim();
-  const password = $("pass").value;
-  const code = $("code").value.trim();
-  $("login-msg").textContent = "";
-  if (!phone) {
-    $("login-msg").textContent = "请输入手机号";
-    return;
-  }
-  $("btn-login").disabled = true;
-  try {
-    let res;
-    if (S.loginMode === "sms") {
-      res = await api("/api/auth/sms-login", {
-        method: "POST",
-        body: JSON.stringify({ phone, code }),
-      });
-    } else {
-      res = await api("/api/auth/login", {
-        method: "POST",
-        body: JSON.stringify({
-          phone,
-          password,
-          mode: S.loginMode === "onekey" ? "onekey" : "password",
-        }),
-      });
-    }
-    if (!res.data.ok) {
-      $("login-msg").textContent = res.data.error || res.data.message || "登录失败";
-      return;
-    }
-    if (res.data.web_sid) setSid(res.data.web_sid);
-    applyUser(res.data.user);
-    showLogin(false);
-    buildNav();
-    go("home");
-    toast("登录成功");
-  } catch (e) {
-    $("login-msg").textContent = String(e);
-  } finally {
-    $("btn-login").disabled = false;
-  }
-};
-
-$("btn-logout-side").onclick = logout;
-$("btn-reload").onclick = () => go(S.page);
-$("btn-menu").onclick = () => {
+function openDrawer() {
   $("sidebar").classList.add("open");
   $("drawer-mask").classList.remove("hide");
-};
-$("drawer-mask").onclick = closeDrawer;
+  $("open-menu").setAttribute("aria-expanded", "true");
+  document.body.classList.add("drawer-open");
+  setTimeout(() => $("close-menu").focus(), 0);
+}
 
-/* boot */
-(async () => {
-  buildNav();
-  if (!S.sid) {
-    showLogin(true);
+function closeDrawer(returnFocus = false) {
+  $("sidebar").classList.remove("open");
+  $("drawer-mask").classList.add("hide");
+  $("open-menu").setAttribute("aria-expanded", "false");
+  document.body.classList.remove("drawer-open");
+  if (returnFocus && !$("open-menu").classList.contains("hide")) $("open-menu").focus();
+}
+
+function hashRoute() {
+  const value = location.hash.replace(/^#\/?/, "").split(/[?&]/)[0];
+  return value || "nearby";
+}
+
+function go(id, options = {}) {
+  const target = isRouteAllowed(id) ? id : "nearby";
+  closeDrawer();
+  const hash = `#/${target}`;
+  if (options.replace) {
+    history.replaceState(null, "", hash);
+    void activateRoute(target);
+  } else if (location.hash !== hash) {
+    location.hash = hash;
+  } else if (options.force) {
+    void activateRoute(target);
+  }
+}
+
+async function activateRoute(id) {
+  if (!S.authenticated) return;
+  const target = isRouteAllowed(id) ? id : "nearby";
+  if (target !== id) {
+    go(target, { replace: true });
     return;
   }
-  const { status, data } = await api("/api/me");
-  if (status === 200 && data.ok && data.user?.logged_in) {
-    applyUser(data.user);
-    showLogin(false);
-    go("home");
-  } else {
-    setSid("");
-    showLogin(true);
+  if (S.routeController) S.routeController.abort();
+  const controller = new AbortController();
+  const seq = ++S.routeSeq;
+  S.routeController = controller;
+  S.route = target;
+  syncNav();
+  closeDrawer();
+  root().innerHTML = loadingState("正在准备页面…");
+  window.scrollTo({ top: 0, behavior: "auto" });
+  try {
+    const page = PAGE_RENDERERS[target] || pageNearby;
+    const html = await page(controller.signal);
+    if (controller.signal.aborted || seq !== S.routeSeq) return;
+    root().innerHTML = `<div class="page-enter">${html}</div>`;
+    root().focus({ preventScroll: true });
+  } catch (error) {
+    if (error && error.name === "AbortError") return;
+    if (error instanceof AuthExpiredError) return;
+    if (seq !== S.routeSeq) return;
+    root().innerHTML = errorState(error.message || String(error), target);
   }
+}
+
+function loadingState(text = "加载中…") {
+  return `<div class="loading-state"><span>${esc(text)}</span></div>`;
+}
+
+function emptyState(title, detail = "", route = "") {
+  return `<div class="empty-state"><div><strong>${esc(title || "暂无内容")}</strong><span>${esc(detail)}</span>${
+    route ? `<button type="button" class="btn soft small" data-route="${esc(route)}">去看看</button>` : ""
+  }</div></div>`;
+}
+
+function errorState(message, route = "") {
+  return `<div class="error-state"><div><strong>页面暂时没有加载成功</strong><span>${esc(message)}</span>${
+    route ? `<button type="button" class="btn secondary small" data-action="refresh-route">重新加载</button>` : ""
+  }</div></div>`;
+}
+
+function itemsOf(value) {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== "object") return [];
+  if (Array.isArray(value.items)) return value.items;
+  if (Array.isArray(value.list)) return value.list;
+  return [];
+}
+
+function envelopeHtml(envelope, renderer, emptyTitle = "暂无内容", emptyDetail = "稍后再来看看") {
+  if (envelope && envelope.ok === false) {
+    const info = errorInfo(envelope);
+    return emptyState(info.title, info.detail || emptyDetail, actionRoute(info.action));
+  }
+  const items = itemsOf(envelope);
+  if (!items.length) return emptyState(emptyTitle, emptyDetail);
+  return `<div class="stack">${items.map((item, index) => renderer(item, index)).join("")}</div>`;
+}
+
+function actionRoute(action) {
+  if (action === "wallet" || action === "buy_card") return action === "wallet" ? "wallet" : "match";
+  if (action === "relogin") return "me";
+  return "";
+}
+
+function avatarHtml(name, url) {
+  const src = mediaUrl(url);
+  return `<div class="avatar" aria-hidden="true"><span>${esc(firstChar(name, "贝"))}</span>${
+    src
+      ? `<img src="${esc(src)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-media />`
+      : ""
+  }</div>`;
+}
+
+function userCard(item, options = {}) {
+  const user = item && typeof item === "object" ? item : { nickname: String(item || "用户") };
+  const id = String(user.id || user.uid || "");
+  const name = user.nickname || user.name || "乐园用户";
+  const subtitle = user.subtitle || [id && `UID ${id}`, user.city, user.signature].filter(Boolean).join(" · ") || "等待一次友好的相遇";
+  const actions = [];
+  if (options.accept && id) {
+    actions.push(`<button type="button" class="btn primary small" data-action="agree-friend" data-id="${esc(id)}">同意</button>`);
+  }
+  if (options.follow !== false && id) {
+    actions.push(`<button type="button" class="btn soft small" data-action="follow-user" data-uid="${esc(id)}">关注</button>`);
+  }
+  return `<article class="user-card">
+    ${avatarHtml(name, user.avatar || user.portrait)}
+    <div class="card-copy"><strong>${esc(name)}</strong><span>${esc(subtitle)}</span></div>
+    ${actions.length ? `<div class="card-actions">${actions.join("")}</div>` : ""}
+  </article>`;
+}
+
+function giftCard(item) {
+  const gift = item && typeof item === "object" ? item : { name: String(item || "礼物") };
+  return `<article class="gift-card">
+    <div><strong>${esc(gift.name || gift.giftname || "心意礼物")}</strong><span>${esc(
+      gift.price === 0 || gift.price ? `${gift.price} 乐园币` : "人气礼物"
+    )}</span></div>
+  </article>`;
+}
+
+function slideCard(item) {
+  const slide = item && typeof item === "object" ? item : { title: String(item || "发现") };
+  const title = slide.title || slide.name || slide.nickname || "今日发现";
+  const sub = slide.subtitle || slide.desc || slide.description || "打开一段新鲜故事";
+  const image = mediaUrl(slide.image || slide.img || slide.avatar || slide.picture);
+  return `<article class="slide-card">${
+    image ? `<img src="${esc(image)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-media />` : ""
+  }<div class="slide-copy"><strong>${esc(title)}</strong><span>${esc(sub)}</span></div></article>`;
+}
+
+function topicCard(item) {
+  const topic = item && typeof item === "object" ? item : { title: String(item || "话题") };
+  const title = topic.title || topic.topic || topic.name || topic.nickname || "热门话题";
+  const sub = topic.subtitle || topic.desc || topic.description || topic.content || "来分享你的此刻";
+  return `<article class="topic-card"><div class="card-copy"><strong>${esc(title)}</strong><span>${esc(sub)}</span></div>
+    <span class="badge">话题</span></article>`;
+}
+
+function roomCard(item) {
+  const room = item && typeof item === "object" ? item : { name: String(item || "房间") };
+  const title = room.room_name || room.title || room.name || room.nickname || "语音房间";
+  const online = room.online_count ?? room.online_num;
+  const sub =
+    room.subtitle ||
+    [online ? `${online} 人在线` : "", room.room_type || room.type, room.owner_name, room.desc]
+      .filter(Boolean)
+      .join(" · ") ||
+    "正在等待新的声音";
+  return `<article class="room-card"><div class="card-copy"><strong>${esc(title)}</strong><span>${esc(sub)}</span></div>
+    <span class="badge green">房间</span></article>`;
+}
+
+function songCard(item) {
+  const song = item && typeof item === "object" ? item : { name: String(item || "歌曲") };
+  const title = song.song_name || song.title || song.name || song.nickname || "歌曲";
+  const sub = song.artist || song.singer || song.subtitle || "KTV 曲库";
+  return `<article class="song-card"><div class="card-copy"><strong>${esc(title)}</strong><span>${esc(sub)}</span></div>
+    <span class="badge">音乐</span></article>`;
+}
+
+function bottleCard(item) {
+  const bottle = item && typeof item === "object" ? item : { content: String(item || "") };
+  const name = bottle.nickname || "匿名漂流瓶";
+  const meta = [bottle.created_at, bottle.reply_count ? `${bottle.reply_count} 条回应` : ""]
+    .filter(Boolean)
+    .join(" · ");
+  return `<article class="bottle-card">
+    ${avatarHtml(name, bottle.avatar)}
+    <div class="card-copy"><strong>${esc(name)}</strong><span>${esc(
+    bottle.content || "这个漂流瓶没有留下文字"
+  )}</span>${meta ? `<small>${esc(meta)}</small>` : ""}</div>
+    <span class="badge orange">漂流瓶</span>
+  </article>`;
+}
+
+function taskCard(item) {
+  const task = item && typeof item === "object" ? item : {};
+  const id = String(task.id || task.task_id || "");
+  const statusText = String(task.status_text || "");
+  const claimedByStatus = /(已领取|已领|完成领取|领取成功|claimed|received)/i.test(statusText);
+  const done = task.is_claimed === true || claimedByStatus;
+  const canReceive = Boolean(task.can_receive) && !done;
+  // 服务端偶尔会在已领取任务上返回重置后的 0/N 进度；领取状态更权威，避免并排展示矛盾信息。
+  const meta = [
+    done ? "" : task.progress_text,
+    done ? "已领取" : statusText,
+    task.reward && `奖励 ${task.reward}`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return `<article class="task-card${done ? " done" : ""}"><div class="card-copy"><strong>${esc(task.title || task.name || "成长任务")}</strong><span>${esc(
+      meta || "完成后领取奖励"
+    )}</span></div>
+    <div class="card-actions"><button type="button" class="btn ${canReceive ? "primary" : "secondary"} small" data-action="receive-task" data-id="${esc(
+    id
+  )}" ${!id || done || !canReceive ? "disabled" : ""}>${done ? "已领取" : canReceive ? "领取" : "未完成"}</button></div></article>`;
+}
+
+function valueCard(item) {
+  if (item == null || typeof item !== "object") {
+    return `<article class="value-card"><div class="card-copy"><strong>${esc(
+      item ?? "—"
+    )}</strong><span>信息</span></div></article>`;
+  }
+  const title = item.title || item.name || item.nickname || item.id || "信息";
+  const detail = item.subtitle || item.message || item.detail || briefObject(item);
+  return `<article class="value-card"><div class="card-copy"><strong>${esc(
+    title
+  )}</strong><span>${esc(detail)}</span></div></article>`;
+}
+
+const SENSITIVE_KEY = /(password|token|user_?sig|secret|web_?sid|cert_?no|raw|sign(?:ature)?|prepay|order_?(?:string|params))/i;
+
+function briefObject(object) {
+  if (!object || typeof object !== "object") return String(object ?? "—");
+  const parts = [];
+  for (const [key, value] of Object.entries(object)) {
+    if (SENSITIVE_KEY.test(key) || value == null || typeof value === "object") continue;
+    parts.push(`${key}: ${String(value)}`);
+    if (parts.length >= 3) break;
+  }
+  return parts.join(" · ") || "查看详情";
+}
+
+function flattenSafe(value, prefix = "", depth = 0, output = []) {
+  if (output.length >= 18 || value == null) return output;
+  if (typeof value !== "object") {
+    output.push([prefix || "值", String(value)]);
+    return output;
+  }
+  if (Array.isArray(value)) {
+    output.push([prefix || "列表", `${value.length} 项`]);
+    return output;
+  }
+  for (const [key, item] of Object.entries(value)) {
+    if (output.length >= 18 || SENSITIVE_KEY.test(key) || key === "items" || key === "list") continue;
+    const label = prefix ? `${prefix}.${key}` : key;
+    if (item == null || typeof item !== "object") output.push([label, String(item ?? "—")]);
+    else if (depth < 1) flattenSafe(item, label, depth + 1, output);
+  }
+  return output;
+}
+
+function keyValueView(value) {
+  const rows = flattenSafe(value);
+  if (!rows.length) return `<div class="notice">暂无可展示的结构化信息</div>`;
+  return `<dl class="kv-grid">${rows
+    .map(([key, val]) => `<div class="kv-item"><dt>${esc(key)}</dt><dd>${esc(val)}</dd></div>`)
+    .join("")}</dl>`;
+}
+
+function detailsView(value, title = "更多信息") {
+  return `<details class="details-card"><summary>${esc(title)}</summary><div class="details-body">${keyValueView(value)}</div></details>`;
+}
+
+function operationView(data, successTitle = "操作已提交") {
+  if (!data || data.ok === false) {
+    const info = errorInfo(data);
+    return `<div class="notice error"><strong>${esc(info.title)}</strong>${info.detail ? `<div>${esc(info.detail)}</div>` : ""}</div>${detailsView(
+      data || {},
+      "错误信息"
+    )}`;
+  }
+  const notice = data.product_notice || data.message || successTitle;
+  return `<div class="notice"><strong>${esc(successTitle)}</strong><div>${esc(notice)}</div></div>${detailsView(data, "订单/操作信息")}`;
+}
+
+function servicesHtml() {
+  return `<div class="service-grid">${SECONDARY_NAV.map(
+    (item) =>
+      `<button type="button" class="service-card" data-route="${item.id}"><span><strong>${item.name}</strong><span>${item.desc}</span></span></button>`
+  ).join("")}</div>`;
+}
+
+function statCard(value, label) {
+  return `<div class="stat-card"><div class="stat-value">${esc(value ?? "—")}</div><div class="stat-label">${esc(label)}</div></div>`;
+}
+
+function membershipText(value) {
+  const raw = String(value ?? "0").trim();
+  if (!raw || raw === "0") return "未开通";
+  const number = Number(raw);
+  if (!Number.isFinite(number) || number <= 0) return raw;
+  const millis = number > 1e12 ? number : number > 1e9 ? number * 1000 : 0;
+  if (!millis) return raw;
+  const date = new Date(millis);
+  if (Number.isNaN(date.getTime())) return raw;
+  return date.getTime() > Date.now()
+    ? `至 ${date.toLocaleDateString("zh-CN")}`
+    : "已到期";
+}
+
+function chatLogHtml() {
+  if (!S.imMessages.length) return `<div class="chat-line system">连接后，消息会显示在这里</div>`;
+  return S.imMessages
+    .map((entry) => `<div class="chat-line ${entry.type || ""}">${esc(entry.text)}</div>`)
+    .join("");
+}
+
+function addImMessage(text, type = "system") {
+  S.imMessages.push({ text: String(text), type });
+  if (S.imMessages.length > 100) S.imMessages.splice(0, S.imMessages.length - 100);
+  const log = $("im-log");
+  if (log) {
+    log.innerHTML = chatLogHtml();
+    log.scrollTop = log.scrollHeight;
+  }
+}
+
+async function pageNearby(signal) {
+  const [homeResult, slideResult] = await Promise.allSettled([
+    api("/api/home", { signal }),
+    api("/api/slide", { signal }),
+  ]);
+  if (homeResult.status !== "fulfilled") throw homeResult.reason;
+  const data = homeResult.value.data;
+  if (data.user) applyUser(data.user);
+  const user = data.user || S.user || {};
+  const name = user.nickname || "新朋友";
+  const heartbeat = data.heartbeat && data.heartbeat.running ? `在线 · 心跳 ${data.heartbeat.ticks || 0}` : "当前在线";
+  const gifts = itemsOf(data.gifts);
+  const slides = slideResult.status === "fulfilled" ? itemsOf(slideResult.value.data) : [];
+  return `<section class="hero-card"><div class="hero-copy"><p class="eyebrow">AROUND YOU</p><h2>嗨，${esc(
+    name
+  )}，今天也去认识有趣的人吧</h2><p>${esc(heartbeat)} · ${user.is_realname ? "已完成实名" : "完成实名后可体验更多匹配能力"}</p></div>
+    <div class="hero-actions"><button type="button" class="btn primary" data-route="match">开始匹配</button><button type="button" class="btn secondary" data-route="moments">看看动态</button></div></section>
+    <section class="section"><div class="section-head"><div><h2>常用服务</h2><p>关系、房间、钱包与成长任务</p></div></div>${servicesHtml()}</section>
+    ${
+      slides.length
+        ? `<section class="section"><div class="section-head"><div><h2>今日发现</h2><p>乐园里正在发生的新鲜事</p></div></div><div class="slide-scroll">${slides
+            .map(slideCard)
+            .join("")}</div></section>`
+        : ""
+    }
+    <section class="section"><div class="section-head"><div><h2>乐园推荐</h2><p>为你推荐值得了解的内容</p></div><button type="button" class="btn secondary small" data-action="refresh-route">换一批</button></div>${envelopeHtml(
+      data.recommend,
+      (item) => slideCard(item),
+      "暂时没有推荐内容",
+      "稍后再回来看看"
+    )}</section>
+    ${
+      gifts.length
+        ? `<section class="section"><div class="section-head"><div><h2>人气礼物</h2><p>用小小心意开启话题</p></div></div><div class="gift-scroll">${gifts
+            .slice(0, 24)
+            .map(giftCard)
+            .join("")}</div></section>`
+        : ""
+    }`;
+}
+
+async function pageMessages() {
+  const ready = Boolean(window.TIM);
+  return `<section class="hero-card"><div class="hero-copy"><p class="eyebrow">MESSAGES</p><h2>${
+    S.imConnected ? "消息通道已连接" : "继续一段聊得来的相遇"
+  }</h2><p>${
+    ready
+      ? "检测到宿主已提供 TIM SDK，可获取凭证并连接。"
+      : "当前页面未预装 TIM SDK；可获取凭证，但不会动态加载不受控的外部脚本。"
+  }</p></div><div class="hero-actions"><button type="button" class="btn primary" data-action="im-connect">${
+    S.imConnected ? "重新连接" : "连接 TIM"
+  }</button><button type="button" class="btn secondary" data-action="im-rong">检查融云凭证</button></div></section>
+    <section class="section"><div class="section-head"><div><h2>即时对话</h2><p>当前仅提供 C2C 文本消息能力</p></div><span class="badge ${S.imConnected ? "green" : "orange"}">${
+    S.imConnected ? "已连接" : "未连接"
+  }</span></div><div class="chat-log" id="im-log" aria-live="polite">${chatLogHtml()}</div>
+      <form class="inline-form mt-sm" data-form="im-send"><div class="field"><label for="im-peer">对方 UserID</label><input id="im-peer" name="peer" autocomplete="off" placeholder="输入对方 uid" required /></div><div class="field"><label for="im-text">消息</label><input id="im-text" name="text" autocomplete="off" placeholder="说点什么…" required /></div><button type="submit" class="btn primary" ${
+        S.imConnected ? "" : "disabled"
+      }>发送</button></form><div id="im-info" class="result-panel"></div></section>`;
+}
+
+async function pageMatch(signal) {
+  const { data } = await api("/api/match/status", { signal });
+  if (data.user) applyUser(data.user);
+  const display = data.display || (data.status && data.status.display) || {};
+  return `<div id="match-stats" class="stats-grid">${statCard(display.online ?? "—", "在线免费")}${statCard(
+    display.local ?? "—",
+    "同城免费"
+  )}${statCard(display.card ?? "—", "匹配卡")}${statCard(display.money ?? data.user?.money ?? "0", "乐园币")}</div>
+    <section class="section"><div class="section-head"><div><h2>选择匹配方式</h2><p>匹配和同城能力可能需要实名或匹配卡</p></div></div><div class="card-grid">
+      <button type="button" class="service-card" data-action="match-online"><span><strong>在线匹配</strong><span>优先使用免费次数</span></span></button>
+      <button type="button" class="service-card" data-action="match-local"><span><strong>同城匹配</strong><span>发现附近有缘的人</span></span></button>
+      <button type="button" class="service-card is-disabled" disabled><span><strong>语音匹配</strong><span>需在官方 App 中使用实时音频能力</span></span></button>
+      <button type="button" class="service-card" data-action="match-pick"><span><strong>捡漂流瓶</strong><span>读一段陌生人的心情</span></span></button>
+      <button type="button" class="service-card" data-action="match-users"><span><strong>在线列表</strong><span>看看谁也在匹配池</span></span></button>
+    </div></section>
+    <section class="section"><div class="surface-card"><div class="section-head"><div><h2>漂流瓶与约会</h2><p>真诚表达，比一句“在吗”更容易被看见</p></div></div>
+      <form class="inline-form" data-form="bottle-throw"><div class="field"><label for="bottle-text">漂流瓶内容</label><input id="bottle-text" name="text" maxlength="160" placeholder="写下一句想说的话" required /></div><button type="submit" class="btn secondary">扔出漂流瓶</button></form>
+      <form class="inline-form mt-sm" data-form="dating-publish"><div class="field"><label for="dating-text">约会说明</label><input id="dating-text" name="text" maxlength="160" placeholder="简单介绍想一起做什么" required /></div><button type="submit" class="btn secondary">发布约会</button></form>
+    </div></section>
+    <section class="section"><div class="section-head"><div><h2>匹配结果</h2><p>你的下一次相遇会显示在这里</p></div><button type="button" class="btn secondary small" data-action="buy-card">购买匹配卡</button></div><div id="match-result">${emptyState(
+      "准备好后开始匹配",
+      "请尊重对方，也保护好自己的隐私"
+    )}</div></section>`;
+}
+
+async function pageMoments(signal) {
+  const results = await Promise.allSettled([
+    api("/api/recommend", { signal }),
+    api("/api/slide", { signal }),
+    api("/api/topics?q=", { signal }),
+  ]);
+  const rec = results[0].status === "fulfilled" ? results[0].value.data : { ok: false, error: results[0].reason?.message };
+  const slides = results[1].status === "fulfilled" ? results[1].value.data : { items: [] };
+  const topics = results[2].status === "fulfilled" ? results[2].value.data : { items: [] };
+  const slideItems = itemsOf(slides);
+  return `<section class="hero-card"><div class="hero-copy"><p class="eyebrow">MOMENTS</p><h2>分享此刻，也发现别人的闪光</h2><p>从一个共同话题开始，比直接打招呼更自然。</p></div></section>
+    <section class="section"><div class="surface-card"><div class="section-head"><div><h2>搜索话题</h2><p>找到你感兴趣的圈子</p></div></div><form class="inline-form" data-form="topic-search"><div class="field"><label for="topic-query">关键词</label><input id="topic-query" name="query" placeholder="例如：旅行、音乐、周末" /></div><button type="submit" class="btn primary">搜索</button></form><div id="topic-result" class="result-panel">${envelopeHtml(
+      topics,
+      topicCard,
+      "还没有话题",
+      "可以创建第一个话题"
+    )}</div></div></section>
+    <section class="section"><div class="surface-card"><div class="section-head"><div><h2>创建话题</h2><p>用简短清晰的标题邀请大家参与</p></div></div><form class="inline-form" data-form="topic-create"><div class="field"><label for="topic-name">话题名</label><input id="topic-name" name="topic" maxlength="40" placeholder="输入新话题名称" required /></div><button type="submit" class="btn secondary">创建</button></form><div id="topic-create-result" class="result-panel"></div></div></section>
+    ${
+      slideItems.length
+        ? `<section class="section"><div class="section-head"><div><h2>乐园精选</h2><p>今日值得看见的内容</p></div></div><div class="slide-scroll">${slideItems
+            .map(slideCard)
+            .join("")}</div></section>`
+        : ""
+    }
+    <section class="section"><div class="section-head"><div><h2>乐园推荐</h2><p>发现值得了解的内容</p></div></div>${envelopeHtml(
+      rec,
+      (item) => slideCard(item),
+      "暂时没有推荐",
+      "稍后再回来看看"
+    )}</section>`;
+}
+
+async function pageSocial(signal) {
+  const paths = {
+    follows: "/api/social/follows",
+    fans: "/api/social/fans",
+    apply: "/api/social/friend-apply",
+    black: "/api/social/blacklist",
+  };
+  const { data } = await api(paths[S.socialTab] || paths.follows, { signal });
+  const tabs = [
+    ["follows", "关注"],
+    ["fans", "粉丝"],
+    ["apply", "好友申请"],
+    ["black", "黑名单"],
+  ];
+  return `<section class="surface-card"><div class="section-head"><div><h2>查找用户</h2><p>通过 UID 查看资料、关注或取关</p></div></div><form class="inline-form" data-form="social-user"><div class="field"><label for="social-uid">对方 UID</label><input id="social-uid" name="uid" placeholder="输入用户 uid" required /></div><button type="submit" class="btn primary" name="intent" value="view">查看资料</button><button type="submit" class="btn secondary" name="intent" value="follow">关注</button><button type="submit" class="btn secondary" name="intent" value="unfollow">取关</button></form><div id="social-user-result" class="result-panel"></div></section>
+    <section class="section"><div class="tab-row" role="tablist" aria-label="社交列表">${tabs
+      .map(
+        ([id, label]) => `<button type="button" class="tab-chip${S.socialTab === id ? " on" : ""}" data-action="social-tab" data-tab="${id}" role="tab" aria-selected="${
+          S.socialTab === id
+        }">${label}</button>`
+      )
+      .join("")}</div><div class="mt-sm">${envelopeHtml(
+    data,
+    (item) => userCard(item, { accept: S.socialTab === "apply" }),
+    "列表还是空的",
+    "新的关系会显示在这里"
+  )}</div></section>
+    <section class="section"><div class="surface-card"><div class="section-head"><div><h2>举报不友善行为</h2><p>举报会提交给服务端处理，请如实填写</p></div></div><form class="inline-form" data-form="social-report"><div class="field"><label for="report-id">用户/内容 ID</label><input id="report-id" name="itemid" required /></div><div class="field"><label for="report-reason">原因</label><input id="report-reason" name="reason" maxlength="120" placeholder="简要说明原因" required /></div><button type="submit" class="btn danger">提交举报</button></form></div></section>`;
+}
+
+async function pageRoom(signal) {
+  const { data } = await api("/api/room/top", { signal });
+  return `<section class="hero-card"><div class="hero-copy"><p class="eyebrow">VOICE ROOMS</p><h2>听见声音，也让别人听见你</h2><p>Web 当前提供房间发现、创建、歌曲搜索和 RTC 凭证能力。</p></div><div class="hero-actions"><button type="button" class="btn secondary" data-action="room-auth">查看房间权限</button></div></section>
+    <section class="section"><div class="section-head"><div><h2>热门房间</h2><p>榜单中的房间会显示在这里</p></div></div><div id="room-list">${envelopeHtml(
+      data,
+      roomCard,
+      "暂无热门房间",
+      "稍后再来听听"
+    )}</div></section>
+    <section class="section"><div class="form-grid">
+      <form class="surface-card" data-form="room-create"><div class="section-head"><div><h2>创建房间</h2><p>选择简洁明确的房间类型</p></div></div><div class="field"><label for="room-type">房间类型</label><input id="room-type" name="type" value="处CP" required /></div><button type="submit" class="btn primary full mt-sm">创建</button></form>
+      <form class="surface-card" data-form="room-ktv"><div class="section-head"><div><h2>KTV 搜索</h2><p>搜索想唱的歌曲</p></div></div><div class="field"><label for="room-keyword">歌名或歌手</label><input id="room-keyword" name="query" placeholder="输入关键词" required /></div><button type="submit" class="btn secondary full mt-sm">搜索</button></form>
+      <form class="surface-card span-all" data-form="room-rtc"><div class="section-head"><div><h2>RTC 凭证</h2><p>仅展示非敏感状态；实际通话仍需受控的 RTC SDK</p></div></div><div class="inline-form"><div class="field"><label for="room-channel">Channel</label><input id="room-channel" name="channel" placeholder="输入房间 channel" required /></div><button type="submit" class="btn secondary">获取状态</button></div></form>
+    </div><div id="room-result" class="result-panel"></div></section>`;
+}
+
+async function pageWallet(signal) {
+  const { data } = await api("/api/wallet", { signal });
+  if (data.user) applyUser(data.user);
+  const user = data.user || S.user || {};
+  const gifts = itemsOf(data.my_gifts);
+  return `<div class="stats-grid">${statCard(user.money ?? "0", "乐园币")}${statCard(membershipText(user.vip), "VIP")}${statCard(
+    membershipText(user.svip),
+    "SVIP"
+  )}${statCard(user.is_realname ? "已完成" : "未完成", "实名认证")}</div>
+    <section class="section"><div class="surface-card"><div class="section-head"><div><h2>会员服务</h2><p>提交前请确认服务端返回的业务说明</p></div></div><div class="button-row"><button type="button" class="btn secondary" data-action="wallet-svip">申请 SVIP 试用</button><button type="button" class="btn secondary" data-action="wallet-exchange">余额兑换 VIP</button></div></div></section>
+    <section class="section"><div class="form-grid">
+      <form class="surface-card" data-form="wallet-coin"><div class="section-head"><div><h2>创建充币订单</h2><p>创建订单参数不等于到账</p></div></div><div class="field"><label for="coin-channel">支付方式</label><select id="coin-channel" name="channel"><option value="wechat">微信</option><option value="alipay">支付宝</option></select></div><div class="field"><label for="coin-id">商品 ID</label><input id="coin-id" name="coin_id" value="1" inputmode="numeric" required /></div><button type="submit" class="btn primary full mt-sm">确认创建订单</button></form>
+      <form class="surface-card" data-form="wallet-vip"><div class="section-head"><div><h2>创建会员订单</h2><p>开通结果以官方收银和服务端状态为准</p></div></div><div class="field"><label for="vip-channel">支付方式</label><select id="vip-channel" name="channel"><option value="wechat">微信</option><option value="alipay">支付宝</option></select></div><div class="field"><label for="vip-level">会员等级</label><select id="vip-level" name="level"><option value="vip">VIP</option><option value="svip">SVIP</option></select></div><div class="field"><label for="vip-product-id">会员商品 ID</label><input id="vip-product-id" name="vipid" value="5" inputmode="numeric" required /></div><button type="submit" class="btn secondary full mt-sm">确认创建订单</button></form>
+    </div></section>
+    <section class="section"><div class="surface-card"><div class="section-head"><div><h2>提现</h2><p>需要完成实名；请仔细确认账户和金额</p></div></div><form class="inline-form" data-form="wallet-withdraw"><div class="field"><label for="withdraw-account">支付宝账号</label><input id="withdraw-account" name="alipay" autocomplete="off" required /></div><div class="field"><label for="withdraw-name">真实姓名</label><input id="withdraw-name" name="name" autocomplete="off" required /></div><div class="field"><label for="withdraw-amount">金额</label><input id="withdraw-amount" name="amount" type="number" min="0.01" step="0.01" inputmode="decimal" required /></div><button type="submit" class="btn danger">确认提现</button></form></div></section>
+    <section class="section"><div class="section-head"><div><h2>我的礼物</h2><p>背包中的礼物会独立展示，不再混作用户</p></div></div>${
+      gifts.length
+        ? `<div class="gift-scroll">${gifts.map(giftCard).join("")}</div>`
+        : emptyState("背包还没有礼物", "收到或购买的礼物会出现在这里")
+    }</section><div id="wallet-result" class="result-panel"></div>`;
+}
+
+async function pageTasks(signal) {
+  const { data } = await api("/api/tasks", { signal });
+  const tasks = itemsOf(data);
+  return `<section class="hero-card"><div class="hero-copy"><p class="eyebrow">GROWTH</p><h2>每一次认真参与，都值得一点奖励</h2><p>任务进度由服务端统计，领取结果以服务端为准。</p></div></section>
+    <section class="section"><div class="section-head"><div><h2>成长任务</h2><p>${tasks.length ? `共 ${tasks.length} 个任务` : "今日任务列表"}</p></div><button type="button" class="btn secondary small" data-action="refresh-route">刷新</button></div>${
+      tasks.length ? `<div class="stack">${tasks.map(taskCard).join("")}</div>` : emptyState("暂无任务", "稍后再来看看新的成长目标")
+    }</section><div id="task-result" class="result-panel"></div>`;
+}
+
+async function pageMe(signal) {
+  const { data } = await api("/api/profile/me", { signal });
+  if (data.user) applyUser(data.user);
+  const user = data.user || S.user || {};
+  const name = user.nickname || "乐园用户";
+  return `<section class="surface-card"><div class="profile-head">${avatarHtml(name, user.avatar || user.portrait)}<div><h2>${esc(
+    name
+  )}</h2><p>UID ${esc(user.uid || user.id || "—")} · ${user.is_realname ? "已实名" : "未实名"} · 乐园币 ${esc(
+    user.money ?? "0"
+  )}</p></div></div></section>
+    <section class="section"><div class="section-head"><div><h2>我的服务</h2><p>常用能力集中在这里</p></div></div>${servicesHtml()}</section>
+    <section class="section"><div class="form-grid">
+      <form class="surface-card" data-form="profile-nick"><div class="section-head"><div><h2>修改昵称</h2><p>实名及修改次数限制由服务端决定</p></div></div><div class="field"><label for="nickname-new">新昵称</label><input id="nickname-new" name="name" maxlength="24" placeholder="输入新昵称" required /></div><button type="submit" class="btn primary full mt-sm">保存昵称</button></form>
+      <div class="surface-card"><div class="section-head"><div><h2>账户信息</h2><p>仅展示必要的非敏感字段</p></div></div>${keyValueView({
+        uid: user.uid || user.id,
+        nickname: name,
+        is_realname: Boolean(user.is_realname),
+        money: user.money,
+        vip: user.vip,
+        svip: user.svip,
+        user_role: user.user_role,
+      })}</div>
+    </div></section>
+    <section class="section"><div class="surface-card"><div class="section-head"><div><h2>资料与礼仪</h2><p>实名刷脸建议在官方 App 中完成</p></div></div><div class="button-row"><button type="button" class="btn secondary" data-action="face-status">实名状态</button><button type="button" class="btn secondary" data-action="etiquette">礼仪分</button><button type="button" class="btn secondary" data-action="referral-get">查看推荐码</button></div><form class="inline-form mt-sm" data-form="referral-set"><div class="field"><label for="referral-value">设置推荐码</label><input id="referral-value" name="referral" placeholder="输入推荐码" required /></div><button type="submit" class="btn secondary">保存</button></form><div id="me-result" class="result-panel"></div></div></section>
+    <section class="section"><button type="button" class="btn danger full" data-action="logout">退出登录</button></section>`;
+}
+
+async function pageLab() {
+  if (!S.labEnabled) return emptyState("协议台未启用", "当前环境没有开启 lab_enabled");
+  return `<section class="surface-card"><div class="section-head"><div><h2>协议调用台</h2><p>仅在后端明确开启 lab_enabled 时显示</p></div></div><form data-form="lab-call"><div class="field"><label for="lab-action">Action</label><input id="lab-action" name="action" placeholder="getGiftList" required /></div><div class="field"><label for="lab-params">Params JSON</label><textarea id="lab-params" name="params" rows="5">{}</textarea></div><div class="button-row"><button type="submit" class="btn primary" name="intent" value="call">调用</button><button type="submit" class="btn secondary" name="intent" value="redis">Redis 调用</button><button type="button" class="btn secondary" data-action="lab-actions">列出 Actions</button></div></form><pre class="lab-code mt-md" id="lab-output">等待调用…</pre></section>`;
+}
+
+const PAGE_RENDERERS = {
+  nearby: pageNearby,
+  msg: pageMessages,
+  match: pageMatch,
+  moments: pageMoments,
+  me: pageMe,
+  social: pageSocial,
+  room: pageRoom,
+  wallet: pageWallet,
+  tasks: pageTasks,
+  lab: pageLab,
+};
+
+function setPanel(id, html) {
+  const panel = $(id);
+  if (panel) panel.innerHTML = html;
+}
+
+async function refreshMatchStats() {
+  try {
+    const { data } = await api("/api/match/status", { timeout: 8000 });
+    const display = data.display || data.status?.display || {};
+    setPanel(
+      "match-stats",
+      `${statCard(display.online ?? "—", "在线免费")}${statCard(display.local ?? "—", "同城免费")}${statCard(
+        display.card ?? "—",
+        "匹配卡"
+      )}${statCard(display.money ?? data.user?.money ?? "0", "乐园币")}`
+    );
+  } catch {
+    // The primary operation result is more important than a soft counter refresh.
+  }
+}
+
+async function runMatch(path, body = {}) {
+  setPanel("match-result", loadingState("正在寻找合适的人…"));
+  const { data } = await api(path, { method: "POST", body: JSON.stringify(body) });
+  toastEnv(data, "请求已完成");
+  const renderer = path.includes("bottle") ? bottleCard : (item) => userCard(item);
+  setPanel("match-result", envelopeHtml(data, renderer, "暂时没有结果", "稍后再试，或检查匹配次数"));
+  await refreshMatchStats();
+}
+
+async function connectTIM(credential) {
+  if (!window.TIM) {
+    addImMessage("凭证已获取，但当前页面未预装 TIM SDK。请由受信任的宿主提供固定版本 SDK。", "system");
+    return false;
+  }
+  await cleanupIM();
+  const TIM = window.TIM;
+  const chat = TIM.create({ SDKAppID: credential.SDKAppID });
+  if (typeof chat.setLogLevel === "function") chat.setLogLevel(1);
+  S.imHandler = (event) => {
+    (event.data || []).forEach((message) => {
+      addImMessage(`${message.from || "对方"}: ${(message.payload && message.payload.text) || "[新消息]"}`);
+    });
+  };
+  chat.on(TIM.EVENT.MESSAGE_RECEIVED, S.imHandler);
+  await chat.login({ userID: credential.userID, userSig: credential.userSig });
+  S.chat = chat;
+  S.imConnected = true;
+  addImMessage("TIM 登录成功，可以发送文本消息。", "system");
+  return true;
+}
+
+async function cleanupIM() {
+  const chat = S.chat;
+  S.chat = null;
+  S.imConnected = false;
+  if (!chat) return;
+  try {
+    if (window.TIM && S.imHandler && typeof chat.off === "function") {
+      chat.off(window.TIM.EVENT.MESSAGE_RECEIVED, S.imHandler);
+    }
+  } catch {
+    // Best-effort cleanup.
+  }
+  S.imHandler = null;
+  try {
+    if (typeof chat.logout === "function") await chat.logout();
+  } catch {
+    // Best-effort cleanup.
+  }
+  try {
+    if (typeof chat.destroy === "function") chat.destroy();
+  } catch {
+    // Best-effort cleanup.
+  }
+}
+
+function stopPresenceTimer() {
+  clearInterval(S.presenceTimer);
+  S.presenceTimer = null;
+}
+
+function updatePresence(active) {
+  stopPresenceTimer();
+  if (!S.authenticated) return;
+  const post = (path, body = {}) =>
+    api(path, {
+      method: "POST",
+      body: JSON.stringify(body),
+      timeout: 3500,
+      authOptional: true,
+    }).catch(() => {});
+  void post("/api/frontback", { frontorback: active ? "1" : "0" });
+  if (!active) {
+    if (S.serverHeartbeat) void post("/api/heartbeat/stop");
+    return;
+  }
+  if (S.serverHeartbeat) {
+    void post("/api/heartbeat/start", { interval_sec: 55 });
+    return;
+  }
+  const once = () => void post("/api/heartbeat/once");
+  once();
+  S.presenceTimer = setInterval(once, 45000);
+}
+
+async function logout() {
+  try {
+    await api("/api/auth/logout", { method: "POST", body: "{}", timeout: 7000, authOptional: true });
+  } catch (error) {
+    toast(`服务端退出未确认：${error.message || error}`, "error", 3600);
+  } finally {
+    if (S.routeController) S.routeController.abort();
+    stopPresenceTimer();
+    await cleanupIM();
+    S.authenticated = false;
+    S.user = null;
+    S.imMessages = [];
+    applyUser(null);
+    showLogin(true, true);
+    history.replaceState(null, "", "#/nearby");
+  }
+}
+
+async function handleAction(action, button) {
+  if (action === "refresh-route") return go(S.route, { force: true });
+  if (action === "logout") return logout();
+  if (action === "follow-user") {
+    const uid = button.dataset.uid;
+    const { data } = await api("/api/social/follow", { method: "POST", body: JSON.stringify({ uid }) });
+    if (toastEnv(data, "已关注")) {
+      button.textContent = "已关注";
+      button.disabled = true;
+      button.dataset.locked = "true";
+    }
+    return;
+  }
+  if (action === "agree-friend") {
+    const { data } = await api("/api/social/agree-friend", {
+      method: "POST",
+      body: JSON.stringify({ id: button.dataset.id }),
+    });
+    if (toastEnv(data, "已同意好友申请")) go("social", { force: true });
+    return;
+  }
+  if (action === "social-tab") {
+    S.socialTab = button.dataset.tab || "follows";
+    go("social", { force: true });
+    return;
+  }
+  if (action === "match-online") return runMatch("/api/match/online");
+  if (action === "match-local") return runMatch("/api/match/local");
+  if (action === "match-pick") return runMatch("/api/match/bottle-pick");
+  if (action === "match-users") {
+    setPanel("match-result", loadingState("正在读取在线列表…"));
+    const { data } = await api("/api/match/online-users");
+    setPanel("match-result", envelopeHtml(data, (item) => userCard(item), "暂无在线用户", "稍后再来看看"));
+    return;
+  }
+  if (action === "buy-card") {
+    if (!window.confirm("确认使用乐园币购买默认匹配卡？请以服务端返回的价格和结果为准。")) return;
+    const { data } = await api("/api/pay/card", { method: "POST", body: JSON.stringify({ card_id: "1" }) });
+    toastEnv(data, "购买请求已提交");
+    setPanel("match-result", operationView(data, "匹配卡购买请求已提交"));
+    await refreshMatchStats();
+    return;
+  }
+  if (action === "room-auth") {
+    const { data } = await api("/api/room/auth");
+    setPanel("room-result", operationView(data, "房间权限已读取"));
+    return;
+  }
+  if (action === "wallet-svip") {
+    const { data } = await api("/api/wallet/svip-try", { method: "POST", body: "{}" });
+    toastEnv(data, "试用申请已提交");
+    setPanel("wallet-result", operationView(data, "SVIP 试用申请已提交"));
+    return;
+  }
+  if (action === "wallet-exchange") {
+    if (!window.confirm("确认使用余额兑换默认 VIP 商品？")) return;
+    const { data } = await api("/api/wallet/exchange-vip", { method: "POST", body: JSON.stringify({ vip_id: 5 }) });
+    toastEnv(data, "兑换请求已提交");
+    setPanel("wallet-result", operationView(data, "VIP 兑换请求已提交"));
+    return;
+  }
+  if (action === "receive-task") {
+    const id = button.dataset.id;
+    if (!id) throw new Error("缺少任务 ID");
+    const { data } = await api("/api/tasks/receive", { method: "POST", body: JSON.stringify({ id }) });
+    if (toastEnv(data, "领取请求已提交")) go("tasks", { force: true });
+    else setPanel("task-result", operationView(data, "任务领取结果"));
+    return;
+  }
+  if (action === "face-status") {
+    const { data } = await api("/api/face/status");
+    setPanel("me-result", `<div class="notice warn">Web 不执行刷脸流程，请在官方 App 中完成实名认证。</div>${detailsView(data, "实名状态")}`);
+    return;
+  }
+  if (action === "etiquette") {
+    const { data } = await api("/api/profile/etiquette");
+    setPanel("me-result", operationView(data, "礼仪信息已读取"));
+    return;
+  }
+  if (action === "referral-get") {
+    const { data } = await api("/api/referral");
+    setPanel("me-result", operationView(data, "推荐码信息已读取"));
+    return;
+  }
+  if (action === "im-connect") {
+    const { data } = await api("/api/im/tim?prefer=server");
+    if (!data.ok || !data.userSig) {
+      setPanel("im-info", operationView(data, "TIM 凭证读取结果"));
+      toastEnv(data, "TIM 凭证已读取");
+      return;
+    }
+    setPanel("im-info", `<div class="notice">凭证已安全获取：SDKAppID ${esc(data.SDKAppID)} · UserID ${esc(data.userID)}。页面不会显示 UserSig。</div>`);
+    const connected = await connectTIM(data);
+    toast(connected ? "消息通道已连接" : "凭证可用，但未检测到受信任的 TIM SDK", connected ? "info" : "error", 3800);
+    if (connected) go("msg", { force: true });
+    return;
+  }
+  if (action === "im-rong") {
+    const { data } = await api("/api/im/rong");
+    setPanel("im-info", `<div class="notice">${esc(data.ok ? "融云凭证接口已响应，敏感 token 不在页面展示。" : errorInfo(data).title)}</div>${detailsView(
+      data,
+      "非敏感状态"
+    )}`);
+    toastEnv(data, "融云凭证接口已响应");
+    return;
+  }
+  if (action === "lab-actions") {
+    const { data } = await api("/api/actions");
+    const output = $("lab-output");
+    if (output) output.textContent = JSON.stringify(data, null, 2).slice(0, 18000);
+  }
+}
+
+function formValues(form) {
+  return Object.fromEntries(new FormData(form).entries());
+}
+
+async function handleProductForm(form, submitter) {
+  const kind = form.dataset.form;
+  const values = formValues(form);
+  if (kind === "topic-search") {
+    const { data } = await api(`/api/topics?q=${encodeURIComponent(String(values.query || "").trim())}`);
+    setPanel("topic-result", envelopeHtml(data, topicCard, "没有找到相关话题", "换一个关键词试试"));
+    return;
+  }
+  if (kind === "topic-create") {
+    const topic = String(values.topic || "").trim();
+    if (!topic) throw new Error("请输入话题名");
+    const { data } = await api("/api/topics/create", { method: "POST", body: JSON.stringify({ topic }) });
+    toastEnv(data, "话题创建请求已提交");
+    setPanel("topic-create-result", operationView(data, "话题创建请求已提交"));
+    return;
+  }
+  if (kind === "bottle-throw") {
+    const text = String(values.text || "").trim();
+    if (!text) throw new Error("请输入漂流瓶内容");
+    const { data } = await api("/api/match/bottle-throw", {
+      method: "POST",
+      body: JSON.stringify({ content: text, message: text, text }),
+    });
+    toastEnv(data, "漂流瓶已扔出");
+    setPanel("match-result", operationView(data, "漂流瓶请求已提交"));
+    if (data.ok) form.reset();
+    return;
+  }
+  if (kind === "dating-publish") {
+    const text = String(values.text || "").trim();
+    if (!text) throw new Error("请输入约会说明");
+    const { data } = await api("/api/match/dating-publish", {
+      method: "POST",
+      body: JSON.stringify({ content: text, message: text, text }),
+    });
+    toastEnv(data, "约会发布请求已提交");
+    setPanel("match-result", operationView(data, "约会发布请求已提交"));
+    if (data.ok) form.reset();
+    return;
+  }
+  if (kind === "social-user") {
+    const uid = String(values.uid || "").trim();
+    const intent = submitter?.value || "view";
+    if (!uid) throw new Error("请输入用户 UID");
+    if (intent === "view") {
+      const { data } = await api(`/api/profile/user?uid=${encodeURIComponent(uid)}`);
+      setPanel("social-user-result", envelopeHtml(data, (item) => userCard(item), "未找到用户", "请检查 UID"));
+      return;
+    }
+    const path = intent === "unfollow" ? "/api/social/unfollow" : "/api/social/follow";
+    const { data } = await api(path, { method: "POST", body: JSON.stringify({ uid }) });
+    toastEnv(data, intent === "unfollow" ? "已取关" : "已关注");
+    setPanel("social-user-result", operationView(data, intent === "unfollow" ? "取关请求已提交" : "关注请求已提交"));
+    return;
+  }
+  if (kind === "social-report") {
+    if (!window.confirm("确认提交这条举报？请确保内容真实、准确。")) return;
+    const { data } = await api("/api/social/report", {
+      method: "POST",
+      body: JSON.stringify({ type: "user", itemid: values.itemid, reason: values.reason }),
+    });
+    toastEnv(data, "举报已提交");
+    if (data.ok) form.reset();
+    return;
+  }
+  if (kind === "room-create") {
+    const { data } = await api("/api/room/create", { method: "POST", body: JSON.stringify({ type: values.type || "处CP" }) });
+    toastEnv(data, "创建房间请求已提交");
+    setPanel("room-result", operationView(data, "创建房间请求已提交"));
+    return;
+  }
+  if (kind === "room-ktv") {
+    const { data } = await api("/api/room/ktv-search", {
+      method: "POST",
+      body: JSON.stringify({ q: String(values.query || "").trim() }),
+    });
+    setPanel("room-result", envelopeHtml(data, songCard, "没有找到歌曲", "换个歌名或歌手试试"));
+    return;
+  }
+  if (kind === "room-rtc") {
+    const { data } = await api("/api/room/rtc-token", {
+      method: "POST",
+      body: JSON.stringify({ channel: String(values.channel || "").trim() }),
+    });
+    setPanel("room-result", `<div class="notice">RTC 接口已响应。敏感凭证不会直接显示。</div>${detailsView(data, "非敏感状态")}`);
+    return;
+  }
+  if (kind === "wallet-coin") {
+    if (!window.confirm("确认创建充币订单？创建订单不代表已经支付或到账。")) return;
+    const { data } = await api("/api/pay/coin", {
+      method: "POST",
+      body: JSON.stringify({ channel: values.channel, coin_id: values.coin_id }),
+    });
+    toastEnv(data, "充币订单参数已生成");
+    setPanel("wallet-result", operationView(data, "充币订单创建结果"));
+    return;
+  }
+  if (kind === "wallet-vip") {
+    if (!window.confirm("确认创建会员订单？开通结果以官方收银和服务端状态为准。")) return;
+    const vipid = String(values.vipid || "").trim();
+    if (!vipid) throw new Error("请输入会员商品 ID");
+    const { data } = await api("/api/pay/vip", {
+      method: "POST",
+      body: JSON.stringify({ channel: values.channel, level: values.level || "vip", vipid }),
+    });
+    toastEnv(data, "会员订单参数已生成");
+    setPanel("wallet-result", operationView(data, "会员订单创建结果"));
+    return;
+  }
+  if (kind === "wallet-withdraw") {
+    const amount = Number(values.amount);
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error("请输入有效的提现金额");
+    if (!window.confirm(`确认向支付宝账号 ${values.alipay} 提现 ${amount.toFixed(2)}？`)) return;
+    const { data } = await api("/api/wallet/withdraw", {
+      method: "POST",
+      body: JSON.stringify({ alipay: values.alipay, name: values.name, amount: values.amount }),
+    });
+    toastEnv(data, "提现请求已提交");
+    setPanel("wallet-result", operationView(data, "提现请求结果"));
+    return;
+  }
+  if (kind === "profile-nick") {
+    const name = String(values.name || "").trim();
+    if (!name) throw new Error("请输入新昵称");
+    const { data } = await api("/api/profile/nick", { method: "POST", body: JSON.stringify({ name }) });
+    if (data.user) applyUser(data.user);
+    if (toastEnv(data, "昵称已更新")) go("me", { force: true });
+    else setPanel("me-result", operationView(data, "昵称修改结果"));
+    return;
+  }
+  if (kind === "referral-set") {
+    const { data } = await api("/api/referral/set", {
+      method: "POST",
+      body: JSON.stringify({ referral: String(values.referral || "").trim() }),
+    });
+    toastEnv(data, "推荐码设置请求已提交");
+    setPanel("me-result", operationView(data, "推荐码设置结果"));
+    return;
+  }
+  if (kind === "im-send") {
+    if (!S.chat || !window.TIM || !S.imConnected) throw new Error("消息通道尚未连接");
+    const peer = String(values.peer || "").trim();
+    const text = String(values.text || "").trim();
+    if (!peer || !text) throw new Error("请输入对方 UserID 和消息内容");
+    const message = S.chat.createTextMessage({
+      to: peer,
+      conversationType: window.TIM.TYPES.CONV_C2C,
+      payload: { text },
+    });
+    await S.chat.sendMessage(message);
+    addImMessage(`我: ${text}`, "mine");
+    const input = $("im-text");
+    if (input) input.value = "";
+    return;
+  }
+  if (kind === "lab-call") {
+    if (!S.labEnabled) throw new Error("协议台未启用");
+    let params;
+    try {
+      params = JSON.parse(String(values.params || "{}"));
+    } catch {
+      throw new Error("Params JSON 格式无效");
+    }
+    const path = submitter?.value === "redis" ? "/api/call-redis" : "/api/call";
+    const { data } = await api(path, {
+      method: "POST",
+      body: JSON.stringify({ action: String(values.action || "").trim(), params }),
+    });
+    const output = $("lab-output");
+    if (output) output.textContent = JSON.stringify(data, null, 2).slice(0, 18000);
+  }
+}
+
+async function loadFeatures() {
+  try {
+    const { data } = await api("/api/features", { authOptional: true, timeout: 6000 });
+    const features = data && data.features;
+    S.serverHeartbeat = Boolean(data?.auto_heartbeat);
+    S.labEnabled = Boolean(
+      data?.lab_enabled === true ||
+        (!Array.isArray(features) && features && features.lab_enabled === true) ||
+        (Array.isArray(features) && features.some((item) => item && item.id === "lab" && item.lab_enabled === true))
+    );
+  } catch {
+    S.labEnabled = false;
+  }
+  buildNav();
+}
+
+function startSmsCountdown(button, seconds = 60) {
+  clearInterval(S.smsTimer);
+  let remain = seconds;
+  button.dataset.locked = "true";
+  button.disabled = true;
+  const original = "获取验证码";
+  button.textContent = `${remain}s 后重试`;
+  S.smsTimer = setInterval(() => {
+    remain -= 1;
+    if (remain <= 0) {
+      clearInterval(S.smsTimer);
+      S.smsTimer = null;
+      button.dataset.locked = "false";
+      button.disabled = false;
+      button.textContent = original;
+      return;
+    }
+    button.textContent = `${remain}s 后重试`;
+  }, 1000);
+}
+
+$("login-tabs").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-mode]");
+  if (button) setLoginMode(button.dataset.mode);
+});
+
+$("send-sms").addEventListener("click", (event) => {
+  const button = event.currentTarget;
+  void withPending(button, async () => {
+    const phone = $("phone").value.trim();
+    if (!/^\d{6,18}$/.test(phone)) throw new Error("请输入有效手机号");
+    const { data } = await api("/api/auth/sms-send", {
+      method: "POST",
+      body: JSON.stringify({ phone }),
+      authOptional: true,
+    });
+    if (toastEnv(data, "验证码已发送")) startSmsCountdown(button);
+  });
+});
+
+$("login-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const button = $("login-submit");
+  void withPending(button, async () => {
+    const phone = $("phone").value.trim();
+    const password = $("password").value;
+    const code = $("sms-code").value.trim();
+    $("login-message").textContent = "";
+    if (!/^\d{6,18}$/.test(phone)) throw new Error("请输入有效手机号");
+    let result;
+    if (S.loginMode === "sms") {
+      if (!code) throw new Error("请输入短信验证码");
+      result = await api("/api/auth/sms-login", {
+        method: "POST",
+        body: JSON.stringify({ phone, code }),
+        authOptional: true,
+      });
+    } else {
+      if (!password) throw new Error("请输入密码");
+      result = await api("/api/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ phone, password, mode: "password" }),
+        authOptional: true,
+      });
+    }
+    if (!result.data.ok) {
+      const info = errorInfo(result.data, "登录失败");
+      $("login-message").textContent = info.title;
+      return;
+    }
+    S.authenticated = true;
+    applyUser(result.data.user);
+    showLogin(false, true);
+    updatePresence(!document.hidden);
+    buildNav();
+    const desired = hashRoute();
+    go(isRouteAllowed(desired) ? desired : "nearby", { replace: !isRouteAllowed(desired), force: true });
+    toast("登录成功");
+  });
+});
+
+document.addEventListener("click", (event) => {
+  const routeButton = event.target.closest("[data-route]");
+  if (routeButton) {
+    event.preventDefault();
+    go(routeButton.dataset.route);
+    return;
+  }
+  const actionButton = event.target.closest("[data-action]");
+  if (!actionButton) return;
+  event.preventDefault();
+  void withPending(actionButton, () => handleAction(actionButton.dataset.action, actionButton));
+});
+
+document.addEventListener("submit", (event) => {
+  const form = event.target.closest("form[data-form]");
+  if (!form) return;
+  event.preventDefault();
+  const submitter = event.submitter || form.querySelector('button[type="submit"]');
+  void withPending(submitter, () => handleProductForm(form, submitter));
+});
+
+document.addEventListener(
+  "error",
+  (event) => {
+    if (event.target && event.target.matches && event.target.matches("img[data-media]")) event.target.hidden = true;
+  },
+  true
+);
+
+$("open-menu").addEventListener("click", openDrawer);
+$("close-menu").addEventListener("click", () => closeDrawer(true));
+$("drawer-mask").addEventListener("click", () => closeDrawer(true));
+$("reload-page").addEventListener("click", (event) => {
+  void withPending(event.currentTarget, async () => go(S.route, { force: true }));
+});
+$("logout-side").addEventListener("click", (event) => {
+  void withPending(event.currentTarget, logout);
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && $("sidebar").classList.contains("open")) closeDrawer(true);
+});
+
+window.addEventListener("hashchange", () => {
+  if (S.authenticated) void activateRoute(hashRoute());
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (!S.authenticated) return;
+  updatePresence(!document.hidden);
+});
+
+window.addEventListener("pagehide", () => {
+  stopPresenceTimer();
+  if (S.authenticated) {
+    const options = {
+      method: "POST",
+      credentials: "include",
+      keepalive: true,
+      headers: { "Content-Type": "application/json" },
+    };
+    void fetch("/api/frontback", {
+      ...options,
+      body: JSON.stringify({ frontorback: "0" }),
+    }).catch(() => {});
+    if (S.serverHeartbeat) {
+      void fetch("/api/heartbeat/stop", { ...options, body: "{}" }).catch(() => {});
+    }
+  }
+  if (S.chat && typeof S.chat.logout === "function") {
+    try {
+      void S.chat.logout();
+    } catch {
+      // Page is leaving; nothing else to do.
+    }
+  }
+});
+
+(async function boot() {
+  setLoginMode("password");
+  await loadFeatures();
+  try {
+    const { status, data } = await api("/api/me", { authOptional: true, timeout: 8000 });
+    if (status === 200 && data.ok && data.user?.logged_in) {
+      S.authenticated = true;
+      applyUser(data.user);
+      showLogin(false);
+      S.serverHeartbeat = Boolean(data.auto_heartbeat ?? S.serverHeartbeat);
+      updatePresence(!document.hidden);
+      const desired = hashRoute();
+      go(isRouteAllowed(desired) ? desired : "nearby", { replace: !isRouteAllowed(desired), force: true });
+      return;
+    }
+  } catch {
+    // Login screen remains available when the bootstrap request fails.
+  }
+  S.authenticated = false;
+  applyUser(null);
+  showLogin(true, true);
+  if (!isRouteAllowed(hashRoute())) history.replaceState(null, "", "#/nearby");
 })();

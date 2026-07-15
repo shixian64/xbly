@@ -4,4 +4,4 @@ Import protocol only at the edges (store / bff). Never put multi-tenant
 logic into bbw_protocol.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

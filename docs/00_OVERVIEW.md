@@ -13,7 +13,7 @@
 | APK | `xbly.apk`（当前 v154）/ `beibeiwu.apk`（v148 基线） |
 | 包名 | `xin.banghua.beiyuan0` |
 | versionCode | **154**（旧 148） |
-| Application | Sophix 壳 → `App` |
+| Application | v154 直接 `App`；v148 基线曾使用 Sophix 壳 |
 | 后端 | 微擎 `do=` + `m=socialchat` |
 | 主域名 | `applet.banghua.xin` / `redis.banghua.xin` / `oss.banghua.xin` |
 

@@ -57,7 +57,19 @@ def _parse_result(status: int, raw: str, headers: Dict[str, str]) -> ApiResult:
     if status < 0:
         return ApiResult(False, status, text, kind="error", message=text, headers=headers)
     if not text.strip():
-        return ApiResult(True, status, text, kind="empty", headers=headers)
+        # An empty HTTP 200 only proves that the transport completed.  Several
+        # business APIs use an empty body for a rejected/no-op operation, so it
+        # must not be promoted to a successful business result globally.
+        return ApiResult(
+            False,
+            status,
+            text,
+            data=None,
+            code="EMPTY_RESPONSE",
+            message="empty response; business outcome is unknown",
+            kind="empty",
+            headers=headers,
+        )
 
     # try JSON
     try:
@@ -65,9 +77,12 @@ def _parse_result(status: int, raw: str, headers: Dict[str, str]) -> ApiResult:
     except Exception:
         # plain text business result
         stripped = text.strip()
-        if stripped in ("false", "no", "NULL", "null"):
+        lowered = stripped.lower()
+        failure_code = ""
+        if lowered in ("false", "no", "null", "none"):
             ok = False
-        elif stripped in ("true", "ok", "OK", "success", "T"):
+            failure_code = "FALSE_RESPONSE" if lowered in ("false", "no") else "NULL_RESPONSE"
+        elif lowered in ("true", "ok", "success", "t"):
             ok = True
         elif any(
             k in stripped
@@ -95,22 +110,68 @@ def _parse_result(status: int, raw: str, headers: Dict[str, str]) -> ApiResult:
             ok = False
         else:
             # long opaque payloads (word lists, tokens) treat as transport OK
-            ok = status == 200
+            ok = 200 <= status < 300
+        ok = ok and 200 <= status < 300
         return ApiResult(
             ok=ok,
             status=status,
             raw=text,
             data=text,
+            code=failure_code,
             message=text[:200],
             kind="text",
             headers=headers,
         )
 
-    if isinstance(data, (list, int, float, bool)):
-        return ApiResult(True, status, text, data=data, kind="json_other", headers=headers)
+    transport_ok = 200 <= status < 300
+
+    # JSON booleans/null need explicit handling.  json.loads("false") and
+    # json.loads("null") succeed, so the plain-text failure branch above never
+    # sees them.  Numeric values and lists, on the other hand, are legitimate
+    # payloads used by endpoints such as getReferral and must be preserved.
+    if data is None:
+        return ApiResult(
+            False,
+            status,
+            text,
+            data=None,
+            code="NULL_RESPONSE",
+            message="null response; business outcome is unknown",
+            kind="json_other",
+            headers=headers,
+        )
+    if isinstance(data, bool):
+        return ApiResult(
+            ok=transport_ok and data,
+            status=status,
+            raw=text,
+            data=data,
+            code="" if data else "FALSE_RESPONSE",
+            message="" if data else "service returned false",
+            kind="json_other",
+            headers=headers,
+        )
+    if isinstance(data, (list, int, float, str)):
+        return ApiResult(
+            transport_ok,
+            status,
+            text,
+            data=data,
+            message="" if transport_ok else f"HTTP {status}",
+            kind="json_other",
+            headers=headers,
+        )
 
     if not isinstance(data, dict):
-        return ApiResult(True, status, text, data=data, kind="json_other", headers=headers)
+        return ApiResult(
+            transport_ok,
+            status,
+            text,
+            data=data,
+            message="" if transport_ok else f"HTTP {status}",
+            kind="json_other",
+            headers=headers,
+        )
 
     code = str(data.get("code", data.get("error", "")))
     message = str(data.get("message", data.get("info", "")))
@@ -123,11 +184,15 @@ def _parse_result(status: int, raw: str, headers: Dict[str, str]) -> ApiResult:
         except Exception:
             pass
 
-    ok = code in ("200", "0", "") or data.get("error") == "0" or data.get("error") == 0
+    ok = transport_ok and (
+        code in ("200", "0", "")
+        or data.get("error") == "0"
+        or data.get("error") == 0
+    )
     if code in ("400", "403", "700", "300"):
         ok = False
     # some success only have message T
-    if code == "200":
+    if code == "200" and transport_ok:
         ok = True
 
     return ApiResult(

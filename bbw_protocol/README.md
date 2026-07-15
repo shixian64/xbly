@@ -12,12 +12,13 @@
 | ✅ 资料 | 用户信息/改昵称/隐私… |
 | ✅ 经济 | VIP/金币/送礼/提现下单参数 |
 | ✅ 房间/匹配/IM 辅助 HTTP | token 获取、列表、redis 缓存接口 |
-| ✅ **任意 do= 通用调用** | `app.call("Action", **params)` — 覆盖目录内 ~400 action |
+| ✅ **action 名称面 + 调用器** | 默认 action 用 `app.call`；特殊租户/URL/Redis/multipart 用对应 `call_*` |
 | ⚠️ 腾讯/融云 **实时长连接** | `adapters.im` 出凭证；收发需 TIM/融云 SDK（见 `bbw_web`） |
 | ⚠️ 阿里云刷脸 | `adapters.face` 编排 Init/Describe；活体 metaInfo 仍靠 ZIM |
 | ⚠️ 支付收银台 | `adapters.pay` 规范 order_params；收银靠微信/支付宝官方 |
 
-完整 action 目录：`../docs/api_catalog.json`（402 actions）。  
+完整 action 目录：`../docs/api_catalog.json`（v154 活跃 **398**；历史并集 **405**，含 7 个已下线小说 action）。
+
 原生边车：`adapters/` + Web BFF：`../bbw_web/`。
 
 ## 安装 / 运行
@@ -75,6 +76,7 @@ python -m bbw_protocol.cli native-status
 python -m bbw_protocol.cli im-tim --prefer local
 python -m bbw_protocol.cli im-rong
 python -m bbw_protocol.cli pay-coin --channel wechat --coin-id 1
+python -m bbw_protocol.cli pay-vip --channel wechat --level vip --vipid 5
 python -m bbw_protocol.cli face-status
 ```
 

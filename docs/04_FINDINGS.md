@@ -89,13 +89,13 @@
 
 ## P2 · 中
 
-### F-009 · Sophix 调试模式开启
+### F-009 · Sophix 调试模式开启（v148 历史版本）
 
 | 项 | 内容 |
 |---|---|
 | 代码 | `setEnableDebug(true)` + tags `test` + secret metadata null |
 | 风险 | 热修复通道/调试信息面扩大 |
-| 状态 | **静态确认** |
+| 状态 | **v148 静态确认；v154 已移除 Sophix 组件** |
 
 ### F-010 · 资料修改强制实名
 
@@ -202,4 +202,4 @@
 3. 客户端签名改为 HMAC(服务端密钥) 或直接依赖 HTTPS + 短时 token。  
 4. 登录响应去掉 password 哈希。  
 5. 短信接口强制图形验证 + 频控 + 业务 token。  
-6. Sophix 关闭 debug、配置正确 secret。
+6. 历史 v148 若仍在分发，应关闭 Sophix debug 并配置正确 secret；v154 已移除该组件。

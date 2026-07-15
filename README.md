@@ -19,13 +19,13 @@
 |---|---|---|
 | 签名与会话（SIGN / EXPIRE / AUTHOR） | ✅ 可本地复现 | `bbw_protocol.sign` |
 | 登录 / 短信 / 改密 / 一键登录 | ✅ | `cli login` · `auth` |
-| ~403 个业务 action 通用调用 | ✅ | `cli call` · `app.call` |
+| 398 个 v154 活跃 action（catalog 405，含 7 个历史下线项） | ✅ 名称面/调用器 | `app.call*` · `call_url` · multipart |
 | 匹配 / 任务 / 资料 / 社交 / 房间 | ✅ HTTP | 各 `modules/*` |
 | IM 凭证（腾讯 UserSig / 融云） | ✅ 凭证 | `app.native.im` |
 | IM 实时收发 | ⚠️ 需官方 SDK | `bbw_web` + TIM |
 | 刷脸实名 | ⚠️ 仅 HTTP 编排 | `app.native.face` · 活体靠阿里云 |
 | 支付下单 | ⚠️ 仅 order 参数 | `app.native.pay` · 收银官方 |
-| 全功能 Web App（PC/手机） | ✅ | `python -m bbw_web` · 10 大模块对齐 APK |
+| 产品化 Web App（PC/手机） | ✅ 主流程 | `python -m bbw_web` · 五主导航对齐 v154 APK，原生能力明确降级 |
 
 ---
 
@@ -70,10 +70,11 @@ python -m bbw_protocol.cli native-status
 python -m bbw_protocol.cli im-tim
 python -m bbw_protocol.cli repl
 
-# —— 全功能 Web App（简洁 UI · PC 侧栏 / 手机底栏）——
+# —— 产品化 Web App（PC 侧栏 / 手机五项底栏）——
 python -m bbw_web --port 8765
 # http://127.0.0.1:8765/
-# 首页·广场·匹配·社交·房间·消息·钱包·任务·我的·协议台
+# 身边·消息·匹配·动态·我的；社交/房间/钱包/任务为二级服务
+# 授权研究时才使用：python -m bbw_web --enable-lab
 ```
 
 ```python
@@ -96,8 +97,8 @@ print(app.native.im.tim_login_payload())   # 给 TIM Web SDK
 ## 架构（简）
 
 ```
-Browser SPA（简洁浅色 · PC 侧栏 / 手机底栏）
-        │ Cookie bbw_sid
+Browser SPA（社交娱乐风 · PC 侧栏 / 手机五项底栏）
+        │ HttpOnly + SameSite=Strict Cookie
         ▼
    bbw_web BFF（全功能语义 API + 多用户）
         │
@@ -108,8 +109,9 @@ Browser SPA（简洁浅色 · PC 侧栏 / 手机底栏）
    banghua HTTP（与 APK 相同 do= / 签名 / token）
 ```
 
-- **Web 目标**：APK 主功能域（首页/广场/匹配/社交/房间/消息/钱包/任务/我的）均可在浏览器操作。  
-- **协议台**：高级用户可直接调任意 `do=`（约 400+）。  
+- **Web 目标**：按 APK 的“身边 / 消息 / 匹配 / 动态 / 我的”组织主流程；社交、房间、钱包、任务下沉为二级服务。
+- **产品与研究隔离**：默认关闭协议台、任意 action、会话列表和弱一键登录；仅 `--enable-lab` 显式开启。
+- **会话安全**：SID 只存在 HttpOnly Cookie；CORS 默认关闭；Web 会话默认仅内存保存。
 - **原生边界**：IM 长连接 / 刷脸活体 / 微信收银仍依赖厂商 SDK 或官方 App。
 
 ---

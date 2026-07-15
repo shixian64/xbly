@@ -6,18 +6,18 @@
 
 | 类别 | 数量/说明 |
 |---|---|
-| ZIP entries | 7487 |
-| classes*.dex | 12 个（最大约 10MB 级） |
-| native .so | 63（arm64 为主） |
-| assets | 480 |
-| res | 大量 UI 资源 |
+| ZIP entries | **8039**（v148：7487） |
+| classes*.dex | **11** 个（v148：12） |
+| native .so | **62**（v148：63，arm64 为主） |
+| assets | **481**（v148：480） |
+| res 文件 | **7202**（v148：6665） |
 
 ### 1.1 主要 SDK / 组件（从 so / 包名推断）
 
 - 融云 IM / RTC：`libRongIMLib.so`、`libRongRTCLib.so` 等
 - 腾讯 IM / 音视频相关
 - 穿山甲广告（`assets/408037528` 为嵌套 APK/ZIP）
-- 阿里 Sophix 热修复
+- 阿里 Sophix 热修复（仅 v148 基线；v154 已移除壳、service、so 与 metadata）
 - 阿里云 OSS、号码认证、HA 监控
 - 高德 / 腾讯地图相关 so
 - ffmpeg / ijkplayer 系
@@ -40,7 +40,7 @@
 | `App.java` | 真 Application：IM、广告、推送初始化 |
 | `BuildConfig.java` | APP_KEY / BASE_SERVER 等 |
 | `LaunchActivity.java` | 启动、唯一登录校验、热修复查询 |
-| `SophixStubApplication.java` | Sophix 壳，`setEnableDebug(true)` |
+| `SophixStubApplication.java` | v148 基线的 Sophix 壳；v154 Manifest 已直接使用 `App` |
 | `Signin/*` | 登录注册找回密码 |
 | `TencentIM/signature/GenerateTestUserSig.java` | **IM SECRETKEY 硬编码** |
 | `me/setting/NicknameEditActivity.java` | 改昵称 UI |
@@ -158,7 +158,7 @@ URL 拼装：
 - `hostnameVerifier`：非 `banghua.xin` 直接 `true`；`banghua.xin` 仅粗查证书 CN 是否含 `RapidSSL`
 - **非真正 Certificate Pinning**
 
-## 10. Sophix
+## 10. Sophix（v148 基线；v154 已移除）
 
 ```java
 // SophixStubApplication
@@ -167,6 +167,8 @@ setEnableFullLog()
 setSecretMetaData(null, null, null)
 setTags(["test"])
 ```
+
+`xbly.apk` v154 已确认移除 `SophixStubApplication`、下载 service、`libsophix.so` 与相关 metadata；此段仅保留用于解释 v148 的历史风险。
 
 ## 11. 高价值 action 列表（部分）
 

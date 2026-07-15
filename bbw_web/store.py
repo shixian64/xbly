@@ -1,7 +1,8 @@
-"""Multi-user web session store — isolated from bbw_protocol core.
+"""Multi-user web session store — isolated from ``bbw_protocol`` core.
 
-Each browser gets a web_sid cookie/token → one BeibeiwuApp instance + optional heartbeat.
-Protocol sessions are saved under sessions/{uid}.json (gitignored).
+Browser session ids are intentionally kept in HttpOnly cookies by the BFF.  Protocol
+sessions stay in memory by default; opt-in persistence writes a reduced session file
+which never contains the login password or ``raw_user`` response.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ import json
 import secrets
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -26,6 +27,19 @@ SESSIONS_DIR = REPO_ROOT / "sessions"
 WEB_META_DIR = Path(__file__).resolve().parent / "data"
 
 
+def _session_path(uid: Any) -> Optional[Path]:
+    """Return a path confined to ``sessions/`` for a simple server uid."""
+    value = str(uid or "").strip()
+    if (
+        not value
+        or value == "0"
+        or len(value) > 64
+        or any(not (ch.isalnum() or ch in "_-") for ch in value)
+    ):
+        return None
+    return SESSIONS_DIR / f"{value}.json"
+
+
 @dataclass
 class WebUser:
     """One authenticated (or pending) browser session."""
@@ -37,6 +51,8 @@ class WebUser:
     last_seen: float = field(default_factory=time.time)
     heartbeat: Optional[Heartbeat] = None
     label: str = ""  # optional display label
+    persist_sessions: bool = False
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def touch(self) -> None:
         self.last_seen = time.time()
@@ -54,24 +70,67 @@ class WebUser:
             self.heartbeat = None
 
     def persist(self) -> Optional[Path]:
-        """Save protocol session file keyed by uid (if logged in)."""
+        """Persist a reduced protocol session, when explicitly enabled.
+
+        ``Session.save`` serializes every dataclass field, including ``password`` and
+        ``raw_user``.  Web persistence must not do that, so it owns a small sanitized
+        writer here instead.
+        """
         s = self.app.session
-        if not s.logged_in:
+        if not self.persist_sessions or not s.logged_in:
             return None
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        path = SESSIONS_DIR / f"{s.uid}.json"
+        path = _session_path(s.uid)
+        if path is None:
+            return None
+        data = asdict(s)
+        data.pop("path", None)
+        data.pop("password", None)
+        data.pop("raw_user", None)
+        # Write atomically so two request threads cannot leave truncated JSON.
+        tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
         s.path = str(path)
-        return s.save(str(path))
+        return path
+
+    def delete_persisted(self, uid: Optional[str] = None) -> bool:
+        """Delete this user's optional persisted session file."""
+        path = _session_path(uid or self.app.session.uid)
+        if path is None:
+            return False
+        try:
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return False
 
     def public(self) -> Dict[str, Any]:
         who = self.app.whoami()
+        raw_phone = str(who.get("phone") or "")
+        phone = raw_phone
+        if len(phone) >= 7:
+            phone = f"{phone[:3]}****{phone[-4:]}"
+        label = str(self.label or "")
+        if label == raw_phone or (label.isdigit() and len(label) >= 7):
+            label = f"{label[:3]}****{label[-4:]}"
         return {
-            "web_sid": self.web_sid,
-            "label": self.label,
+            "label": label,
             "created_at": self.created_at,
             "last_seen": self.last_seen,
             "heartbeat": self.heartbeat.status() if self.heartbeat else {"running": False},
-            "user": who,
+            "user": {
+                "logged_in": bool(who.get("logged_in")),
+                "uid": str(who.get("uid") or ""),
+                "nickname": str(who.get("nickname") or ""),
+                "user_role": str(who.get("user_role") or ""),
+                "rp_verify_time": str(who.get("rp_verify_time") or "0"),
+                "is_realname": bool(who.get("is_realname")),
+                "vip": str(who.get("vip") or "0"),
+                "svip": str(who.get("svip") or "0"),
+                "money": str(who.get("money") or "0"),
+                "phone": phone,
+            },
         }
 
 
@@ -84,13 +143,18 @@ class SessionStore:
         ttl_sec: float = 86400.0 * 7,
         auto_heartbeat: bool = True,
         heartbeat_interval: float = 55.0,
+        persist_sessions: bool = False,
+        allow_weak_onekey: bool = False,
     ):
         self._lock = threading.RLock()
         self.users: Dict[str, WebUser] = {}
         self.ttl_sec = ttl_sec
         self.auto_heartbeat = auto_heartbeat
         self.heartbeat_interval = heartbeat_interval
-        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        self.persist_sessions = bool(persist_sessions)
+        self.allow_weak_onekey = bool(allow_weak_onekey)
+        if self.persist_sessions:
+            SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
         WEB_META_DIR.mkdir(parents=True, exist_ok=True)
 
     def _new_sid(self) -> str:
@@ -109,7 +173,26 @@ class SessionStore:
                 app=app,
                 native=NativeBundle(app),
                 label=label or "",
+                persist_sessions=self.persist_sessions,
             )
+            self.users[sid] = user
+            return user
+
+    def rotate_sid(self, user: WebUser) -> WebUser:
+        """Rotate the browser credential after authentication.
+
+        The old map key is removed before the new key is published, preventing login
+        fixation while preserving the already initialized app/session object.
+        """
+        with self._lock:
+            old_sid = user.web_sid
+            if self.users.get(old_sid) is user:
+                self.users.pop(old_sid, None)
+            sid = self._new_sid()
+            while sid in self.users:
+                sid = self._new_sid()
+            user.web_sid = sid
+            user.touch()
             self.users[sid] = user
             return user
 
@@ -132,19 +215,36 @@ class SessionStore:
             raise KeyError("invalid or expired web session")
         return u
 
-    def drop(self, web_sid: str) -> bool:
+    def drop(
+        self,
+        web_sid: str,
+        *,
+        delete_persisted: bool = False,
+        persisted_uid: Optional[str] = None,
+    ) -> bool:
         with self._lock:
-            return self._drop(web_sid)
+            return self._drop(
+                web_sid,
+                delete_persisted=delete_persisted,
+                persisted_uid=persisted_uid,
+            )
 
-    def _drop(self, web_sid: str) -> bool:
+    def _drop(
+        self,
+        web_sid: str,
+        *,
+        delete_persisted: bool = False,
+        persisted_uid: Optional[str] = None,
+    ) -> bool:
         u = self.users.pop(web_sid, None)
         if not u:
             return False
         u.stop_heartbeat()
-        try:
-            u.persist()
-        except Exception:
-            pass
+        if delete_persisted:
+            try:
+                u.delete_persisted(persisted_uid)
+            except OSError:
+                pass
         return True
 
     def purge_expired(self) -> int:
@@ -159,6 +259,12 @@ class SessionStore:
             self.purge_expired()
             return [u.public() for u in self.users.values()]
 
+    def close(self) -> None:
+        """Stop all background work without serializing credentials on shutdown."""
+        with self._lock:
+            for sid in list(self.users):
+                self._drop(sid)
+
     def login_password(
         self,
         web_sid: Optional[str],
@@ -168,21 +274,27 @@ class SessionStore:
         label: str = "",
         start_hb: Optional[bool] = None,
     ) -> WebUser:
-        """Login into existing web session or create one."""
-        with self._lock:
-            user = self.get(web_sid) if web_sid else None
-            if not user:
-                user = self.create(label=label or phone)
-            elif label:
-                user.label = label
+        """Log in, then rotate the browser SID before returning it."""
+        user = self.get(web_sid) if web_sid else None
+        created = user is None
+        if not user:
+            user = self.create(label=label or phone)
+        elif label:
+            user.label = label
+        with user.lock:
             # stable device profile per phone
             user.app.session.apply_device(build_device_profile(seed=phone))
             r = user.app.auth.login_password(phone, password)
-            if not r.ok and not user.app.session.logged_in:
-                # keep web session for retry
+            if not r.ok or not user.app.session.logged_in:
+                if created:
+                    self.drop(user.web_sid)
                 raise RuntimeError(
                     r.message or r.code or r.raw[:200] or "login failed"
                 )
+            # The protocol helper keeps the submitted password for CLI refresh.  The
+            # Web process never needs to retain it after the request completes.
+            user.app.session.password = ""
+            self.rotate_sid(user)
             user.persist()
             do_hb = self.auto_heartbeat if start_hb is None else start_hb
             if do_hb and user.app.session.logged_in:
@@ -198,16 +310,25 @@ class SessionStore:
         label: str = "",
         start_hb: Optional[bool] = None,
     ) -> WebUser:
-        with self._lock:
-            user = self.get(web_sid) if web_sid else None
-            if not user:
-                user = self.create(label=label or phone)
+        if not self.allow_weak_onekey:
+            raise PermissionError("weak one-key login is disabled")
+        user = self.get(web_sid) if web_sid else None
+        created = user is None
+        if not user:
+            user = self.create(label=label or phone)
+        elif label:
+            user.label = label
+        with user.lock:
             user.app.session.apply_device(build_device_profile(seed=phone))
             r = user.app.auth.login_onekey(phone)
-            if not r.ok and not user.app.session.logged_in:
+            if not r.ok or not user.app.session.logged_in:
+                if created:
+                    self.drop(user.web_sid)
                 raise RuntimeError(
                     r.message or r.code or r.raw[:200] or "onekey login failed"
                 )
+            user.app.session.password = ""
+            self.rotate_sid(user)
             user.persist()
             do_hb = self.auto_heartbeat if start_hb is None else start_hb
             if do_hb and user.app.session.logged_in:
@@ -217,7 +338,11 @@ class SessionStore:
 
     def restore_from_disk(self, uid: str, web_sid: Optional[str] = None) -> Optional[WebUser]:
         """Attach a previously saved protocol session (uid.json) to a web session."""
-        path = SESSIONS_DIR / f"{uid}.json"
+        if not self.persist_sessions:
+            return None
+        path = _session_path(uid)
+        if path is None:
+            return None
         if not path.exists():
             return None
         with self._lock:
@@ -229,6 +354,7 @@ class SessionStore:
                 user = self.create(label=sess.nickname or uid)
             user.app = BeibeiwuApp(sess)
             user.native = NativeBundle(user.app)
+            user.persist_sessions = True
             if self.auto_heartbeat:
                 user.start_heartbeat(self.heartbeat_interval)
             user.touch()
@@ -243,7 +369,7 @@ class SessionStore:
         with self._lock:
             return {
                 "active_web_sessions": len(self.users),
-                "sessions_dir": str(SESSIONS_DIR),
                 "ttl_sec": self.ttl_sec,
                 "auto_heartbeat": self.auto_heartbeat,
+                "persist_sessions": self.persist_sessions,
             }

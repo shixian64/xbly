@@ -53,6 +53,17 @@
 
 已写入 `api_catalog.json` → `deprecated_actions`。服务端可能仍响应，但新包不再调用。
 
+### Catalog 扫描补录
+
+`signin0` 与 `SigninOneKeyLogin1` 在 v154 登录流程中仍被调用，但 URL 的 `do=` 值由运行时
+拼接，旧的“明文 URL / `startHttp(..., "action")`”正则扫描没有收录。现已作为
+`dynamic_do_actions` 补录。修订后的口径为：
+
+- v154 当前活跃 action：**398**；
+- v148 下线但为溯源保留：**7**；
+- catalog 历史并集：**405**；
+- v154 完整/重建 URL：**328**。
+
 ---
 
 ## 5. 协议核变更清单
@@ -72,4 +83,4 @@
 
 1. jadx `xbly.apk` 还原 `Id2MetaVerifyRequest` 完整表单字段  
 2. 全量重扫 startHttp 是否有非 `do=` 明文新接口  
-3. 确认热修 Sophix 是否从新包移除及影响  
+3. ✅ 已确认 v154 移除 Sophix 壳、service、`libsophix.so` 与相关 metadata；后续仅需评估历史版本影响

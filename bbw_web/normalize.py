@@ -135,6 +135,26 @@ def _as_list(x: Any) -> List[Any]:
         "giftlist",
         "gift_list",
         "matchlist",
+        "slides",
+        "slide_list",
+        "banners",
+        "topics",
+        "topic_list",
+        "rooms",
+        "roomlist",
+        "room_list",
+        "songs",
+        "songlist",
+        "song_list",
+        "music",
+        "musiclist",
+        "music_list",
+        "bottles",
+        "bottlelist",
+        "bottle_list",
+        "stickers",
+        "stickerlist",
+        "sticker_list",
     ):
         v = d.get(k)
         if isinstance(v, list):
@@ -176,6 +196,74 @@ def _num(v: Any, default: int = 0) -> int:
         return int(float(str(v).strip()))
     except Exception:
         return default
+
+
+def _bool(v: Any, default: bool = False) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "on", "t", "已收藏", "是"):
+        return True
+    if s in ("0", "false", "no", "n", "off", "f", "未收藏", "否", ""):
+        return False
+    return default
+
+
+def normalize_value(data: Any) -> Dict[str, Any]:
+    """Preserve a scalar/object response as a stable generic value DTO.
+
+    This is for endpoints such as referral/version/auth/token responses where
+    forcing the payload through a list/user normalizer would lose the actual
+    business value.
+    """
+    value = data
+    if isinstance(value, str):
+        s = value.strip()
+        if s[:1] in ("{", "["):
+            try:
+                value = json.loads(s)
+            except Exception:
+                value = data
+
+    if value is None:
+        value_type = "null"
+        text = ""
+        empty = True
+    elif isinstance(value, bool):
+        value_type = "boolean"
+        text = "true" if value else "false"
+        empty = False
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        value_type = "number"
+        text = str(value)
+        empty = False
+    elif isinstance(value, list):
+        value_type = "array"
+        text = json.dumps(value, ensure_ascii=False)
+        empty = len(value) == 0
+    elif isinstance(value, dict):
+        value_type = "object"
+        text = json.dumps(value, ensure_ascii=False)
+        empty = len(value) == 0
+    else:
+        value_type = "string"
+        text = str(value)
+        empty = text == ""
+
+    return {
+        "value": value,
+        "value_type": value_type,
+        "text": text,
+        "empty": empty,
+    }
+
+
+# Explicit alias for callers that prefer the longer name.
+normalize_generic_value = normalize_value
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +366,244 @@ def normalize_users(data: Any) -> List[Dict[str, Any]]:
     return out
 
 
+def _entity_dict(item: Any, nested_keys: Tuple[str, ...] = ()) -> Optional[Dict[str, Any]]:
+    if isinstance(item, str):
+        parsed = _as_dict(item)
+        if not parsed:
+            return None
+        item = parsed
+    if not isinstance(item, dict):
+        return None
+    out = dict(item)
+    for key in nested_keys:
+        nested = out.get(key)
+        if isinstance(nested, str):
+            nested = _as_dict(nested)
+        if isinstance(nested, dict):
+            out = {**out, **nested}
+    return out
+
+
+def _normalize_many(data: Any, one: Any) -> List[Dict[str, Any]]:
+    raw = extract_list(data)
+    if not raw and isinstance(data, (dict, str)):
+        item = one(data)
+        return [item] if item else []
+    out: List[Dict[str, Any]] = []
+    for item in raw:
+        dto = one(item)
+        if dto:
+            out.append(dto)
+    return out
+
+
+def normalize_slide(item: Any) -> Optional[Dict[str, Any]]:
+    d = _entity_dict(item, ("slide", "banner", "info"))
+    if not d:
+        return None
+    sid = str(_first(d, ["id", "slideid", "slide_id", "banner_id"], ""))
+    title = str(
+        _first(d, ["title", "name", "slidename", "slide_name", "description", "desc"], "")
+    )
+    image = str(
+        _first(
+            d,
+            [
+                "image",
+                "img",
+                "pic",
+                "picture",
+                "cover",
+                "thumb",
+                "thumbnail",
+                "slideimage",
+                "slide_img",
+                "slidepic",
+                "slidepicture",
+                "slide_picture",
+            ],
+            "",
+        )
+    )
+    link = str(
+        _first(
+            d,
+            ["link", "href", "target_url", "jump_url", "web_url", "redirect", "slideurl", "url"],
+            "",
+        )
+    )
+    if not any((sid, title, image, link)):
+        return None
+    return {
+        "id": sid,
+        "title": title or sid or "轮播",
+        "image": image,
+        "url": link,
+        "sort": str(_first(d, ["sort", "slidesort", "order", "weight"], "")),
+    }
+
+
+def normalize_slides(data: Any) -> List[Dict[str, Any]]:
+    return _normalize_many(data, normalize_slide)
+
+
+def normalize_topic(item: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(item, str) and not _as_dict(item):
+        name = item.strip()
+        return {"id": "", "name": name, "title": name, "description": "", "image": "", "post_count": 0} if name else None
+    d = _entity_dict(item, ("topic", "info"))
+    if not d:
+        return None
+    tid = str(_first(d, ["id", "topicid", "topic_id", "topicId"], ""))
+    name = str(_first(d, ["topic", "topic_name", "topicName", "name", "title"], ""))
+    desc = str(_first(d, ["description", "desc", "content", "summary"], ""))
+    image = str(_first(d, ["image", "img", "pic", "cover", "thumb"], ""))
+    if not any((tid, name, desc, image)):
+        return None
+    return {
+        "id": tid,
+        "name": name or tid or "话题",
+        "title": name or tid or "话题",
+        "description": desc,
+        "image": image,
+        "post_count": _num(_first(d, ["post_count", "postnum", "count", "num"], 0)),
+    }
+
+
+def normalize_topics(data: Any) -> List[Dict[str, Any]]:
+    return _normalize_many(data, normalize_topic)
+
+
+def normalize_room(item: Any) -> Optional[Dict[str, Any]]:
+    d = _entity_dict(item, ("room", "roominfo", "roomInfo", "info"))
+    if not d:
+        return None
+    rid = str(_first(d, ["id", "roomId", "room_id", "roomid", "channel_id"], ""))
+    name = str(_first(d, ["roomName", "room_name", "roomname", "name", "title"], ""))
+    cover = str(_first(d, ["cover", "image", "img", "pic", "roomCover", "portrait"], ""))
+    channel = str(_first(d, ["channel", "channelName", "channel_name", "channel_id"], ""))
+    owner_id = str(_first(d, ["owner_id", "ownerId", "uid", "userId", "anchor_id", "myID"], ""))
+    owner_name = str(_first(d, ["owner_name", "ownerName", "nickname", "anchor_name"], ""))
+    if not any((rid, name, cover, channel, owner_id)):
+        return None
+    return {
+        "id": rid,
+        "name": name or rid or "房间",
+        "title": name or rid or "房间",
+        "cover": cover,
+        "channel": channel,
+        "owner_id": owner_id,
+        "owner_name": owner_name,
+        "room_type": str(_first(d, ["audioroomtype", "room_type", "roomType", "type"], "")),
+        "online_count": _num(_first(d, ["online_count", "online", "member_count", "people", "num"], 0)),
+        "status": str(_first(d, ["status", "state"], "")),
+    }
+
+
+def normalize_rooms(data: Any) -> List[Dict[str, Any]]:
+    return _normalize_many(data, normalize_room)
+
+
+def normalize_song(item: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(item, str) and not _as_dict(item):
+        name = item.strip()
+        return {"id": "", "name": name, "title": name, "singer": "", "cover": "", "url": "", "duration": ""} if name else None
+    d = _entity_dict(item, ("song", "music", "info"))
+    if not d:
+        return None
+    sid = str(_first(d, ["id", "songId", "song_id", "musicId", "music_id"], ""))
+    name = str(_first(d, ["songName", "song_name", "musicName", "music_name", "name", "title"], ""))
+    singer = str(_first(d, ["singer", "artist", "author", "singerName", "singer_name"], ""))
+    cover = str(_first(d, ["cover", "image", "img", "pic", "album_pic", "albumPic"], ""))
+    url = str(_first(d, ["url", "play_url", "playUrl", "music_url", "song_url", "audio"], ""))
+    if not any((sid, name, singer, cover, url)):
+        return None
+    return {
+        "id": sid,
+        "name": name or sid or "歌曲",
+        "title": name or sid or "歌曲",
+        "singer": singer,
+        "cover": cover,
+        "url": url,
+        "duration": str(_first(d, ["duration", "time", "length"], "")),
+    }
+
+
+def normalize_songs(data: Any) -> List[Dict[str, Any]]:
+    return _normalize_many(data, normalize_song)
+
+
+def normalize_bottle(item: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(item, str) and not _as_dict(item):
+        content = item.strip()
+        return {"id": "", "content": content, "user_id": "", "nickname": "", "avatar": "", "created_at": "", "reply_count": 0} if content else None
+    d = _entity_dict(item, ("bottle", "draftBottle", "info"))
+    if not d:
+        return None
+    bid = str(_first(d, ["id", "bottleId", "bottle_id", "draftBottleId", "draft_id"], ""))
+    content = str(_first(d, ["content", "message", "text", "body", "leave_word"], ""))
+    user = normalize_user(_first(d, ["user", "userinfo", "userInfo"], None))
+    user_id = str(_first(d, ["user_id", "userId", "uid", "myid", "owner_id"], ""))
+    nickname = str(_first(d, ["nickname", "nick", "user_name", "name"], ""))
+    avatar = str(_first(d, ["avatar", "portrait", "head", "headimg"], ""))
+    if user:
+        user_id = user_id or str(user.get("id") or "")
+        nickname = nickname or str(user.get("nickname") or "")
+        avatar = avatar or str(user.get("avatar") or "")
+    if not any((bid, content, user_id, nickname, avatar)):
+        return None
+    return {
+        "id": bid,
+        "content": content,
+        "user_id": user_id,
+        "nickname": nickname,
+        "avatar": avatar,
+        "created_at": str(_first(d, ["created_at", "create_time", "createtime", "time"], "")),
+        "reply_count": _num(_first(d, ["reply_count", "comment_count", "leave_word_count", "num"], 0)),
+    }
+
+
+def normalize_bottles(data: Any) -> List[Dict[str, Any]]:
+    return _normalize_many(data, normalize_bottle)
+
+
+def normalize_sticker(item: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(item, str) and not _as_dict(item):
+        value = item.strip()
+        if not value:
+            return None
+        is_url = value.startswith(("http://", "https://", "data:"))
+        return {
+            "id": "",
+            "name": "" if is_url else value,
+            "image": value if is_url else "",
+            "url": value if is_url else "",
+            "thumbnail": "",
+            "favorite": False,
+        }
+    d = _entity_dict(item, ("sticker", "emoji", "info"))
+    if not d:
+        return None
+    sid = str(_first(d, ["id", "stickerId", "sticker_id", "emoji_id"], ""))
+    name = str(_first(d, ["name", "title", "stickerName", "sticker_name"], ""))
+    image = str(_first(d, ["image", "img", "pic", "sticker_url", "stickerUrl", "url"], ""))
+    thumb = str(_first(d, ["thumbnail", "thumb", "preview", "small_url"], ""))
+    if not any((sid, name, image, thumb)):
+        return None
+    return {
+        "id": sid,
+        "name": name or sid or "表情",
+        "image": image,
+        "url": image,
+        "thumbnail": thumb,
+        "favorite": _bool(_first(d, ["favorite", "is_favorite", "isFavorite", "collected"], False)),
+    }
+
+
+def normalize_stickers(data: Any) -> List[Dict[str, Any]]:
+    return _normalize_many(data, normalize_sticker)
+
+
 def normalize_gift(item: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(item, dict):
         return None
@@ -310,16 +636,39 @@ def normalize_task(item: Any) -> Optional[Dict[str, Any]]:
     progress = _num(_first(item, ["progress", "now", "current", "finish"], 0))
     total = _num(_first(item, ["num", "total", "target", "need", "max"], 0))
     available = str(_first(item, ["available", "status", "state", "receive"], ""))
-    can_receive = False
-    av_l = available.lower()
-    if total > 0 and progress >= total:
-        can_receive = True
-    if any(x in available for x in ("可领取", "领取", "未领")):
-        can_receive = True
-    if any(x in available for x in ("已领取", "已领", "完成领取")):
+    av_l = available.strip().lower()
+    claimed_states = (
+        "已领取",
+        "已领",
+        "完成领取",
+        "领取成功",
+        "claimed",
+        "received",
+    )
+    negative_states = (
+        "不可领取",
+        "不能领取",
+        "无法领取",
+        "未完成",
+        "disabled",
+    )
+    positive_states = (
+        "可领取",
+        "待领取",
+        "未领取",
+        "领取奖励",
+        "available",
+        "ready",
+    )
+    is_claimed = any(x in av_l for x in claimed_states)
+    blocked = is_claimed or any(x in av_l for x in negative_states)
+    explicitly_ready = any(x in av_l for x in positive_states)
+    if blocked:
         can_receive = False
-    if "已领取" in av_l or available == "已领取":
-        can_receive = False
+    elif explicitly_ready:
+        can_receive = True
+    else:
+        can_receive = total > 0 and progress >= total
     return {
         "id": tid,
         "title": title,
@@ -327,6 +676,7 @@ def normalize_task(item: Any) -> Optional[Dict[str, Any]]:
         "total": total,
         "progress_text": f"{progress}/{total}" if total else str(progress or "—"),
         "status_text": available or ("可领取" if can_receive else "进行中"),
+        "is_claimed": is_claimed,
         "can_receive": can_receive,
         "reward": str(_first(item, ["reward", "prize", "gift", "card"], "")),
     }
@@ -481,11 +831,14 @@ def normalize_match_result(r: Any) -> Dict[str, Any]:
 
 
 def session_user_dto(who: Dict[str, Any]) -> Dict[str, Any]:
+    phone = str(who.get("phone") or "")
+    if len(phone) >= 7:
+        phone = f"{phone[:3]}****{phone[-4:]}"
     return {
         "id": str(who.get("uid") or ""),
         "uid": str(who.get("uid") or ""),
         "nickname": str(who.get("nickname") or "游客"),
-        "phone": str(who.get("phone") or ""),
+        "phone": phone,
         "is_realname": bool(who.get("is_realname")),
         "money": str(who.get("money") or "0"),
         "vip": str(who.get("vip") or "0"),

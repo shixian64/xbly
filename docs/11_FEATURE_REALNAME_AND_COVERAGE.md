@@ -1,7 +1,7 @@
 # 11 · 功能全景：实名门槛 / 其他功能 / 协议覆盖
 
 **最后更新：** 2026-07-15  
-**依据：** jadx 静态门禁 + 协议实测 + `api_catalog.json`（402 actions）+ `bbw_protocol`
+**依据：** jadx 静态门禁 + 协议实测 + `api_catalog.json`（v154 活跃 398；历史并集 405）+ `bbw_protocol`
 
 ---
 
@@ -26,8 +26,8 @@
 
 | 维度 | 结论 |
 |---|---|
-| **HTTP `do=` / startHttp 业务接口** | **是（可达）**：`bbw_protocol` 的 `call("Action")` 覆盖目录内 **全部 402 个 action** |
-| **语义化封装方法** | 约 **101** 个高频 action 有具名 API；其余用通用 `call` |
+| **HTTP `do=` / startHttp 业务接口** | **名称可达**：目录含 v154 活跃 **398** 个 action，另保留 7 个 v148 历史下线项；特殊 `i/m`、absolute URL、multipart 仍应使用对应调用器 |
+| **语义化封装方法** | modules/adapters 当前有 **105** 个静态 action 名，另有动态支付 action；其余用通用 `call` |
 | **原生 SDK 能力** | **否 / 部分**：人脸活体、支付收银台 UI、IM 实时长连接需外挂 SDK |
 | **因未实名测不通 ≠ 未实现** | **正确**：协议方法已实现；服务端 403 是业务门禁，不是缺接口 |
 
@@ -220,11 +220,12 @@
 
 | 项 | 数量 |
 |---|---:|
-| 静态枚举 HTTP actions | **402** |
+| catalog 历史 action 并集 | **405**（含 7 个 v148 下线小说 action） |
+| v154 当前活跃 actions | **398** |
 | 分类（auth/profile/social/…） | 见 `api_catalog.json` |
-| 具名封装（modules 内写死的 action） | **≈101** |
-| 通用 `app.call("AnyAction")` 可达 | **402（100% 枚举面）** |
-| 全量 absolute URL | 332（含 H5/小说/支付 PHP 等） |
+| 具名静态 action（modules/adapters） | **105**（另有动态支付 action） |
+| 通用 `app.call("AnyAction")` 名称可达 | **405**；非默认租户/模块、absolute URL、multipart 需专用调用器 |
+| v154 完整/重建 URL | 328（含 H5/支付 PHP；已补运行时拼接的两个登录 URL） |
 
 ### 3.2 「是否实现了所有 APK 功能接口？」
 
@@ -233,7 +234,7 @@
 ```
 APK 功能
 ├── A. HTTP 业务接口（微擎 do= / otherinterface PHP）
-│     └── bbw_protocol：✅ 已全部可达（语义 API + call 逃生舱）
+│     └── bbw_protocol：✅ 已具备各类调用器；catalog 完成名称枚举，冷门接口仍需准确参数/租户/编码
 ├── B. 服务端业务门禁（实名/余额/权限）
 │     └── 协议已实现调用；未满足条件会 403/文本失败（与 App 一致）
 ├── C. 客户端-only UI 逻辑
@@ -247,7 +248,7 @@ APK 功能
 
 **简答：**
 
-- **是的：APK 暴露出的 HTTP 功能接口，协议层都实现了调用能力。**  
+- **传输层具备调用能力**：但仅有 action 名还不等于已还原参数、`i/m`、multipart/file 等语义。
 - **不是：不等于每个功能在当前游客未实名账号上都能业务成功。**  
 - **因实名失败测不通的**（如改昵称、提现），**协议代码路径已写好**，实名后同一命令即可再测。
 
@@ -266,7 +267,7 @@ APK 功能
 | IM 实时凭证 | `app.native.im.*` / BFF `/api/im/*` | adapters + Web |
 | 实名 HTTP | `app.misc.face_*` / `app.native.face.*` | 具名 + 编排 |
 | 支付下单 | `app.native.pay.*` / BFF `/api/pay/*` | order_params |
-| **任意冷门按钮** | `app.call("ExactDoName", **form)` | **全量** |
+| **任意冷门按钮** | `app.call*` / `call_url` / multipart | 名称全量；按真实传输元数据选择调用器 |
 
 ### 3.4 未实名账号上：协议「已实现且可成功」vs「已实现但被拒」
 
@@ -309,7 +310,7 @@ python -m bbw_protocol.cli withdraw --alipay ... --name ... --amount ...
 |---|---|
 | 哪些必须实名？ | **改资料、提现（服务端）**；发帖/评论/好友/匹配/主播群主督导申请/部分会话玩法/提现入口（客户端，多数还加绑手机） |
 | 哪些不必须实名？ | 登录、浏览、礼物/推荐配置、关注、心跳、多数读接口、IM token、充值下单参数等 |
-| 协议是否覆盖全部 HTTP 接口？ | **是（402/402 经通用 call）**；约 1/4 有语义封装 |
+| 协议是否覆盖全部 HTTP 接口？ | catalog 名称面为 **405**（v154 活跃 398）；默认 `call` 并不替代 `call_i888` / `call_url` / multipart 等传输差异 |
 | 是否等于完整 APK？ | **HTTP 业务层 ≈ 是**；**原生 SDK 层 ≠ 是** |
 | 实名导致测失败算不算没实现？ | **不算**；接口已实现，门禁与 App 一致 |
 

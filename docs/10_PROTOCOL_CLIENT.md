@@ -2,7 +2,7 @@
 
 **最后更新：** 2026-07-15  
 **包路径：** `bbw_protocol/`  
-**Action 目录：** `docs/api_catalog.json`（**402** 个 action）
+**Action 目录：** `docs/api_catalog.json`（v154 活跃 **398**；历史并集 **405**）
 
 ---
 
@@ -10,10 +10,10 @@
 
 | 目标 | 状态 |
 |---|---|
-| 枚举客户端 HTTP 功能面 | ✅ 402 actions / 332 full URLs |
+| 枚举客户端 HTTP 功能面 | ✅ v154 活跃 398 actions / 328 full URLs；catalog 另保留 7 个 v148 下线 action |
 | 统一签名与会话 | ✅ `sign.py` + `session.json` |
 | 语义化业务 API | ✅ auth/social/profile/content/economy/room/match/im/misc |
-| **任意 action 通用调用** | ✅ `app.call` / CLI `call` — 覆盖目录内全部 do= |
+| **action 名称面与调用器** | ✅ 默认 `app.call`；另有 `call_i888` / Redis / URL / multipart |
 | CLI + REPL | ✅ `python -m bbw_protocol.cli` |
 | 冒烟测试 | ✅ 登录/礼物/推荐/关注/门禁行为符合预期 |
 | 原生 SDK 1:1（刷脸/支付 UI/IM 长连接） | ⚠️ `adapters` + `bbw_web` 集成面已加；活体/收银/长连接仍靠官方 SDK |
@@ -120,26 +120,33 @@ BeibeiwuApp
 
 `api_catalog.json` 分类：
 
-| 分类 | 数量（约） |
+| 分类 | 目录条目 |
 |---|---:|
 | social | 71 |
 | profile | 62 |
-| content | 37 |
+| content | 34 |
 | match | 28 |
 | economy | 28 |
 | room | 26 |
-| auth | 22 |
+| auth | 24 |
 | im | 8 |
-| other | 120 |
-| **合计** | **402** |
+| other | 121 |
+| 未分类历史下线项 | 3 |
+| **catalog 历史并集** | **405** |
 
-**全部**可通过：
+其中 v154 当前活跃 **398**；7 个小说 action 仅为 v148 历史留档。`signin0` 与
+`SigninOneKeyLogin1` 由登录流程运行时拼接 `do=`，旧的明文 URL/startHttp 扫描会漏掉，
+现已作为 `dynamic_do_actions` 补录。
+
+默认 `i=999999&m=socialchat`、表单编码的 action 可通过：
 
 ```text
 python -m bbw_protocol.cli call <ActionName> k=v k2=v2
 ```
 
-这就是「客户端所有 HTTP 功能落协议」的完备性保证。
+需要 `i=888`、Redis、absolute URL 或 multipart/file 的接口，应分别使用
+`call_i888`、`call_redis`、`call_url`、`call_multipart`；action 名称已枚举不等于
+参数、租户和编码方式已自动推断。
 
 ### 4.3 无法单靠本库完成的部分
 
@@ -167,7 +174,7 @@ python -m bbw_protocol.cli call <ActionName> k=v k2=v2
 | withdraw | 403 未实名（门禁正常） |
 | room create | no（条件不足） |
 | local UserSig | ✅ |
-| catalog size | 402 |
+| catalog size | 405（其中 v154 活跃 398） |
 
 ---
 

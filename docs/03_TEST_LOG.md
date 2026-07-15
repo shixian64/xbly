@@ -398,7 +398,8 @@ HTTP 主路径已协议化；通用 `call` 覆盖全部枚举 action。原生 SD
 **协议核更新：**
 
 - `sign.VERSION_CODE` / UA / 探针脚本 → **154**
-- `api_catalog.json`：+Id2、About version=154、deprecated 小说、计数刷新
+- `api_catalog.json`：+Id2、About version=154、deprecated 小说、动态登录 action 补录；当前口径为 v154 活跃 398 / 历史并集 405
+- 本文 T10 中的 `402` 是旧扫描器当时的历史输出：它漏了运行时拼接的 `signin0` / `SigninOneKeyLogin1`，且尚未按 v154 下线项拆分口径
 - `misc.id2_meta_verify`、`content.about` 跟 session 版本
 
 **实测：**

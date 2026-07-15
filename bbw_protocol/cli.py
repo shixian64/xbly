@@ -137,6 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("pay-vip", help="prepare VIP/SVIP order")
     sp.add_argument("--channel", default="wechat", choices=("wechat", "alipay"))
     sp.add_argument("--level", default="vip", choices=("vip", "svip"))
+    sp.add_argument("--vipid", required=True, help="server-defined VIP product id")
     sp = sub.add_parser("pay-card", help="buy match card with 乐园币")
     sp.add_argument("--card-id", default="1")
     sub.add_parser("face-status", help="face real-name pipeline hint")
@@ -310,9 +311,9 @@ def main(argv=None) -> int:
         return 0 if res.ok else 1
     if args.cmd == "pay-vip":
         if args.channel == "alipay":
-            res = app.native.pay.prepare_vip_alipay(args.level)
+            res = app.native.pay.prepare_vip_alipay(args.level, vipid=args.vipid)
         else:
-            res = app.native.pay.prepare_vip_wechat(args.level)
+            res = app.native.pay.prepare_vip_wechat(args.level, vipid=args.vipid)
         print(json.dumps(res.to_dict(), ensure_ascii=False, indent=2))
         return 0 if res.ok else 1
     if args.cmd == "pay-card":
