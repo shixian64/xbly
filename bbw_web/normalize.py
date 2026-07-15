@@ -1,0 +1,496 @@
+"""Normalize banghua API payloads into stable DTOs for the Web UI.
+
+Product pages should render DTOs only — never depend on raw nested JSON.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Error catalogue (product copy)
+# ---------------------------------------------------------------------------
+
+ERROR_MAP: List[Tuple[Any, ...]] = [
+    # (matchers on code/message/raw, title, detail, action)
+    (("700", "登录失效", "登陆失效", "登录过期"), "登录已失效", "请重新登录后再试", "relogin"),
+    (("340", "未实名", "实名认证", "还未实名"), "需要实名认证", "该功能需先完成实名，请在官方 App 内刷脸认证", "realname"),
+    (("430", "卡不足", "匹配卡", "次数不足"), "次数或道具不足", "匹配卡/免费次数不够，可做任务或乐园币买卡", "buy_card"),
+    (("403", "不可修改", "不可提现"), "暂无权限", "服务端拒绝了操作（常见：未实名或业务限制）", "none"),
+    (("余额不足", "乐园币不足", "money"), "余额不足", "乐园币或余额不够，请先充值（Web 仅能创建订单参数）", "wallet"),
+    (("400", "参数", "失败"), "请求未成功", "参数不完整或业务失败", "none"),
+    (("false", "no", "NULL"), "操作未成功", "服务端返回失败", "none"),
+]
+
+
+def explain_error(
+    code: str = "",
+    message: str = "",
+    raw: str = "",
+    extra: str = "",
+) -> Dict[str, Any]:
+    blob = f"{code} {message} {extra} {raw}".lower()
+    for entry in ERROR_MAP:
+        keys = entry[0]
+        title, detail, action = entry[1], entry[2], entry[3]
+        for k in keys:
+            if str(k).lower() in blob:
+                return {
+                    "title": title,
+                    "detail": detail,
+                    "action": action,
+                    "code": str(code or ""),
+                    "message": str(message or extra or raw or title)[:200],
+                }
+    msg = (message or extra or raw or "未知错误").strip()
+    return {
+        "title": msg[:40] if msg else "操作失败",
+        "detail": msg[:200] if msg else "请稍后重试",
+        "action": "none",
+        "code": str(code or ""),
+        "message": msg[:200],
+    }
+
+
+def envelope(
+    r: Any,
+    *,
+    items: Optional[List[Dict[str, Any]]] = None,
+    extra: Optional[Dict[str, Any]] = None,
+    include_raw: bool = False,
+) -> Dict[str, Any]:
+    """Standard API envelope for product pages."""
+    ok = bool(getattr(r, "ok", False))
+    code = str(getattr(r, "code", "") or "")
+    message = str(getattr(r, "message", "") or "")
+    extra_s = str(getattr(r, "extra", "") or "")
+    raw = str(getattr(r, "raw", "") or "")
+    err = None if ok else explain_error(code, message, raw, extra_s)
+    # business fail with http 200 + empty body patterns
+    if ok and message and any(x in message for x in ("不足", "未实名", "不可", "失败")):
+        if code in ("400", "403", "340", "430", "700") or "未实名" in message:
+            ok = False
+            err = explain_error(code, message, raw, extra_s)
+    out: Dict[str, Any] = {
+        "ok": ok,
+        "code": code,
+        "message": message or (err["message"] if err else ""),
+        "error": err,
+        "items": items if items is not None else [],
+        "count": len(items) if items is not None else 0,
+    }
+    if extra:
+        out.update(extra)
+    if include_raw:
+        out["raw_preview"] = raw[:800]
+        out["data"] = getattr(r, "data", None)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Deep extract helpers
+# ---------------------------------------------------------------------------
+
+def _as_dict(x: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str) and x.strip()[:1] in "{[":
+        try:
+            p = json.loads(x)
+            return p if isinstance(p, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def _as_list(x: Any) -> List[Any]:
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return x
+    if isinstance(x, str) and x.strip()[:1] == "[":
+        try:
+            p = json.loads(x)
+            return p if isinstance(p, list) else []
+        except Exception:
+            return []
+    d = _as_dict(x)
+    if not d:
+        return []
+    for k in (
+        "json_obj",
+        "json",
+        "list",
+        "data",
+        "info",
+        "users",
+        "userlist",
+        "items",
+        "result",
+        "rows",
+        "records",
+        "giftlist",
+        "gift_list",
+        "matchlist",
+    ):
+        v = d.get(k)
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            inner = _as_list(v)
+            if inner:
+                return inner
+        if isinstance(v, dict):
+            # sometimes { "0": {...}, "1": {...} }
+            vals = list(v.values())
+            if vals and all(isinstance(i, dict) for i in vals):
+                return vals
+            nested = _as_list(v)
+            if nested:
+                return nested
+    # dict of dicts
+    vals = list(d.values())
+    if vals and all(isinstance(i, dict) for i in vals[:5]):
+        return [i for i in vals if isinstance(i, dict)]
+    return []
+
+
+def extract_list(data: Any) -> List[Any]:
+    return _as_list(data)
+
+
+def _first(d: Dict[str, Any], keys: List[str], default: Any = "") -> Any:
+    for k in keys:
+        if k in d and d[k] is not None and d[k] != "":
+            return d[k]
+    return default
+
+
+def _num(v: Any, default: int = 0) -> int:
+    try:
+        if v is None or v == "":
+            return default
+        return int(float(str(v).strip()))
+    except Exception:
+        return default
+
+
+# ---------------------------------------------------------------------------
+# Entity normalizers
+# ---------------------------------------------------------------------------
+
+def normalize_user(item: Any) -> Optional[Dict[str, Any]]:
+    if item is None:
+        return None
+    if isinstance(item, str):
+        d = _as_dict(item)
+        if not d:
+            return {
+                "id": "",
+                "nickname": item[:32],
+                "avatar": "",
+                "subtitle": "",
+                "raw": item,
+            }
+        item = d
+    if not isinstance(item, dict):
+        return None
+    # unwrap one level
+    for k in ("user", "userinfo", "userInfo", "json_obj"):
+        if isinstance(item.get(k), dict):
+            item = {**item, **item[k]}
+        elif isinstance(item.get(k), str):
+            inner = _as_dict(item[k])
+            if inner:
+                item = {**item, **inner}
+
+    uid = str(
+        _first(
+            item,
+            ["id", "uid", "userId", "user_id", "userid", "myid", "ID", "Uuid"],
+            "",
+        )
+    )
+    nick = str(
+        _first(
+            item,
+            ["nickname", "nick", "name", "username", "user_name", "userNickName"],
+            uid or "用户",
+        )
+    )
+    avatar = str(
+        _first(
+            item,
+            [
+                "portrait",
+                "avatar",
+                "head",
+                "headimg",
+                "head_img",
+                "icon",
+                "photo",
+                "userPortrait",
+            ],
+            "",
+        )
+    )
+    role = str(_first(item, ["user_role", "role", "identity"], ""))
+    city = str(_first(item, ["city", "area", "address", "location"], ""))
+    sign = str(_first(item, ["signature", "sign", "desc", "description"], ""))
+    dist = str(_first(item, ["distance", "dist", "juli"], ""))
+    sub_parts = [p for p in (uid and f"uid {uid}", role, city, dist, sign[:24]) if p]
+    return {
+        "id": uid,
+        "nickname": nick,
+        "avatar": avatar,
+        "subtitle": " · ".join(sub_parts) if sub_parts else "",
+        "role": role,
+        "city": city,
+        "signature": sign,
+        "vip": str(_first(item, ["vip", "vip_time"], "0")),
+        "svip": str(_first(item, ["svip", "svip_time"], "0")),
+        "sex": str(_first(item, ["sex", "gender", "xingbie"], "")),
+        "age": str(_first(item, ["age"], "")),
+    }
+
+
+def normalize_users(data: Any) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    raw_list = extract_list(data)
+    # single user object
+    if not raw_list and isinstance(data, dict):
+        u = normalize_user(data)
+        if u and (u["id"] or u["nickname"] != "用户"):
+            return [u]
+        # maybe nested user
+        for k in ("user", "info", "data", "json_obj"):
+            if k in data:
+                u = normalize_user(data[k])
+                if u and u.get("id"):
+                    return [u]
+    for it in raw_list:
+        u = normalize_user(it)
+        if u:
+            out.append(u)
+    return out
+
+
+def normalize_gift(item: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(item, dict):
+        return None
+    return {
+        "id": str(_first(item, ["id", "giftid", "gift_id", "giftId"], "")),
+        "name": str(
+            _first(item, ["giftname", "gift_name", "name", "title", "giftName"], "礼物")
+        ),
+        "price": str(_first(item, ["price", "money", "coin", "cost", "gold"], "")),
+        "icon": str(_first(item, ["icon", "image", "img", "picture", "url", "pic"], "")),
+    }
+
+
+def normalize_gifts(data: Any) -> List[Dict[str, Any]]:
+    out = []
+    for it in extract_list(data):
+        g = normalize_gift(it)
+        if g:
+            out.append(g)
+    return out
+
+
+def normalize_task(item: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(item, dict):
+        return None
+    tid = str(_first(item, ["id", "task_id", "taskId", "activity_id"], ""))
+    title = str(
+        _first(item, ["title", "name", "activity_name", "task_name", "content"], "任务")
+    )
+    progress = _num(_first(item, ["progress", "now", "current", "finish"], 0))
+    total = _num(_first(item, ["num", "total", "target", "need", "max"], 0))
+    available = str(_first(item, ["available", "status", "state", "receive"], ""))
+    can_receive = False
+    av_l = available.lower()
+    if total > 0 and progress >= total:
+        can_receive = True
+    if any(x in available for x in ("可领取", "领取", "未领")):
+        can_receive = True
+    if any(x in available for x in ("已领取", "已领", "完成领取")):
+        can_receive = False
+    if "已领取" in av_l or available == "已领取":
+        can_receive = False
+    return {
+        "id": tid,
+        "title": title,
+        "progress": progress,
+        "total": total,
+        "progress_text": f"{progress}/{total}" if total else str(progress or "—"),
+        "status_text": available or ("可领取" if can_receive else "进行中"),
+        "can_receive": can_receive,
+        "reward": str(_first(item, ["reward", "prize", "gift", "card"], "")),
+    }
+
+
+def normalize_tasks(data: Any) -> List[Dict[str, Any]]:
+    out = []
+    for it in extract_list(data):
+        t = normalize_task(it)
+        if t:
+            out.append(t)
+    return out
+
+
+def _dig_num(data: Any, keys: List[str]) -> Optional[int]:
+    if data is None:
+        return None
+    if isinstance(data, (int, float)) and not isinstance(data, bool):
+        return int(data)
+    d = data if isinstance(data, dict) else _as_dict(data)
+    if not d:
+        # search in string
+        if isinstance(data, str):
+            for k in keys:
+                m = re.search(rf'"{k}"\s*:\s*"?(\d+)"?', data)
+                if m:
+                    return int(m.group(1))
+        return None
+    for k in keys:
+        if k in d and d[k] is not None and d[k] != "":
+            return _num(d[k], 0)
+    for v in d.values():
+        if isinstance(v, dict):
+            n = _dig_num(v, keys)
+            if n is not None:
+                return n
+        if isinstance(v, str) and v.strip()[:1] == "{":
+            n = _dig_num(v, keys)
+            if n is not None:
+                return n
+    return None
+
+
+def normalize_match_status(cards_data: Any, nums_data: Any, user: Optional[Dict] = None) -> Dict[str, Any]:
+    online = _dig_num(
+        nums_data,
+        [
+            "online",
+            "online_free",
+            "free_online",
+            "online_num",
+            "onlinefree",
+            "Online",
+            "onlinematch",
+            "freeOnline",
+        ],
+    )
+    local = _dig_num(
+        nums_data,
+        [
+            "local",
+            "local_free",
+            "free_local",
+            "local_num",
+            "localfree",
+            "Local",
+            "localmatch",
+            "freeLocal",
+        ],
+    )
+    voice = _dig_num(nums_data, ["voice", "voice_free", "free_voice", "yuyin"])
+    video = _dig_num(nums_data, ["video", "video_free", "free_video"])
+    match_card = _dig_num(
+        cards_data,
+        [
+            "match_card",
+            "matchcard",
+            "card",
+            "num",
+            "count",
+            "number",
+            "card_num",
+            "matchCard",
+        ],
+    )
+    # fallbacks: first small ints in dict
+    if online is None and isinstance(nums_data, dict):
+        for k, v in nums_data.items():
+            if "online" in str(k).lower() or "在线" in str(k):
+                online = _num(v, 0)
+                break
+    if local is None and isinstance(nums_data, dict):
+        for k, v in nums_data.items():
+            if "local" in str(k).lower() or "同城" in str(k):
+                local = _num(v, 0)
+                break
+    if match_card is None and isinstance(cards_data, dict):
+        for k, v in cards_data.items():
+            if "card" in str(k).lower() or "match" in str(k).lower():
+                match_card = _num(v, 0)
+                break
+
+    money = "0"
+    if user:
+        money = str(user.get("money") or "0")
+
+    return {
+        "online_free": online if online is not None else 0,
+        "local_free": local if local is not None else 0,
+        "voice_free": voice if voice is not None else 0,
+        "video_free": video if video is not None else 0,
+        "match_card": match_card if match_card is not None else 0,
+        "money": money,
+        "display": {
+            "online": str(online if online is not None else "—"),
+            "local": str(local if local is not None else "—"),
+            "card": str(match_card if match_card is not None else "—"),
+            "money": money,
+        },
+        "parsed": {
+            "online_ok": online is not None,
+            "local_ok": local is not None,
+            "card_ok": match_card is not None,
+        },
+    }
+
+
+def normalize_match_result(r: Any) -> Dict[str, Any]:
+    """Turn match API result into product envelope with user cards."""
+    base = envelope(r, include_raw=False)
+    users = normalize_users(getattr(r, "data", None))
+    # sometimes matched user is top-level fields
+    if not users and isinstance(getattr(r, "data", None), dict):
+        u = normalize_user(r.data)
+        if u and u.get("id"):
+            users = [u]
+    base["items"] = users
+    base["count"] = len(users)
+    if base["ok"] and not users:
+        # ok but empty — still success with empty state
+        base["empty"] = True
+        base["empty_title"] = "暂时没有可匹配的人"
+        base["empty_detail"] = "稍后再试，或检查匹配次数/匹配卡"
+    elif not base["ok"] and base.get("error"):
+        base["empty"] = True
+        base["empty_title"] = base["error"]["title"]
+        base["empty_detail"] = base["error"]["detail"]
+        base["empty_action"] = base["error"]["action"]
+    else:
+        base["empty"] = False
+    return base
+
+
+def session_user_dto(who: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": str(who.get("uid") or ""),
+        "uid": str(who.get("uid") or ""),
+        "nickname": str(who.get("nickname") or "游客"),
+        "phone": str(who.get("phone") or ""),
+        "is_realname": bool(who.get("is_realname")),
+        "money": str(who.get("money") or "0"),
+        "vip": str(who.get("vip") or "0"),
+        "svip": str(who.get("svip") or "0"),
+        "user_role": str(who.get("user_role") or ""),
+        "rp_verify_time": str(who.get("rp_verify_time") or "0"),
+        "logged_in": bool(who.get("logged_in")),
+    }

@@ -56,10 +56,52 @@ async function api(path, opts = {}) {
     data = { ok: false, error: "bad json", status: res.status };
   }
   if (data.web_sid) setSid(data.web_sid);
-  if (res.status === 401 && !path.includes("/auth/")) {
+
+  // session expired / unauthorized
+  const code = String(data.code || "");
+  const errAct = data.error && data.error.action;
+  if (
+    (res.status === 401 || code === "700" || errAct === "relogin") &&
+    !String(path).includes("/auth/")
+  ) {
+    setSid("");
+    S.user = null;
     showLogin(true);
+    const msg =
+      (data.error && data.error.title) ||
+      data.message ||
+      "登录已失效，请重新登录";
+    toast(msg);
   }
   return { status: res.status, data };
+}
+
+/** Product toast from envelope.error */
+function toastEnv(data, fallback) {
+  if (data && data.error) {
+    toast(data.error.title + (data.error.detail ? " · " + data.error.detail : ""));
+    return;
+  }
+  if (data && data.message) {
+    toast(data.message);
+    return;
+  }
+  toast(fallback || "完成");
+}
+
+function emptyBox(title, detail, action) {
+  let btn = "";
+  if (action === "realname")
+    btn = `<p class="muted" style="margin-top:.5rem">请打开官方 App 完成刷脸实名后再试。</p>`;
+  if (action === "buy_card")
+    btn = `<button type="button" class="btn primary" data-go="match" style="margin-top:.5rem">去匹配/买卡</button>`;
+  if (action === "wallet")
+    btn = `<button type="button" class="btn primary" data-go="wallet" style="margin-top:.5rem">去钱包</button>`;
+  if (action === "relogin")
+    btn = `<p class="muted" style="margin-top:.5rem">请重新登录</p>`;
+  return `<div class="empty"><div style="font-weight:600;margin-bottom:.25rem">${esc(
+    title || "暂无内容"
+  )}</div><div class="muted">${esc(detail || "")}</div>${btn}</div>`;
 }
 
 function showLogin(on) {
@@ -118,36 +160,49 @@ function go(id) {
   renderPage(id);
 }
 
-/* ---------- helpers UI ---------- */
+/* ---------- helpers UI (DTO only — no bare JSON on product pages) ---------- */
 function person(item) {
   if (!item || typeof item !== "object") {
     return `<div class="row-card"><div class="meta"><div class="n">${esc(item)}</div></div></div>`;
   }
-  const id = item.id || item.uid || item.userId || item.user_id || item.userid || "";
-  const nick = item.nickname || item.nick || item.name || item.username || id || "用户";
-  const sub = [id && `uid ${id}`, item.user_role || item.role, item.city || item.signature || item.distance]
-    .filter(Boolean)
-    .join(" · ");
+  // prefer normalized DTO fields
+  const id = item.id || item.uid || "";
+  const nick = item.nickname || "用户";
+  const sub = item.subtitle || [id && `uid ${id}`, item.role, item.city].filter(Boolean).join(" · ");
+  const av = item.avatar
+    ? `<img class="av" src="${esc(item.avatar)}" alt="" style="object-fit:cover;padding:0" onerror="this.outerHTML='<div class=av>${esc(
+        String(nick).slice(0, 1)
+      )}</div>'" />`
+    : `<div class="av">${esc(String(nick).slice(0, 1))}</div>`;
   return `<div class="row-card">
-    <div class="av">${esc(String(nick).slice(0, 1))}</div>
+    ${av}
     <div class="meta"><div class="n">${esc(nick)}</div><div class="s">${esc(sub || "—")}</div></div>
     ${id ? `<button type="button" class="btn ghost" data-f="${esc(id)}">关注</button>` : ""}
   </div>`;
 }
 
-function listHtml(list, empty = "暂无数据") {
-  if (!list || (Array.isArray(list) && !list.length)) return `<div class="empty">${empty}</div>`;
-  if (!Array.isArray(list)) {
-    if (typeof list === "object") {
-      const vals = Object.values(list).filter((x) => x && typeof x === "object");
-      if (vals.length && (vals[0].id || vals[0].nickname || vals[0].uid)) {
-        return `<div class="list">${vals.map(person).join("")}</div>`;
-      }
-      return `<pre class="code">${esc(JSON.stringify(list, null, 2).slice(0, 3000))}</pre>`;
-    }
-    return `<div class="empty">${esc(list)}</div>`;
+/** Render items[] from product envelope; never dump raw JSON on main pages */
+function listHtml(list, emptyTitle = "暂无数据", emptyDetail = "") {
+  const items = Array.isArray(list) ? list : list && list.items;
+  if (!items || !items.length) {
+    return emptyBox(emptyTitle, emptyDetail || "换个时间再试试");
   }
-  return `<div class="list">${list.map(person).join("")}</div>`;
+  return `<div class="list">${items.map(person).join("")}</div>`;
+}
+
+function renderEnvelopeList(data, emptyTitle) {
+  if (data && data.error) {
+    return emptyBox(data.error.title, data.error.detail, data.error.action);
+  }
+  if (data && data.empty) {
+    return emptyBox(
+      data.empty_title || emptyTitle || "暂无",
+      data.empty_detail || "",
+      data.empty_action
+    );
+  }
+  const items = (data && (data.items || data.list)) || [];
+  return listHtml(items, emptyTitle || "暂无数据");
 }
 
 function bindFollow(root) {
@@ -213,16 +268,16 @@ async function pageHome(el) {
   const { data } = await api("/api/home");
   if (data.user) applyUser(data.user);
   const nick = data.user?.nickname || "游客";
-  const hb = data.heartbeat?.running ? `在线心跳 · ${data.heartbeat.ticks || 0}` : "心跳未开";
+  const hb = data.heartbeat?.running ? `在线 · 心跳 ${data.heartbeat.ticks || 0}` : "心跳未开启";
   el.innerHTML = `
     <div class="hero">
       <div>你好，<b>${esc(nick)}</b></div>
-      <div class="muted" style="margin-top:.35rem">${esc(hb)} · 币 ${esc(data.user?.money ?? 0)} · ${
-    data.user?.is_realname ? "已实名" : "未实名"
-  }</div>
+      <div class="muted" style="margin-top:.35rem">${esc(hb)} · 币 ${esc(
+    data.user?.money ?? 0
+  )} · ${data.user?.is_realname ? "已实名" : "未实名"}</div>
     </div>
     <div class="h">快捷</div>
-    <div class="chip-row" id="home-chips">
+    <div class="chip-row">
       ${["match", "social", "wallet", "tasks", "room", "msg"]
         .map((id) => {
           const n = NAV.find((x) => x.id === id);
@@ -235,21 +290,25 @@ async function pageHome(el) {
     <div class="h">礼物</div>
     <div class="scroll-x" id="home-gifts"></div>`;
   el.querySelectorAll("[data-go]").forEach((b) => (b.onclick = () => go(b.dataset.go)));
+  // empty-state action buttons
+  el.addEventListener("click", (ev) => {
+    const t = ev.target.closest("[data-go]");
+    if (t && t.dataset.go) go(t.dataset.go);
+  });
   const recBox = el.querySelector("#home-rec");
-  recBox.innerHTML = listHtml(data.recommend?.list || data.recommend?.data, "暂无推荐");
+  recBox.innerHTML = renderEnvelopeList(data.recommend, "暂无推荐");
   bindFollow(recBox);
-  const gifts = data.gifts?.list || [];
-  const garr = Array.isArray(gifts) ? gifts : [];
-  el.querySelector("#home-gifts").innerHTML = garr.length
-    ? garr
+  const gifts = (data.gifts && (data.gifts.items || data.gifts.list)) || [];
+  el.querySelector("#home-gifts").innerHTML = gifts.length
+    ? gifts
         .slice(0, 24)
         .map((g) => {
-          const name = g.giftname || g.name || g.title || "礼物";
-          const price = g.price ?? g.money ?? g.coin ?? "";
+          const name = g.name || "礼物";
+          const price = g.price || "";
           return `<div class="pill">🎁<div>${esc(name)}</div><div class="muted">${esc(price)}</div></div>`;
         })
         .join("")
-    : `<div class="empty">无礼物数据</div>`;
+    : emptyBox("暂无礼物", "礼物列表为空或暂时无法解析");
 }
 
 async function pageSquare(el) {
@@ -277,20 +336,20 @@ async function pageSquare(el) {
   const loadRec = async () => {
     const { data } = await api("/api/recommend");
     const box = el.querySelector("#sq-list");
-    box.innerHTML = listHtml(data.list, data.message || "空");
+    box.innerHTML = renderEnvelopeList(data, "暂无推荐");
     bindFollow(box);
     out(data);
   };
   el.querySelector("#sq-rec").onclick = loadRec;
   el.querySelector("#sq-slide").onclick = async () => {
     const { data } = await api("/api/slide");
-    el.querySelector("#sq-list").innerHTML = listHtml(data.list, "无幻灯");
+    el.querySelector("#sq-list").innerHTML = renderEnvelopeList(data, "暂无幻灯");
     out(data);
   };
   el.querySelector("#btn-topic").onclick = async () => {
     const q = el.querySelector("#topic-q").value.trim();
     const { data } = await api("/api/topics?q=" + encodeURIComponent(q));
-    el.querySelector("#sq-list").innerHTML = listHtml(data.list, "无话题");
+    el.querySelector("#sq-list").innerHTML = renderEnvelopeList(data, "暂无话题");
     out(data);
   };
   el.querySelector("#btn-topic-new").onclick = async () => {
@@ -309,41 +368,41 @@ async function pageSquare(el) {
 async function pageMatch(el) {
   const { data } = await api("/api/match/status");
   if (data.user) applyUser(data.user);
-  const nums = data.nums_data || {};
-  const cards = data.cards_data || {};
+  const d = (data.display || data.status?.display || {});
   el.innerHTML = `
     <div class="stats">
-      <div class="stat"><div class="v" id="m-on">${esc(field(nums, ["online", "online_free", "free_online"], short(nums)))}</div><div class="l">在线次数</div></div>
-      <div class="stat"><div class="v">${esc(field(nums, ["local", "local_free", "free_local"], "—"))}</div><div class="l">同城次数</div></div>
-      <div class="stat"><div class="v">${esc(field(cards, ["match_card", "card", "num", "count"], short(cards)))}</div><div class="l">匹配卡</div></div>
-      <div class="stat"><div class="v">${esc(data.user?.money ?? 0)}</div><div class="l">乐园币</div></div>
+      <div class="stat"><div class="v">${esc(d.online ?? "—")}</div><div class="l">在线免费</div></div>
+      <div class="stat"><div class="v">${esc(d.local ?? "—")}</div><div class="l">同城免费</div></div>
+      <div class="stat"><div class="v">${esc(d.card ?? "—")}</div><div class="l">匹配卡</div></div>
+      <div class="stat"><div class="v">${esc(d.money ?? data.user?.money ?? 0)}</div><div class="l">乐园币</div></div>
     </div>
-    <div class="h">匹配</div>
+    <div class="h">开始匹配</div>
     <div class="actions">
-      <button type="button" class="action" data-m="online"><span class="t">在线匹配</span><span class="d">需实名 · 有免费优先</span></button>
-      <button type="button" class="action" data-m="local"><span class="t">同城匹配</span><span class="d">需实名 + 匹配卡</span></button>
-      <button type="button" class="action" data-m="pick"><span class="t">捡漂流瓶</span><span class="d">PickADraftBottle</span></button>
-      <button type="button" class="action" data-m="throw"><span class="t">扔漂流瓶</span><span class="d">输入内容后发送</span></button>
-      <button type="button" class="action" data-m="users"><span class="t">在线匹配列表</span><span class="d">getOnlineMatchUser</span></button>
-      <button type="button" class="action" data-m="card"><span class="t">乐园币买卡</span><span class="d">buyCard</span></button>
+      <button type="button" class="action" data-m="online"><span class="t">在线匹配</span><span class="d">需实名 · 优先用免费次数</span></button>
+      <button type="button" class="action" data-m="local"><span class="t">同城匹配</span><span class="d">需实名 · 可能消耗匹配卡</span></button>
+      <button type="button" class="action" data-m="pick"><span class="t">捡漂流瓶</span><span class="d">随机捞一条留言</span></button>
+      <button type="button" class="action" data-m="throw"><span class="t">扔漂流瓶</span><span class="d">写下想说的话</span></button>
+      <button type="button" class="action" data-m="users"><span class="t">在线列表</span><span class="d">看看谁在匹配池</span></button>
+      <button type="button" class="action" data-m="card"><span class="t">乐园币买卡</span><span class="d">消耗乐园币购买匹配卡</span></button>
     </div>
     <div class="h">约会</div>
     <div class="inline">
-      <input id="dating-body" placeholder="约会参数 JSON 或文案" />
-      <button type="button" class="btn ghost" id="btn-dating">发布约会</button>
+      <input id="dating-body" placeholder="约会说明（简要）" />
+      <button type="button" class="btn ghost" id="btn-dating">发布</button>
     </div>
     <div class="h">结果</div>
-    <div id="match-out"></div>`;
+    <div id="match-out">${emptyBox("点上方按钮开始", "匹配结果会显示在这里")}</div>`;
   const box = el.querySelector("#match-out");
   const run = async (path, body = {}) => {
-    box.innerHTML = `<div class="empty">请求中…</div>`;
-    const { data: d } = await api(path, { method: "POST", body: JSON.stringify(body) });
-    toast(d.message || d.code || (d.ok ? "完成" : "失败"));
-    if (d.list && (Array.isArray(d.list) ? d.list.length : true)) {
-      box.innerHTML = listHtml(d.list, d.message || "空");
-      bindFollow(box);
-    } else {
-      box.innerHTML = `<pre class="code">${esc(JSON.stringify(d, null, 2).slice(0, 3500))}</pre>`;
+    box.innerHTML = emptyBox("请稍候", "正在请求…");
+    const { data: res } = await api(path, { method: "POST", body: JSON.stringify(body) });
+    toastEnv(res, res.ok ? "完成" : "未成功");
+    box.innerHTML = renderEnvelopeList(res, "没有结果");
+    bindFollow(box);
+    // refresh counters after attempt
+    const st = await api("/api/match/status");
+    if (st.data.display) {
+      /* soft refresh page counters without full remount if still on match */
     }
   };
   el.querySelectorAll("[data-m]").forEach((b) => {
@@ -353,35 +412,36 @@ async function pageMatch(el) {
       if (m === "local") return run("/api/match/local");
       if (m === "pick") return run("/api/match/bottle-pick");
       if (m === "throw") {
-        const content = prompt("漂流瓶内容", "hello from web");
+        const content = prompt("漂流瓶内容", "你好，很高兴认识你");
         if (content == null) return;
         return run("/api/match/bottle-throw", { content, message: content, text: content });
       }
       if (m === "users") {
-        const { data: d } = await api("/api/match/online-users");
-        box.innerHTML = listHtml(d.list, "无在线用户");
+        const { data: res } = await api("/api/match/online-users");
+        box.innerHTML = renderEnvelopeList(res, "暂无在线用户");
         bindFollow(box);
         return;
       }
       if (m === "card") {
-        const { data: d } = await api("/api/pay/card", {
+        const { data: res } = await api("/api/pay/card", {
           method: "POST",
           body: JSON.stringify({ card_id: "1" }),
         });
-        toast(d.message || (d.ok ? "已提交" : "失败"));
-        box.innerHTML = `<pre class="code">${esc(JSON.stringify(d, null, 2))}</pre>`;
+        toastEnv(res, res.ok ? "购买已提交" : "购买失败");
+        box.innerHTML = res.ok
+          ? emptyBox("购买请求已发送", "请下拉刷新匹配状态查看卡数")
+          : emptyBox(
+              (res.error && res.error.title) || "购买失败",
+              (res.error && res.error.detail) || res.message || "",
+              res.error && res.error.action
+            );
         go("match");
       }
     };
   });
   el.querySelector("#btn-dating").onclick = async () => {
-    let body = { content: el.querySelector("#dating-body").value };
-    try {
-      body = JSON.parse(el.querySelector("#dating-body").value || "{}");
-    } catch {
-      /* text */
-    }
-    run("/api/match/dating-publish", body);
+    const text = el.querySelector("#dating-body").value.trim();
+    run("/api/match/dating-publish", { content: text, message: text, text });
   };
 }
 
@@ -417,7 +477,7 @@ async function pageSocial(el) {
     };
     const { data } = await api(map[S.socialTab] || map.follows);
     const box = el.querySelector("#s-list");
-    box.innerHTML = listHtml(data.list, data.message || "空");
+    box.innerHTML = renderEnvelopeList(data, "列表为空");
     bindFollow(box);
   };
   el.querySelectorAll("#s-tabs button").forEach((b) => {
@@ -435,7 +495,7 @@ async function pageSocial(el) {
       method: "POST",
       body: JSON.stringify({ uid }),
     });
-    toast(data.message || (data.ok ? "已关注" : "失败"));
+    toastEnv(data, data.ok ? "已关注" : "关注失败");
     load();
   };
   el.querySelector("#s-un").onclick = async () => {
@@ -444,7 +504,7 @@ async function pageSocial(el) {
       method: "POST",
       body: JSON.stringify({ uid }),
     });
-    toast(data.message || String(data.ok));
+    toastEnv(data);
     load();
   };
   el.querySelector("#s-view").onclick = async () => {
@@ -452,10 +512,8 @@ async function pageSocial(el) {
     if (!uid) return toast("填写 uid");
     const { data } = await api("/api/profile/user?uid=" + encodeURIComponent(uid));
     const box = el.querySelector("#s-user");
-    if (data.data && typeof data.data === "object") {
-      box.innerHTML = listHtml([data.data]);
-      bindFollow(box);
-    } else box.innerHTML = `<pre class="code">${esc(JSON.stringify(data, null, 2).slice(0, 3000))}</pre>`;
+    box.innerHTML = renderEnvelopeList(data, "未找到用户");
+    bindFollow(box);
   };
   el.querySelector("#s-report").onclick = async () => {
     const { data } = await api("/api/social/report", {
@@ -668,10 +726,10 @@ async function pageWallet(el) {
   const out = (d) => {
     el.querySelector("#w-out").textContent = JSON.stringify(d, null, 2).slice(0, 3500);
   };
-  el.querySelector("#w-gifts").innerHTML = listHtml(data.my_gifts?.list, "无背包礼物");
+  el.querySelector("#w-gifts").innerHTML = renderEnvelopeList(data.my_gifts, "背包暂无礼物");
   el.querySelector("#w-svip").onclick = async () => {
     const { data: d } = await api("/api/wallet/svip-try", { method: "POST", body: "{}" });
-    toast(d.message || String(d.ok));
+    toastEnv(d);
     out(d);
   };
   el.querySelector("#w-ex").onclick = async () => {
@@ -679,7 +737,7 @@ async function pageWallet(el) {
       method: "POST",
       body: JSON.stringify({ vip_id: 5 }),
     });
-    toast(d.message || String(d.ok));
+    toastEnv(d);
     out(d);
   };
   el.querySelector("#w-pay").onclick = async () => {
@@ -690,7 +748,11 @@ async function pageWallet(el) {
         coin_id: el.querySelector("#w-coin").value || "1",
       }),
     });
-    toast(d.message || (d.ok ? "订单已创建" : "失败"));
+    toast(
+      d.ok
+        ? d.product_notice || "订单参数已生成（尚未支付到账）"
+        : (d.error && d.error.title) || d.message || "下单失败"
+    );
     out(d);
   };
   el.querySelector("#w-vip").onclick = async () => {
@@ -698,7 +760,7 @@ async function pageWallet(el) {
       method: "POST",
       body: JSON.stringify({ channel: el.querySelector("#w-ch").value, level: "vip" }),
     });
-    toast(d.message || String(d.ok));
+    toast(d.ok ? d.product_notice || "VIP 订单参数已生成" : d.message || "失败");
     out(d);
   };
   el.querySelector("#w-wd").onclick = async () => {
@@ -710,7 +772,7 @@ async function pageWallet(el) {
         amount: el.querySelector("#w-amt").value,
       }),
     });
-    toast(d.message || String(d.ok));
+    toastEnv(d);
     out(d);
   };
 }
@@ -727,21 +789,27 @@ async function pageTasks(el) {
     <pre class="code" id="t-out"></pre>`;
   const load = async () => {
     const { data } = await api("/api/tasks");
-    el.querySelector("#t-out").textContent = JSON.stringify(data, null, 2).slice(0, 3500);
-    const list = data.create_list || data.have_list || [];
-    if (!Array.isArray(list) || !list.length) {
-      el.querySelector("#t-list").innerHTML = `<div class="empty">无任务或结构未识别</div>`;
+    const list = data.items || [];
+    el.querySelector("#t-out").textContent = list.length
+      ? `共 ${list.length} 个任务`
+      : "暂无任务数据";
+    if (!list.length) {
+      el.querySelector("#t-list").innerHTML = emptyBox("暂无任务", "没有可展示的任务，或账号暂不可见");
       return;
     }
     el.querySelector("#t-list").innerHTML = list
       .map((t) => {
-        const id = t.id || t.task_id || "";
-        const title = t.title || t.name || t.activity_name || "任务";
-        const prog = t.progress != null ? `${t.progress}/${t.num || t.total || "?"}` : "";
+        const id = t.id || "";
+        const title = t.title || "任务";
+        const prog = t.progress_text || "";
+        const st = t.status_text || "";
+        const can = t.can_receive;
         return `<div class="row-card">
           <div class="meta"><div class="n">${esc(title)}</div>
-          <div class="s">id ${esc(id)} ${esc(prog)} ${esc(t.available || t.status || "")}</div></div>
-          <button type="button" class="btn ghost" data-tid="${esc(id)}">领取</button>
+          <div class="s">${esc(prog)} · ${esc(st)}${id ? " · id " + esc(id) : ""}</div></div>
+          <button type="button" class="btn ${can ? "primary" : "ghost"}" data-tid="${esc(
+          id
+        )}" ${can ? "" : "title=进度未完成也可尝试领取"}">领取</button>
         </div>`;
       })
       .join("");
@@ -760,7 +828,7 @@ async function pageTasks(el) {
       method: "POST",
       body: JSON.stringify({ id }),
     });
-    toast(data.message || String(data.ok));
+    toastEnv(data);
     load();
   };
   load();

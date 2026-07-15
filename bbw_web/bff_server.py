@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bbw_web.store import SessionStore  # noqa: E402
+from bbw_web import normalize as N  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 COOKIE_NAME = "bbw_sid"
@@ -34,62 +35,49 @@ def _json_bytes(obj: Any, status: int = 200) -> Tuple[int, bytes, str]:
     )
 
 
-def R(r: Any) -> Dict[str, Any]:
-    return {
-        "ok": bool(getattr(r, "ok", False)),
-        "status": getattr(r, "status", 0),
-        "code": str(getattr(r, "code", "") or ""),
-        "message": str(getattr(r, "message", "") or ""),
-        "extra": str(getattr(r, "extra", "") or ""),
-        "kind": str(getattr(r, "kind", "") or ""),
-        "data": getattr(r, "data", None),
-        "raw_preview": (getattr(r, "raw", None) or "")[:1200],
-    }
+def R(r: Any, *, lab: bool = False) -> Dict[str, Any]:
+    """Protocol result. Product pages prefer RU/RG/RT/envelope helpers."""
+    d = N.envelope(r, items=[], include_raw=lab)
+    d["status"] = getattr(r, "status", 0)
+    d["kind"] = str(getattr(r, "kind", "") or "")
+    d["extra"] = str(getattr(r, "extra", "") or "")
+    if lab:
+        d["data"] = getattr(r, "data", None)
+        d["raw_preview"] = (getattr(r, "raw", None) or "")[:1200]
+    return d
 
 
 def L(data: Any) -> Any:
-    if data is None:
-        return []
-    if isinstance(data, list):
-        return data
-    if not isinstance(data, dict):
-        return data
-    for k in (
-        "json_obj",
-        "json",
-        "list",
-        "data",
-        "info",
-        "users",
-        "items",
-        "result",
-        "rows",
-        "records",
-    ):
-        v = data.get(k)
-        if isinstance(v, list):
-            return v
-        if isinstance(v, str) and v.strip()[:1] in "[{":
-            try:
-                p = json.loads(v)
-                if isinstance(p, list):
-                    return p
-                if isinstance(p, dict):
-                    inner = L(p)
-                    if inner != p:
-                        return inner
-            except Exception:
-                pass
-        if isinstance(v, dict):
-            inner = L(v)
-            if isinstance(inner, list):
-                return inner
-    return data
+    return N.extract_list(data)
 
 
 def RL(r: Any) -> Dict[str, Any]:
-    d = R(r)
-    d["list"] = L(r.data)
+    """List endpoint: normalized user cards when possible."""
+    users = N.normalize_users(getattr(r, "data", None))
+    items = users if users else []
+    # fallback generic list of dicts as items with nickname guess
+    if not items:
+        for it in N.extract_list(getattr(r, "data", None)):
+            u = N.normalize_user(it)
+            if u:
+                items.append(u)
+    d = N.envelope(r, items=items)
+    d["list"] = items  # back-compat
+    d["status"] = getattr(r, "status", 0)
+    return d
+
+
+def RG(r: Any) -> Dict[str, Any]:
+    gifts = N.normalize_gifts(getattr(r, "data", None))
+    d = N.envelope(r, items=gifts)
+    d["list"] = gifts
+    return d
+
+
+def RT(r: Any) -> Dict[str, Any]:
+    tasks = N.normalize_tasks(getattr(r, "data", None))
+    d = N.envelope(r, items=tasks)
+    d["list"] = tasks
     return d
 
 
@@ -211,7 +199,15 @@ class Handler(BaseHTTPRequestHandler):
             u = STORE.get(sid)
             if not u:
                 return self.ok({"ok": False, "logged_in": False}, 401)
-            return self.ok({"ok": True, **u.public(), "features": FEATURES})
+            pub = u.public()
+            return self.ok(
+                {
+                    "ok": True,
+                    **pub,
+                    "user": N.session_user_dto(u.app.whoami()),
+                    "features": FEATURES,
+                }
+            )
 
         u = self.user(sid)
         if not u:
@@ -224,11 +220,12 @@ class Handler(BaseHTTPRequestHandler):
             rec = app.content.recommend()
             slide = app.content.slide()
             ver = app.content.version()
+            who = N.session_user_dto(app.whoami())
             return self.ok(
                 {
                     "ok": True,
-                    "user": app.whoami(),
-                    "gifts": RL(gifts),
+                    "user": who,
+                    "gifts": RG(gifts),
                     "recommend": RL(rec),
                     "slide": RL(slide),
                     "version": R(ver),
@@ -250,7 +247,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # ---- content / square ----
         if path == "/api/gifts":
-            return self.ok(RL(app.content.gift_list()))
+            return self.ok(RG(app.content.gift_list()))
         if path == "/api/recommend":
             return self.ok(RL(app.content.recommend()))
         if path == "/api/slide":
@@ -270,7 +267,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/profile/me":
             r = app.profile.get_me()
             u.persist()
-            return self.ok({**R(r), "user": app.whoami()})
+            who = N.session_user_dto(app.whoami())
+            items = N.normalize_users(r.data)
+            return self.ok({**R(r), "user": who, "items": items, "list": items})
         if path == "/api/profile/user":
             return self.ok(RL(app.profile.get_user(q("uid") or app.session.uid)))
         if path == "/api/profile/reset-num":
@@ -296,14 +295,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/match/status":
             cards = app.call("getMyCard")
             nums = app.call("getMatchNum")
+            who = N.session_user_dto(app.whoami())
+            status = N.normalize_match_status(cards.data, nums.data, who)
             return self.ok(
                 {
                     "ok": True,
-                    "user": app.whoami(),
-                    "cards": R(cards),
-                    "cards_data": cards.data,
-                    "nums": R(nums),
-                    "nums_data": nums.data,
+                    "user": who,
+                    "status": status,
+                    "display": status["display"],
+                    # keep raw only for lab debugging if needed
+                    "cards_ok": cards.ok,
+                    "nums_ok": nums.ok,
                 }
             )
         if path == "/api/match/online-users":
@@ -315,13 +317,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/tasks":
             create = app.call("createHotActivityList")
             have = app.call("haveHotActivityList")
+            items = N.normalize_tasks(create.data) or N.normalize_tasks(have.data)
             return self.ok(
                 {
                     "ok": True,
-                    "create": RL(create),
-                    "have": RL(have),
-                    "create_list": L(create.data),
-                    "have_list": L(have.data),
+                    "items": items,
+                    "count": len(items),
+                    "create": RT(create),
+                    "have": RT(have),
                 }
             )
 
@@ -346,11 +349,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.ok(
                 {
                     "ok": True,
-                    "user": app.whoami(),
+                    "user": N.session_user_dto(app.whoami()),
                     "me": R(me),
-                    "my_gifts": RL(myg),
-                    "gift_shop": RL(glist),
+                    "my_gifts": RG(myg),
+                    "gift_shop": RG(glist),
                     "pay": u.native.pay.capabilities(),
+                    "pay_notice": "下单成功只表示拿到支付参数，不等于资金到账；请在官方收银台完成支付。",
                 }
             )
 
@@ -486,12 +490,12 @@ class Handler(BaseHTTPRequestHandler):
                 params = data.get("params") if isinstance(data.get("params"), dict) else {}
                 if not action:
                     return self.ok({"ok": False, "error": "action required"}, 400)
-                return self.ok(R(app.call(action, **params)))
+                return self.ok(R(app.call(action, **params), lab=True))
 
             if path == "/api/call-redis":
                 action = str(data.get("action") or "")
                 params = data.get("params") if isinstance(data.get("params"), dict) else {}
-                return self.ok(R(app.call_redis(action, **params)))
+                return self.ok(R(app.call_redis(action, **params), lab=True))
 
             # social writes
             if path == "/api/social/follow":
@@ -523,7 +527,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/profile/nick":
                 r = app.profile.reset_nickname(str(data.get("name") or data.get("nickname") or ""))
                 u.persist()
-                return self.ok({**R(r), "user": app.whoami()})
+                return self.ok({**R(r), "user": N.session_user_dto(app.whoami())})
             if path == "/api/profile/reset":
                 r = app.profile.reset_personal(
                     str(data.get("value") or ""),
@@ -536,15 +540,15 @@ class Handler(BaseHTTPRequestHandler):
 
             # match
             if path == "/api/match/online":
-                return self.ok(RL(app.match.online_one(**_params(data))))
+                return self.ok(N.normalize_match_result(app.match.online_one(**_params(data))))
             if path == "/api/match/local":
-                return self.ok(RL(app.match.local_one(**_params(data))))
+                return self.ok(N.normalize_match_result(app.match.local_one(**_params(data))))
             if path == "/api/match/remove":
                 return self.ok(R(app.match.remove(str(data.get("type") or "1"))))
             if path == "/api/match/bottle-throw":
                 return self.ok(R(app.match.throw_bottle(**_params(data))))
             if path == "/api/match/bottle-pick":
-                return self.ok(RL(app.match.pick_bottle(**_params(data))))
+                return self.ok(N.normalize_match_result(app.match.pick_bottle(**_params(data))))
             if path == "/api/match/bottle-delete":
                 return self.ok(R(app.match.delete_bottle(**_params(data))))
             if path == "/api/match/dating-publish":
@@ -557,7 +561,8 @@ class Handler(BaseHTTPRequestHandler):
             # tasks
             if path == "/api/tasks/receive":
                 tid = str(data.get("id") or data.get("task_id") or "")
-                return self.ok(R(app.call("receiveHotActivityList", id=tid)))
+                r = app.call("receiveHotActivityList", id=tid)
+                return self.ok(R(r))
 
             # room
             if path == "/api/room/create":
@@ -598,7 +603,19 @@ class Handler(BaseHTTPRequestHandler):
                     if ch == "alipay"
                     else u.native.pay.prepare_coin_wechat(cid)
                 )
-                return self.ok(res.to_dict())
+                d = res.to_dict()
+                d["product_notice"] = (
+                    "仅创建支付订单参数，不等于充值到账。请在微信/支付宝官方收银台完成支付后刷新余额。"
+                )
+                if d.get("ok"):
+                    d["message"] = d.get("message") or "订单参数已生成（未支付）"
+                else:
+                    d["error"] = N.explain_error(
+                        str(d.get("code") or ""),
+                        str(d.get("message") or ""),
+                        str(d.get("raw") or "")[:200],
+                    )
+                return self.ok(d)
             if path == "/api/pay/vip":
                 ch = (data.get("channel") or "wechat").lower()
                 lv = str(data.get("level") or "vip")
@@ -607,11 +624,19 @@ class Handler(BaseHTTPRequestHandler):
                     if ch == "alipay"
                     else u.native.pay.prepare_vip_wechat(lv)
                 )
-                return self.ok(res.to_dict())
+                d = res.to_dict()
+                d["product_notice"] = "仅创建 VIP 订单参数，不等于开通成功。"
+                return self.ok(d)
             if path == "/api/pay/card":
-                return self.ok(
-                    u.native.pay.buy_match_card(str(data.get("card_id") or "1")).to_dict()
-                )
+                res = u.native.pay.buy_match_card(str(data.get("card_id") or "1"))
+                d = res.to_dict()
+                if not d.get("ok"):
+                    d["error"] = N.explain_error(
+                        str(d.get("code") or ""),
+                        str(d.get("message") or ""),
+                        "",
+                    )
+                return self.ok(d)
             if path == "/api/wallet/svip-try":
                 return self.ok(R(app.economy.svip_try()))
             if path == "/api/wallet/exchange-vip":
