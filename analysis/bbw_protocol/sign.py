@@ -18,7 +18,8 @@ TXIM_SECRETKEY = (
 SALT_SIGN = "socialchat"
 SALT_EXPIRE = "xiaobei"
 PACKAGE_NAME = "xin.banghua.beiyuan0"
-VERSION_CODE = "148"
+# xbly.apk client build (About_app&version=154); was 148 on beibeiwu.apk
+VERSION_CODE = "154"
 
 
 def md5_hex(s: str) -> str:

@@ -3,7 +3,7 @@
 > 工作目录：`D:\project\AI\bbw`  
 > 目标 APK：`beibeiwu.apk`  
 > 包名：`xin.banghua.beiyuan0`  
-> 版本：`148`  
+> 版本：`154`（对照包 `xbly.apk`；旧包 `beibeiwu.apk` 为 148）
 > 文档维护原则：**凡分析、测试、结论，一律写入本文档体系；禁止只口头结论不落盘。**
 
 ---
@@ -25,6 +25,7 @@
 | [10_PROTOCOL_CLIENT.md](./10_PROTOCOL_CLIENT.md) | **全功能协议客户端**落地说明 |
 | [11_FEATURE_REALNAME_AND_COVERAGE.md](./11_FEATURE_REALNAME_AND_COVERAGE.md) | 实名门槛功能 / 其他功能 / 协议覆盖评估 |
 | [12_NATIVE_INTEGRATION.md](./12_NATIVE_INTEGRATION.md) | **IM / 刷脸 / 支付** 原生能力集成 |
+| [13_APK_V154_DIFF.md](./13_APK_V154_DIFF.md) | **xbly.apk v154** 与旧包差异 / 协议跟版 |
 | [bbw_protocol/README.md](./bbw_protocol/README.md) | 协议库使用手册 |
 | [bbw_web/README.md](./bbw_web/README.md) | BFF + Web 脚手架 |
 | [DEEP_DIVE.md](./DEEP_DIVE.md) | 早期深挖报告（保留，内容已并入 01/02/04） |
@@ -72,4 +73,5 @@
 - 实名绕过：`Describe/Save` 回显恒 `T` 但**未改服务端实名状态**；协议级伪造实名**尚未打通**（见 08 / F-015）。  
 - 游客能力：见 **09**；L1 未实名可 follow；改资料/提现 403；大量读接口 L0 也开放。  
 - **协议客户端已落地**：`bbw_protocol` + CLI，`call` 覆盖 402 actions；见 **10**。  
-- **原生能力集成面已落地**：`adapters` + `bbw_web` BFF（IM 凭证 / 支付下单 / 刷脸编排）；见 **12**。
+- **原生能力集成面已落地**：`adapters` + `bbw_web` BFF（IM 凭证 / 支付下单 / 刷脸编排）；见 **12**。  
+- **协议核已跟版 v154**（`xbly.apk`）：`VERSION_CODE=154`，新增 `Id2MetaVerifyRequest`；见 **13** / T13。

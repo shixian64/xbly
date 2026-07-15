@@ -64,8 +64,11 @@ class ContentAPI:
         return self.c.call("testField")
 
     def about(self) -> ApiResult:
+        from .. import sign
+
+        ver = getattr(self.c.session, "version_code", None) or sign.VERSION_CODE
         return self.c.call_url(
-            f"https://applet.banghua.xin/app/index.php?i=888&c=entry&do=About_app&m=socialchat&version=148"
+            f"https://applet.banghua.xin/app/index.php?i=888&c=entry&do=About_app&m=socialchat&version={ver}"
         )
 
     def hot_task(self) -> ApiResult:

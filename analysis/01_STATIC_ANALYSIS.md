@@ -67,7 +67,7 @@
 | APP_KEY（融云） | `m7ua80gbmo0km` |
 | BASE_SERVER_ADDRES | `https://redis.banghua.xin:8080/` |
 | BUSINESS_TOKEN | `lymM6dNKREIknE5VJGskfU` |
-| VERSION_CODE | `148` |
+| VERSION_CODE | `154`（`xbly.apk`；旧 `beibeiwu.apk` 为 148） |
 | FLAVOR | `official` |
 | DEBUG | `false` |
 

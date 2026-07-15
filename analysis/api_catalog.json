@@ -1,9 +1,11 @@
 {
   "counts": {
-    "do": 311,
+    "do": 312,
     "short_startHttp": 95,
-    "full_urls": 332,
-    "all_actions": 402
+    "full_urls": 326,
+    "all_actions": 403,
+    "deprecated": 7,
+    "new_in_v154": 1
   },
   "categories": {
     "other": [
@@ -15,6 +17,7 @@
       "GetOnlineMusic",
       "Hot_task",
       "ISawAndSawMe",
+      "Id2MetaVerifyRequest",
       "Lottery_ninegrid",
       "Penalty_wall",
       "SetAllowCall",
@@ -271,7 +274,6 @@
       "createNovel",
       "createTopic",
       "deleteNovel",
-      "getCategoryNovels",
       "getChatCensorship",
       "getFilmTopic",
       "getFilterWords",
@@ -281,8 +283,6 @@
       "getIllegalWordGroup",
       "getMyNovels",
       "getNovelChapters",
-      "getNovelsSource",
-      "getRankNovels",
       "getSlide",
       "getTopic",
       "getVersion",
@@ -439,6 +439,7 @@
     "Game_fivechess",
     "GetOnlineMusic",
     "Hot_task",
+    "Id2MetaVerifyRequest",
     "Lottery_ninegrid",
     "Luntan0",
     "Mbti28",
@@ -841,21 +842,16 @@
     "https://applet.banghua.xin/advanceduseragreement.html",
     "https://applet.banghua.xin/anchoragreement.html",
     "https://applet.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=GetOnlineMusic&m=moyuan",
+    "https://applet.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=Id2MetaVerifyRequest&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=ReportViolation&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=ReportViolationWithMultiImage&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=SaveRPVerifyInfo&m=socialchat",
-    "https://applet.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=getCategoryNovels&m=socialchat&gender=",
-    "https://applet.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=getChapterList&m=socialchat&novel_id=",
-    "https://applet.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=getDetailedChapter&m=socialchat&chapter_id=",
     "https://applet.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=getFilmTopic&m=moyuan",
-    "https://applet.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=getMyChapterList&m=socialchat&novel_id=",
-    "https://applet.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=getMyDetailedChapter&m=socialchat&chapter_id=",
-    "https://applet.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=getNovelsSource&m=socialchat&xsname=",
     "https://applet.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=refundSupervisionApply&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=supervisorApply&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=uploadAudioFileWithCheck&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=uploadVideoFile&m=socialchat",
-    "https://applet.banghua.xin/app/index.php?i=888&c=entry&do=About_app&m=socialchat&version=148",
+    "https://applet.banghua.xin/app/index.php?i=888&c=entry&do=About_app&m=socialchat&version=154",
     "https://applet.banghua.xin/app/index.php?i=888&c=entry&do=Hot_task&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=888&c=entry&do=Lottery_ninegrid&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=888&c=entry&do=Mbti28&m=socialchat",
@@ -1156,7 +1152,6 @@
     "https://applet.banghua.xin/useragreement0.html",
     "https://applet.banghua.xin/vipagreement.html",
     "https://redis.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=getChannelFilmInfo&m=rediscache",
-    "https://redis.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=getRankNovels&m=rediscache",
     "https://redis.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=getUserRoomInfo&m=rediscache",
     "https://redis.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=isOpenOrderSong&m=rediscache",
     "https://redis.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=moyuansignin&m=rediscache",
@@ -1171,5 +1166,31 @@
     "https://redis.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=xiaobeisignout&m=rediscache",
     "https://redis.banghua.xin:8080/"
   ],
-  "method_hints": {}
+  "method_hints": {},
+  "apk_version": {
+    "previous": 148,
+    "current": 154,
+    "source_apk": "xbly.apk",
+    "compared_against": "beibeiwu.apk"
+  },
+  "deprecated_actions": {
+    "since_apk": 154,
+    "actions": [
+      "getCategoryNovels",
+      "getChapterList",
+      "getDetailedChapter",
+      "getMyChapterList",
+      "getMyDetailedChapter",
+      "getNovelsSource",
+      "getRankNovels"
+    ],
+    "note": "Novel module removed from xbly.apk v154 client; server may still respond"
+  },
+  "new_actions": {
+    "since_apk": 154,
+    "actions": [
+      "Id2MetaVerifyRequest"
+    ],
+    "note": "Id2MetaVerifyRequest present in v154; needs real params (401 without)"
+  }
 }

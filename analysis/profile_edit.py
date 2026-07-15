@@ -39,7 +39,7 @@ def headers(uid: str, token: str, content_type: Optional[str] = None) -> Dict[st
         "AUTHOR-TOKEN": token,
         "EXPIRE-TOKEN": expire_token(),
         "SIGN-TOKEN": sign_token(uid),
-        "User-Agent": "okhttp/4.9.3 beibeiwu/148",
+        "User-Agent": "okhttp/4.9.3 beibeiwu/154",
         "Accept": "*/*",
         "Connection": "keep-alive",
     }
@@ -113,7 +113,7 @@ def login() -> Tuple[str, str, dict]:
             "uniquelogintoken": sha1_hex("xiaobei" + UID_HINT),
             "phonebrand": "Android",
             "pushregid": "protocol_probe",
-            "version_code": "148",
+            "version_code": "154",
         },
         "0",
         "0",

@@ -14,7 +14,7 @@ from typing import Any, Dict, Optional, Tuple
 
 PHONE = "19122614669"
 PASSWORD = "YOUR_PASSWORD"  # set locally; do not commit real secrets
-VERSION_CODE = "148"
+VERSION_CODE = "154"
 PACKAGE = "xin.banghua.beiyuan0"
 
 APPLET = "https://applet.banghua.xin/app/index.php"

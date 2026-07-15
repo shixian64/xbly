@@ -88,6 +88,7 @@
 | 人工实名 | `applyManualVerify` + 图片 OSS |
 | 年龄校验 | `checkAge` |
 | 二次身份证确认 | `verify_certNo` |
+| 二要素/元信息（v154） | `Id2MetaVerifyRequest`（`misc.id2_meta_verify`；缺参常见 401） |
 
 这些在 `bbw_protocol.modules.misc` / 文档 08 已覆盖。**活体通过依赖阿里云原生 SDK，协议只能走到 HTTP 壳。**
 

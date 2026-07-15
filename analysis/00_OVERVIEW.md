@@ -10,9 +10,9 @@
 
 | 项 | 值 |
 |---|---|
-| APK | `beibeiwu.apk` |
+| APK | `xbly.apk`（当前）/ `beibeiwu.apk`（v148 基线） |
 | 包名 | `xin.banghua.beiyuan0` |
-| versionCode / Name | `148` / `148` |
+| versionCode / Name | **`154`**（旧包 148） |
 | Application | `xin.banghua.beiyuan0.SophixStubApplication`（Sophix 热修复壳） |
 | 真实 Application | `xin.banghua.beiyuan0.App` |
 | 业务主包 | `xin.banghua.beiyuan0` + `cn.leyuan.base_library` |

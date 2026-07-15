@@ -52,7 +52,7 @@ TXIM_SECRETKEY = (
 WX_APP_ID_BEIYUAN0 = "wxf057dbbb960d9c39"
 WX_APP_ID_BEIYUAN = "wxb8adb92718082e0b"
 PACKAGE_NAME = "xin.banghua.beiyuan0"
-VERSION_CODE = 148
+VERSION_CODE = 154
 
 
 def md5_hex(s: str) -> str:

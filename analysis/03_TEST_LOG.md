@@ -380,6 +380,42 @@ HTTP 主路径已协议化；通用 `call` 覆盖全部枚举 action。原生 SD
 
 ---
 
+## T13 · xbly.apk v154 对比与协议核跟版（2026-07-15）
+
+**目的：** 对比 `beibeiwu.apk`(148) vs `xbly.apk`(154)，更新协议核需跟版项。
+
+**静态 diff 摘要：**
+
+| 项 | 结论 |
+|---|---|
+| 鉴权盐 / Header / 包名 | 未变（`socialchat`/`xiaobei`/`xin.banghua.beiyuan0`） |
+| 融云/微信/TIM 密钥串 | 仍在 |
+| 版本 | **148 → 154**（`About_app&version=`） |
+| 新增 action | `Id2MetaVerifyRequest` |
+| 删除 action（客户端） | 小说 7 个：`getCategoryNovels` 等 |
+| `otherinterface` 路径集 | 无差 |
+
+**协议核更新：**
+
+- `sign.VERSION_CODE` / UA / 探针脚本 → **154**
+- `api_catalog.json`：+Id2、About version=154、deprecated 小说、计数刷新
+- `misc.id2_meta_verify`、`content.about` 跟 session 版本
+
+**实测：**
+
+| 调用 | 结果 |
+|---|---|
+| `UpdateOnline0` version_code=148 | 成功 |
+| `UpdateOnline0` version_code=154 | 成功 |
+| `Id2MetaVerifyRequest` 无参 | `401 接口调用失败`（需真实参数，接口存在） |
+
+**结论：** 主协议可继续用；跟版常量 + catalog 即可，无需重写鉴权。
+
+### 状态
+✅ 跟版完成
+
+---
+
 ## 附录 · 测试脚本命令
 
 ```powershell

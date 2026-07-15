@@ -13,7 +13,7 @@
 | 登录密码 | `YOUR_PASSWORD`（协议 `findpassword` 设置成功） |
 | 用户 uid | `726285` |
 | 包名 | `xin.banghua.beiyuan0` |
-| version_code | `148` |
+| version_code | `154`（协议核默认；随 `sign.VERSION_CODE`） |
 
 ---
 

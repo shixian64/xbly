@@ -35,7 +35,7 @@ def headers(uid: str, token: str) -> Dict[str, str]:
         "AUTHOR-TOKEN": token,
         "EXPIRE-TOKEN": expire_token(),
         "SIGN-TOKEN": md5_hex(uid + "socialchat" + uid),
-        "User-Agent": "okhttp/4.9.3 beibeiwu/148",
+        "User-Agent": "okhttp/4.9.3 beibeiwu/154",
         "Content-Type": "application/x-www-form-urlencoded",
     }
 
@@ -68,7 +68,7 @@ def login() -> Tuple[str, str, dict]:
             "uniquelogintoken": sha1_hex("xiaobei" + UID_HINT),
             "phonebrand": "Android",
             "pushregid": "rp_probe",
-            "version_code": "148",
+            "version_code": "154",
         },
         "0",
         "0",
@@ -106,7 +106,7 @@ def reset_new(uid: str, token: str, nick: str = "Vom") -> None:
             "AUTHOR-TOKEN": token,
             "EXPIRE-TOKEN": expire_token(),
             "SIGN-TOKEN": md5_hex(uid + "socialchat" + uid),
-            "User-Agent": "okhttp/4.9.3 beibeiwu/148",
+            "User-Agent": "okhttp/4.9.3 beibeiwu/154",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
         },
         method="POST",

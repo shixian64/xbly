@@ -81,6 +81,10 @@ class MiscAPI:
     def verify_cert_no(self, cert_no: str) -> ApiResult:
         return self.c.call("verify_certNo", cert_no=cert_no)
 
+    def id2_meta_verify(self, **params: Any) -> ApiResult:
+        """v154+ Id2MetaVerifyRequest (二要素/元信息类；缺参常见 401)."""
+        return self.c.call("Id2MetaVerifyRequest", params)
+
     def verify_phone(self, **params: Any) -> ApiResult:
         return self.c.call("verifyPhone", params)
 
