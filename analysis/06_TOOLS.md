@@ -14,6 +14,8 @@
 | `guest_capability_probe.py` | L0/L1 协议能力批测 → JSON 矩阵 |
 | `enum_all_apis.py` | 生成 api_catalog.json（402 actions） |
 | **`bbw_protocol/`** | **完整协议客户端 + CLI（主入口）** |
+| **`bbw_protocol/adapters/`** | IM / face / pay 原生边车（`app.native`） |
+| **`bbw_web/`** | BFF + static 演示页（`python -m bbw_web`） |
 | `enum_short.py` | 从源码枚举 do= / startHttp action |
 | `enum_apis.py` | 全量枚举（可能较慢） |
 
@@ -106,6 +108,21 @@ GUI：桌面快捷方式 → `jadx-gui-1.5.5.exe`。
 | `guest_capability_results.json` | 游客能力批测原始结果 |
 | `api_catalog.json` | 全量 action 目录 |
 
-## 10. 新增工具登记模板
+## 10. adapters / bbw_web（原生 IM·刷脸·支付）
+
+```powershell
+cd D:\project\AI\bbw\analysis
+python -m bbw_protocol.cli native-status
+python -m bbw_protocol.cli im-tim --prefer local
+python -m bbw_protocol.cli im-rong
+python -m bbw_protocol.cli pay-coin --channel wechat --coin-id 1
+python -m bbw_protocol.cli face-status
+python -m bbw_web --port 8765
+# 浏览器 http://127.0.0.1:8765/
+```
+
+说明见 [12_NATIVE_INTEGRATION.md](./12_NATIVE_INTEGRATION.md)、[bbw_web/README.md](./bbw_web/README.md)。
+
+## 11. 新增工具登记模板
 
 新增脚本时在本表追加一行，并在 `README.md` 产物表同步。

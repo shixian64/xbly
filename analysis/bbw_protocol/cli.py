@@ -123,6 +123,32 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("txim-sign")
     sub.add_parser("online")
 
+    # native adapters (IM / face / pay)
+    sub.add_parser("native-status", help="IM/face/pay adapter capability snapshot")
+    sp = sub.add_parser("im-tim", help="TIM login payload (UserSig)")
+    sp.add_argument("--prefer", default="local", choices=("local", "server"))
+    sp.add_argument("--uid", default=None)
+    sub.add_parser("im-rong", help="RongCloud register + token")
+    sp = sub.add_parser("im-boot", help="TIM + Rong bootstrap JSON")
+    sp.add_argument("--prefer", default="local", choices=("local", "server"))
+    sp = sub.add_parser("pay-coin", help="prepare coin recharge order")
+    sp.add_argument("--channel", default="wechat", choices=("wechat", "alipay"))
+    sp.add_argument("--coin-id", default="1")
+    sp = sub.add_parser("pay-vip", help="prepare VIP/SVIP order")
+    sp.add_argument("--channel", default="wechat", choices=("wechat", "alipay"))
+    sp.add_argument("--level", default="vip", choices=("vip", "svip"))
+    sp = sub.add_parser("pay-card", help="buy match card with 乐园币")
+    sp.add_argument("--card-id", default="1")
+    sub.add_parser("face-status", help="face real-name pipeline hint")
+    sp = sub.add_parser("face-init", help="InitFaceVerify0 (needs real metaInfo from ZIM)")
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--idno", required=True)
+    sp.add_argument("--meta", required=True, help="SDK metaInfo JSON string")
+    sp = sub.add_parser("face-describe", help="DescribeFaceVerify0")
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--idno", required=True)
+    sp.add_argument("--certify-id", required=True)
+
     # generic
     sp = sub.add_parser("call", help="call any short action")
     sp.add_argument("action")
@@ -242,6 +268,68 @@ def main(argv=None) -> int:
         return _print_result(app.im.tencent_sign(), raw)
     if args.cmd == "online":
         return _print_result(app.misc.update_online(), raw)
+
+    if args.cmd == "native-status":
+        print(json.dumps(app.native.status(), ensure_ascii=False, indent=2))
+        return 0
+    if args.cmd == "im-tim":
+        try:
+            if args.uid:
+                if args.prefer == "server":
+                    payload = app.native.im.tim_server(args.uid).web_login_options()
+                    payload["source"] = "server"
+                else:
+                    payload = app.native.im.tim_login_payload(
+                        prefer=args.prefer, uid=args.uid
+                    )
+            else:
+                payload = app.native.im.tim_login_payload(prefer=args.prefer)
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0
+        except Exception as e:
+            print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+            return 1
+    if args.cmd == "im-rong":
+        print(json.dumps(app.native.im.rong_register().to_dict(), ensure_ascii=False, indent=2))
+        return 0
+    if args.cmd == "im-boot":
+        print(
+            json.dumps(
+                app.native.im.bootstrap(prefer_tim=args.prefer),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.cmd == "pay-coin":
+        if args.channel == "alipay":
+            res = app.native.pay.prepare_coin_alipay(args.coin_id)
+        else:
+            res = app.native.pay.prepare_coin_wechat(args.coin_id)
+        print(json.dumps(res.to_dict(), ensure_ascii=False, indent=2))
+        return 0 if res.ok else 1
+    if args.cmd == "pay-vip":
+        if args.channel == "alipay":
+            res = app.native.pay.prepare_vip_alipay(args.level)
+        else:
+            res = app.native.pay.prepare_vip_wechat(args.level)
+        print(json.dumps(res.to_dict(), ensure_ascii=False, indent=2))
+        return 0 if res.ok else 1
+    if args.cmd == "pay-card":
+        res = app.native.pay.buy_match_card(args.card_id)
+        print(json.dumps(res.to_dict(), ensure_ascii=False, indent=2))
+        return 0 if res.ok else 1
+    if args.cmd == "face-status":
+        print(json.dumps(app.native.face.status_hint(), ensure_ascii=False, indent=2))
+        return 0
+    if args.cmd == "face-init":
+        sess = app.native.face.start(args.name, args.idno, args.meta)
+        print(json.dumps(sess.to_dict(), ensure_ascii=False, indent=2))
+        return 0 if sess.init_ok else 1
+    if args.cmd == "face-describe":
+        sess = app.native.face.describe(args.certify_id, args.name, args.idno)
+        print(json.dumps(sess.to_dict(), ensure_ascii=False, indent=2))
+        return 0 if sess.describe_ok else 1
 
     if args.cmd == "call":
         return _print_result(app.call(args.action, **_parse_kv(args.kv)), raw)

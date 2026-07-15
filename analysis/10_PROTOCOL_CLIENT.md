@@ -16,7 +16,7 @@
 | **任意 action 通用调用** | ✅ `app.call` / CLI `call` — 覆盖目录内全部 do= |
 | CLI + REPL | ✅ `python -m bbw_protocol.cli` |
 | 冒烟测试 | ✅ 登录/礼物/推荐/关注/门禁行为符合预期 |
-| 原生 SDK 1:1（刷脸/支付 UI/IM 长连接） | ⚠️ 仅 HTTP 辅助；实时需外挂 SDK |
+| 原生 SDK 1:1（刷脸/支付 UI/IM 长连接） | ⚠️ `adapters` + `bbw_web` 集成面已加；活体/收银/长连接仍靠官方 SDK |
 
 **结论：**  
 在「HTTP 业务 = App 主路径」前提下，**已经可以像用 APK 一样通过协议完成绝大多数功能**；剩余缺口集中在活体 SDK、支付收银台 UI、IM 实时通道。

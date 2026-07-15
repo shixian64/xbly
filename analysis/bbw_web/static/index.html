@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>bbw · 原生能力脚手架</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --card: #1a2332;
+      --text: #e7ecf3;
+      --muted: #8b9bb4;
+      --accent: #3d8bfd;
+      --ok: #3dd68c;
+      --warn: #f5a524;
+      --err: #f31260;
+      --border: #2a3548;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg); color: var(--text); line-height: 1.5;
+      min-height: 100vh;
+    }
+    header {
+      padding: 1.25rem 1.5rem; border-bottom: 1px solid var(--border);
+      display: flex; flex-wrap: wrap; gap: 1rem; align-items: center;
+      justify-content: space-between;
+    }
+    header h1 { margin: 0; font-size: 1.15rem; font-weight: 600; }
+    header .meta { color: var(--muted); font-size: 0.85rem; }
+    main {
+      max-width: 960px; margin: 0 auto; padding: 1.25rem;
+      display: grid; gap: 1rem;
+    }
+    .card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 12px; padding: 1rem 1.15rem;
+    }
+    .card h2 {
+      margin: 0 0 0.75rem; font-size: 1rem;
+      display: flex; align-items: center; gap: 0.5rem;
+    }
+    .badge {
+      font-size: 0.7rem; padding: 0.15rem 0.45rem; border-radius: 999px;
+      background: #243044; color: var(--muted); font-weight: 500;
+    }
+    .badge.ok { background: #163528; color: var(--ok); }
+    .badge.warn { background: #3a2a10; color: var(--warn); }
+    label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 0.25rem; }
+    input, select, textarea {
+      width: 100%; padding: 0.5rem 0.65rem; border-radius: 8px;
+      border: 1px solid var(--border); background: #121a26; color: var(--text);
+      margin-bottom: 0.65rem; font: inherit;
+    }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+    @media (max-width: 640px) { .row { grid-template-columns: 1fr; } }
+    button {
+      cursor: pointer; border: none; border-radius: 8px;
+      padding: 0.5rem 0.9rem; font: inherit; font-weight: 500;
+      background: var(--accent); color: #fff;
+    }
+    button.secondary { background: #2a3548; color: var(--text); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.25rem; }
+    pre {
+      margin: 0.75rem 0 0; padding: 0.75rem; border-radius: 8px;
+      background: #0c1018; border: 1px solid var(--border);
+      font-size: 0.75rem; overflow: auto; max-height: 220px;
+      white-space: pre-wrap; word-break: break-all; color: #b8c4d8;
+    }
+    .log { max-height: 280px; }
+    .hint { font-size: 0.8rem; color: var(--muted); margin: 0.35rem 0 0; }
+    .chat-box {
+      display: flex; flex-direction: column; gap: 0.35rem;
+      max-height: 200px; overflow-y: auto; margin-top: 0.5rem;
+      padding: 0.5rem; background: #0c1018; border-radius: 8px;
+      border: 1px solid var(--border); min-height: 80px;
+    }
+    .msg { font-size: 0.85rem; padding: 0.35rem 0.5rem; border-radius: 6px; background: #1e2a3d; }
+    .msg.me { background: #1a3358; align-self: flex-end; }
+    .msg.sys { color: var(--muted); background: transparent; font-size: 0.8rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>bbw 原生能力脚手架</h1>
+      <div class="meta">BFF + TIM Web · 密钥不下发浏览器 · 需先 CLI 登录写 session.json</div>
+    </div>
+    <div class="meta" id="who">未加载</div>
+  </header>
+  <main>
+    <section class="card">
+      <h2>会话 <span class="badge" id="sess-badge">—</span></h2>
+      <div class="actions">
+        <button type="button" id="btn-me">刷新 /api/me</button>
+        <button type="button" class="secondary" id="btn-boot">Web bootstrap</button>
+      </div>
+      <pre id="out-me">{}</pre>
+    </section>
+
+    <section class="card">
+      <h2>IM 实时 <span class="badge warn">SDK</span></h2>
+      <p class="hint">
+        先拉 UserSig（BFF 本地签发），再按需加载腾讯 TIM Web SDK。
+        默认不自动 npm 装 SDK；可点「仅展示凭证」或「尝试 CDN 登录」。
+      </p>
+      <div class="row">
+        <div>
+          <label>prefer</label>
+          <select id="tim-prefer">
+            <option value="local">local UserSig（BFF 签发）</option>
+            <option value="server">server tximsign.php</option>
+          </select>
+        </div>
+        <div>
+          <label>对端 userID（试发消息）</label>
+          <input id="peer-id" placeholder="对方 uid" />
+        </div>
+      </div>
+      <div class="actions">
+        <button type="button" id="btn-tim-cred">获取 TIM 凭证</button>
+        <button type="button" class="secondary" id="btn-rong">获取融云 token</button>
+        <button type="button" class="secondary" id="btn-tim-sdk">CDN 登录 TIM（实验）</button>
+        <button type="button" class="secondary" id="btn-send" disabled>发文本</button>
+      </div>
+      <div>
+        <label>消息</label>
+        <input id="msg-text" placeholder="hello from bbw web" />
+      </div>
+      <div class="chat-box" id="chat"></div>
+      <pre id="out-im">{}</pre>
+    </section>
+
+    <section class="card">
+      <h2>支付确认 <span class="badge warn">下单协议</span></h2>
+      <p class="hint">只创建业务订单参数；真正收款走微信/支付宝官方收银台（商户绑定官方包名）。</p>
+      <div class="row">
+        <div>
+          <label>渠道</label>
+          <select id="pay-channel">
+            <option value="wechat">微信</option>
+            <option value="alipay">支付宝</option>
+          </select>
+        </div>
+        <div>
+          <label>coin_id</label>
+          <input id="coin-id" value="1" />
+        </div>
+      </div>
+      <div class="actions">
+        <button type="button" id="btn-pay-coin">准备充币订单</button>
+        <button type="button" class="secondary" id="btn-pay-card">乐园币买卡 buyCard</button>
+        <button type="button" class="secondary" id="btn-pay-cap">capabilities</button>
+      </div>
+      <pre id="out-pay">{}</pre>
+    </section>
+
+    <section class="card">
+      <h2>刷脸实名 <span class="badge warn">需阿里云 SDK</span></h2>
+      <p class="hint">
+        metaInfo 必须来自阿里云实人/ZIM SDK。假 meta 会 Init 失败；假 certifyId 可能回 T 但不改 rp_verify_time。
+      </p>
+      <div class="row">
+        <div>
+          <label>姓名</label>
+          <input id="cert-name" autocomplete="off" />
+        </div>
+        <div>
+          <label>身份证号</label>
+          <input id="cert-no" autocomplete="off" />
+        </div>
+      </div>
+      <label>metaInfo（SDK 生成 JSON 字符串）</label>
+      <textarea id="meta-info" rows="3" placeholder='{"zimVer":"..."}'></textarea>
+      <label>certifyId（Init 成功后）</label>
+      <input id="certify-id" />
+      <div class="actions">
+        <button type="button" id="btn-face-init">InitFaceVerify</button>
+        <button type="button" class="secondary" id="btn-face-desc">DescribeFaceVerify</button>
+        <button type="button" class="secondary" id="btn-face-st">status</button>
+      </div>
+      <pre id="out-face">{}</pre>
+    </section>
+
+    <section class="card">
+      <h2>日志</h2>
+      <pre class="log" id="log"></pre>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

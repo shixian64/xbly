@@ -13,11 +13,12 @@
 | ✅ 经济 | VIP/金币/送礼/提现下单参数 |
 | ✅ 房间/匹配/IM 辅助 HTTP | token 获取、列表、redis 缓存接口 |
 | ✅ **任意 do= 通用调用** | `app.call("Action", **params)` — 覆盖目录内 ~400 action |
-| ⚠️ 腾讯/融云 **实时长连接** | 可拿 userSign/rong token；收发需 SDK 或厂商 REST |
-| ⚠️ 阿里云刷脸 | 仅 Init/Describe HTTP；活体在原生 SDK |
-| ⚠️ 支付收银台 | 可下单拿到支付串；完成支付需微信/支付宝 |
+| ⚠️ 腾讯/融云 **实时长连接** | `adapters.im` 出凭证；收发需 TIM/融云 SDK（见 `bbw_web`） |
+| ⚠️ 阿里云刷脸 | `adapters.face` 编排 Init/Describe；活体 metaInfo 仍靠 ZIM |
+| ⚠️ 支付收银台 | `adapters.pay` 规范 order_params；收银靠微信/支付宝官方 |
 
-完整 action 目录：`../api_catalog.json`（402 actions）。
+完整 action 目录：`../api_catalog.json`（402 actions）。  
+原生边车：`adapters/` + Web BFF：`../bbw_web/`。
 
 ## 安装 / 运行
 
@@ -60,6 +61,25 @@ print(app.profile.reset_nickname("Vom").message)
 app.call("getRoomTop")
 app.call_redis("getUserRoomInfo", uid=app.session.uid)
 app.im.local_user_sig()  # 本地腾讯 IM UserSig
+
+# 原生能力适配（凭证 / 下单 / 刷脸编排）
+print(app.native.im.tim_login_payload())
+print(app.native.pay.prepare_coin_wechat("1").to_dict())
+print(app.native.face.status_hint())
+```
+
+## 原生能力 CLI
+
+```powershell
+python -m bbw_protocol.cli native-status
+python -m bbw_protocol.cli im-tim --prefer local
+python -m bbw_protocol.cli im-rong
+python -m bbw_protocol.cli pay-coin --channel wechat --coin-id 1
+python -m bbw_protocol.cli face-status
+
+# Web BFF + 前端脚手架
+python -m bbw_web --port 8765
+# 浏览器打开 http://127.0.0.1:8765/
 ```
 
 ## 模块结构
@@ -69,11 +89,14 @@ bbw_protocol/
   sign.py       # SIGN/EXPIRE/UNIQUE/UserSig
   session.py    # 持久会话
   client.py     # HTTP 引擎 + 统一 ApiResult
-  app.py        # 门面 BeibeiwuApp
+  app.py        # 门面 BeibeiwuApp（含 .native）
   cli.py        # 命令行
   modules/
     auth.py profile.py social.py content.py
     economy.py room.py match.py im.py misc.py
+  adapters/     # IM / face / pay 边车（给 SDK 的载荷）
+    im.py face.py pay.py bundle.py
+bbw_web/        # 最小 BFF + static TIM 演示页
 ```
 
 ## 与正常 App 的对应关系

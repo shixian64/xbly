@@ -352,6 +352,34 @@ HTTP 主路径已协议化；通用 `call` 覆盖全部枚举 action。原生 SD
 
 ---
 
+## T12 · 原生能力集成 scaffold（2026-07-15）
+
+**目的：** 落地 IM / 刷脸 / 支付的可集成边车（非伪造）。
+
+**交付：**
+
+- `bbw_protocol/adapters/`：`ImAdapter` / `FaceAdapter` / `PayAdapter` / `NativeBundle`（`app.native`）
+- `bbw_web/`：stdlib BFF + static 演示页
+- CLI：`native-status` `im-tim` `im-rong` `pay-coin` `face-*`
+- 文档：`12_NATIVE_INTEGRATION.md`
+
+**冒烟（本机 session uid=726285）：**
+
+| 项 | 结果 |
+|---|---|
+| `native-status` | logged_in，能力字典正常 |
+| `im-tim` local | SDKAppID=1600039823，userSig 长度约 192 |
+| `im-rong` | 接口回 `{"token":"123"}`（疑似占位 token，adapter 标 stub） |
+| BFF `/api/health` `/api/im/tim` | 200 |
+| 支付/刷脸 | 仅编排层；未对真实商户/活体做资金或实名写入 |
+
+**结论：** 集成面可用；实时收发仍接官方 TIM SDK；融云 token 需再对真实 App 抓包核对 register 参数。
+
+### 状态
+✅ scaffold 完成
+
+---
+
 ## 附录 · 测试脚本命令
 
 ```powershell

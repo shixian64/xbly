@@ -237,11 +237,11 @@ APK 功能
 │     └── 协议已实现调用；未满足条件会 403/文本失败（与 App 一致）
 ├── C. 客户端-only UI 逻辑
 │     └── 不需要协议（跳转、本地校验）；可用协议绕过部分 UI 门禁去打服务端
-└── D. 原生 SDK
-      ├── 人脸 ZIM          → ⚠️ 仅 HTTP 壳
-      ├── 微信/支付宝支付 UI → ⚠️ 仅下单串
-      ├── 腾讯/融云实时 IM  → ⚠️ 可拿 token/UserSig，收发需 SDK
-      └── 运营商一键登录    → ⚠️ 可用短信/密码替代
+└── D. 原生 SDK（2026-07-15 已加 adapters + bbw_web BFF）
+      ├── 人脸 ZIM          → adapters.face 编排 HTTP；活体仍需阿里云 SDK
+      ├── 微信/支付宝支付 UI → adapters.pay 规范 order_params；收银官方
+      ├── 腾讯/融云实时 IM  → adapters.im 出凭证；TIM Web 接 BFF
+      └── 运营商一键登录    → 可用短信/密码替代
 ```
 
 **简答：**
@@ -262,7 +262,9 @@ APK 功能
 | 语音房 | `app.room.*` | 具名 + call |
 | 匹配漂流瓶 | `app.match.*` | 具名 + call |
 | IM 辅助 | `app.im.*` | 具名 + UserSig |
-| 实名 HTTP | `app.misc.face_*` / `apply_manual_verify` | 具名 |
+| IM 实时凭证 | `app.native.im.*` / BFF `/api/im/*` | adapters + Web |
+| 实名 HTTP | `app.misc.face_*` / `app.native.face.*` | 具名 + 编排 |
+| 支付下单 | `app.native.pay.*` / BFF `/api/pay/*` | order_params |
 | **任意冷门按钮** | `app.call("ExactDoName", **form)` | **全量** |
 
 ### 3.4 未实名账号上：协议「已实现且可成功」vs「已实现但被拒」
@@ -272,7 +274,7 @@ APK 功能
 | ✅ 已实现且当前可成功 | 登录、礼物列表、推荐、关注、心跳、UserSig、testField… |
 | ⚠️ 已实现，业务拒绝 | `nick`→403 实名；`withdraw`→403 实名；`exchange-vip`→余额不足；`room-create`→no |
 | ⚠️ 已实现，客户端会拦但协议可尝试 | 发帖/加好友等（需补参数；服务端是否 403 待实名前后对比） |
-| ❌ 协议无法单独完成 | 刷脸通过、支付确认、IM 实时会话流 |
+| ❌ 协议无法单独完成 | 刷脸**活体通过**、支付**资金确认**、IM **长连接收发**（现已提供 SDK 集成面，非伪造） |
 
 ---
 

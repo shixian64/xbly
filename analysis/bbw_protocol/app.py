@@ -30,6 +30,10 @@ class BeibeiwuApp:
         app.social.follow("123")
         app.profile.reset_nickname("Vom")
         app.save()
+
+    Native sidecars (IM / face / pay adapters):
+        app.native.im.tim_login_payload()
+        app.native.pay.prepare_coin_wechat("1")
     """
 
     def __init__(self, session: Optional[Session] = None):
@@ -44,7 +48,17 @@ class BeibeiwuApp:
         self.match = MatchAPI(self.client)
         self.im = ImAPI(self.client)
         self.misc = MiscAPI(self.client)
+        self._native = None  # lazy NativeBundle
         self._catalog: Optional[Dict[str, Any]] = None
+
+    @property
+    def native(self):
+        """IM / face / pay adapters (lazy import)."""
+        if self._native is None:
+            from .adapters import NativeBundle
+
+            self._native = NativeBundle(self)
+        return self._native
 
     # ---- session ----
     @classmethod
