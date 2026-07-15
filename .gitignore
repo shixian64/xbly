@@ -1,0 +1,23 @@
+# Large / regenerable binaries
+beibeiwu.apk
+jadx_out/
+analysis/asset_408037528/
+analysis/assets/
+
+# Live secrets / session tokens
+analysis/session.json
+analysis/login_session.json
+analysis/rp_verify_probe_result.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
