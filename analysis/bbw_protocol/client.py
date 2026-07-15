@@ -180,6 +180,10 @@ class ProtocolClient:
         uid = uid if uid is not None else self.session.uid
         token = token if token is not None else self.session.token
         hdrs = sign.auth_headers(uid, token, with_author_sig=with_author_sig)
+        # prefer session UA (APK-like); fall back to sign default
+        ua = getattr(self.session, "user_agent", None)
+        if ua:
+            hdrs["User-Agent"] = ua
 
         data: Optional[bytes]
         if files or multipart is not None:

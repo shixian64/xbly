@@ -13,22 +13,36 @@ class AuthAPI:
     def __init__(self, client: ProtocolClient):
         self.c = client
 
+    def _device_fields(
+        self,
+        phonebrand: Optional[str] = None,
+        pushregid: Optional[str] = None,
+        version_code: Optional[str] = None,
+    ) -> Dict[str, str]:
+        s = self.c.session
+        return {
+            "phonebrand": phonebrand or getattr(s, "phonebrand", None) or "Android",
+            "pushregid": pushregid or getattr(s, "pushregid", None) or "bbw_protocol",
+            "version_code": version_code
+            or getattr(s, "version_code", None)
+            or sign.VERSION_CODE,
+        }
+
     def login_password(
         self,
         phone: str,
         password: str,
         *,
-        phonebrand: str = "Android",
-        pushregid: str = "bbw_protocol",
-        version_code: str = sign.VERSION_CODE,
+        phonebrand: Optional[str] = None,
+        pushregid: Optional[str] = None,
+        version_code: Optional[str] = None,
     ) -> ApiResult:
+        dev = self._device_fields(phonebrand, pushregid, version_code)
         body = {
             "userAccount": phone,
             "userPassword": password,
             "uniquelogintoken": sign.unique_login_token(self.c.session.uid or "0"),
-            "phonebrand": phonebrand,
-            "pushregid": pushregid,
-            "version_code": version_code,
+            **dev,
         }
         # login often without prior token
         r = self.c.request(self.c.url("signin0"), body, uid="0", token="0")
@@ -39,17 +53,16 @@ class AuthAPI:
         self,
         phone: str,
         *,
-        version_code: str = sign.VERSION_CODE,
-        phonebrand: str = "Android",
-        pushregid: str = "bbw_protocol",
+        version_code: Optional[str] = None,
+        phonebrand: Optional[str] = None,
+        pushregid: Optional[str] = None,
     ) -> ApiResult:
         """SigninOneKeyLogin1 — known weak path (may not need SMS)."""
+        dev = self._device_fields(phonebrand, pushregid, version_code)
         body = {
             "userAccount": phone,
             "uniquelogintoken": sign.unique_login_token("0"),
-            "version_code": version_code,
-            "phonebrand": phonebrand,
-            "pushregid": pushregid,
+            **dev,
         }
         r = self.c.request(self.c.url("SigninOneKeyLogin1"), body, uid="0", token="0")
         self._apply_login_result(r, phone=phone)
@@ -104,12 +117,11 @@ class AuthAPI:
         """Re-login with stored password if present, else getUserAttributesMe1."""
         if self.c.session.phone and self.c.session.password:
             return self.login_password(self.c.session.phone, self.c.session.password)
+        dev = self._device_fields()
         return self.c.call(
             "getUserAttributesMe1",
             userId=self.c.session.uid,
-            phonebrand="Android",
-            pushregid="bbw_protocol",
-            version_code=sign.VERSION_CODE,
+            **dev,
         )
 
     def _apply_login_result(

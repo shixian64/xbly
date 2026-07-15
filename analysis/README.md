@@ -37,9 +37,10 @@
 |---|---|
 | `../beibeiwu.apk` | 原始 APK（约 253MB） |
 | `../jadx_out/` | jadx 反编译输出（sources + resources） |
-| `./bbw_protocol/` | **完整协议客户端**（推荐） |
+| `./bbw_protocol/` | **协议核**（CLI / 单会话，无 Web） |
 | `./bbw_protocol/adapters/` | IM / face / pay 原生边车 |
-| `./bbw_web/` | BFF + static TIM 演示页 |
+| `./bbw_web/` | **Web 层**（多用户 BFF + UI，与核隔离） |
+| `./sessions/` | Web 多用户协议会话落盘（gitignore） |
 | `./api_catalog.json` | 402 个 action 目录 |
 | `./session.json` | 协议客户端登录会话 |
 | `./bbw_client.py` | 早期签名/UserSig/请求模板 |

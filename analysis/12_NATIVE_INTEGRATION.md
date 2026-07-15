@@ -1,8 +1,9 @@
 # 12 · 原生能力集成（IM / 刷脸 / 支付）
 
 **最后更新：** 2026-07-15  
-**代码：** `bbw_protocol/adapters/` + `bbw_web/`  
-**前提：** HTTP 业务核 `bbw_protocol` 已覆盖 402 actions；本页只补 **SDK 边车**。
+**代码：** `bbw_protocol/adapters/`（核） + `bbw_web/`（多用户 Web，独立模块）  
+**前提：** HTTP 业务核 `bbw_protocol` 已覆盖 402 actions；本页只补 **SDK 边车**。  
+**隔离：** 协议核无 Cookie/web_sid；多用户只在 `bbw_web.store`。
 
 ---
 

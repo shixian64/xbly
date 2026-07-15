@@ -71,6 +71,38 @@ class BeibeiwuApp:
     def whoami(self) -> Dict[str, Any]:
         return self.session.summary()
 
+    def set_device(
+        self,
+        *,
+        seed: Optional[str] = None,
+        phonebrand: Optional[str] = None,
+        pushregid: Optional[str] = None,
+        **extra: str,
+    ) -> Dict[str, str]:
+        """Attach APK-like device fields to this session (protocol fidelity)."""
+        from .device import build_device_profile
+
+        prof = build_device_profile(
+            seed=seed or self.session.phone or self.session.uid or None,
+            phonebrand=phonebrand,
+            pushregid=pushregid,
+            **{k: v for k, v in extra.items() if k in (
+                "device_id", "version_code", "package_name"
+            )},
+        )
+        self.session.apply_device(prof)
+        return self.session.device_dict()
+
+    def start_heartbeat(
+        self, interval_sec: float = 55.0, jitter_sec: float = 8.0
+    ):
+        """Start background UpdateOnline0. Caller must keep the returned object."""
+        from .heartbeat import Heartbeat
+
+        hb = Heartbeat(self, interval_sec=interval_sec, jitter_sec=jitter_sec)
+        hb.start()
+        return hb
+
     # ---- generic escape hatch (all 400 actions) ----
     def call(self, action: str, **params: Any) -> ApiResult:
         return self.client.call(action, params)

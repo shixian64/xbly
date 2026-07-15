@@ -8,6 +8,8 @@ analysis/assets/
 analysis/session.json
 analysis/login_session.json
 analysis/rp_verify_probe_result.json
+analysis/sessions/
+analysis/bbw_web/data/
 
 # Python
 __pycache__/

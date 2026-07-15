@@ -68,7 +68,7 @@ print(app.native.pay.prepare_coin_wechat("1").to_dict())
 print(app.native.face.status_hint())
 ```
 
-## 原生能力 CLI
+## 原生能力 CLI（协议核内）
 
 ```powershell
 python -m bbw_protocol.cli native-status
@@ -76,27 +76,20 @@ python -m bbw_protocol.cli im-tim --prefer local
 python -m bbw_protocol.cli im-rong
 python -m bbw_protocol.cli pay-coin --channel wechat --coin-id 1
 python -m bbw_protocol.cli face-status
-
-# Web BFF + 前端脚手架
-python -m bbw_web --port 8765
-# 浏览器打开 http://127.0.0.1:8765/
 ```
+
+**Web 多用户不在本包**：见独立模块 `../bbw_web/`（`python -m bbw_web`）。  
+协议核不依赖 Cookie / web_sid；CLI 与 Web 可同时存在、互不耦合。
 
 ## 模块结构
 
 ```
-bbw_protocol/
-  sign.py       # SIGN/EXPIRE/UNIQUE/UserSig
-  session.py    # 持久会话
-  client.py     # HTTP 引擎 + 统一 ApiResult
-  app.py        # 门面 BeibeiwuApp（含 .native）
-  cli.py        # 命令行
-  modules/
-    auth.py profile.py social.py content.py
-    economy.py room.py match.py im.py misc.py
-  adapters/     # IM / face / pay 边车（给 SDK 的载荷）
-    im.py face.py pay.py bundle.py
-bbw_web/        # 最小 BFF + static TIM 演示页
+bbw_protocol/          # 协议核（无 Web）
+  sign.py session.py client.py app.py cli.py
+  device.py heartbeat.py   # 单实例设备字段 / 心跳
+  modules/  adapters/
+bbw_web/               # Web 层（多用户）—— 独立包
+  store.py bff_server.py static/
 ```
 
 ## 与正常 App 的对应关系

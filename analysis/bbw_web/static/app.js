@@ -1,27 +1,38 @@
-/* bbw web scaffold — talks to local BFF only */
+/* bbw_web multi-user client — talks only to BFF; protocol core never in browser */
 
 const $ = (id) => document.getElementById(id);
-const logEl = $("log");
-let timCred = null;
-let chat = null; // TIM instance if CDN loaded
+let webSid = localStorage.getItem("bbw_sid") || "";
 
 function log(msg, obj) {
   const line =
     new Date().toISOString().slice(11, 19) +
     " " +
     msg +
-    (obj !== undefined ? " " + JSON.stringify(obj).slice(0, 500) : "");
-  logEl.textContent = line + "\n" + logEl.textContent;
+    (obj !== undefined ? " " + JSON.stringify(obj).slice(0, 400) : "");
+  $("log").textContent = line + "\n" + $("log").textContent;
 }
 
 function show(id, data) {
   $(id).textContent = JSON.stringify(data, null, 2);
 }
 
+function setSid(sid) {
+  webSid = sid || "";
+  if (sid) localStorage.setItem("bbw_sid", sid);
+  else localStorage.removeItem("bbw_sid");
+  $("sid-show").textContent = sid ? "sid=" + sid.slice(0, 10) + "…" : "";
+}
+
 async function api(path, opts = {}) {
+  const headers = {
+    "Content-Type": "application/json",
+    ...(opts.headers || {}),
+  };
+  if (webSid) headers["X-BBW-SID"] = webSid;
   const res = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+    credentials: "include",
     ...opts,
+    headers,
   });
   const text = await res.text();
   let data;
@@ -30,142 +41,120 @@ async function api(path, opts = {}) {
   } catch {
     data = { raw: text, status: res.status };
   }
+  // capture sid from body
+  if (data.web_sid) setSid(data.web_sid);
   if (!res.ok) log("HTTP " + res.status, data);
-  return data;
+  return { status: res.status, data };
 }
 
-function chatLine(text, cls) {
-  const d = document.createElement("div");
-  d.className = "msg" + (cls ? " " + cls : "");
-  d.textContent = text;
-  $("chat").appendChild(d);
-  $("chat").scrollTop = $("chat").scrollHeight;
+function showApp(loggedIn) {
+  $("panel-login").classList.toggle("hidden", loggedIn);
+  $("panel-app").classList.toggle("hidden", !loggedIn);
 }
 
-async function refreshMe() {
-  const data = await api("/api/me");
-  show("out-me", data);
-  const uid = data.uid || "—";
-  const nick = data.nickname || "";
-  $("who").textContent = `uid=${uid} ${nick}`;
-  $("sess-badge").textContent = data.logged_in ? "已登录" : "未登录";
-  $("sess-badge").className = "badge " + (data.logged_in ? "ok" : "warn");
-  log("me", { uid, logged_in: data.logged_in });
+function setHdr(user) {
+  if (!user || !user.logged_in) {
+    $("hdr-user").textContent = "未登录";
+    return;
+  }
+  $("hdr-user").textContent =
+    (user.nickname || "") + " uid=" + (user.uid || "") + " · " + (user.phone || "");
 }
 
-$("btn-me").onclick = () => refreshMe();
-$("btn-boot").onclick = async () => {
-  const prefer = $("tim-prefer").value;
-  const data = await api("/api/bootstrap?prefer=" + encodeURIComponent(prefer));
-  show("out-me", data);
-  log("bootstrap ok");
+// tabs
+document.querySelectorAll(".tabs button").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tabs button").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    ["tab-home", "tab-im", "tab-pay", "tab-face", "tab-call", "tab-admin"].forEach((id) => {
+      $(id).classList.toggle("hidden", id !== btn.dataset.tab);
+    });
+  });
+});
+
+$("btn-login").onclick = async () => {
+  const body = {
+    phone: $("phone").value.trim(),
+    password: $("password").value,
+    mode: $("login-mode").value,
+    label: $("label").value.trim(),
+  };
+  const { status, data } = await api("/api/auth/login", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  show("out-login", data);
+  if (data.ok && data.user && data.user.logged_in) {
+    setSid(data.web_sid);
+    showApp(true);
+    setHdr(data.user);
+    log("login ok", { uid: data.user.uid, sid: (data.web_sid || "").slice(0, 8) });
+  } else {
+    log("login fail", data.error || status);
+  }
 };
 
-$("btn-tim-cred").onclick = async () => {
+$("btn-logout").onclick = async () => {
+  await api("/api/auth/logout", { method: "POST", body: "{}" });
+  setSid("");
+  showApp(false);
+  setHdr(null);
+  log("logout");
+};
+
+$("btn-health").onclick = async () => {
+  const { data } = await api("/api/health");
+  show("out-login", data);
+  log("health", data);
+};
+
+$("btn-refresh").onclick = async () => {
+  const { status, data } = await api("/api/me");
+  show("out-home", data);
+  if (status === 401) {
+    showApp(false);
+    return;
+  }
+  if (data.user) setHdr(data.user);
+  log("me", data.user && data.user.uid);
+};
+
+$("btn-boot").onclick = async () => {
+  const { data } = await api("/api/bootstrap");
+  show("out-home", data);
+};
+
+$("btn-gifts").onclick = async () => {
+  const { data } = await api("/api/gifts");
+  show("out-home", data);
+};
+
+$("btn-profile").onclick = async () => {
+  const { data } = await api("/api/profile/me");
+  show("out-home", data);
+};
+
+$("btn-hb-once").onclick = async () => {
+  const { data } = await api("/api/heartbeat/once", {
+    method: "POST",
+    body: "{}",
+  });
+  show("out-home", data);
+};
+
+$("btn-tim").onclick = async () => {
   const prefer = $("tim-prefer").value;
-  const data = await api("/api/im/tim?prefer=" + encodeURIComponent(prefer));
-  timCred = data;
+  const { data } = await api("/api/im/tim?prefer=" + encodeURIComponent(prefer));
   show("out-im", data);
-  log("tim credentials", { userID: data.userID, source: data.source });
-  chatLine("已拿到 UserSig source=" + (data.source || "?"), "sys");
 };
 
 $("btn-rong").onclick = async () => {
-  const data = await api("/api/im/rong");
+  const { data } = await api("/api/im/rong");
   show("out-im", data);
-  log("rong", { ok: data.ok, user_id: data.user_id });
-};
-
-$("btn-tim-sdk").onclick = async () => {
-  if (!timCred || !timCred.userSig) {
-    await $("btn-tim-cred").onclick();
-  }
-  if (!timCred || !timCred.userSig) {
-    chatLine("无 UserSig，请先登录 session", "sys");
-    return;
-  }
-  // Load official TIM Web SDK from CDN (version may need bump)
-  if (!window.TIM) {
-    chatLine("加载 TIM Web SDK CDN…", "sys");
-    await new Promise((resolve, reject) => {
-      const s = document.createElement("script");
-      s.src = "https://web.sdk.qcloud.com/im/demo/latest/tim-js.js";
-      s.onload = resolve;
-      s.onerror = () => reject(new Error("CDN load failed — open TIM docs and host SDK yourself"));
-      document.head.appendChild(s);
-    }).catch((e) => {
-      chatLine(String(e.message || e), "sys");
-      log("tim cdn fail", String(e));
-      show("out-im", {
-        error: String(e),
-        manual:
-          "npm i @tencentcloud/chat 后在自建前端用 BFF /api/im/tim 的 userID+userSig 登录",
-        cred: timCred,
-      });
-      return;
-    });
-  }
-  if (!window.TIM) {
-    show("out-im", {
-      hint: "CDN 未暴露 TIM 全局。请用 npm @tencentcloud/chat + 下方凭证",
-      login: {
-        SDKAppID: timCred.SDKAppID,
-        userID: timCred.userID,
-        userSig: timCred.userSig,
-      },
-    });
-    chatLine("请用 npm SDK + 已展示凭证登录（CDN 全局名可能变更）", "sys");
-    return;
-  }
-  try {
-    chat = TIM.create({ SDKAppID: timCred.SDKAppID });
-    chat.setLogLevel(1);
-    chat.on(TIM.EVENT.MESSAGE_RECEIVED, (ev) => {
-      (ev.data || []).forEach((m) => {
-        const text =
-          (m.payload && m.payload.text) || JSON.stringify(m.payload || {}).slice(0, 80);
-        chatLine((m.from || "?") + ": " + text);
-      });
-    });
-    const imResp = await chat.login({
-      userID: timCred.userID,
-      userSig: timCred.userSig,
-    });
-    chatLine("TIM login ok", "sys");
-    $("btn-send").disabled = false;
-    show("out-im", { login: "ok", imResponse: imResp, cred: { userID: timCred.userID } });
-    log("tim login ok");
-  } catch (e) {
-    chatLine("TIM login fail: " + e, "sys");
-    show("out-im", { error: String(e), cred: timCred });
-    log("tim login err", String(e));
-  }
-};
-
-$("btn-send").onclick = async () => {
-  if (!chat || !window.TIM) return;
-  const to = $("peer-id").value.trim();
-  const text = $("msg-text").value.trim() || "hello from bbw";
-  if (!to) {
-    chatLine("填写对端 userID", "sys");
-    return;
-  }
-  try {
-    const msg = chat.createTextMessage({
-      to,
-      conversationType: TIM.TYPES.CONV_C2C,
-      payload: { text },
-    });
-    await chat.sendMessage(msg);
-    chatLine(text, "me");
-    log("sent", { to, text });
-  } catch (e) {
-    chatLine("send fail: " + e, "sys");
-  }
 };
 
 $("btn-pay-coin").onclick = async () => {
-  const data = await api("/api/pay/coin", {
+  const { data } = await api("/api/pay/coin", {
     method: "POST",
     body: JSON.stringify({
       channel: $("pay-channel").value,
@@ -173,25 +162,18 @@ $("btn-pay-coin").onclick = async () => {
     }),
   });
   show("out-pay", data);
-  log("pay coin", { ok: data.ok, channel: data.channel });
 };
 
 $("btn-pay-card").onclick = async () => {
-  const data = await api("/api/pay/card", {
+  const { data } = await api("/api/pay/card", {
     method: "POST",
     body: JSON.stringify({ card_id: "1" }),
   });
   show("out-pay", data);
-  log("buyCard", { ok: data.ok, message: data.message });
-};
-
-$("btn-pay-cap").onclick = async () => {
-  const data = await api("/api/pay/capabilities");
-  show("out-pay", data);
 };
 
 $("btn-face-init").onclick = async () => {
-  const data = await api("/api/face/init", {
+  const { data } = await api("/api/face/init", {
     method: "POST",
     body: JSON.stringify({
       cert_name: $("cert-name").value,
@@ -201,11 +183,10 @@ $("btn-face-init").onclick = async () => {
   });
   show("out-face", data);
   if (data.certify_id) $("certify-id").value = data.certify_id;
-  log("face init", { ok: data.init_ok, certify_id: data.certify_id });
 };
 
 $("btn-face-desc").onclick = async () => {
-  const data = await api("/api/face/describe", {
+  const { data } = await api("/api/face/describe", {
     method: "POST",
     body: JSON.stringify({
       cert_name: $("cert-name").value,
@@ -214,11 +195,58 @@ $("btn-face-desc").onclick = async () => {
     }),
   });
   show("out-face", data);
-  log("face describe", { ok: data.describe_ok });
 };
 
-$("btn-face-st").onclick = async () => {
-  show("out-face", await api("/api/face/status"));
+$("btn-call").onclick = async () => {
+  let params = {};
+  try {
+    params = JSON.parse($("call-params").value || "{}");
+  } catch (e) {
+    show("out-call", { error: "params JSON 无效" });
+    return;
+  }
+  const { data } = await api("/api/call", {
+    method: "POST",
+    body: JSON.stringify({
+      action: $("call-action").value.trim(),
+      params,
+    }),
+  });
+  show("out-call", data);
 };
 
-refreshMe().catch((e) => log("init fail", String(e)));
+$("btn-list").onclick = async () => {
+  const { data } = await api("/api/sessions");
+  show("out-admin", data);
+  const rows = (data.sessions || [])
+    .map(
+      (s) =>
+        `<tr><td>${(s.web_sid || "").slice(0, 8)}…</td><td>${
+          (s.user && s.user.uid) || ""
+        }</td><td>${(s.user && s.user.nickname) || ""}</td><td>${
+          s.heartbeat && s.heartbeat.running ? "hb" : "-"
+        }</td><td>${s.label || ""}</td></tr>`
+    )
+    .join("");
+  $("sess-table").innerHTML =
+    "<table><thead><tr><th>sid</th><th>uid</th><th>nick</th><th>hb</th><th>label</th></tr></thead><tbody>" +
+    rows +
+    "</tbody></table>";
+};
+
+// boot: try restore
+(async () => {
+  if (webSid) setSid(webSid);
+  const { status, data } = await api("/api/me");
+  if (status === 200 && data.ok && data.user && data.user.logged_in) {
+    showApp(true);
+    setHdr(data.user);
+    show("out-home", data);
+    log("restored session", data.user.uid);
+  } else {
+    showApp(false);
+    // health for login panel
+    const h = await api("/api/health");
+    show("out-login", h.data);
+  }
+})().catch((e) => log("init err", String(e)));

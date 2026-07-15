@@ -15,7 +15,7 @@
 | `enum_all_apis.py` | 生成 api_catalog.json（402 actions） |
 | **`bbw_protocol/`** | **完整协议客户端 + CLI（主入口）** |
 | **`bbw_protocol/adapters/`** | IM / face / pay 原生边车（`app.native`） |
-| **`bbw_web/`** | BFF + static 演示页（`python -m bbw_web`） |
+| **`bbw_web/`** | **多用户 Web 层**（与协议核隔离：`store` + BFF + UI） |
 | `enum_short.py` | 从源码枚举 do= / startHttp action |
 | `enum_apis.py` | 全量枚举（可能较慢） |
 

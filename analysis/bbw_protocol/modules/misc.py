@@ -13,22 +13,24 @@ class MiscAPI:
         self.c = client
 
     def update_online(self, first: bool = False) -> ApiResult:
+        s = self.c.session
         body = {
-            "id": self.c.session.uid,
-            "sign": sign.sign_token(self.c.session.uid),
-            "version_code": sign.VERSION_CODE,
+            "id": s.uid,
+            "sign": sign.sign_token(s.uid),
+            "version_code": getattr(s, "version_code", None) or sign.VERSION_CODE,
         }
         if first:
             body["first"] = "first"
         return self.c.call("UpdateOnline0", body)
 
     def front_or_back(self, frontorback: str = "1") -> ApiResult:
+        s = self.c.session
         return self.c.call_url(
             "https://redis.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=xiaobeifrontorback&m=rediscache",
-            myid=self.c.session.uid,
+            myid=s.uid,
             frontorback=frontorback,
-            phonebrand="Android",
-            pushregid="bbw_protocol",
+            phonebrand=getattr(s, "phonebrand", None) or "Android",
+            pushregid=getattr(s, "pushregid", None) or "bbw_protocol",
         )
 
     def check_age(self, cert_no: str) -> ApiResult:
