@@ -25,7 +25,7 @@
 | IM 实时收发 | ⚠️ 需官方 SDK | `bbw_web` + TIM |
 | 刷脸实名 | ⚠️ 仅 HTTP 编排 | `app.native.face` · 活体靠阿里云 |
 | 支付下单 | ⚠️ 仅 order 参数 | `app.native.pay` · 收银官方 |
-| 多用户 Web App（类 APK 界面） | ✅ | `python -m bbw_web` · 首页/匹配/社交/消息/我的 |
+| 全功能 Web App（PC/手机） | ✅ | `python -m bbw_web` · 10 大模块对齐 APK |
 
 ---
 
@@ -70,9 +70,10 @@ python -m bbw_protocol.cli native-status
 python -m bbw_protocol.cli im-tim
 python -m bbw_protocol.cli repl
 
-# —— Web App（像使用 APK：底部导航 首页/匹配/社交/消息/我的）——
+# —— 全功能 Web App（简洁 UI · PC 侧栏 / 手机底栏）——
 python -m bbw_web --port 8765
-# 浏览器打开 http://127.0.0.1:8765/
+# http://127.0.0.1:8765/
+# 首页·广场·匹配·社交·房间·消息·钱包·任务·我的·协议台
 ```
 
 ```python
@@ -95,10 +96,10 @@ print(app.native.im.tim_login_payload())   # 给 TIM Web SDK
 ## 架构（简）
 
 ```
-Browser SPA（类 App 五 Tab）
+Browser SPA（简洁浅色 · PC 侧栏 / 手机底栏）
         │ Cookie bbw_sid
         ▼
-   bbw_web BFF（语义 API + 多用户）
+   bbw_web BFF（全功能语义 API + 多用户）
         │
         ▼
    BeibeiwuApp ── adapters ──► TIM / 刷脸 / 支付 SDK（可选）
@@ -107,10 +108,9 @@ Browser SPA（类 App 五 Tab）
    banghua HTTP（与 APK 相同 do= / 签名 / token）
 ```
 
-- **Web 目标**：像使用 APK 一样完成登录、匹配、社交、任务、钱包等**业务路径**。  
-- **协议层**：与官方 App 同一套 Header / form。  
-- **原生层**：IM 长连接 / 刷脸活体 / 微信收银仍依赖厂商 SDK 或官方 App。  
-- **多用户**：每个浏览器独立会话 + 可选心跳。
+- **Web 目标**：APK 主功能域（首页/广场/匹配/社交/房间/消息/钱包/任务/我的）均可在浏览器操作。  
+- **协议台**：高级用户可直接调任意 `do=`（约 400+）。  
+- **原生边界**：IM 长连接 / 刷脸活体 / 微信收银仍依赖厂商 SDK 或官方 App。
 
 ---
 

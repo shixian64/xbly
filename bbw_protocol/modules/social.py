@@ -69,7 +69,7 @@ class SocialAPI:
         return self.c.call("luntanlike", postid=postid)
 
     def guangchang_like(self, id_: str) -> ApiResult:
-        return self.c.call("guangchanglike", **{"id": id_} if False else {})  # placeholder
+        return self.c.call("guangchanglike", id=id_)
 
     def report(
         self, type_: str, itemid: str, reason: str, myid: Optional[str] = None
