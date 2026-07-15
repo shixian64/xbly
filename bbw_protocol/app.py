@@ -18,7 +18,7 @@ from .modules.room import RoomAPI
 from .modules.social import SocialAPI
 from .session import Session
 
-CATALOG_PATH = Path(__file__).resolve().parent.parent / "api_catalog.json"
+CATALOG_PATH = Path(__file__).resolve().parent.parent / "docs" / "api_catalog.json"
 
 
 class BeibeiwuApp:

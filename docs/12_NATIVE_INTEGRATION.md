@@ -59,7 +59,7 @@ print(app.native.face.status_hint())
 ### 3.2 CLI
 
 ```powershell
-cd D:\project\AI\bbw\analysis
+cd <repo-root>
 python -m bbw_protocol.cli native-status
 python -m bbw_protocol.cli im-tim --prefer local
 python -m bbw_protocol.cli im-rong

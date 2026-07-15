@@ -31,7 +31,7 @@
 脚本可直接再跑：
 
 ```powershell
-python D:\project\AI\bbw\analysis\profile_edit.py
+python tools/profile_edit.py
 ```
 
 （按需把目标昵称写死为 Vom，已是默认）

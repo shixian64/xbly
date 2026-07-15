@@ -420,24 +420,24 @@ HTTP 主路径已协议化；通用 `call` 覆盖全部枚举 action。原生 SD
 
 ```powershell
 # 签名 demo
-python D:\project\AI\bbw\analysis\bbw_client.py demo
+python tools/bbw_client.py demo
 
 # 登录探测
-python D:\project\AI\bbw\analysis\auth_flow.py probe
-python D:\project\AI\bbw\analysis\auth_flow.py login
+python tools/auth_flow.py probe
+python tools/auth_flow.py login
 
 # 资料修改探测
-python D:\project\AI\bbw\analysis\profile_edit.py
+python tools/profile_edit.py
 
 # 实名相关接口探测
-python D:\project\AI\bbw\analysis\rp_verify_probe.py
+python tools/rp_verify_probe.py
 
 # 游客能力矩阵
-python D:\project\AI\bbw\analysis\guest_gates_scan.py
-python D:\project\AI\bbw\analysis\guest_capability_probe.py
+python tools/guest_gates_scan.py
+python tools/guest_capability_probe.py
 
 # 协议客户端
-cd D:\project\AI\bbw\analysis
+cd <repo-root>
 python -m bbw_protocol.cli login --phone PHONE --password PASS
 python -m bbw_protocol.cli bootstrap
 python -m bbw_protocol.cli call getGiftList

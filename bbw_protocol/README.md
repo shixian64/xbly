@@ -17,7 +17,7 @@
 | ⚠️ 阿里云刷脸 | `adapters.face` 编排 Init/Describe；活体 metaInfo 仍靠 ZIM |
 | ⚠️ 支付收银台 | `adapters.pay` 规范 order_params；收银靠微信/支付宝官方 |
 
-完整 action 目录：`../api_catalog.json`（402 actions）。  
+完整 action 目录：`../docs/api_catalog.json`（402 actions）。  
 原生边车：`adapters/` + Web BFF：`../bbw_web/`。
 
 ## 安装 / 运行
@@ -25,7 +25,7 @@
 无需第三方依赖（stdlib only）。
 
 ```powershell
-cd D:\project\AI\bbw\analysis
+cd <repo-root>
 
 # CLI
 python -m bbw_protocol.cli whoami
@@ -41,7 +41,7 @@ python -m bbw_protocol.cli actions --cat social
 python -m bbw_protocol.cli repl
 ```
 
-会话默认保存在 `analysis/session.json`。
+会话默认保存在 `session.json`。
 
 ## Python API
 

@@ -1,7 +1,7 @@
 """Multi-user web session store — isolated from bbw_protocol core.
 
 Each browser gets a web_sid cookie/token → one BeibeiwuApp instance + optional heartbeat.
-Protocol sessions are saved under analysis/sessions/{uid}.json (gitignored).
+Protocol sessions are saved under sessions/{uid}.json (gitignored).
 """
 
 from __future__ import annotations
@@ -21,8 +21,8 @@ from bbw_protocol.heartbeat import Heartbeat
 from bbw_protocol.session import Session
 
 # bbw_web owns multi-user paths; protocol core stays single-session oriented
-ANALYSIS_ROOT = Path(__file__).resolve().parent.parent
-SESSIONS_DIR = ANALYSIS_ROOT / "sessions"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SESSIONS_DIR = REPO_ROOT / "sessions"
 WEB_META_DIR = Path(__file__).resolve().parent / "data"
 
 

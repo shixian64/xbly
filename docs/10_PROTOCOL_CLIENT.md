@@ -1,8 +1,8 @@
 # 10 · 全功能协议客户端落地
 
 **最后更新：** 2026-07-15  
-**包路径：** `analysis/bbw_protocol/`  
-**Action 目录：** `analysis/api_catalog.json`（**402** 个 action）
+**包路径：** `bbw_protocol/`  
+**Action 目录：** `docs/api_catalog.json`（**402** 个 action）
 
 ---
 
@@ -28,7 +28,7 @@
 ### 2.1 快速开始
 
 ```powershell
-cd D:\project\AI\bbw\analysis
+cd <repo-root>
 
 # 登录（保存 session.json）
 python -m bbw_protocol.cli login --phone 19122614669 --password "YOUR_PASSWORD"

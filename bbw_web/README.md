@@ -26,7 +26,7 @@
 ## 启动
 
 ```powershell
-cd D:\project\AI\bbw\analysis
+cd <repo-root>
 python -m bbw_web --port 8765
 # http://127.0.0.1:8765/
 ```
@@ -74,7 +74,7 @@ python -m bbw_web
 
 | 文件 | 归属 |
 |---|---|
-| `analysis/session.json` | 协议 CLI 默认 |
+| `session.json` | 协议 CLI 默认 |
 | `analysis/sessions/{uid}.json` | Web 多用户落盘 |
 
 ## 安全

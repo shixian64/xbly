@@ -284,7 +284,7 @@ APK 功能
 ### 未实名现在就能当「半个 App」用
 
 ```powershell
-cd D:\project\AI\bbw\analysis
+cd <repo-root>
 python -m bbw_protocol.cli login --phone ... --password ...
 python -m bbw_protocol.cli bootstrap
 python -m bbw_protocol.cli gifts
