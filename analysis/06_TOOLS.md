@@ -4,20 +4,22 @@
 
 ## 1. 工具一览
 
-| 脚本 | 用途 |
-|---|---|
-| `bbw_client.py` | 客户端签名算法、UserSig、curl 模板（默认不发网） |
-| `auth_flow.py` | 登录/注册/短信/改密协议探测 |
-| `profile_edit.py` | 登录后改昵称/角色/VIP 探测 |
-| `rp_verify_probe.py` | 实名相关接口探测（Init/Describe/Save/人工） |
-| `guest_gates_scan.py` | 静态扫描登录/实名/VIP 门禁文案与条件 |
-| `guest_capability_probe.py` | L0/L1 协议能力批测 → JSON 矩阵 |
-| `enum_all_apis.py` | 生成 api_catalog.json（402 actions） |
-| **`bbw_protocol/`** | **完整协议客户端 + CLI（主入口）** |
-| **`bbw_protocol/adapters/`** | IM / face / pay 原生边车（`app.native`） |
-| **`bbw_web/`** | **多用户 Web 层**（与协议核隔离：`store` + BFF + UI） |
-| `enum_short.py` | 从源码枚举 do= / startHttp action |
-| `enum_apis.py` | 全量枚举（可能较慢） |
+**日常主入口：** `python -m bbw_protocol.cli` · `python -m bbw_web`
+
+| 脚本 | 用途 | 备注 |
+|---|---|---|
+| **`bbw_protocol/`** | 协议客户端 + CLI | **主入口** |
+| **`bbw_web/`** | 多用户 BFF + UI | 与核隔离 |
+| `bbw_client.py` | 早期签名/UserSig 模板 | 已被 protocol 覆盖 |
+| `auth_flow.py` | 登录/短信/改密探测 | 可选 |
+| `profile_edit.py` | 改昵称/角色探测 | 可选 |
+| `rp_verify_probe.py` | 实名接口探测 | 可选 |
+| `guest_gates_scan.py` | 门禁文案静态扫 | 需 `jadx_out` |
+| `guest_capability_probe.py` | L0/L1 批测 | 可选 |
+| `enum_all_apis.py` / `enum_short.py` / `enum_apis.py` | 生成 catalog | 需源码树 |
+| `coverage_report.py` | 覆盖率摘要 | 可选 |
+
+本地不入库：`session.json`、`sessions/`、`jadx_out/`、`*.apk`（见根目录 `.gitignore`）。
 
 ## 2. bbw_client.py
 

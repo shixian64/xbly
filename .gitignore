@@ -1,14 +1,17 @@
-# Large / regenerable binaries
+# Large / regenerable binaries & decompile trees
 beibeiwu.apk
 xbly.apk
+*.apk
 jadx_out/
+apk_extracted/
 analysis/asset_408037528/
 analysis/assets/
 
-# Live secrets / session tokens
+# Live secrets / session tokens / probe dumps
 analysis/session.json
 analysis/login_session.json
 analysis/rp_verify_probe_result.json
+analysis/guest_capability_results.json
 analysis/sessions/
 analysis/bbw_web/data/
 

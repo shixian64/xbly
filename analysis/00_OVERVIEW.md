@@ -19,47 +19,41 @@
 | 后端形态 | 微擎 WeEngine 风格 `app/index.php?i=...&do=...&m=socialchat` |
 | 主域名 | `applet.banghua.xin` / `redis.banghua.xin` / `oss.banghua.xin` |
 
-## 3. 工作区结构
+## 3. 工作区结构（精简）
 
 ```
 D:\project\AI\bbw\
-├── beibeiwu.apk
-├── jadx_out\                 # jadx 反编译
-│   ├── sources\
-│   └── resources\
-└── analysis\                 # 文档 + 脚本 + 提取物（本目录）
-    ├── README.md
-    ├── 00_OVERVIEW.md
-    ├── 01_STATIC_ANALYSIS.md
-    ├── 02_PROTOCOL.md
-    ├── 03_TEST_LOG.md
-    ├── 04_FINDINGS.md
-    ├── 05_ACCOUNT.md
-    ├── 06_TOOLS.md
-    ├── 07_NEXT.md
-    ├── DEEP_DIVE.md
-    ├── bbw_client.py
-    ├── auth_flow.py
-    ├── profile_edit.py
-    ├── login_session.json
-    ├── assets\
-    └── asset_408037528\
+├── xbly.apk / beibeiwu.apk   # 本地 APK（gitignore）
+├── .gitignore
+└── analysis\                 # 文档 + 协议核 + Web（入库主体）
+    ├── README.md             # 索引
+    ├── 00_…13_*.md           # 分析文档
+    ├── api_catalog.json
+    ├── bbw_protocol/         # 协议核
+    ├── bbw_web/              # 多用户 Web
+    ├── bbw_client.py …       # 可选早期探测脚本
+    └── （本地）session.json / sessions/  # gitignore
 ```
+
+历史反编译树 `jadx_out/`、提取物 `assets/` 等**已清理**，需要时从 APK 再生。  
+文档列表见 [README.md](./README.md)。
 
 ## 4. 进度
 
 | 阶段 | 状态 | 说明 |
 |---|---|---|
-| APK 结构摸底 | ✅ | 12 dex、63 so、assets 分析 |
-| jadx 反编译 | ✅ | 输出 `jadx_out/`，约 4 万文件 |
+| APK 结构摸底 | ✅ | 结论已写入 01 |
+| jadx 反编译 | ✅ | 本地树可删可再生 |
 | 鉴权算法还原 | ✅ | SIGN/EXPIRE/UNIQUE/AUTHOR-SIG |
 | 硬编码密钥梳理 | ✅ | 融云/腾讯 IM/微信/推送等 |
 | 登录协议测试 | ✅ | 短信 + 一键登录洞 + 改密 + 密码登录 |
 | 资料修改测试 | ✅ | 昵称/角色/VIP 探测 |
 | 用户实名 | ⏳ | **用户自行在 App 操作** |
 | 实名后改昵称 | ⏳ | 待实名完成再测 `resetNew` |
-| 游客能力矩阵 | ✅ | 见 09；L0/L1 协议批测完成 |
-| 协议客户端落地 | ✅ | `bbw_protocol` + CLI + 402 action 目录 |
+| 游客能力矩阵 | ✅ | 见 09 |
+| 协议客户端落地 | ✅ | `bbw_protocol` + CLI + catalog |
+| 原生/多用户 Web | ✅ | adapters + `bbw_web` |
+| 协议跟版 v154 | ✅ | 见 13 |
 | 越权/支付深测 | ⏳ | 见 07_NEXT |
 
 ## 5. 测试账号（摘要）

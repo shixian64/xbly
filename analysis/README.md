@@ -32,24 +32,18 @@
 
 ---
 
-## 产物路径
+## 产物路径（精简后）
 
 | 路径 | 说明 |
 |---|---|
-| `../beibeiwu.apk` | 原始 APK（约 253MB） |
-| `../jadx_out/` | jadx 反编译输出（sources + resources） |
-| `./bbw_protocol/` | **协议核**（CLI / 单会话，无 Web） |
-| `./bbw_protocol/adapters/` | IM / face / pay 原生边车 |
-| `./bbw_web/` | **Web 层**（多用户 BFF + UI，与核隔离） |
-| `./sessions/` | Web 多用户协议会话落盘（gitignore） |
-| `./api_catalog.json` | 402 个 action 目录 |
-| `./session.json` | 协议客户端登录会话 |
-| `./bbw_client.py` | 早期签名/UserSig/请求模板 |
-| `./auth_flow.py` | 登录注册协议探测 |
-| `./profile_edit.py` | 昵称/角色/VIP 修改探测 |
-| `./login_session.json` | 最近一次登录会话快照 |
-| `./assets/` | 从 APK 提取的配置/证书等 |
-| `./asset_408037528/` | 穿山甲嵌套包解压结果（非业务） |
+| `../xbly.apk` / `../beibeiwu.apk` | 原始 APK（本地保留，**gitignore**，不入库） |
+| `./bbw_protocol/` | **协议核**（CLI / 单会话） |
+| `./bbw_web/` | **Web 层**（多用户 BFF + UI） |
+| `./api_catalog.json` | action 目录（v154） |
+| `./bbw_client.py` 等 | 早期探测脚本（可选；主入口用 `bbw_protocol`） |
+| `session.json` / `sessions/` | 登录会话（本地，**gitignore**） |
+
+**已清理、勿再提交：** `jadx_out/`、`apk_extracted/`、`analysis/assets/`、`asset_408037528/`、`__pycache__/`、各类 `*_results.json`。需要时从 APK 用 jadx 重新反编译即可。
 
 ---
 
