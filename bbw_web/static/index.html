@@ -2,229 +2,261 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>bbw_web · 多用户</title>
-  <style>
-    :root {
-      --bg: #0f1419; --card: #1a2332; --text: #e7ecf3; --muted: #8b9bb4;
-      --accent: #3d8bfd; --ok: #3dd68c; --warn: #f5a524; --err: #f31260;
-      --border: #2a3548;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0; font-family: "Segoe UI", system-ui, sans-serif;
-      background: var(--bg); color: var(--text); line-height: 1.5; min-height: 100vh;
-    }
-    header {
-      padding: 1rem 1.25rem; border-bottom: 1px solid var(--border);
-      display: flex; flex-wrap: wrap; gap: .75rem; align-items: center;
-      justify-content: space-between;
-    }
-    header h1 { margin: 0; font-size: 1.1rem; }
-    .meta { color: var(--muted); font-size: .8rem; }
-    main { max-width: 980px; margin: 0 auto; padding: 1rem; display: grid; gap: 1rem; }
-    .card {
-      background: var(--card); border: 1px solid var(--border);
-      border-radius: 12px; padding: 1rem 1.1rem;
-    }
-    .card h2 { margin: 0 0 .65rem; font-size: .95rem; }
-    label { display: block; font-size: .78rem; color: var(--muted); margin-bottom: .2rem; }
-    input, select, textarea {
-      width: 100%; padding: .45rem .6rem; border-radius: 8px; margin-bottom: .55rem;
-      border: 1px solid var(--border); background: #121a26; color: var(--text); font: inherit;
-    }
-    .row { display: grid; grid-template-columns: 1fr 1fr; gap: .65rem; }
-    @media (max-width: 640px) { .row { grid-template-columns: 1fr; } }
-    button {
-      cursor: pointer; border: none; border-radius: 8px;
-      padding: .45rem .85rem; font: inherit; font-weight: 500;
-      background: var(--accent); color: #fff;
-    }
-    button.secondary { background: #2a3548; color: var(--text); }
-    button.danger { background: #5c1a2e; color: #ffb4c8; }
-    .actions { display: flex; flex-wrap: wrap; gap: .45rem; margin: .35rem 0; }
-    pre {
-      margin: .55rem 0 0; padding: .65rem; border-radius: 8px;
-      background: #0c1018; border: 1px solid var(--border);
-      font-size: .72rem; overflow: auto; max-height: 240px;
-      white-space: pre-wrap; word-break: break-all; color: #b8c4d8;
-    }
-    .badge {
-      font-size: .68rem; padding: .12rem .4rem; border-radius: 999px;
-      background: #243044; color: var(--muted);
-    }
-    .badge.ok { background: #163528; color: var(--ok); }
-    .badge.warn { background: #3a2a10; color: var(--warn); }
-    .hidden { display: none !important; }
-    .hint { font-size: .78rem; color: var(--muted); margin: 0 0 .5rem; }
-    .tabs { display: flex; gap: .35rem; margin-bottom: .75rem; flex-wrap: wrap; }
-    .tabs button { background: #243044; font-size: .85rem; }
-    .tabs button.active { background: var(--accent); }
-    table { width: 100%; border-collapse: collapse; font-size: .8rem; }
-    th, td { text-align: left; padding: .35rem .4rem; border-bottom: 1px solid var(--border); }
-  </style>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0f14" />
+  <title>小贝乐园</title>
+  <link rel="stylesheet" href="/static/app.css" />
 </head>
 <body>
-  <header>
-    <div>
-      <h1>bbw_web <span class="badge">多用户</span></h1>
-      <div class="meta">模块隔离：Web 会话 ≠ 协议核 · Cookie <code>bbw_sid</code></div>
+  <div id="toast" class="toast hidden"></div>
+
+  <!-- ===== LOGIN ===== -->
+  <div id="view-login" class="view">
+    <div class="login-hero">
+      <div class="logo">贝</div>
+      <h1>小贝乐园</h1>
+      <p class="sub">Web · 像使用 App 一样</p>
     </div>
-    <div class="meta" id="hdr-user">未登录</div>
-  </header>
-  <main>
-    <!-- LOGIN -->
-    <section class="card" id="panel-login">
-      <h2>登录 <span class="badge">每浏览器独立会话</span></h2>
-      <p class="hint">多用户：A/B 两个浏览器（或无痕）可同时登录不同账号；服务端用 web_sid 隔离 BeibeiwuApp。</p>
-      <div class="row">
-        <div>
-          <label>手机号</label>
-          <input id="phone" autocomplete="username" />
-        </div>
-        <div>
-          <label>密码</label>
-          <input id="password" type="password" autocomplete="current-password" />
+    <div class="login-card">
+      <div class="seg">
+        <button type="button" class="seg-btn active" data-mode="password">密码登录</button>
+        <button type="button" class="seg-btn" data-mode="onekey">一键登录</button>
+        <button type="button" class="seg-btn" data-mode="sms">短信登录</button>
+      </div>
+      <label>手机号</label>
+      <input id="login-phone" type="tel" inputmode="numeric" placeholder="11 位手机号" autocomplete="username" />
+      <div id="login-pass-wrap">
+        <label>密码</label>
+        <input id="login-pass" type="password" placeholder="登录密码" autocomplete="current-password" />
+      </div>
+      <div id="login-sms-wrap" class="hidden">
+        <label>验证码</label>
+        <div class="row-inline">
+          <input id="login-code" type="text" inputmode="numeric" placeholder="短信验证码" />
+          <button type="button" class="btn secondary" id="btn-sms">获取验证码</button>
         </div>
       </div>
-      <div class="row">
-        <div>
-          <label>模式</label>
-          <select id="login-mode">
-            <option value="password">密码 signin0</option>
-            <option value="onekey">一键 SigninOneKeyLogin1（弱）</option>
-          </select>
-        </div>
-        <div>
-          <label>标签（可选）</label>
-          <input id="label" placeholder="我的号" />
-        </div>
-      </div>
-      <div class="actions">
-        <button type="button" id="btn-login">登录</button>
-        <button type="button" class="secondary" id="btn-health">健康检查</button>
-      </div>
-      <pre id="out-login">{}</pre>
-    </section>
+      <button type="button" class="btn primary block" id="btn-login">进入乐园</button>
+      <p class="hint center" id="login-hint">登录后将同步礼物、推荐、在线状态（与 App 同协议）</p>
+      <p class="err center" id="login-err"></p>
+    </div>
+  </div>
 
-    <!-- APP -->
-    <section class="card hidden" id="panel-app">
-      <div class="actions" style="justify-content:space-between">
-        <div>
-          <span class="badge ok" id="sess-badge">已登录</span>
-          <span class="meta" id="sid-show"></span>
-        </div>
-        <div class="actions">
-          <button type="button" class="secondary" id="btn-refresh">刷新 me</button>
-          <button type="button" class="danger" id="btn-logout">退出</button>
-        </div>
+  <!-- ===== APP SHELL ===== -->
+  <div id="view-app" class="view hidden">
+    <header class="topbar">
+      <div>
+        <div class="top-title" id="top-title">首页</div>
+        <div class="top-sub" id="top-sub">—</div>
       </div>
+      <button type="button" class="icon-btn" id="btn-refresh" title="刷新">↻</button>
+    </header>
 
-      <div class="tabs">
-        <button type="button" class="active" data-tab="tab-home">概览</button>
-        <button type="button" data-tab="tab-im">IM</button>
-        <button type="button" data-tab="tab-pay">支付</button>
-        <button type="button" data-tab="tab-face">刷脸</button>
-        <button type="button" data-tab="tab-call">协议 call</button>
-        <button type="button" data-tab="tab-admin">在线会话</button>
-      </div>
-
-      <div id="tab-home">
-        <p class="hint">心跳由 BFF 在登录后自动启动（UpdateOnline0）。</p>
-        <div class="actions">
-          <button type="button" id="btn-boot">bootstrap</button>
-          <button type="button" class="secondary" id="btn-gifts">礼物列表</button>
-          <button type="button" class="secondary" id="btn-profile">拉资料</button>
-          <button type="button" class="secondary" id="btn-hb-once">心跳一次</button>
-        </div>
-        <pre id="out-home">{}</pre>
-      </div>
-
-      <div id="tab-im" class="hidden">
-        <div class="row">
-          <div>
-            <label>prefer</label>
-            <select id="tim-prefer">
-              <option value="local">local UserSig</option>
-              <option value="server">server tximsign</option>
-            </select>
-          </div>
-          <div>
-            <label>对端 uid</label>
-            <input id="peer-id" />
+    <main class="pages">
+      <!-- HOME -->
+      <section class="page active" data-page="home">
+        <div class="banner" id="home-banner">
+          <div class="banner-title">你好，<span id="home-nick">游客</span></div>
+          <div class="banner-meta">
+            <span id="home-uid">uid —</span>
+            <span class="dot">·</span>
+            <span id="home-realname">未实名</span>
+            <span class="dot">·</span>
+            <span id="home-hb">心跳 —</span>
           </div>
         </div>
-        <div class="actions">
-          <button type="button" id="btn-tim">TIM 凭证</button>
-          <button type="button" class="secondary" id="btn-rong">融云 token</button>
+        <div class="section-h">发现</div>
+        <div class="chips" id="home-chips">
+          <button type="button" class="chip" data-go="match">去匹配</button>
+          <button type="button" class="chip" data-go="social">社交</button>
+          <button type="button" class="chip" data-go="wallet">钱包</button>
+          <button type="button" class="chip" data-go="tasks">任务</button>
         </div>
-        <pre id="out-im">{}</pre>
-      </div>
+        <div class="section-h">推荐</div>
+        <div class="card-list" id="home-recommend"><div class="empty">加载中…</div></div>
+        <div class="section-h">礼物一览</div>
+        <div class="gift-scroll" id="home-gifts"><div class="empty">—</div></div>
+      </section>
 
-      <div id="tab-pay" class="hidden">
-        <div class="row">
+      <!-- MATCH -->
+      <section class="page" data-page="match">
+        <div class="section-h">匹配状态</div>
+        <div class="stat-grid" id="match-stats">
+          <div class="stat"><div class="stat-v" id="st-online">—</div><div class="stat-l">在线免费</div></div>
+          <div class="stat"><div class="stat-v" id="st-local">—</div><div class="stat-l">同城免费</div></div>
+          <div class="stat"><div class="stat-v" id="st-card">—</div><div class="stat-l">匹配卡</div></div>
+          <div class="stat"><div class="stat-v" id="st-money">—</div><div class="stat-l">乐园币</div></div>
+        </div>
+        <div class="section-h">开始匹配</div>
+        <div class="action-grid">
+          <button type="button" class="action-card" id="btn-match-online">
+            <span class="ac-icon">⚡</span>
+            <span class="ac-t">在线匹配</span>
+            <span class="ac-d">需实名；有免费次数优先</span>
+          </button>
+          <button type="button" class="action-card" id="btn-match-local">
+            <span class="ac-icon">📍</span>
+            <span class="ac-t">同城匹配</span>
+            <span class="ac-d">需实名 + 匹配卡</span>
+          </button>
+          <button type="button" class="action-card" id="btn-bottle-pick">
+            <span class="ac-icon">🍾</span>
+            <span class="ac-t">捡漂流瓶</span>
+            <span class="ac-d">PickADraftBottle</span>
+          </button>
+          <button type="button" class="action-card" id="btn-bottle-throw">
+            <span class="ac-icon">🌊</span>
+            <span class="ac-t">扔漂流瓶</span>
+            <span class="ac-d">需要文案参数</span>
+          </button>
+        </div>
+        <div class="section-h">匹配结果</div>
+        <div class="card-list" id="match-result"><div class="empty">点上方按钮开始</div></div>
+        <div class="section-h">乐园币买卡</div>
+        <button type="button" class="btn secondary block" id="btn-buy-card">buyCard（乐园币）</button>
+      </section>
+
+      <!-- SOCIAL -->
+      <section class="page" data-page="social">
+        <div class="section-h">找人</div>
+        <div class="row-inline">
+          <input id="social-uid" placeholder="对方 uid" />
+          <button type="button" class="btn primary" id="btn-follow">关注</button>
+          <button type="button" class="btn secondary" id="btn-view-user">资料</button>
+        </div>
+        <div class="seg small">
+          <button type="button" class="seg-btn active" data-slist="follows">关注</button>
+          <button type="button" class="seg-btn" data-slist="fans">粉丝</button>
+          <button type="button" class="seg-btn" data-slist="apply">好友申请</button>
+        </div>
+        <div class="card-list" id="social-list"><div class="empty">加载中…</div></div>
+        <div class="section-h">用户卡片</div>
+        <div class="card-list" id="social-user"><div class="empty">输入 uid 查看</div></div>
+      </section>
+
+      <!-- MSG / IM -->
+      <section class="page" data-page="msg">
+        <div class="section-h">即时消息</div>
+        <p class="hint">协议侧已拿到腾讯 IM 凭证。完整收发需浏览器加载 TIM Web SDK；此处先展示凭证与能力说明。</p>
+        <div class="info-card" id="im-info">未加载</div>
+        <div class="row-inline">
+          <button type="button" class="btn primary" id="btn-im-cred">获取 TIM 凭证</button>
+          <button type="button" class="btn secondary" id="btn-im-rong">融云 token</button>
+        </div>
+        <div class="section-h">试发（需 TIM SDK）</div>
+        <div class="row-inline">
+          <input id="im-peer" placeholder="对端 userID（uid）" />
+        </div>
+        <div class="row-inline">
+          <input id="im-text" placeholder="消息内容" />
+          <button type="button" class="btn secondary" id="btn-im-send" disabled>发送</button>
+        </div>
+        <div class="chat-log" id="im-log"></div>
+        <pre class="code" id="im-json"></pre>
+      </section>
+
+      <!-- ME -->
+      <section class="page" data-page="me">
+        <div class="me-card">
+          <div class="avatar" id="me-avatar">游</div>
           <div>
-            <label>渠道</label>
-            <select id="pay-channel">
-              <option value="wechat">微信</option>
-              <option value="alipay">支付宝</option>
-            </select>
-          </div>
-          <div>
-            <label>coin_id</label>
-            <input id="coin-id" value="1" />
+            <div class="me-name" id="me-name">—</div>
+            <div class="me-meta" id="me-meta">—</div>
           </div>
         </div>
-        <div class="actions">
-          <button type="button" id="btn-pay-coin">充币下单</button>
-          <button type="button" class="secondary" id="btn-pay-card">乐园币买卡</button>
+        <div class="menu">
+          <button type="button" class="menu-item" data-panel="profile">
+            <span>我的资料</span><span class="arrow">›</span>
+          </button>
+          <button type="button" class="menu-item" data-panel="nick">
+            <span>修改昵称</span><span class="arrow">›</span>
+          </button>
+          <button type="button" class="menu-item" data-panel="wallet">
+            <span>钱包 / VIP</span><span class="arrow">›</span>
+          </button>
+          <button type="button" class="menu-item" data-panel="tasks">
+            <span>热门任务</span><span class="arrow">›</span>
+          </button>
+          <button type="button" class="menu-item" data-panel="room">
+            <span>语音房</span><span class="arrow">›</span>
+          </button>
+          <button type="button" class="menu-item" data-panel="face">
+            <span>实名认证说明</span><span class="arrow">›</span>
+          </button>
+          <button type="button" class="menu-item" data-panel="dev">
+            <span>开发：任意协议</span><span class="arrow">›</span>
+          </button>
         </div>
-        <pre id="out-pay">{}</pre>
-      </div>
+        <button type="button" class="btn danger block" id="btn-logout">退出登录</button>
+        <div class="panel hidden" id="panel-profile">
+          <div class="section-h">资料 JSON</div>
+          <pre class="code" id="me-profile-json"></pre>
+        </div>
+        <div class="panel hidden" id="panel-nick">
+          <div class="section-h">修改昵称</div>
+          <p class="hint">未实名会 403。实名后受改名次数/改名卡限制。</p>
+          <input id="nick-input" placeholder="新昵称" />
+          <button type="button" class="btn primary block" id="btn-nick">提交 resetNew</button>
+          <pre class="code" id="nick-out"></pre>
+        </div>
+        <div class="panel hidden" id="panel-wallet">
+          <div class="section-h">钱包</div>
+          <div class="stat-grid" id="wallet-stats"></div>
+          <div class="row-inline">
+            <button type="button" class="btn secondary" id="btn-svip-try">SVIP 试用</button>
+            <button type="button" class="btn secondary" id="btn-exchange-vip">余额兑 VIP</button>
+          </div>
+          <div class="row-inline">
+            <select id="pay-channel"><option value="wechat">微信</option><option value="alipay">支付宝</option></select>
+            <input id="coin-id" value="1" style="max-width:80px" />
+            <button type="button" class="btn primary" id="btn-pay-coin">充币下单</button>
+          </div>
+          <p class="hint">下单成功 ≠ 到账。收银需官方微信/支付宝（商户绑官方包名）。</p>
+          <pre class="code" id="wallet-out"></pre>
+        </div>
+        <div class="panel hidden" id="panel-tasks">
+          <div class="section-h">热门任务</div>
+          <button type="button" class="btn secondary block" id="btn-tasks-load">刷新任务列表</button>
+          <div class="card-list" id="tasks-list"><div class="empty">—</div></div>
+          <div class="row-inline">
+            <input id="task-id" placeholder="任务 id" />
+            <button type="button" class="btn primary" id="btn-task-recv">领取</button>
+          </div>
+          <p class="hint">进度由服务端统计；空 progress 领取通常无效。</p>
+        </div>
+        <div class="panel hidden" id="panel-room">
+          <div class="section-h">语音房</div>
+          <button type="button" class="btn secondary block" id="btn-room-top">房间榜 getRoomTop</button>
+          <div class="row-inline">
+            <input id="room-type" value="处CP" />
+            <button type="button" class="btn primary" id="btn-room-create">创建房间</button>
+          </div>
+          <pre class="code" id="room-out"></pre>
+        </div>
+        <div class="panel hidden" id="panel-face">
+          <div class="section-h">实名</div>
+          <p class="hint">活体必须走阿里云 ZIM。Web 仅编排 Init/Describe；建议在官方 App 完成实名。</p>
+          <pre class="code" id="face-out"></pre>
+        </div>
+        <div class="panel hidden" id="panel-dev">
+          <div class="section-h">任意 do= 调用</div>
+          <input id="dev-action" placeholder="Action 名，如 getGiftList" />
+          <textarea id="dev-params" rows="3">{}</textarea>
+          <button type="button" class="btn primary block" id="btn-dev-call">执行</button>
+          <pre class="code" id="dev-out"></pre>
+        </div>
+      </section>
+    </main>
 
-      <div id="tab-face" class="hidden">
-        <p class="hint">metaInfo 须来自阿里云 ZIM SDK。</p>
-        <div class="row">
-          <div><label>姓名</label><input id="cert-name" /></div>
-          <div><label>身份证</label><input id="cert-no" /></div>
-        </div>
-        <label>metaInfo</label>
-        <textarea id="meta-info" rows="2"></textarea>
-        <label>certifyId</label>
-        <input id="certify-id" />
-        <div class="actions">
-          <button type="button" id="btn-face-init">Init</button>
-          <button type="button" class="secondary" id="btn-face-desc">Describe</button>
-        </div>
-        <pre id="out-face">{}</pre>
-      </div>
+    <nav class="tabbar">
+      <button type="button" class="tab active" data-page="home"><span>🏠</span>首页</button>
+      <button type="button" class="tab" data-page="match"><span>💫</span>匹配</button>
+      <button type="button" class="tab" data-page="social"><span>👥</span>社交</button>
+      <button type="button" class="tab" data-page="msg"><span>💬</span>消息</button>
+      <button type="button" class="tab" data-page="me"><span>👤</span>我的</button>
+    </nav>
+  </div>
 
-      <div id="tab-call" class="hidden">
-        <label>action</label>
-        <input id="call-action" placeholder="getGiftList" />
-        <label>params JSON</label>
-        <textarea id="call-params" rows="3">{}</textarea>
-        <div class="actions">
-          <button type="button" id="btn-call">执行 call</button>
-        </div>
-        <pre id="out-call">{}</pre>
-      </div>
-
-      <div id="tab-admin" class="hidden">
-        <p class="hint">本机 BFF 内存中的全部 web 会话（多用户可见性）。</p>
-        <div class="actions">
-          <button type="button" id="btn-list">刷新列表</button>
-        </div>
-        <div id="sess-table"></div>
-        <pre id="out-admin">{}</pre>
-      </div>
-    </section>
-
-    <section class="card">
-      <h2>日志</h2>
-      <pre id="log" style="max-height:160px"></pre>
-    </section>
-  </main>
   <script src="/static/app.js"></script>
 </body>
 </html>

@@ -86,7 +86,7 @@ class SessionStore:
         heartbeat_interval: float = 55.0,
     ):
         self._lock = threading.RLock()
-        self._users: Dict[str, WebUser] = {}
+        self.users: Dict[str, WebUser] = {}
         self.ttl_sec = ttl_sec
         self.auto_heartbeat = auto_heartbeat
         self.heartbeat_interval = heartbeat_interval
@@ -110,14 +110,14 @@ class SessionStore:
                 native=NativeBundle(app),
                 label=label or "",
             )
-            self._users[sid] = user
+            self.users[sid] = user
             return user
 
     def get(self, web_sid: Optional[str]) -> Optional[WebUser]:
         if not web_sid:
             return None
         with self._lock:
-            u = self._users.get(web_sid)
+            u = self.users.get(web_sid)
             if not u:
                 return None
             if time.time() - u.last_seen > self.ttl_sec:
@@ -137,7 +137,7 @@ class SessionStore:
             return self._drop(web_sid)
 
     def _drop(self, web_sid: str) -> bool:
-        u = self._users.pop(web_sid, None)
+        u = self.users.pop(web_sid, None)
         if not u:
             return False
         u.stop_heartbeat()
@@ -149,7 +149,7 @@ class SessionStore:
 
     def purge_expired(self) -> int:
         now = time.time()
-        dead = [k for k, v in self._users.items() if now - v.last_seen > self.ttl_sec]
+        dead = [k for k, v in self.users.items() if now - v.last_seen > self.ttl_sec]
         for k in dead:
             self._drop(k)
         return len(dead)
@@ -157,7 +157,7 @@ class SessionStore:
     def list_public(self) -> List[Dict[str, Any]]:
         with self._lock:
             self.purge_expired()
-            return [u.public() for u in self._users.values()]
+            return [u.public() for u in self.users.values()]
 
     def login_password(
         self,
@@ -234,10 +234,15 @@ class SessionStore:
             user.touch()
             return user
 
+    def put(self, user: WebUser) -> None:
+        """Register / replace a WebUser in the store (e.g. after sms login)."""
+        with self._lock:
+            self.users[user.web_sid] = user
+
     def stats(self) -> Dict[str, Any]:
         with self._lock:
             return {
-                "active_web_sessions": len(self._users),
+                "active_web_sessions": len(self.users),
                 "sessions_dir": str(SESSIONS_DIR),
                 "ttl_sec": self.ttl_sec,
                 "auto_heartbeat": self.auto_heartbeat,

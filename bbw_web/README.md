@@ -1,84 +1,64 @@
-# bbw_web — 多用户 Web 层（与协议核隔离）
+# bbw_web — 像使用 App 一样的 Web 客户端
+
+多用户 Web 壳：**登录 → 首页 / 匹配 / 社交 / 消息 / 我的**，走与 APK 相同的 `bbw_protocol` HTTP 业务。
 
 ```
-┌──────────────────────────────────────────┐
-│  bbw_web（本目录）                         │
-│  · store.py      多用户 SessionStore       │
-│  · bff_server.py HTTP BFF + Cookie        │
-│  · static/       浏览器 UI                 │
-└──────────────────┬───────────────────────┘
-                   │ 仅 import 调用
-                   ▼
-┌──────────────────────────────────────────┐
-│  bbw_protocol（协议核，无 Web 概念）        │
-│  · BeibeiwuApp / Session / adapters      │
-│  · device / heartbeat（单实例工具）        │
-│  · CLI 仍可单独用，不依赖 bbw_web          │
-└──────────────────────────────────────────┘
+浏览器 SPA
+   │ Cookie bbw_sid
+   ▼
+bff_server.py          ← 本包
+   │ 每用户独立 BeibeiwuApp + 心跳
+   ▼
+bbw_protocol（协议核）
+   ▼
+banghua 后端
 ```
-
-**原则**
-
-- 协议核 **不知道** Cookie、web_sid、多租户。
-- Web 层为每个浏览器会话持有 **独立** `BeibeiwuApp` + 可选 `Heartbeat`。
-- TIM SECRETKEY / 登录 token 只在 BFF 进程；浏览器只有 `web_sid` + UserSig。
 
 ## 启动
 
 ```powershell
 cd <repo-root>
 python -m bbw_web --port 8765
-# http://127.0.0.1:8765/
+# 浏览器打开 http://127.0.0.1:8765/
 ```
 
-## 多用户怎么用
+## 界面能力（对齐 App 主路径）
 
-1. 浏览器 A 登录手机号 1 → Cookie `bbw_sid=S1`，后端 `BeibeiwuApp` 实例 1。  
-2. 浏览器 B（或无痕）登录手机号 2 → `bbw_sid=S2`，实例 2。  
-3. `GET /api/sessions` 可看当前内存中全部 web 会话。  
-4. 协议会话落盘：`analysis/sessions/{uid}.json`（勿提交 git）。
-
-认证方式（任选）：
-
-- Cookie `bbw_sid`（页面自动）
-- Header `X-BBW-SID`
-- Query `?sid=`
-
-## API
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| POST | `/api/auth/login` | `{phone,password,mode?,label?}` → 设 Cookie |
-| POST | `/api/auth/logout` | 销毁 web 会话 |
-| POST | `/api/auth/guest` | 空 web 会话 |
-| GET | `/api/me` | 当前用户 |
-| GET | `/api/sessions` | 全部 web 会话（本机） |
-| GET | `/api/bootstrap` | IM/pay 启动包 |
-| GET | `/api/im/tim` | TIM 凭证 |
-| POST | `/api/call` | `{action, params}` 任意协议 action |
-| POST | `/api/heartbeat/*` | start/stop/once |
-| POST | `/api/pay/*` `/api/face/*` | 下单 / 刷脸编排 |
-
-## 与 CLI 的关系
-
-```powershell
-# 协议核 CLI（单 session.json）—— 不经过 Web
-python -m bbw_protocol.cli login --phone ... --password ...
-python -m bbw_protocol.cli whoami
-
-# Web 多用户 —— 只起 BFF
-python -m bbw_web
-```
-
-两套会话文件：
-
-| 文件 | 归属 |
+| Tab | 功能 |
 |---|---|
-| `session.json` | 协议 CLI 默认 |
-| `analysis/sessions/{uid}.json` | Web 多用户落盘 |
+| **首页** | 冷启动推荐 / 礼物列表 / 在线心跳状态 |
+| **匹配** | 匹配次数与卡、在线/同城匹配、漂流瓶、乐园币买卡 |
+| **社交** | 关注 / 粉丝 / 好友申请、查资料、关注用户 |
+| **消息** | 拉取 TIM UserSig，尝试 CDN 登录发消息（完整体验需 TIM SDK） |
+| **我的** | 资料、改昵称、钱包/VIP 下单、任务领取、语音房、实名说明、任意 `do=` |
 
-## 安全
+登录方式：密码 · 一键（弱接口）· 短信。
 
-- 默认绑定 `127.0.0.1`；勿对公网裸奔。  
-- `/api/sessions` 暴露本机所有登录态，仅适合本地 CTF。  
-- 密码可写入 `sessions/*.json`（与 CLI 相同本地便利）；生产应改加密存储。
+## 与「调试台」的区别
+
+- 产品化底部导航与移动端布局，而不是 JSON 调试面板为主。  
+- BFF 提供 `/api/app/home`、`/api/match/*`、`/api/social/*` 等语义 API。  
+- 仍保留 `/api/call` 逃生舱给高级用户。
+
+## 能力边界（与 APK）
+
+| 能力 | Web 现状 |
+|---|---|
+| 业务 HTTP（登录、匹配、关注、任务…） | ✅ 同协议 |
+| IM 实时 | ⚠️ 有凭证；收发依赖 TIM Web SDK |
+| 刷脸实名 | ⚠️ 建议官方 App 完成；Web 仅 HTTP 编排 |
+| 微信支付到账 | ⚠️ 可下单；收银受官方包名/商户限制 |
+
+## 多用户
+
+每个浏览器 Cookie `bbw_sid` 对应独立协议会话；无痕/多浏览器可同时登录不同账号。
+
+## 文件
+
+| 文件 | 说明 |
+|---|---|
+| `bff_server.py` | App BFF |
+| `store.py` | 多用户 SessionStore |
+| `static/index.html` | App 壳 |
+| `static/app.css` | 移动端样式 |
+| `static/app.js` | 前端逻辑 |
