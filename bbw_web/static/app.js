@@ -18,6 +18,7 @@ const SECONDARY_NAV = [
 ];
 
 const LAB_NAV = { id: "lab", name: "协议台", desc: "仅限已启用的调试环境" };
+const SYSTEM_CUSTOMER_SERVICE_UID = "1";
 
 const S = {
   user: null,
@@ -1072,6 +1073,10 @@ function activeConversation() {
   return S.conversations.find((item) => conversationPeer(item) === S.activePeer) || null;
 }
 
+function isSystemCustomerServicePeer(peer) {
+  return String(peer || "").trim() === SYSTEM_CUSTOMER_SERVICE_UID;
+}
+
 function conversationListHtml() {
   return S.conversations.length
     ? S.conversations.map(conversationCard).join("")
@@ -1092,11 +1097,15 @@ function chatPaneHtml() {
     S.activePeer
   )}">资料</button></div>
     <div class="chat-log" id="im-log" aria-live="polite">${chatLogHtml()}</div>
-    <form class="chat-composer" data-form="im-send"><input type="hidden" name="peer" value="${esc(
-      S.activePeer
-    )}" /><label class="sr-only" for="im-text">消息</label><textarea id="im-text" name="text" rows="1" autocomplete="off" placeholder="输入消息" required></textarea><button type="submit" class="btn primary" ${
-      S.imConnected ? "" : "disabled"
-    }>发送</button></form>`;
+    ${
+      isSystemCustomerServicePeer(S.activePeer)
+        ? '<div class="chat-readonly-notice">系统客服消息无需回复</div>'
+        : `<form class="chat-composer" data-form="im-send"><input type="hidden" name="peer" value="${esc(
+            S.activePeer
+          )}" /><label class="sr-only" for="im-text">消息</label><textarea id="im-text" name="text" rows="1" autocomplete="off" placeholder="输入消息" required></textarea><button type="submit" class="btn primary" ${
+            S.imConnected ? "" : "disabled"
+          }>发送</button></form>`
+    }`;
 }
 
 function refreshMessageConversationRegion({
@@ -2512,6 +2521,7 @@ async function handleProductForm(form, submitter) {
     const peer = String(values.peer || S.activePeer || "").trim();
     const text = String(values.text || "").trim();
     if (!peer || !text) throw new Error("请输入对方 UserID 和消息内容");
+    if (isSystemCustomerServicePeer(peer)) throw new Error("系统客服消息无需回复");
 
     if (S.imConnected && S.imMode === "sdk" && S.chat && resolveTimApi()) {
       const TIM = resolveTimApi();

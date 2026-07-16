@@ -1502,6 +1502,15 @@ summary:focus-visible {
   resize: none;
 }
 
+.chat-readonly-notice {
+  border-top: 1px solid var(--line);
+  background: #fff;
+  padding: 0.95rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-align: center;
+}
+
 .profile-head {
   display: flex;
   align-items: center;

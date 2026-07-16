@@ -320,6 +320,15 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('data-action="agree-friend" data-id=', app_js)
         self.assertIn('S.pageCache.delete("friends")', app_js)
 
+    def test_system_customer_service_conversation_is_read_only(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('const SYSTEM_CUSTOMER_SERVICE_UID = "1"', app_js)
+        self.assertIn("isSystemCustomerServicePeer(S.activePeer)", app_js)
+        self.assertIn("系统客服消息无需回复", app_js)
+        self.assertIn("if (isSystemCustomerServicePeer(peer))", app_js)
+
 
 if __name__ == "__main__":
     unittest.main()
