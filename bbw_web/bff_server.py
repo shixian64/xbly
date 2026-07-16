@@ -553,8 +553,22 @@ def _cached_profile(
             profiles = N.normalize_users(getattr(result, "data", None))
             profile = next(
                 (item for item in profiles if str(item.get("id") or "") == target),
-                profiles[0] if profiles else None,
+                None,
             )
+            if profile is None:
+                # Some payloads omit an id for a single requested profile. That
+                # shape is safe to use, but an explicit different id must never
+                # be attached to this conversation as the peer's avatar.
+                idless = [
+                    item
+                    for item in profiles
+                    if not str(item.get("id") or "").strip()
+                ]
+                profile = (
+                    idless[0]
+                    if len(profiles) == 1 and len(idless) == 1
+                    else None
+                )
     except Exception:
         profile = None
     cache[target] = (now, dict(profile) if profile else None)

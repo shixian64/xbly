@@ -26,12 +26,32 @@ from bbw_web.normalize import (
     normalize_comments,
     normalize_messages,
     normalize_posts,
+    resolve_media_url,
     session_user_dto,
 )
 from bbw_web.store import WebUser, _session_path
 
 
 class BffEnvelopeTests(unittest.TestCase):
+    def test_avatar_media_sentinels_are_not_treated_as_image_urls(self) -> None:
+        for value in (
+            "0",
+            "NULL",
+            "None",
+            "nil",
+            "false",
+            "[]",
+            "{}",
+            "[object Object]",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(resolve_media_url(value), "")
+        self.assertEqual(resolve_media_url("data:audio/wav;base64,AA=="), "")
+        self.assertEqual(
+            resolve_media_url("data:image/png;base64,AA=="),
+            "data:image/png;base64,AA==",
+        )
+
     def test_logged_in_user_avatar_is_exposed_to_the_web_client(self) -> None:
         session = Session(
             uid="42",
@@ -343,6 +363,45 @@ class BffEnvelopeTests(unittest.TestCase):
         self.assertEqual(first["items"][0]["nickname"], "头像用户")
         self.assertEqual(second["items"][0]["avatar"], first["items"][0]["avatar"])
         self.assertEqual(calls, ["9"])
+
+    def test_conversation_list_rejects_a_mismatched_profile_avatar(self) -> None:
+        def get_user(_uid: str) -> ApiResult:
+            return ApiResult(
+                True,
+                200,
+                "",
+                data=[
+                    {
+                        "id": "42",
+                        "nickname": "当前用户",
+                        "portrait": "images/users/me.jpg",
+                    },
+                    {
+                        "nickname": "无编号资料",
+                        "portrait": "images/users/idless.jpg",
+                    },
+                ],
+            )
+
+        app = SimpleNamespace(profile=SimpleNamespace(get_user=get_user))
+        result = ApiResult(
+            True,
+            200,
+            "",
+            data=[
+                {
+                    "conversation_user": "9",
+                    "content": "你好",
+                    "userInfoList": {"id": "42", "nickname": "当前用户"},
+                }
+            ],
+        )
+
+        item = conversation_envelope(app, result, {})["items"][0]
+
+        self.assertEqual(item["peer_id"], "9")
+        self.assertEqual(item["avatar"], "")
+        self.assertEqual(item["nickname"], "9")
 
     def test_message_normalization_keeps_revoke_identity_and_state(self) -> None:
         messages = normalize_messages(
@@ -1134,9 +1193,12 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertNotIn("match-section-index", app_css)
         self.assertNotIn("function firstChar", app_js)
         self.assertNotIn("avatar.textContent", app_js)
+        self.assertIn("mediaUrl(validAvatarValue(url))", avatar_renderer)
         self.assertIn('if (!src) return "";', avatar_renderer)
         self.assertIn('aria-hidden="true" hidden', avatar_renderer)
         self.assertIn("data-avatar-image", avatar_renderer)
+        self.assertIn('loading="eager"', avatar_renderer)
+        self.assertNotIn('loading="lazy"', avatar_renderer)
         self.assertNotIn("onload=", avatar_renderer)
         self.assertNotIn("onerror=", avatar_renderer)
         self.assertIn("function revealLoadedAvatar(image)", app_js)
@@ -1214,8 +1276,18 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("updateConversationActivity(peer", app_js)
         self.assertIn("avatarHtml(avatar)", conversation_card)
         self.assertIn("conversationProfilesByUid: new Map()", app_js)
+        self.assertIn("function conversationAvatar(item)", app_js)
+        self.assertIn("function preserveConversationAvatar(preferred, fallback)", app_js)
+        self.assertIn("Boolean(conversation._avatar_from_fallback)", app_js)
+        self.assertIn("_avatar_from_fallback: inherited", app_js)
         self.assertIn("function applyCachedConversationProfile(item)", app_js)
+        self.assertIn("const avatar = currentAvatar || profileAvatar;", app_js)
         self.assertIn("async function hydrateConversationProfiles()", app_js)
+        self.assertIn("function conversationProfileForPeer(rows, peer)", app_js)
+        self.assertIn(".filter((item) => !conversationAvatar(item))", app_js)
+        self.assertIn(".map(applyCachedConversationProfile);", app_js)
+        self.assertIn("return profiles.length === 1 && idless.length === 1 ? idless[0] : null;", app_js)
+        self.assertNotIn("profiles[0] ||", app_js)
         self.assertIn("function timUserProfileRows(result)", app_js)
         self.assertIn("function rememberTimConversationProfiles(rows)", app_js)
         self.assertIn("S.chat.getUserProfile({ userIDList })", app_js)

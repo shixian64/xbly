@@ -11,15 +11,26 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # APK serves relative paths like /images/999999/... from this host.
 MEDIA_BASE = "https://oss.banghua.xin"
+EMPTY_MEDIA_VALUES = {
+    "0",
+    "false",
+    "nil",
+    "none",
+    "null",
+    "undefined",
+    "[]",
+    "{}",
+    "[object object]",
+}
 
 
 def resolve_media_url(value: Any) -> str:
     """Turn relative APK media paths into absolute OSS URLs."""
     raw = str(value or "").strip()
-    if not raw or raw in {"null", "undefined", "None"}:
+    if not raw or raw.lower() in EMPTY_MEDIA_VALUES:
         return ""
-    if raw.startswith("data:image/"):
-        return raw
+    if raw.lower().startswith("data:"):
+        return raw if raw.lower().startswith("data:image/") else ""
     if raw.startswith("//"):
         return "https:" + raw
     if re.match(r"^https?://", raw, re.I):

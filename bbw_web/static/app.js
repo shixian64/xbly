@@ -199,6 +199,17 @@ function localizedSystemText(value, fallback = "操作未成功") {
 
 /** Official OSS host used by APK for /images/... relative paths. */
 const MEDIA_BASE = "https://oss.banghua.xin";
+const INVALID_AVATAR_VALUES = new Set([
+  "0",
+  "false",
+  "nil",
+  "none",
+  "null",
+  "undefined",
+  "[]",
+  "{}",
+  "[object object]",
+]);
 
 function mediaUrl(value) {
   const raw = String(value || "").trim();
@@ -212,6 +223,17 @@ function mediaUrl(value) {
   if (/^(images|attachment|upload|uploads)\//i.test(raw)) return `${MEDIA_BASE}/${raw}`;
   if (!raw.includes("://") && !raw.startsWith("{")) {
     return `${MEDIA_BASE}/${raw.replace(/^\.\//, "")}`;
+  }
+  return "";
+}
+
+function validAvatarValue(...values) {
+  for (const value of values) {
+    const raw = String(value || "").trim();
+    if (!raw || INVALID_AVATAR_VALUES.has(raw.toLowerCase())) continue;
+    const src = mediaUrl(raw);
+    if (!src || (/^data:/i.test(src) && !/^data:image\//i.test(src))) continue;
+    return raw;
   }
   return "";
 }
@@ -600,9 +622,7 @@ function refreshConversationSummary({ force = false } = {}) {
   if (S.conversationRefreshPromise && !force) return S.conversationRefreshPromise;
   const task = api("/api/im/conversations?page=1", { timeout: 9000 })
     .then(({ data }) => {
-      S.conversations = mergeConversationSources(itemsOf(data), S.conversations).map(
-        applyCachedConversationProfile
-      );
+      S.conversations = mergeConversationSources(itemsOf(data), S.conversations);
       recalculateUnreadTotal();
       refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
       void hydrateConversationProfiles();
@@ -905,11 +925,14 @@ function actionRoute(action) {
 }
 
 function avatarHtml(url) {
-  const src = mediaUrl(url);
+  const src = mediaUrl(validAvatarValue(url));
   if (!src) return "";
+  // The wrapper stays hidden until the real image loads. Native lazy loading
+  // cannot be used here: an image below display:none may never enter the lazy
+  // loading queue, so no load event would be available to reveal the wrapper.
   return `<span class="avatar" aria-hidden="true" hidden><img src="${esc(
     src
-  )}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-avatar-image /></span>`;
+  )}" alt="" loading="eager" decoding="async" referrerpolicy="no-referrer" data-avatar-image /></span>`;
 }
 
 function revealLoadedAvatar(image) {
@@ -1180,13 +1203,53 @@ function conversationPeer(item) {
   const from = String(conversation.from_user_id || conversation.fromUserId || "");
   const to = String(conversation.to_user_id || conversation.toUserId || "");
   const candidates = [
+    conversation.peer_id,
     conversation.conversation_user,
     from && from !== me ? from : "",
     to && to !== me ? to : "",
-    conversation.peer_id,
     conversation.user_id,
   ];
   return String(candidates.find((value) => value != null && String(value) && String(value) !== me) || "");
+}
+
+function conversationAvatar(item) {
+  const conversation = item && typeof item === "object" ? item : {};
+  const nestedUser =
+    conversation.user && typeof conversation.user === "object"
+      ? conversation.user
+      : conversation.user_info && typeof conversation.user_info === "object"
+        ? conversation.user_info
+        : {};
+  return validAvatarValue(
+    conversation.avatar,
+    conversation.portrait,
+    nestedUser.avatar,
+    nestedUser.portrait
+  );
+}
+
+function preserveConversationAvatar(preferred, fallback) {
+  const conversation = preferred && typeof preferred === "object" ? preferred : {};
+  const currentAvatar = conversationAvatar(conversation);
+  const fallbackAvatar = conversationAvatar(fallback);
+  let avatar = currentAvatar;
+  let inherited = Boolean(conversation._avatar_from_fallback);
+  if ((!currentAvatar || inherited) && fallbackAvatar) {
+    avatar = fallbackAvatar;
+    inherited = true;
+  }
+  if (!avatar) return conversation;
+  if (conversation.avatar === avatar && Boolean(conversation._avatar_from_fallback) === inherited) {
+    return conversation;
+  }
+  const currentUser = conversation.user && typeof conversation.user === "object" ? conversation.user : {};
+  const fallbackUser = fallback?.user && typeof fallback.user === "object" ? fallback.user : {};
+  return {
+    ...conversation,
+    avatar,
+    _avatar_from_fallback: inherited,
+    user: { ...fallbackUser, ...currentUser, avatar },
+  };
 }
 
 function normalizeTimConversation(item) {
@@ -1204,7 +1267,7 @@ function normalizeTimConversation(item) {
     source: "tim",
     peer_id: peer,
     nickname: profile.nick || profile.name || profile.userID || peer,
-    avatar: profile.avatar || "",
+    avatar: validAvatarValue(profile.avatar, profile.portrait, profile.faceUrl, profile.face_url),
     last_message:
       !sdkPreview || sdkPreview === "自定义消息" || sdkPreview === "[自定义消息]"
         ? messagePreview(lastEntry)
@@ -1244,7 +1307,9 @@ function mergeConversationSources(history, cached) {
   history.filter(isC2CConversation).forEach((item) => {
     const peer = conversationPeer(item);
     if (peer) {
-      byPeer.set(peer, applyConversationReadOverride(peer, item));
+      const normalized = applyConversationReadOverride(peer, item);
+      const current = byPeer.get(peer);
+      byPeer.set(peer, current ? preserveConversationAvatar(normalized, current) : normalized);
     }
   });
   cached.filter(isC2CConversation).forEach((item) => {
@@ -1253,10 +1318,14 @@ function mergeConversationSources(history, cached) {
     const normalized = applyConversationReadOverride(peer, item);
     const current = byPeer.get(peer);
     if (!current || item.source === "tim" || conversationTimestamp(item) > conversationTimestamp(current)) {
-      byPeer.set(peer, normalized);
+      byPeer.set(peer, preserveConversationAvatar(normalized, current));
+    } else {
+      byPeer.set(peer, preserveConversationAvatar(current, normalized));
     }
   });
-  return [...byPeer.values()].sort((a, b) => conversationTimestamp(b) - conversationTimestamp(a));
+  return [...byPeer.values()]
+    .sort((a, b) => conversationTimestamp(b) - conversationTimestamp(a))
+    .map(applyCachedConversationProfile);
 }
 
 function applyCachedConversationProfile(item) {
@@ -1266,9 +1335,12 @@ function applyCachedConversationProfile(item) {
   const profile = S.conversationProfilesByUid.get(peer);
   if (!profile) return conversation;
   const nestedUser = conversation.user && typeof conversation.user === "object" ? conversation.user : {};
-  const currentAvatar =
-    conversation.avatar || conversation.portrait || nestedUser.avatar || nestedUser.portrait || "";
-  const avatar = currentAvatar || profile.avatar || profile.portrait || "";
+  const currentAvatar = conversationAvatar(conversation);
+  const profileAvatar = validAvatarValue(profile.avatar, profile.portrait);
+  const avatar = currentAvatar || profileAvatar;
+  const inherited = currentAvatar
+    ? Boolean(conversation._avatar_from_fallback)
+    : Boolean(profileAvatar);
   const currentName = String(
     conversation.nickname || conversation.peer_name || nestedUser.nickname || nestedUser.name || ""
   ).trim();
@@ -1276,11 +1348,18 @@ function applyCachedConversationProfile(item) {
   const name = placeholderName
     ? profile.nickname || profile.name || currentName || `用户 ${peer}`
     : currentName;
-  if (conversation.avatar === avatar && conversation.nickname === name) return conversation;
+  if (
+    conversation.avatar === avatar &&
+    conversation.nickname === name &&
+    Boolean(conversation._avatar_from_fallback) === inherited
+  ) {
+    return conversation;
+  }
   return {
     ...conversation,
     nickname: name,
     avatar,
+    _avatar_from_fallback: inherited,
     user: { ...profile, ...nestedUser, nickname: name, avatar },
   };
 }
@@ -1299,8 +1378,8 @@ function rememberTimConversationProfiles(rows) {
   (Array.isArray(rows) ? rows : []).forEach((item) => {
     if (!item || typeof item !== "object") return;
     const peer = String(item.userID || item.userId || item.uid || item.id || "").trim();
-    const avatar = item.avatar || item.portrait || item.faceUrl || item.face_url || "";
-    if (!peer || !mediaUrl(avatar)) return;
+    const avatar = validAvatarValue(item.avatar, item.portrait, item.faceUrl, item.face_url);
+    if (!peer || !avatar) return;
     S.conversationProfilesByUid.set(peer, {
       id: peer,
       nickname: item.nick || item.nickname || item.name || peer,
@@ -1317,21 +1396,26 @@ function renderHydratedConversationProfiles() {
   }
 }
 
+function conversationProfileForPeer(rows, peer) {
+  const profiles = Array.isArray(rows) ? rows : [];
+  const exact = profiles.find((item) => String(item?.id || item?.uid || "") === peer);
+  if (exact) return exact;
+  const idless = profiles.filter((item) => !String(item?.id || item?.uid || "").trim());
+  return profiles.length === 1 && idless.length === 1 ? idless[0] : null;
+}
+
 async function hydrateConversationProfiles() {
   const peers = [...new Set(
     S.conversations
       .filter(isC2CConversation)
-      .filter((item) => {
-        const nestedUser = item?.user && typeof item.user === "object" ? item.user : {};
-        return !(item?.avatar || item?.portrait || nestedUser.avatar || nestedUser.portrait);
-      })
+      .filter((item) => !conversationAvatar(item))
       .map(conversationPeer)
       .filter(
         (peer) => {
           const profile = S.conversationProfilesByUid.get(peer);
           return (
             peer &&
-            !mediaUrl(profile?.avatar || profile?.portrait || "") &&
+            !validAvatarValue(profile?.avatar, profile?.portrait) &&
             !S.conversationProfileLoadingUids.has(peer)
           );
         }
@@ -1356,7 +1440,7 @@ async function hydrateConversationProfiles() {
 
     const unresolved = peers.filter((peer) => {
       const profile = S.conversationProfilesByUid.get(peer);
-      return !mediaUrl(profile?.avatar || profile?.portrait || "");
+      return !validAvatarValue(profile?.avatar, profile?.portrait);
     });
     for (let index = 0; index < unresolved.length; index += 6) {
       const batch = unresolved.slice(index, index + 6);
@@ -1366,10 +1450,7 @@ async function hydrateConversationProfiles() {
             timeout: 9000,
           });
           const profiles = itemsOf(data);
-          const profile =
-            profiles.find((item) => String(item?.id || item?.uid || "") === peer) ||
-            profiles[0] ||
-            null;
+          const profile = conversationProfileForPeer(profiles, peer);
           S.conversationProfilesByUid.set(peer, profile);
         })
       );
@@ -1390,7 +1471,7 @@ function conversationCard(item) {
     nestedUser.nickname ||
     nestedUser.name ||
     (peer ? `用户 ${peer}` : "聊天");
-  const avatar = conversation.avatar || conversation.portrait || nestedUser.avatar || nestedUser.portrait;
+  const avatar = conversationAvatar(conversation);
   const preview = tuiEmojiPreviewText(
     conversation.last_message ||
     conversation.message ||
@@ -3084,10 +3165,12 @@ function ensureConversationForPeer(peer, { name = "", avatar = "" } = {}) {
   if (index >= 0) {
     const current = S.conversations[index];
     const currentName = current.nickname || current.peer_name || current.user?.nickname || "";
+    const explicitAvatar = validAvatarValue(avatar);
     const next = {
       ...current,
       nickname: name && (!currentName || currentName === `用户 ${target}`) ? name : current.nickname,
-      avatar: avatar || current.avatar || current.portrait || current.user?.avatar || "",
+      avatar: explicitAvatar || conversationAvatar(current),
+      _avatar_from_fallback: explicitAvatar ? false : Boolean(current._avatar_from_fallback),
     };
     S.conversations[index] = next;
     return next;
@@ -3098,7 +3181,8 @@ function ensureConversationForPeer(peer, { name = "", avatar = "" } = {}) {
     source: "local",
     peer_id: target,
     nickname: name || `用户 ${target}`,
-    avatar,
+    avatar: validAvatarValue(avatar),
+    _avatar_from_fallback: false,
     last_message: "",
     timestamp: Date.now(),
     unread_count: 0,
