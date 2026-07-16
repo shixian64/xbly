@@ -13,9 +13,11 @@ class ProfileAPI:
         self.c = client
 
     def get_user(self, user_id: Optional[str] = None, lat: str = "0", lng: str = "0") -> ApiResult:
+        target = str(user_id or self.c.session.uid or "").strip()
+        action = "getUserAttributes0" if target and target != str(self.c.session.uid or "") else "getUserAttributes"
         return self.c.call(
-            "getUserAttributes",
-            userId=user_id or self.c.session.uid,
+            action,
+            userId=target,
             latitude=lat,
             longitude=lng,
         )

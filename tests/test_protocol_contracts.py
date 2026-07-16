@@ -15,6 +15,8 @@ from bbw_protocol.adapters.pay import PayAdapter  # noqa: E402
 from bbw_protocol.cli import build_parser  # noqa: E402
 from bbw_protocol.client import ApiResult, _parse_result  # noqa: E402
 from bbw_protocol.modules.im import ImAPI  # noqa: E402
+from bbw_protocol.modules.match import MatchAPI  # noqa: E402
+from bbw_protocol.modules.profile import ProfileAPI  # noqa: E402
 from bbw_protocol.modules.social import SocialAPI  # noqa: E402
 from bbw_web import bff_server as BFF  # noqa: E402
 from bbw_web.normalize import (  # noqa: E402
@@ -23,6 +25,7 @@ from bbw_web.normalize import (  # noqa: E402
     normalize_friend_applications,
     normalize_friends,
     normalize_messages,
+    normalize_match_filters,
     normalize_rooms,
     normalize_slides,
     normalize_social_users,
@@ -80,9 +83,16 @@ class ParseResultContractTests(unittest.TestCase):
 
 
 class NormalizerContractTests(unittest.TestCase):
-    def test_unavailable_task_is_never_receivable(self) -> None:
-        blocked = normalize_task(
+    def test_task_receivability_prefers_completed_progress_without_reopening_claimed(self) -> None:
+        completed_with_stale_status = normalize_task(
             {"id": "1", "available": "不可领取", "progress": 3, "num": 3}
+        )
+        self.assertIsNotNone(completed_with_stale_status)
+        self.assertTrue(completed_with_stale_status["can_receive"])
+        self.assertEqual(completed_with_stale_status["status_text"], "可领取")
+
+        blocked = normalize_task(
+            {"id": "5", "available": "不可领取", "progress": 2, "num": 3}
         )
         self.assertIsNotNone(blocked)
         self.assertFalse(blocked["can_receive"])
@@ -127,6 +137,36 @@ class NormalizerContractTests(unittest.TestCase):
         self.assertEqual(room["channel"], "agora-1")
         self.assertEqual(room["online_count"], 6)
 
+        roomkit_room = normalize_rooms(
+            {
+                "rooms": [
+                    {
+                        "roomId": "rk1",
+                        "roomName": "原生语聊房",
+                        "themePictureUrl": "https://example.invalid/theme.jpg",
+                        "backgroundUrl": "https://example.invalid/background.jpg",
+                        "createUser": {
+                            "userId": "owner-1",
+                            "userName": "房主",
+                            "portrait": "https://example.invalid/owner.jpg",
+                        },
+                        "userTotal": 0,
+                        "isPrivate": 1,
+                        "stop": True,
+                    }
+                ]
+            }
+        )[0]
+        self.assertEqual(roomkit_room["id"], "rk1")
+        self.assertEqual(roomkit_room["cover"], "https://example.invalid/theme.jpg")
+        self.assertEqual(roomkit_room["background_url"], "https://example.invalid/background.jpg")
+        self.assertEqual(roomkit_room["owner_id"], "owner-1")
+        self.assertEqual(roomkit_room["owner_name"], "房主")
+        self.assertEqual(roomkit_room["owner_avatar"], "https://example.invalid/owner.jpg")
+        self.assertEqual(roomkit_room["online_count"], 0)
+        self.assertTrue(roomkit_room["is_private"])
+        self.assertTrue(roomkit_room["is_stopped"])
+
         song = normalize_songs(
             {"songs": [{"musicId": "m1", "musicName": "晴天", "singer": "Jay", "playUrl": "song.mp3"}]}
         )[0]
@@ -139,6 +179,33 @@ class NormalizerContractTests(unittest.TestCase):
         )[0]
         self.assertEqual(bottle["content"], "hello")
         self.assertEqual(bottle["user_id"], "9")
+
+        apk_bottle = normalize_bottles(
+            {
+                "id": "b2",
+                "uid1": "9",
+                "uid2": "42",
+                "leave_words_json": json.dumps(
+                    [
+                        {"uid": "9", "leave_word": "第一句留言"},
+                        {"uid": "42", "leave_word": "一条回应"},
+                    ],
+                    ensure_ascii=False,
+                ),
+                "time": "1751677508",
+                "pick_time": "1751677600",
+                "picked_times": "3",
+                "state": "正常",
+            }
+        )[0]
+        self.assertEqual(apk_bottle["content"], "第一句留言")
+        self.assertEqual(apk_bottle["user_id"], "9")
+        self.assertEqual(apk_bottle["picker_id"], "42")
+        self.assertEqual(apk_bottle["created_at"], "1751677508")
+        self.assertEqual(apk_bottle["picked_at"], "1751677600")
+        self.assertEqual(apk_bottle["picked_times"], 3)
+        self.assertEqual(apk_bottle["reply_count"], 1)
+        self.assertEqual(len(apk_bottle["leave_words"]), 2)
 
         sticker = normalize_stickers(
             {"stickers": [{"stickerId": "e1", "stickerName": "笑", "stickerUrl": "e.png", "isFavorite": "1"}]}
@@ -154,6 +221,18 @@ class NormalizerContractTests(unittest.TestCase):
         obj = normalize_value('{"token":"abc"}')
         self.assertEqual(obj["value_type"], "object")
         self.assertEqual(obj["value"]["token"], "abc")
+
+    def test_match_filters_follow_apk_values_and_defaults(self) -> None:
+        self.assertEqual(
+            normalize_match_filters(
+                {"userInfoList": {"match_gender": "女", "match_property": "Z"}}
+            ),
+            {"gender": "女", "property": "Z"},
+        )
+        self.assertEqual(
+            normalize_match_filters({"match_gender": "未知", "match_property": "未知"}),
+            {"gender": "不限", "property": "双"},
+        )
 
     def test_social_user_fields_preserve_relationship_and_visit_metadata(self) -> None:
         user = normalize_users(
@@ -224,6 +303,7 @@ class NormalizerContractTests(unittest.TestCase):
                     "uid": "726285",
                     "friendid": "9",
                     "friendnickname": "好友",
+                    "friendonline": "Online",
                 }
             ],
             current_uid="726285",
@@ -231,6 +311,7 @@ class NormalizerContractTests(unittest.TestCase):
         self.assertEqual(friend["id"], "9")
         self.assertEqual(friend["nickname"], "好友")
         self.assertEqual(friend["relation_id"], "relation-1")
+        self.assertEqual(friend["online"], "Online")
 
         relations = normalize_social_users(
             [
@@ -265,7 +346,12 @@ class NormalizerContractTests(unittest.TestCase):
                     "channelType": "C2C",
                     "msgTimestamp": "1710000000",
                     "msgUID": "m1",
-                    "userInfoList": {"id": "9", "nickname": "N", "portrait": "n.jpg"},
+                    "userInfoList": {
+                        "id": "9",
+                        "nickname": "N",
+                        "portrait": "n.jpg",
+                        "onlineStatus": "Online",
+                    },
                 }
             ]
         )[0]
@@ -274,6 +360,7 @@ class NormalizerContractTests(unittest.TestCase):
         self.assertEqual(item["last_message"], "你好")
         self.assertEqual(item["timestamp"], "1710000000")
         self.assertEqual(item["msg_uid"], "m1")
+        self.assertEqual(item["online"], "Online")
 
         nested_self = normalize_conversations(
             [
@@ -289,6 +376,22 @@ class NormalizerContractTests(unittest.TestCase):
         self.assertEqual(nested_self["nickname"], "9")
         self.assertIsNone(nested_self["user"])
 
+        peer_portrait = normalize_conversations(
+            [
+                {
+                    "conversation_user": "9",
+                    "conversationNickname": "Peer",
+                    "conversationPortrait": "images/users/peer.jpg",
+                    "userInfoList": {"id": "42", "nickname": "Me"},
+                }
+            ]
+        )[0]
+        self.assertEqual(peer_portrait["nickname"], "Peer")
+        self.assertEqual(
+            peer_portrait["avatar"],
+            "https://oss.banghua.xin/images/users/peer.jpg",
+        )
+
         message = normalize_messages(
             {
                 "messageList": [
@@ -298,12 +401,17 @@ class NormalizerContractTests(unittest.TestCase):
                         "toUserId": "9",
                         "msgTimestamp": "1710000001",
                         "payload": {"text": "历史消息"},
+                        "isPeerRead": True,
+                        "readTime": "1710000042",
                     }
                 ]
             }
         )[0]
         self.assertEqual(message["id"], "m2")
         self.assertEqual(message["text"], "历史消息")
+        self.assertTrue(message["is_peer_read"])
+        self.assertEqual(message["read_state"], "read")
+        self.assertEqual(message["read_time"], "1710000042")
 
 
 class SocialAndImRoutingContractTests(unittest.TestCase):
@@ -363,6 +471,18 @@ class SocialAndImRoutingContractTests(unittest.TestCase):
         ImAPI(client).history_conversations("3")
         self.assertEqual(client.calls, [("getHistoryConversation", {"page": "3"})])
 
+    def test_other_user_profile_uses_apk_get_user_attributes_zero_action(self) -> None:
+        client = self.FakeClient()
+        api = ProfileAPI(client)
+
+        api.get_user("9")
+        api.get_user("42")
+
+        self.assertEqual(client.calls[0][0], "getUserAttributes0")
+        self.assertEqual(client.calls[0][1]["userId"], "9")
+        self.assertEqual(client.calls[1][0], "getUserAttributes")
+        self.assertEqual(client.calls[1][1]["userId"], "42")
+
     def test_history_messages_uses_apk_message_detail_url(self) -> None:
         client = self.FakeClient()
         ImAPI(client).history_messages("9")
@@ -370,6 +490,24 @@ class SocialAndImRoutingContractTests(unittest.TestCase):
         self.assertIn("i=888&c=entry&do=Message_detail&m=socialchat&yourid=9", url)
         self.assertIsNone(body)
         self.assertEqual(kwargs, {"method": "GET"})
+
+    def test_match_filter_uses_reset_match_id_and_value(self) -> None:
+        client = self.FakeClient()
+        MatchAPI(client).set_filter("女")
+        self.assertEqual(client.calls, [("resetMatch", {"id": "42", "value": "女"})])
+
+    def test_bottle_creation_and_rethrow_keep_distinct_apk_actions(self) -> None:
+        client = self.FakeClient()
+        api = MatchAPI(client)
+        api.bottle_leave_word(leave_word="第一句留言")
+        api.throw_bottle(id="b1")
+        self.assertEqual(
+            client.calls,
+            [
+                ("AddDraftBottleLeaveWord", {"leave_word": "第一句留言"}),
+                ("ThrowADriftBottle", {"id": "b1"}),
+            ],
+        )
 
 
 class FakeApp:

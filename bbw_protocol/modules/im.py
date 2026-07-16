@@ -32,11 +32,43 @@ class ImAPI:
             userPortrait=portrait or self.c.session.portrait or "",
         )
 
-    def flash_photo_get(self, **params: Any) -> ApiResult:
+    def flash_photo_get(self, uniqueid: str = "", **params: Any) -> ApiResult:
+        value = str(uniqueid or params.pop("uniqueId", "") or params.get("uniqueid", "")).strip()
+        if value:
+            params["uniqueid"] = value
         return self.c.call("GetflashphotoTencent", params)
 
-    def flash_photo_send(self, **params: Any) -> ApiResult:
+    def flash_photo_send(
+        self,
+        target_id: str = "",
+        photo_url: str = "",
+        **params: Any,
+    ) -> ApiResult:
+        target = str(
+            target_id or params.pop("target_id", "") or params.get("targetId", "")
+        ).strip()
+        photo = str(
+            photo_url or params.pop("photo_url", "") or params.get("photourl", "")
+        ).strip()
+        if target:
+            params["targetId"] = target
+        if photo:
+            # APK sends the OSS object key, not the public absolute URL.
+            params["photourl"] = photo
         return self.c.call("SendTencentFlashPhoto", params)
+
+    def aliyun_signature(self, content: str) -> ApiResult:
+        """Request the APK-compatible OSS signature for one canonical string."""
+        canonical = str(content or "")
+        if not canonical:
+            raise ValueError("content is required")
+        # CommonUtil's OSSCustomSignerCredentialProvider uses this exact tenant
+        # and sends the canonical string in the GET query, not a form POST.
+        url = (
+            f"{APPLET}?i=99999&c=entry&a=webapp&do=getAliyunSignature"
+            f"&m=socialchat&content={quote(canonical, safe='')}"
+        )
+        return self.c.request(url, method="GET")
 
     def stickers(self, **params: Any) -> ApiResult:
         return self.c.call("GetAllStickersWithFavorite", params)

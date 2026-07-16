@@ -8,17 +8,19 @@ from ..app import BeibeiwuApp
 from .face import FaceAdapter
 from .im import ImAdapter
 from .pay import PayAdapter
+from .roomkit import RoomKitAdapter
 from .tim_rest import TimRestClient
 
 
 class NativeBundle:
-    """Attach IM / face / pay adapters to a protocol app."""
+    """Attach IM / face / pay / RoomKit adapters to a protocol app."""
 
     def __init__(self, app: BeibeiwuApp):
         self.app = app
         self.im = ImAdapter(app)
         self.face = FaceAdapter(app)
         self.pay = PayAdapter(app)
+        self.roomkit = RoomKitAdapter(app)
         self.tim_rest = TimRestClient()
 
     def status(self) -> Dict[str, Any]:
@@ -40,6 +42,7 @@ class NativeBundle:
                 "live": "Aliyun ZIM SDK (metaInfo)",
                 "forge": "not viable (see analysis/08)",
             },
+            "roomkit": self.roomkit.public_status(),
             "pay": self.pay.capabilities(),
         }
 

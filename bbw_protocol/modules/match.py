@@ -21,6 +21,14 @@ class MatchAPI:
     def online_users(self, **params: Any) -> ApiResult:
         return self.c.call("getOnlineMatchUser", params)
 
+    def set_filter(self, value: str) -> ApiResult:
+        """Persist one APK-compatible match preference value.
+
+        The native ``MatchDialog`` submits gender and property separately to
+        ``resetMatch`` using the same ``value`` field.
+        """
+        return self.c.call("resetMatch", id=self.c.session.uid, value=value)
+
     def online_one(self, **params: Any) -> ApiResult:
         return self.c.call("getOnlineMatchUserOneNewNew", params)
 
@@ -28,6 +36,7 @@ class MatchAPI:
         return self.c.call("getLocalMatchUserOneNewNew", params)
 
     def throw_bottle(self, **params: Any) -> ApiResult:
+        """Return an existing picked bottle to the pool."""
         return self.c.call("ThrowADriftBottle", params)
 
     def pick_bottle(self, **params: Any) -> ApiResult:
@@ -40,6 +49,7 @@ class MatchAPI:
         return self.c.call("DeleteADriftBottle", params)
 
     def bottle_leave_word(self, **params: Any) -> ApiResult:
+        """Create a bottle's first word, or append a reply when ``id`` is supplied."""
         return self.c.call("AddDraftBottleLeaveWord", params)
 
     def publish_dating(self, **params: Any) -> ApiResult:

@@ -52,6 +52,10 @@ class WebUser:
     heartbeat: Optional[Heartbeat] = None
     label: str = ""  # optional display label
     persist_sessions: bool = False
+    profile_cache: Dict[str, tuple[float, Optional[Dict[str, Any]]]] = field(
+        default_factory=dict,
+        repr=False,
+    )
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def touch(self) -> None:

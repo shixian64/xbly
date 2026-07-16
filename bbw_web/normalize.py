@@ -40,10 +40,10 @@ def resolve_media_url(value: Any) -> str:
 ERROR_MAP: List[Tuple[Any, ...]] = [
     # (matchers on code/message/raw, title, detail, action)
     (("700", "登录失效", "登陆失效", "登录过期"), "登录已失效", "请重新登录后再试", "relogin"),
-    (("340", "未实名", "实名认证", "还未实名"), "需要实名认证", "该功能需先完成实名，请在官方 App 内刷脸认证", "realname"),
+    (("340", "未实名", "实名认证", "还未实名"), "需要实名认证", "该功能需先完成实名，请在官方客户端内刷脸认证", "realname"),
     (("430", "卡不足", "匹配卡", "次数不足"), "次数或道具不足", "匹配卡/免费次数不够，可做任务或乐园币买卡", "buy_card"),
     (("403", "不可修改", "不可提现"), "暂无权限", "服务端拒绝了操作（常见：未实名或业务限制）", "none"),
-    (("余额不足", "乐园币不足", "money"), "余额不足", "乐园币或余额不够，请先充值（Web 仅能创建订单参数）", "wallet"),
+    (("余额不足", "乐园币不足", "money"), "余额不足", "乐园币或余额不够，请先充值（网页版仅能创建订单参数）", "wallet"),
     (("400", "参数", "失败"), "请求未成功", "参数不完整或业务失败", "none"),
     (("false", "no", "NULL"), "操作未成功", "服务端返回失败", "none"),
 ]
@@ -55,6 +55,14 @@ def explain_error(
     raw: str = "",
     extra: str = "",
 ) -> Dict[str, Any]:
+    if str(code or "").strip().upper() == "EMPTY_RESPONSE":
+        return {
+            "title": "结果待确认",
+            "detail": "服务端未返回明确的业务结果，请刷新相关页面确认最终状态。",
+            "action": "none",
+            "code": "EMPTY_RESPONSE",
+            "message": str(message or "服务端返回空响应")[:200],
+        }
     blob = f"{code} {message} {extra} {raw}".lower()
     for entry in ERROR_MAP:
         keys = entry[0]
@@ -183,6 +191,14 @@ def _as_list(x: Any) -> List[Any]:
         "banners",
         "topics",
         "topic_list",
+        "posts",
+        "postlist",
+        "post_list",
+        "luntan",
+        "luntan_list",
+        "comments",
+        "commentlist",
+        "comment_list",
         "rooms",
         "roomlist",
         "room_list",
@@ -384,7 +400,7 @@ def normalize_user(item: Any) -> Optional[Dict[str, Any]]:
     relation_id = str(
         _first(item, ["relation_id", "relationId", "friend_relation_id", "subid"], "")
     )
-    sub_parts = [p for p in (uid and f"uid {uid}", role, city, dist, sign[:24]) if p]
+    sub_parts = [p for p in (uid and f"UID {uid}", role, city, dist, sign[:24]) if p]
     return {
         "id": uid,
         "nickname": nick,
@@ -394,8 +410,16 @@ def normalize_user(item: Any) -> Optional[Dict[str, Any]]:
         "city": city,
         "signature": sign,
         "distance": dist,
-        "online": str(_first(item, ["online", "online_status"], "")),
-        "hide_online": str(_first(item, ["hide_online"], "0")),
+        "online": str(
+            _first(
+                item,
+                ["online", "online_status", "onlineStatus", "user_status", "userStatus"],
+                "",
+            )
+        ),
+        "hide_online": str(
+            _first(item, ["hide_online", "hideOnline", "is_hide_online"], "0")
+        ),
         "visit_time": visit_time,
         "custom_time": str(_first(item, ["custom_time"], "")),
         "friend_remark": str(_first(item, ["friendsremark", "friend_remark", "remark"], "")),
@@ -697,11 +721,43 @@ def normalize_friend_application(item: Any, current_uid: str = "") -> Optional[D
 
     if not applicant_id:
         return None
+    profile_online = ""
+    if nested_id == applicant_id:
+        profile_online = str((nested_user or {}).get("online") or "")
+    elif generic_id == applicant_id:
+        profile_online = str((generic or {}).get("online") or "")
+    peer_online = str(
+        _first(
+            d,
+            [
+                "friendonline",
+                "friend_online",
+                "friendOnline",
+                "youronline",
+                "your_online",
+                "yourOnline",
+            ],
+            profile_online,
+        )
+    )
+    peer_hide_online = str(
+        _first(
+            d,
+            ["friend_hide_online", "friendHideOnline", "your_hide_online"],
+            (nested_user or {}).get("hide_online")
+            if nested_id == applicant_id
+            else (generic or {}).get("hide_online")
+            if generic_id == applicant_id
+            else "0",
+        )
+    )
     return {
         **generic,
         "id": applicant_id,
         "nickname": nickname or f"用户 {applicant_id}",
         "avatar": avatar,
+        "online": peer_online,
+        "hide_online": peer_hide_online,
         "subtitle": " · ".join(
             part
             for part in (
@@ -763,6 +819,44 @@ def normalize_conversation(item: Any) -> Optional[Dict[str, Any]]:
     # a bogus self-conversation appear in the Web list.
     peer_id = str(conversation_user or (user or {}).get("id") or "")
     peer_user = user if not user or not peer_id or str(user.get("id") or "") == peer_id else None
+    peer_nickname = str(
+        _first(
+            d,
+            [
+                "conversation_nickname",
+                "conversationNickname",
+                "peer_name",
+                "peerName",
+                "peer_nickname",
+                "peerNickname",
+                "friendnickname",
+                "friendNickname",
+                "yournickname",
+                "yourNickname",
+            ],
+            (peer_user or {}).get("nickname") or "",
+        )
+    )
+    peer_avatar = resolve_media_url(
+        _first(
+            d,
+            [
+                "conversation_portrait",
+                "conversationPortrait",
+                "conversation_user_portrait",
+                "conversationUserPortrait",
+                "peer_avatar",
+                "peerAvatar",
+                "peer_portrait",
+                "peerPortrait",
+                "friendportrait",
+                "friendPortrait",
+                "yourportrait",
+                "yourPortrait",
+            ],
+            (peer_user or {}).get("avatar") or "",
+        )
+    )
     record_id = str(_first(d, ["id", "conversation_id", "conversationId"], ""))
     content = str(_first(d, ["content", "last_message", "message", "text"], ""))
     timestamp = str(
@@ -774,8 +868,8 @@ def normalize_conversation(item: Any) -> Optional[Dict[str, Any]]:
         "id": record_id or peer_id,
         "conversation_user": conversation_user,
         "peer_id": peer_id,
-        "nickname": str((peer_user or {}).get("nickname") or peer_id or "用户"),
-        "avatar": str((peer_user or {}).get("avatar") or ""),
+        "nickname": peer_nickname or peer_id or "用户",
+        "avatar": peer_avatar,
         "content": content,
         "last_message": content,
         "timestamp": timestamp,
@@ -785,6 +879,20 @@ def normalize_conversation(item: Any) -> Optional[Dict[str, Any]]:
         "channel_type": str(_first(d, ["channelType", "channel_type"], "")),
         "msg_uid": str(_first(d, ["msgUID", "msg_uid", "message_uid"], "")),
         "unread_count": _num(_first(d, ["unreadCount", "unread_count", "unread"], 0)),
+        "online": str(
+            _first(
+                d,
+                ["online", "online_status", "peer_online", "conversation_user_online"],
+                (peer_user or {}).get("online") or "",
+            )
+        ),
+        "hide_online": str(
+            _first(
+                d,
+                ["hide_online", "peer_hide_online"],
+                (peer_user or {}).get("hide_online") or "0",
+            )
+        ),
         "user": peer_user,
     }
 
@@ -793,20 +901,301 @@ def normalize_conversations(data: Any) -> List[Dict[str, Any]]:
     return _normalize_many(data, normalize_conversation)
 
 
+_TIM_TYPE_BY_NUMBER = {
+    "1": "TIMTextElem",
+    "2": "TIMCustomElem",
+    "3": "TIMImageElem",
+    "4": "TIMSoundElem",
+    "5": "TIMVideoFileElem",
+    "6": "TIMFileElem",
+    "7": "TIMLocationElem",
+    "8": "TIMFaceElem",
+    "9": "TIMGroupTipElem",
+    "10": "TIMRelayElem",
+}
+
+_MESSAGE_KIND_BY_OBJECT = {
+    "TIMTextElem": "text",
+    "TIMCustomElem": "custom",
+    "TIMImageElem": "image",
+    "TIMSoundElem": "audio",
+    "TIMVideoFileElem": "video",
+    "TIMFileElem": "file",
+    "TIMLocationElem": "location",
+    "TIMFaceElem": "face",
+    "TIMGroupTipElem": "group_tip",
+    "TIMRelayElem": "relay",
+}
+
+
+def _message_object_name(value: Any) -> str:
+    raw = str(value or "").strip()
+    return _TIM_TYPE_BY_NUMBER.get(raw, raw)
+
+
+def _message_payload(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    parsed = _as_dict(value)
+    return dict(parsed) if parsed else {}
+
+
+def _infer_message_object_name(payload: Dict[str, Any]) -> str:
+    keys = {str(key).lower() for key in payload}
+    if keys & {"text", "content"}:
+        return "TIMTextElem"
+    if keys & {"imageinfoarray", "image_info_array", "imageformat"}:
+        return "TIMImageElem"
+    if keys & {"videourl", "videouuid", "thumburl", "videosecond"}:
+        return "TIMVideoFileElem"
+    if keys & {"filename", "filesize"}:
+        return "TIMFileElem"
+    if "index" in keys and "data" in keys:
+        return "TIMFaceElem"
+    if keys & {"second", "soundurl"} and keys & {"uuid", "url", "soundurl"}:
+        return "TIMSoundElem"
+    return ""
+
+
+def _message_list(value: Any) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value.strip().startswith("["):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def _message_data_text(value: Any) -> str:
+    """Convert TIM face/custom byte data to the UTF-8 text used by the APK."""
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", errors="replace")
+    if isinstance(value, list) and all(isinstance(part, int) for part in value):
+        try:
+            return bytes(value).decode("utf-8", errors="replace")
+        except Exception:
+            pass
+    return str(value or "")
+
+
+def _normalize_image_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(payload)
+    infos = _message_list(
+        _first(payload, ["imageInfoArray", "ImageInfoArray", "image_info_array", "images"], [])
+    )
+    normalized: List[Dict[str, Any]] = []
+    for raw in infos:
+        info = raw if isinstance(raw, dict) else _as_dict(raw)
+        if not info:
+            continue
+        url = resolve_media_url(_first(info, ["url", "URL", "imageUrl", "image_url"], ""))
+        normalized.append(
+            {
+                "type": _num(_first(info, ["type", "Type"], 0)),
+                "url": url,
+                "uuid": str(_first(info, ["UUID", "uuid"], "")),
+                "size": _num(_first(info, ["size", "Size"], 0)),
+                "width": _num(_first(info, ["width", "Width"], 0)),
+                "height": _num(_first(info, ["height", "Height"], 0)),
+            }
+        )
+    direct_url = resolve_media_url(
+        _first(payload, ["url", "URL", "imageUrl", "image_url", "originalUrl"], "")
+    )
+    if direct_url and not any(info.get("url") == direct_url for info in normalized):
+        normalized.append(
+            {
+                "type": _num(_first(payload, ["type", "Type"], 0)),
+                "url": direct_url,
+                "uuid": str(_first(payload, ["UUID", "uuid"], "")),
+                "size": _num(_first(payload, ["size", "Size"], 0)),
+                "width": _num(_first(payload, ["width", "Width"], 0)),
+                "height": _num(_first(payload, ["height", "Height"], 0)),
+            }
+        )
+    original = next((info for info in normalized if info["type"] == 0 and info["url"]), None)
+    large = next((info for info in normalized if info["type"] == 1 and info["url"]), None)
+    thumbnail = next((info for info in normalized if info["type"] == 2 and info["url"]), None)
+    fallback = next((info for info in normalized if info["url"]), {})
+    # TIM image variants are not returned in a stable array order.  Keep the
+    # full-size URL as the canonical target used by preview/download actions,
+    # and expose the thumbnail separately for the chat bubble.
+    primary = original or large or thumbnail or fallback
+    preview = thumbnail or large or original or fallback
+    large_variant = large or original or thumbnail or fallback
+    out.update(
+        {
+            "images": normalized,
+            "url": str(primary.get("url") or ""),
+            "thumbnail": str(preview.get("url") or ""),
+            "thumbnail_url": str(preview.get("url") or ""),
+            "large_url": str(large_variant.get("url") or ""),
+            "original_url": str(primary.get("url") or ""),
+            "width": _num(primary.get("width")),
+            "height": _num(primary.get("height")),
+            "size": _num(primary.get("size")),
+            "uuid": str(primary.get("uuid") or _first(payload, ["UUID", "uuid"], "")),
+            "format": _num(_first(payload, ["imageFormat", "ImageFormat", "format"], 0)),
+        }
+    )
+    return out
+
+
+def _normalize_timed_media_payload(payload: Dict[str, Any], kind: str) -> Dict[str, Any]:
+    out = dict(payload)
+    if kind == "audio":
+        url = resolve_media_url(_first(payload, ["url", "Url", "URL", "soundUrl"], ""))
+        out.update(
+            {
+                "url": url,
+                "uuid": str(_first(payload, ["UUID", "uuid"], "")),
+                "duration": _num(_first(payload, ["second", "Second", "duration"], 0)),
+                "second": _num(_first(payload, ["second", "Second", "duration"], 0)),
+                "size": _num(_first(payload, ["size", "Size"], 0)),
+            }
+        )
+        return out
+    video_url = resolve_media_url(
+        _first(payload, ["videoUrl", "VideoUrl", "url", "URL"], "")
+    )
+    thumb_url = resolve_media_url(
+        _first(payload, ["thumbUrl", "ThumbUrl", "snapshotUrl", "snapshot_url"], "")
+    )
+    out.update(
+        {
+            "url": video_url,
+            "video_url": video_url,
+            "thumbnail_url": thumb_url,
+            "thumb_url": thumb_url,
+            "uuid": str(_first(payload, ["videoUUID", "VideoUUID", "UUID", "uuid"], "")),
+            "thumb_uuid": str(_first(payload, ["thumbUUID", "ThumbUUID"], "")),
+            "duration": _num(_first(payload, ["second", "Second", "videoSecond", "VideoSecond", "duration"], 0)),
+            "second": _num(_first(payload, ["second", "Second", "videoSecond", "VideoSecond", "duration"], 0)),
+            "size": _num(_first(payload, ["videoSize", "VideoSize", "size", "Size"], 0)),
+            "format": str(_first(payload, ["format", "videoFormat", "VideoFormat"], "")),
+            "width": _num(_first(payload, ["thumbWidth", "ThumbWidth", "width", "Width"], 0)),
+            "height": _num(_first(payload, ["thumbHeight", "ThumbHeight", "height", "Height"], 0)),
+        }
+    )
+    return out
+
+
+def _normalize_element_payload(object_name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    kind = _MESSAGE_KIND_BY_OBJECT.get(object_name, "unknown")
+    if kind == "text":
+        out = dict(payload)
+        out["text"] = str(_first(payload, ["text", "Text", "content"], ""))
+        return out
+    if kind == "image":
+        return _normalize_image_payload(payload)
+    if kind in {"audio", "video"}:
+        return _normalize_timed_media_payload(payload, kind)
+    if kind == "file":
+        out = dict(payload)
+        out.update(
+            {
+                "url": resolve_media_url(_first(payload, ["url", "Url", "URL"], "")),
+                "uuid": str(_first(payload, ["UUID", "uuid"], "")),
+                "name": str(_first(payload, ["fileName", "FileName", "name"], "")),
+                "file_name": str(_first(payload, ["fileName", "FileName", "name"], "")),
+                "size": _num(_first(payload, ["fileSize", "FileSize", "size", "Size"], 0)),
+            }
+        )
+        return out
+    if kind == "face":
+        out = dict(payload)
+        data = _message_data_text(_first(payload, ["data", "Data"], ""))
+        out.update(
+            {
+                "index": _num(_first(payload, ["index", "Index"], 0)),
+                "data": data,
+                "url": resolve_media_url(data),
+            }
+        )
+        return out
+    if kind == "custom":
+        out = dict(payload)
+        out.update(
+            {
+                "data": _message_data_text(_first(payload, ["data", "Data"], "")),
+                "description": str(_first(payload, ["description", "Desc"], "")),
+                "extension": str(_first(payload, ["extension", "Ext"], "")),
+            }
+        )
+        return out
+    return dict(payload)
+
+
+def _normalize_message_elements(d: Dict[str, Any]) -> List[Dict[str, Any]]:
+    elements: List[Dict[str, Any]] = []
+    raw_body = _first(d, ["MsgBody", "msgBody", "msg_body", "elements"], None)
+    for raw in _message_list(raw_body):
+        if not isinstance(raw, dict):
+            continue
+        object_name = _message_object_name(
+            _first(raw, ["MsgType", "msgType", "type", "objectName", "object_name"], "")
+        )
+        payload = _message_payload(
+            _first(raw, ["MsgContent", "msgContent", "payload", "content"], {})
+        )
+        elements.append(
+            {
+                "object_name": object_name,
+                "type": _MESSAGE_KIND_BY_OBJECT.get(object_name, "unknown"),
+                "payload": _normalize_element_payload(object_name, payload),
+            }
+        )
+    if elements:
+        return elements
+    object_name = _message_object_name(
+        _first(d, ["objectName", "object_name", "msg_type", "type", "elemType", "elem_type"], "")
+    )
+    payload = _message_payload(_first(d, ["payload", "msgContent", "msg_content"], {}))
+    object_name = object_name or _infer_message_object_name(payload)
+    if object_name or payload:
+        elements.append(
+            {
+                "object_name": object_name,
+                "type": _MESSAGE_KIND_BY_OBJECT.get(object_name, "unknown"),
+                "payload": _normalize_element_payload(object_name, payload),
+            }
+        )
+    return elements
+
+
+def _flash_unique_id(text: str, object_name: str, cloud_data: Any) -> str:
+    is_flash_copy = "闪图" in text or "点击查看5秒闪图" in text
+    if not is_flash_copy and object_name != "flash_photo":
+        return ""
+    parsed = cloud_data if isinstance(cloud_data, dict) else _as_dict(cloud_data)
+    if parsed:
+        return str(_first(parsed, ["uniqueid", "uniqueId", "unique_id", "id"], ""))
+    return _message_data_text(cloud_data).strip()
+
+
 def normalize_message(item: Any) -> Optional[Dict[str, Any]]:
     """Normalize one Message_detail/TIM-style C2C message."""
     d = _entity_dict(item, ("message", "info"))
     if not d:
         return None
-    payload = _first(d, ["payload", "msgContent", "msg_content"], None)
-    payload_dict = payload if isinstance(payload, dict) else _as_dict(payload)
-    text = str(
-        _first(
-            d,
-            ["content", "text", "message", "msg", "body"],
-            _first(payload_dict or {}, ["text", "Text", "content", "data"], ""),
-        )
+    elements = _normalize_message_elements(d)
+    primary = elements[0] if elements else {"object_name": "", "type": "unknown", "payload": {}}
+    object_name = str(primary.get("object_name") or "")
+    payload_dict = primary.get("payload") if isinstance(primary.get("payload"), dict) else {}
+    element_text = "".join(
+        str((element.get("payload") or {}).get("text") or "")
+        for element in elements
+        if element.get("type") == "text" and isinstance(element.get("payload"), dict)
     )
+    text = str(_first(d, ["content", "text", "message", "msg", "body"], element_text))
+    if not object_name and text:
+        object_name = "TIMTextElem"
+        payload_dict = {**payload_dict, "text": text}
+        primary = {"object_name": object_name, "type": "text", "payload": payload_dict}
+        elements = [primary]
     from_id = str(
         _first(
             d,
@@ -819,6 +1208,7 @@ def normalize_message(item: Any) -> Optional[Dict[str, Any]]:
                 "from",
                 "sender",
                 "from_account",
+                "From_Account",
             ],
             "",
         )
@@ -835,24 +1225,140 @@ def normalize_message(item: Any) -> Optional[Dict[str, Any]]:
                 "to",
                 "receiver",
                 "to_account",
+                "To_Account",
             ],
             "",
         )
     )
     timestamp = str(
-        _first(d, ["msgTimestamp", "msg_timestamp", "timestamp", "sent_time", "time", "msg_time"], "")
+        _first(
+            d,
+            [
+                "msgTimestamp",
+                "MsgTimeStamp",
+                "msg_timestamp",
+                "timestamp",
+                "sent_time",
+                "time",
+                "msg_time",
+            ],
+            "",
+        )
     )
-    message_id = str(_first(d, ["msgUID", "msg_uid", "message_uid", "id", "msg_id"], ""))
-    if not any((text, from_id, to_id, timestamp, message_id)):
+    message_id = str(
+        _first(d, ["msgUID", "msg_uid", "message_uid", "MsgKey", "ID", "id", "msg_id"], "")
+    )
+    msg_key = str(
+        _first(d, ["MsgKey", "msg_key", "messageKey", "message_key", "msgUID", "msg_uid"], "")
+    )
+    revoked = _bool(
+        _first(
+            d,
+            ["isRevoked", "is_revoked", "revoked", "isWithdrawn", "is_withdrawn", "is_revoke"],
+            False,
+        ),
+        False,
+    )
+    peer_read_raw = _first(
+        d,
+        [
+            "isPeerRead",
+            "is_peer_read",
+            "peerRead",
+            "peer_read",
+            "readByPeer",
+            "read_by_peer",
+        ],
+        None,
+    )
+    read_state_raw = str(
+        _first(d, ["readStatus", "read_status", "peer_read_status"], "")
+    ).strip()
+    if peer_read_raw is None and read_state_raw:
+        lowered = read_state_raw.lower()
+        if lowered in {"read", "1", "true", "yes", "已读"}:
+            peer_read: Optional[bool] = True
+        elif lowered in {"unread", "0", "false", "no", "未读"}:
+            peer_read = False
+        else:
+            peer_read = None
+    elif peer_read_raw is None:
+        peer_read = None
+    else:
+        peer_read = _bool(peer_read_raw, False)
+    receipt_info = _as_dict(
+        _first(d, ["readReceiptInfo", "read_receipt_info", "receiptInfo", "receipt_info"], {})
+    ) or {}
+    read_time = str(
+        _first(
+            d,
+            [
+                "readTime",
+                "read_time",
+                "lastReadTime",
+                "last_read_time",
+                "readAt",
+                "read_at",
+                "peerReadTime",
+                "peer_read_time",
+            ],
+            _first(
+                receipt_info,
+                [
+                    "readTime",
+                    "read_time",
+                    "lastReadTime",
+                    "last_read_time",
+                    "readAt",
+                    "read_at",
+                ],
+                "",
+            ),
+        )
+    )
+    cloud_data = _first(
+        d,
+        ["cloudCustomData", "CloudCustomData", "cloud_custom_data", "cloudData"],
+        "",
+    )
+    flash_unique_id = _flash_unique_id(text, object_name, cloud_data)
+    kind = "flash" if flash_unique_id else str(primary.get("type") or "unknown")
+    send_status = str(_first(d, ["status", "send_status", "message_status"], ""))
+    progress = _first(d, ["progress", "uploadProgress", "upload_progress"], None)
+    if not any((text, from_id, to_id, timestamp, message_id, object_name, payload_dict, elements)):
         return None
     return {
         "id": message_id,
+        "msg_key": msg_key,
+        "MsgKey": msg_key,
+        "is_revoked": revoked,
+        "isRevoked": revoked,
         "text": text,
         "content": text,
+        "type": kind,
+        "message_type": kind,
+        "payload": payload_dict,
+        "elements": elements,
+        "cloud_custom_data": cloud_data,
+        "cloudCustomData": cloud_data,
+        "flash_unique_id": flash_unique_id,
+        "is_flash": bool(flash_unique_id),
         "from_user_id": from_id,
+        "from": from_id,
         "to_user_id": to_id,
+        "to": to_id,
         "timestamp": timestamp,
-        "object_name": str(_first(d, ["objectName", "object_name", "msg_type", "type"], "")),
+        "time": timestamp,
+        "object_name": object_name,
+        "objectName": object_name,
+        "flow": str(_first(d, ["flow", "message_flow"], "")),
+        "is_peer_read": peer_read,
+        "read_state": "read" if peer_read is True else "unread" if peer_read is False else "",
+        "read_time": read_time,
+        "readTime": read_time,
+        "send_status": send_status,
+        "status": send_status,
+        "progress": progress,
     }
 
 
@@ -968,16 +1474,153 @@ def normalize_topics(data: Any) -> List[Dict[str, Any]]:
     return _normalize_many(data, normalize_topic)
 
 
+def _media_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        values = value
+    else:
+        values = str(value or "").split(",")
+    out: List[str] = []
+    for item in values:
+        url = resolve_media_url(item)
+        if url and not url.endswith("/0") and url not in out:
+            out.append(url)
+    return out
+
+
+def _topic_names(value: Any) -> List[str]:
+    parsed: Any = value
+    if isinstance(value, str) and value.strip()[:1] in "[{":
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            parsed = value
+    values = parsed if isinstance(parsed, list) else [parsed]
+    out: List[str] = []
+    for item in values:
+        if isinstance(item, dict):
+            name = str(_first(item, ["topic", "name", "title"], "")).strip()
+        else:
+            name = str(item or "").strip()
+        if name and name not in {"0", "[]", "{}"} and name not in out:
+            out.append(name)
+    return out
+
+
+def normalize_post(item: Any) -> Optional[Dict[str, Any]]:
+    """Normalize the APK LuntanList payload used by the Dynamic feed."""
+    d = _entity_dict(item, ("post", "luntan", "info"))
+    if not d:
+        return None
+    post_id = str(_first(d, ["id", "postid", "post_id", "postId"], ""))
+    author = normalize_user(_first(d, ["userInfo", "userinfo", "user", "author"], None))
+    author_id = str(_first(d, ["authid", "author_id", "uid", "myid"], ""))
+    nickname = str(_first(d, ["authnickname", "nickname", "author_name", "mynickname"], ""))
+    avatar = resolve_media_url(
+        _first(d, ["authportrait", "portrait", "avatar", "myportrait"], "")
+    )
+    if author:
+        author_id = author_id or str(author.get("id") or "")
+        nickname = nickname or str(author.get("nickname") or "")
+        avatar = avatar or str(author.get("avatar") or "")
+    content = str(_first(d, ["posttext", "content", "context", "text", "body"], ""))
+    pictures = _media_list(_first(d, ["postpicture", "pictures", "picture", "images"], ""))
+    video = resolve_media_url(_first(d, ["postvideo", "video", "video_url"], ""))
+    if video.endswith("/0"):
+        video = ""
+    cover = resolve_media_url(_first(d, ["cover", "video_cover", "thumb"], ""))
+    if not any((post_id, author_id, nickname, content, pictures, video)):
+        return None
+    return {
+        "id": post_id,
+        "author_id": author_id,
+        "nickname": nickname or (f"用户 {author_id}" if author_id else "用户"),
+        "avatar": avatar,
+        "title": str(_first(d, ["posttitle", "title"], "")),
+        "content": content.replace("\\n", "\n"),
+        "pictures": pictures,
+        "video": video,
+        "cover": cover,
+        "plate": str(_first(d, ["platename", "plate", "category"], "")),
+        "posttip": str(_first(d, ["posttip", "tip"], "")),
+        "topics": _topic_names(_first(d, ["topic", "topicLists", "topics"], "")),
+        "like_count": _num(_first(d, ["like", "like_count", "likes"], 0)),
+        "comment_count": _num(_first(d, ["comment_sum", "comment_count", "comments"], 0)),
+        "time": str(_first(d, ["time", "created_at", "create_time"], "")),
+        "age": str(_first(d, ["age", "authage"], "")),
+        "gender": str(_first(d, ["gender", "authgender"], "")),
+        "region": str(_first(d, ["region", "authregion"], "")),
+        "property": str(_first(d, ["property", "authproperty"], "")),
+        "comment_forbid": _bool(_first(d, ["comment_forbid"], False)),
+        "hide_comment": _bool(_first(d, ["hide_comment"], False)),
+        "visibility_scope": str(_first(d, ["visibility_scope", "visible_scope"], "")),
+        "is_pinned": _bool(_first(d, ["u_top", "is_top", "pinned"], False)),
+        "is_liked": _bool(_first(d, ["ifauthlike", "is_liked", "liked"], False)),
+    }
+
+
+def normalize_posts(data: Any) -> List[Dict[str, Any]]:
+    return _normalize_many(data, normalize_post)
+
+
+def normalize_comment(item: Any) -> Optional[Dict[str, Any]]:
+    d = _entity_dict(item, ("comment", "info"))
+    if not d:
+        return None
+    comment_id = str(_first(d, ["id", "comment_id", "commentID"], ""))
+    author_id = str(_first(d, ["authid", "author_id", "uid", "myID"], ""))
+    content = str(_first(d, ["comment_text", "content", "text", "body"], ""))
+    nickname = str(_first(d, ["nickname", "authnickname", "name"], ""))
+    avatar = resolve_media_url(_first(d, ["portrait", "authportrait", "avatar"], ""))
+    if not any((comment_id, author_id, content, nickname)):
+        return None
+    return {
+        "id": comment_id,
+        "post_id": str(_first(d, ["postid", "postID", "post_id"], "")),
+        "author_id": author_id,
+        "nickname": nickname or (f"用户 {author_id}" if author_id else "用户"),
+        "avatar": avatar,
+        "content": content.replace("\\n", "\n"),
+        "time": str(_first(d, ["time", "created_at", "create_time"], "")),
+        "like_count": _num(_first(d, ["like", "like_count", "likes"], 0)),
+        "is_liked": _bool(_first(d, ["ifauthlike", "is_liked", "liked"], False)),
+        "is_forbidden": _bool(_first(d, ["forbid", "is_forbidden"], False)),
+        "main_id": str(_first(d, ["mainID", "main_id"], "")),
+        "sub_id": str(_first(d, ["subID", "sub_id"], "")),
+        "reply_to_name": str(_first(d, ["sub_nickname", "reply_to_name"], "")),
+        "reply_count": _num(_first(d, ["subcomment_num", "reply_count"], 0)),
+    }
+
+
+def normalize_comments(data: Any) -> List[Dict[str, Any]]:
+    return _normalize_many(data, normalize_comment)
+
+
 def normalize_room(item: Any) -> Optional[Dict[str, Any]]:
     d = _entity_dict(item, ("room", "roominfo", "roomInfo", "info"))
     if not d:
         return None
     rid = str(_first(d, ["id", "roomId", "room_id", "roomid", "channel_id"], ""))
     name = str(_first(d, ["roomName", "room_name", "roomname", "name", "title"], ""))
-    cover = resolve_media_url(_first(d, ["cover", "image", "img", "pic", "roomCover", "portrait"], ""))
+    theme_picture_url = resolve_media_url(_first(d, ["themePictureUrl", "theme_picture_url"], ""))
+    background_url = resolve_media_url(_first(d, ["backgroundUrl", "background_url"], ""))
+    legacy_cover = resolve_media_url(
+        _first(d, ["cover", "image", "img", "pic", "roomCover", "portrait"], "")
+    )
+    cover = theme_picture_url or legacy_cover or background_url
     channel = str(_first(d, ["channel", "channelName", "channel_name", "channel_id"], ""))
-    owner_id = str(_first(d, ["owner_id", "ownerId", "uid", "userId", "anchor_id", "myID"], ""))
-    owner_name = str(_first(d, ["owner_name", "ownerName", "nickname", "anchor_name"], ""))
+    create_user = _as_dict(_first(d, ["createUser", "creator", "owner"], None)) or {}
+    owner_id = str(
+        _first(d, ["owner_id", "ownerId", "uid", "userId", "anchor_id", "myID"], "")
+        or _first(create_user, ["userId", "user_id", "uid", "id"], "")
+    )
+    owner_name = str(
+        _first(d, ["owner_name", "ownerName", "nickname", "anchor_name"], "")
+        or _first(create_user, ["userName", "user_name", "nickname", "name"], "")
+    )
+    owner_avatar = resolve_media_url(
+        _first(d, ["owner_avatar", "ownerAvatar"], "")
+        or _first(create_user, ["portrait", "avatar", "headimg"], "")
+    )
     if not any((rid, name, cover, channel, owner_id)):
         return None
     return {
@@ -985,12 +1628,19 @@ def normalize_room(item: Any) -> Optional[Dict[str, Any]]:
         "name": name or rid or "房间",
         "title": name or rid or "房间",
         "cover": cover,
+        "theme_picture_url": theme_picture_url,
+        "background_url": background_url,
         "channel": channel,
         "owner_id": owner_id,
         "owner_name": owner_name,
+        "owner_avatar": owner_avatar,
         "room_type": str(_first(d, ["audioroomtype", "room_type", "roomType", "type"], "")),
-        "online_count": _num(_first(d, ["online_count", "online", "member_count", "people", "num"], 0)),
+        "online_count": _num(
+            _first(d, ["online_count", "online", "member_count", "userTotal", "people", "num"], 0)
+        ),
         "status": str(_first(d, ["status", "state"], "")),
+        "is_private": _bool(_first(d, ["isPrivate", "is_private", "private"], False)),
+        "is_stopped": _bool(_first(d, ["stop", "isStopped", "is_stopped"], False)),
     }
 
 
@@ -1027,33 +1677,103 @@ def normalize_songs(data: Any) -> List[Dict[str, Any]]:
     return _normalize_many(data, normalize_song)
 
 
+def _normalize_bottle_words(value: Any) -> List[Dict[str, str]]:
+    """Normalize the APK ``leave_words_json`` conversation payload."""
+    if isinstance(value, dict):
+        raw_words: List[Any] = [value]
+    else:
+        raw_words = _as_list(value)
+
+    words: List[Dict[str, str]] = []
+    for raw in raw_words:
+        if isinstance(raw, str):
+            parsed = _as_dict(raw)
+            if parsed:
+                raw = parsed
+            elif raw.strip():
+                words.append({"user_id": "", "content": raw.strip(), "time": ""})
+                continue
+        if not isinstance(raw, dict):
+            continue
+        content = str(
+            _first(raw, ["leave_word", "leaveWord", "content", "message", "text"], "")
+        ).replace("\\n", "\n").strip()
+        user_id = str(_first(raw, ["uid", "user_id", "userId", "author_id"], ""))
+        time = str(_first(raw, ["time", "created_at", "create_time"], ""))
+        if content or user_id or time:
+            words.append({"user_id": user_id, "content": content, "time": time})
+    return words
+
+
 def normalize_bottle(item: Any) -> Optional[Dict[str, Any]]:
     if isinstance(item, str) and not _as_dict(item):
         content = item.strip()
-        return {"id": "", "content": content, "user_id": "", "nickname": "", "avatar": "", "created_at": "", "reply_count": 0} if content else None
+        return {
+            "id": "",
+            "content": content,
+            "user_id": "",
+            "picker_id": "",
+            "nickname": "",
+            "avatar": "",
+            "created_at": "",
+            "picked_at": "",
+            "picked_times": 0,
+            "state": "",
+            "leave_words": [{"user_id": "", "content": content, "time": ""}],
+            "reply_count": 0,
+        } if content else None
     d = _entity_dict(item, ("bottle", "draftBottle", "info"))
     if not d:
         return None
     bid = str(_first(d, ["id", "bottleId", "bottle_id", "draftBottleId", "draft_id"], ""))
-    content = str(_first(d, ["content", "message", "text", "body", "leave_word"], ""))
+    leave_words = _normalize_bottle_words(
+        _first(
+            d,
+            ["leave_words_json", "leaveWordsJson", "leave_words", "leaveWords"],
+            [],
+        )
+    )
+    content = str(
+        _first(d, ["content", "message", "text", "body", "leave_word"], "")
+    ).replace("\\n", "\n").strip()
+    if not content and leave_words:
+        content = str(leave_words[0].get("content") or "")
     user = normalize_user(_first(d, ["user", "userinfo", "userInfo"], None))
-    user_id = str(_first(d, ["user_id", "userId", "uid", "myid", "owner_id"], ""))
+    user_id = str(
+        _first(d, ["user_id", "userId", "uid", "uid1", "myid", "owner_id"], "")
+    )
+    picker_id = str(_first(d, ["picker_id", "pickerId", "uid2"], ""))
     nickname = str(_first(d, ["nickname", "nick", "user_name", "name"], ""))
     avatar = resolve_media_url(_first(d, ["avatar", "portrait", "head", "headimg"], ""))
     if user:
         user_id = user_id or str(user.get("id") or "")
         nickname = nickname or str(user.get("nickname") or "")
         avatar = avatar or resolve_media_url(user.get("avatar") or "")
-    if not any((bid, content, user_id, nickname, avatar)):
+    if not any((bid, content, user_id, picker_id, nickname, avatar, leave_words)):
         return None
+    raw_reply_count = _first(
+        d,
+        ["reply_count", "comment_count", "leave_word_count", "num"],
+        None,
+    )
+    reply_count = (
+        _num(raw_reply_count)
+        if raw_reply_count is not None
+        else max(len(leave_words) - 1, 0)
+    )
     return {
         "id": bid,
         "content": content,
         "user_id": user_id,
+        "picker_id": picker_id,
         "nickname": nickname,
         "avatar": avatar,
         "created_at": str(_first(d, ["created_at", "create_time", "createtime", "time"], "")),
-        "reply_count": _num(_first(d, ["reply_count", "comment_count", "leave_word_count", "num"], 0)),
+        "picked_at": str(_first(d, ["picked_at", "pick_time", "pickTime"], "")),
+        "picked_times": _num(_first(d, ["picked_times", "pickedTimes"], 0)),
+        "state": str(_first(d, ["state", "status"], "")),
+        "leave_words": leave_words,
+        "reply_count": reply_count,
     }
 
 
@@ -1072,7 +1792,14 @@ def normalize_sticker(item: Any) -> Optional[Dict[str, Any]]:
             "name": "" if is_url else value,
             "image": value if is_url else "",
             "url": value if is_url else "",
+            "data": value if is_url else "",
             "thumbnail": "",
+            "group_id": "",
+            "group_name": "",
+            "group_icon": "",
+            "index": 0,
+            "width": 0,
+            "height": 0,
             "favorite": False,
         }
     d = _entity_dict(item, ("sticker", "emoji", "info"))
@@ -1089,13 +1816,76 @@ def normalize_sticker(item: Any) -> Optional[Dict[str, Any]]:
         "name": name or sid or "表情",
         "image": image,
         "url": image,
+        "data": str(_first(d, ["data", "faceKey", "face_key"], image)),
         "thumbnail": thumb,
+        "group_id": str(_first(d, ["group_id", "groupId", "packageId", "package_id"], "")),
+        "group_name": str(_first(d, ["group_name", "groupName", "packageName"], "")),
+        "group_icon": resolve_media_url(_first(d, ["group_icon", "groupIcon", "packageIcon"], "")),
+        "index": _num(_first(d, ["index", "group_id", "groupId", "packageId"], 0)),
+        "width": _num(_first(d, ["width", "w"], 0)),
+        "height": _num(_first(d, ["height", "h"], 0)),
         "favorite": _bool(_first(d, ["favorite", "is_favorite", "isFavorite", "collected"], False)),
     }
 
 
 def normalize_stickers(data: Any) -> List[Dict[str, Any]]:
-    return _normalize_many(data, normalize_sticker)
+    """Flatten the v154 FaceGroup response into createFaceMessage-ready rows.
+
+    ``GetAllStickersWithFavorite`` returns packages rather than individual
+    stickers.  TUIKit sends the package id as ``TIMFaceElem.index`` and the
+    image URL bytes as ``TIMFaceElem.data``; keeping those fields avoids a
+    lossy package-to-generic-image conversion in the Web client.
+    """
+    out: List[Dict[str, Any]] = []
+    for item in extract_list(data):
+        d = item if isinstance(item, dict) else _as_dict(item)
+        urls = _message_list(
+            _first(d or {}, ["urls_array", "urlsArray", "urls", "stickerUrls"], [])
+        )
+        if not d or not urls:
+            normalized = normalize_sticker(item)
+            if normalized:
+                out.append(normalized)
+            continue
+        group_id = str(_first(d, ["id", "group_id", "groupId", "packageId"], ""))
+        group_name = str(_first(d, ["name", "group_name", "groupName", "packageName"], "表情包"))
+        group_icon = resolve_media_url(_first(d, ["icon", "group_icon", "groupIcon"], ""))
+        sizes = _message_list(_first(d, ["wh_array", "whArray", "sizes"], []))
+        for position, raw_url in enumerate(urls):
+            url_item = raw_url if isinstance(raw_url, dict) else {"url": raw_url}
+            face_url = resolve_media_url(
+                _first(url_item, ["url", "image", "src", "faceUrl", "face_url"], "")
+            )
+            if not face_url:
+                continue
+            size_item = sizes[position] if position < len(sizes) else {}
+            size = size_item if isinstance(size_item, dict) else (_as_dict(size_item) or {})
+            face_key = _message_data_text(
+                _first(url_item, ["faceKey", "face_key", "data", "url"], face_url)
+            )
+            out.append(
+                {
+                    "id": f"{group_id}:{position}" if group_id else str(position),
+                    "name": str(
+                        _first(url_item, ["name", "title"], f"{group_name} {position + 1}")
+                    ),
+                    "image": face_url,
+                    "url": face_url,
+                    "data": face_key or face_url,
+                    "thumbnail": face_url,
+                    "group_id": group_id,
+                    "group_name": group_name,
+                    "group_icon": group_icon,
+                    "index": _num(group_id),
+                    "width": _num(_first(size, ["width", "w"], 0)),
+                    "height": _num(_first(size, ["height", "h"], 0)),
+                    "favorite": _bool(
+                        _first(d, ["favorite", "is_favorite", "isFavorite", "collected"], True),
+                        True,
+                    ),
+                }
+            )
+    return out
 
 
 def normalize_gift(item: Any) -> Optional[Dict[str, Any]]:
@@ -1155,21 +1945,30 @@ def normalize_task(item: Any) -> Optional[Dict[str, Any]]:
         "ready",
     )
     is_claimed = any(x in av_l for x in claimed_states)
-    blocked = is_claimed or any(x in av_l for x in negative_states)
-    explicitly_ready = any(x in av_l for x in positive_states)
-    if blocked:
+    explicitly_blocked = any(x in av_l for x in negative_states)
+    explicitly_ready = not explicitly_blocked and any(x in av_l for x in positive_states)
+    completed = total > 0 and progress >= total
+    if is_claimed:
         can_receive = False
-    elif explicitly_ready:
+    elif completed or explicitly_ready:
         can_receive = True
     else:
-        can_receive = total > 0 and progress >= total
+        can_receive = False
+    if is_claimed:
+        status_text = "已领取"
+    elif can_receive:
+        # APK 的领取按钮以任务进度达到 num 为本地门禁。服务端偶尔仍返回
+        # “不可领取/未完成”的旧状态，不能让它覆盖已经完成的进度。
+        status_text = "可领取"
+    else:
+        status_text = available or ("未完成" if explicitly_blocked else "进行中")
     return {
         "id": tid,
         "title": title,
         "progress": progress,
         "total": total,
         "progress_text": f"{progress}/{total}" if total else str(progress or "—"),
-        "status_text": available or ("可领取" if can_receive else "进行中"),
+        "status_text": status_text,
         "is_claimed": is_claimed,
         "can_receive": can_receive,
         "reward": str(_first(item, ["reward", "prize", "gift", "card"], "")),
@@ -1212,6 +2011,45 @@ def _dig_num(data: Any, keys: List[str]) -> Optional[int]:
             if n is not None:
                 return n
     return None
+
+
+MATCH_GENDERS = {"不限", "男", "女"}
+MATCH_PROPERTY_ORDER = ("双", "Z", "B")
+MATCH_PROPERTIES = set(MATCH_PROPERTY_ORDER)
+
+
+def normalize_match_filters(data: Any) -> Dict[str, str]:
+    """Read the two preferences exposed by the APK match filter dialog."""
+    source = _as_dict(data) if isinstance(data, str) else data
+    if not isinstance(source, dict):
+        source = {}
+
+    merged = dict(source)
+    for key in ("user", "userinfo", "userInfo", "userInfoList", "json_obj", "data"):
+        nested = source.get(key)
+        if isinstance(nested, str):
+            nested = _as_dict(nested)
+        if isinstance(nested, dict):
+            merged.update(nested)
+
+    gender = str(
+        _first(
+            merged,
+            ["match_gender", "matchGender", "matchgender"],
+            "不限",
+        )
+    ).strip()
+    property_ = str(
+        _first(
+            merged,
+            ["match_property", "matchProperty", "matchproperty"],
+            "双",
+        )
+    ).strip()
+    return {
+        "gender": gender if gender in MATCH_GENDERS else "不限",
+        "property": property_ if property_ in MATCH_PROPERTIES else "双",
+    }
 
 
 def normalize_match_status(cards_data: Any, nums_data: Any, user: Optional[Dict] = None) -> Dict[str, Any]:

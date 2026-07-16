@@ -2,3 +2,8 @@ tim-js-sdk@2.27.6
 Source: https://cdn.jsdelivr.net/npm/tim-js-sdk@2.27.6/tim-js.js
 Global: window.TIM (UMD)
 Purpose: fixed-version vendor for product Web IM; do not replace with unpinned "latest".
+
+tim-upload-plugin@1.4.3
+Source: npm package tim-upload-plugin@1.4.3 (UMD index.js)
+Global: window.TIMUploadPlugin
+Purpose: required by TIM Web SDK 2.27.6 for image/audio/video/file upload.

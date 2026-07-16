@@ -1,4 +1,4 @@
-"""Native capability adapters (IM / face / pay).
+"""Native capability adapters (IM / face / pay / RoomKit).
 
 These sit *beside* the HTTP protocol core:
   protocol  → credentials / order params / face session
@@ -19,6 +19,7 @@ from .bundle import NativeBundle
 from .face import FaceAdapter, FaceSession
 from .im import ImAdapter, RongCredentials, TimCredentials
 from .pay import PayAdapter, PayPrepareResult
+from .roomkit import RoomKitAdapter, RoomKitCredentials
 
 __all__ = [
     "NativeBundle",
@@ -29,4 +30,6 @@ __all__ = [
     "FaceSession",
     "PayAdapter",
     "PayPrepareResult",
+    "RoomKitAdapter",
+    "RoomKitCredentials",
 ]

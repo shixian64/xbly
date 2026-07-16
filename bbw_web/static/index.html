@@ -1,12 +1,12 @@
-<!doctype html>
-<html lang="zh-CN">
+﻿<!doctype html>
+<html lang="zh-CN" class="ui-scrollbar">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#f8f5ff" />
   <meta name="color-scheme" content="light" />
-  <title>小贝乐园</title>
-  <link rel="stylesheet" href="/static/app.css" />
+  <title>XBLY</title>
+  <link rel="stylesheet" href="/static/app.css?v=20260716-mobile-media-retry-secure-viewport-no-text-icons-match-voice-tabs-adaptive-sidebar-message-list-avatar-clean-message-header-message-time-fix-scrollbar-component-csp-avatar-events-message-wide-partial-match-tabs-tim-profile-avatar-zh-ui-partial-social-moments-tabs-feed-fix2" />
 </head>
 <body>
   <div id="toast" class="toast hide" role="status" aria-live="polite" aria-atomic="true"></div>
@@ -16,7 +16,7 @@
       <div class="login-brand">
         <div>
           <p class="eyebrow">欢迎回来</p>
-          <h1 id="login-title">回到小贝乐园</h1>
+          <h1 id="login-title">回到XBLY</h1>
           <p>发现新朋友，分享此刻的快乐。</p>
         </div>
       </div>
@@ -56,21 +56,22 @@
     <aside class="sidebar" id="sidebar" aria-label="主导航">
       <div class="side-brand">
         <div>
-          <strong>小贝乐园</strong>
+          <strong>XBLY</strong>
           <span>让相遇更有趣</span>
         </div>
         <button type="button" class="utility-btn side-close mobile-only" id="close-menu">关闭</button>
       </div>
 
-      <nav id="primary-nav" class="nav-list" aria-label="主要功能"></nav>
-
-      <div class="nav-section">
-        <p>更多服务</p>
-        <nav id="secondary-nav" class="nav-list secondary-nav" aria-label="更多服务"></nav>
+      <div class="side-navigation ui-scrollbar">
+        <nav id="primary-nav" class="nav-list nav-tree" aria-label="功能导航"></nav>
+        <div class="nav-section hide" id="tools-nav-section">
+          <p>调试工具</p>
+          <nav id="secondary-nav" class="nav-list secondary-nav" aria-label="调试工具"></nav>
+        </div>
       </div>
 
       <div class="side-account">
-        <div class="avatar avatar-sm" id="side-avatar" aria-hidden="true">游</div>
+        <div class="avatar avatar-sm" id="side-avatar" aria-hidden="true" hidden></div>
         <div class="side-account-copy">
           <strong id="side-name">游客</strong>
           <span id="side-meta">尚未登录</span>
@@ -88,6 +89,9 @@
           <h1 id="page-title">身边</h1>
           <p id="page-subtitle">看看此刻谁也在这里</p>
         </div>
+        <div class="topbar-actions" id="topbar-actions">
+          <button type="button" class="btn secondary small" id="mark-all-read-top" data-action="mark-all-read" aria-label="将所有会话标记为已读" hidden>全部已读</button>
+        </div>
       </header>
 
       <main id="page-root" class="page-root" tabindex="-1" aria-live="polite"></main>
@@ -104,10 +108,10 @@
       </div>
       <button type="button" class="utility-btn" id="close-profile">关闭</button>
     </div>
-    <div id="profile-dialog-body" class="profile-dialog-body"></div>
+    <div id="profile-dialog-body" class="profile-dialog-body ui-scrollbar"></div>
   </dialog>
 
   <!-- TIM SDK is lazy-loaded only when entering Messages; avoid parsing 600KB on every page load. -->
-  <script src="/static/app.js?v=20260716-social-relations2"></script>
+  <script src="/static/app.js?v=20260716-mobile-media-retry-secure-viewport-no-text-icons-match-voice-tabs-adaptive-sidebar-message-list-avatar-clean-message-header-message-time-fix-scrollbar-component-csp-avatar-events-message-wide-partial-match-tabs-tim-profile-avatar-zh-ui-partial-social-moments-tabs-feed-fix2"></script>
 </body>
 </html>

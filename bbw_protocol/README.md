@@ -14,6 +14,7 @@
 | ✅ 房间/匹配/IM 辅助 HTTP | token 获取、列表、redis 缓存接口 |
 | ✅ **action 名称面 + 调用器** | 默认 action 用 `app.call`；特殊租户/URL/Redis/multipart 用对应 `call_*` |
 | ⚠️ 腾讯/融云 **实时长连接** | `adapters.im` 出凭证；收发需 TIM/融云 SDK（见 `bbw_web`） |
+| ✅ APK RoomKit 房间列表 | `adapters.roomkit` 独立登录并读取 `/mic/room/list`；Authorization 与主协议会话隔离 |
 | ⚠️ 阿里云刷脸 | `adapters.face` 编排 Init/Describe；活体 metaInfo 仍靠 ZIM |
 | ⚠️ 支付收银台 | `adapters.pay` 规范 order_params；收银靠微信/支付宝官方 |
 
@@ -67,6 +68,7 @@ app.im.local_user_sig()  # 本地腾讯 IM UserSig
 print(app.native.im.tim_login_payload())
 print(app.native.pay.prepare_coin_wechat("1").to_dict())
 print(app.native.face.status_hint())
+print(app.native.roomkit.rooms(page=1, size=10).data)
 ```
 
 ## 原生能力 CLI（协议核内）
