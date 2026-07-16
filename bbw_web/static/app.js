@@ -45,10 +45,12 @@ const S = {
   imConnected: false,
   imMode: "", // "sdk" | "rest" | ""
   imConnecting: false,
+  imNextReconnectAt: 0,
   imLastError: "",
   imMessages: [],
   imMessageLoadingPeers: new Set(),
   imMessageLoadedPeers: new Set(),
+  messageSyncTimer: null,
   smsTimer: null,
   presenceTimer: null,
   serverHeartbeat: false,
@@ -160,11 +162,6 @@ function setImConnectingUi(active, detail = "") {
   S.imConnecting = Boolean(active);
   S.imLastError = active ? "" : S.imLastError;
   if (detail) S.imLastError = detail;
-  const btn = document.querySelector('[data-action="im-connect"]');
-  if (btn) {
-    btn.disabled = Boolean(active);
-    btn.textContent = active ? "连接中…" : S.imConnected ? "重新连接" : "连接消息服务";
-  }
   const status = document.getElementById("im-conn-status");
   if (status) {
     if (active) status.textContent = "正在连接消息服务…";
@@ -411,6 +408,31 @@ function warmConversationSummary() {
   return refreshConversationSummary();
 }
 
+function stopMessageSyncTimer() {
+  clearInterval(S.messageSyncTimer);
+  S.messageSyncTimer = null;
+}
+
+function syncMessagesInBackground() {
+  if (!S.authenticated || document.hidden) return Promise.resolve([]);
+  const tasks = [refreshConversationSummary()];
+  if (S.route === "msg" && S.activePeer) {
+    tasks.push(loadConversationMessages(S.activePeer, { force: true }));
+  }
+  if (S.route === "msg" && !S.imConnected && !S.imConnecting && Date.now() >= S.imNextReconnectAt) {
+    tasks.push(ensureTimConnected());
+  }
+  return Promise.allSettled(tasks);
+}
+
+function startMessageSyncTimer() {
+  stopMessageSyncTimer();
+  if (!S.authenticated) return;
+  S.messageSyncTimer = setInterval(() => {
+    void syncMessagesInBackground();
+  }, 12000);
+}
+
 function buildNav() {
   $("primary-nav").innerHTML = PRIMARY_NAV.map((item) => navButton(item)).join("");
   const secondary = [...SECONDARY_NAV, ...(S.labEnabled ? [LAB_NAV] : [])];
@@ -582,7 +604,7 @@ function userCard(item, options = {}) {
   if (options.chat && id) {
     actions.push(`<button type="button" class="btn primary small" data-action="open-chat" data-uid="${esc(id)}" data-name="${esc(
       name
-    )}">聊天</button>`);
+    )}" data-avatar="${esc(user.avatar || user.portrait || "")}">聊天</button>`);
   }
   if (options.follow && id) {
     actions.push(`<button type="button" class="btn soft small" data-action="follow-user" data-uid="${esc(id)}">关注</button>`);
@@ -970,7 +992,7 @@ function chatLogHtml() {
     if (S.activePeer && S.imMessageLoadedPeers.has(S.activePeer)) {
       return `<div class="chat-line system">暂无历史消息</div>`;
     }
-    return `<div class="chat-line system">${S.imConnected ? "还没有消息，礼貌地打个招呼吧" : "连接消息服务后可发送新消息"}</div>`;
+    return `<div class="chat-line system">还没有消息，礼貌地打个招呼吧</div>`;
   }
   return entries
     .sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0))
@@ -1073,6 +1095,53 @@ function activeConversation() {
   return S.conversations.find((item) => conversationPeer(item) === S.activePeer) || null;
 }
 
+function ensureConversationForPeer(peer, { name = "", avatar = "" } = {}) {
+  const target = String(peer || "").trim();
+  if (!target) return null;
+  const index = S.conversations.findIndex((item) => conversationPeer(item) === target);
+  if (index >= 0) {
+    const current = S.conversations[index];
+    const currentName = current.nickname || current.peer_name || current.user?.nickname || "";
+    const next = {
+      ...current,
+      nickname: name && (!currentName || currentName === `用户 ${target}`) ? name : current.nickname,
+      avatar: avatar || current.avatar || current.portrait || current.user?.avatar || "",
+    };
+    S.conversations[index] = next;
+    return next;
+  }
+  const created = {
+    conversation_id: `C2C${target}`,
+    conversation_type: "C2C",
+    source: "local",
+    peer_id: target,
+    nickname: name || `用户 ${target}`,
+    avatar,
+    last_message: "",
+    timestamp: Date.now(),
+    unread_count: 0,
+  };
+  S.conversations.unshift(created);
+  recalculateUnreadTotal();
+  return created;
+}
+
+function updateConversationActivity(peer, { name = "", avatar = "", lastMessage = "", unreadCount } = {}) {
+  const target = String(peer || "").trim();
+  const conversation = ensureConversationForPeer(target, { name, avatar });
+  if (!conversation) return null;
+  conversation.last_message = String(lastMessage || "");
+  conversation.content = conversation.last_message;
+  conversation.timestamp = Date.now();
+  if (unreadCount != null) {
+    conversation.unread_count = Math.max(0, Number(unreadCount) || 0);
+    conversation.unread = conversation.unread_count;
+  }
+  S.conversations = [conversation, ...S.conversations.filter((item) => conversationPeer(item) !== target)];
+  recalculateUnreadTotal();
+  return conversation;
+}
+
 function isSystemCustomerServicePeer(peer) {
   return String(peer || "").trim() === SYSTEM_CUSTOMER_SERVICE_UID;
 }
@@ -1084,16 +1153,12 @@ function conversationListHtml() {
 }
 
 function chatPaneHtml() {
-  const active = activeConversation();
   if (!S.activePeer) {
     return `<div class="chat-placeholder"><div><strong>选择一段聊天</strong><span>在左侧打开最近会话，或从好友列表开始聊天。</span><button type="button" class="btn primary small" data-route="friends">打开好友列表</button></div></div>`;
   }
-  return `<div class="chat-head"><button type="button" class="utility-btn mobile-only" data-action="close-conversation">返回</button>${avatarHtml(
-    S.activePeerName || `用户 ${S.activePeer}`,
-    active?.avatar || active?.portrait || active?.user?.avatar
-  )}<div><h2>${esc(S.activePeerName || `用户 ${S.activePeer}`)}</h2><p>UID ${esc(
-    S.activePeer
-  )}</p></div><button type="button" class="utility-btn chat-profile" data-action="open-profile" data-uid="${esc(
+  return `<div class="chat-head"><button type="button" class="utility-btn mobile-only" data-action="close-conversation">返回</button><div><h2>${esc(
+    S.activePeerName || `用户 ${S.activePeer}`
+  )}</h2></div><button type="button" class="utility-btn chat-profile" data-action="open-profile" data-uid="${esc(
     S.activePeer
   )}">资料</button></div>
     <div class="chat-log" id="im-log" aria-live="polite">${chatLogHtml()}</div>
@@ -1103,7 +1168,7 @@ function chatPaneHtml() {
         : `<form class="chat-composer" data-form="im-send"><input type="hidden" name="peer" value="${esc(
             S.activePeer
           )}" /><label class="sr-only" for="im-text">消息</label><textarea id="im-text" name="text" rows="1" autocomplete="off" placeholder="输入消息" required></textarea><button type="submit" class="btn primary" ${
-            S.imConnected ? "" : "disabled"
+            S.imConnecting ? "disabled" : ""
           }>发送</button></form>`
     }`;
 }
@@ -1207,7 +1272,7 @@ async function pageMessages(signal) {
   const ready = Boolean(resolveTimApi());
   const connectionText = S.imConnected
     ? S.imMode === "rest"
-      ? "REST 发送通道已启用（可发文本；收消息依赖刷新历史）"
+      ? "消息服务已连接，正在自动同步新消息"
       : "消息服务已连接（TIM SDK 实时）"
     : S.imConnecting
       ? "正在连接消息服务…"
@@ -1218,9 +1283,6 @@ async function pageMessages(signal) {
           : "将自动加载 TIM SDK；失败时回退 REST";
   return `<div class="message-page${S.activePeer ? " conversation-open" : ""}"><section class="message-toolbar"><div><h2>消息</h2><p id="im-conn-status">${esc(connectionText)}</p></div><div class="button-row compact-row">
       <button type="button" class="btn secondary small" data-action="mark-all-read" ${S.conversations.length ? "" : "disabled"}>全部已读</button>
-      <button type="button" class="btn ${S.imConnected ? "secondary" : "primary"} small" data-action="im-connect" ${S.imConnecting ? "disabled" : ""}>${
-    S.imConnecting ? "连接中…" : S.imConnected ? "重新连接" : "连接消息服务"
-  }</button>
     </div></section>
     <section class="message-shortcuts" aria-label="消息快捷入口">
       <button type="button" data-action="social-open-tab" data-tab="fans"><strong>新粉丝</strong><span>查看关注你的人</span></button>
@@ -1232,7 +1294,7 @@ async function pageMessages(signal) {
     </section>
     <section class="conversation-layout${S.activePeer ? " has-active" : ""}">
       <aside class="conversation-list-pane" aria-label="聊天列表">
-        <div class="pane-head"><div><h2>聊天列表</h2><p data-conversation-count>${S.conversations.length ? `${S.conversations.length} 个最近会话` : "最近联系的人会显示在这里"}</p></div><button type="button" class="utility-btn" data-action="refresh-route">刷新</button></div>
+        <div class="pane-head"><div><h2>聊天列表</h2><p data-conversation-count>${S.conversations.length ? `${S.conversations.length} 个最近会话` : "最近联系的人会显示在这里"}</p></div></div>
         <div class="conversation-list">${conversationListHtml()}</div>
       </aside>
       <div class="chat-pane">${chatPaneHtml()}</div>
@@ -1549,7 +1611,7 @@ async function openProfile(uid) {
         ? `<button type="button" class="btn primary" data-route="me">返回我的页面</button>`
         : `<button type="button" class="btn primary" data-action="open-chat" data-uid="${esc(
             user.id || user.uid || target
-          )}" data-name="${esc(name)}">聊天</button><button type="button" class="btn secondary" data-action="follow-user" data-uid="${esc(
+          )}" data-name="${esc(name)}" data-avatar="${esc(user.avatar || user.portrait || "")}">聊天</button><button type="button" class="btn secondary" data-action="follow-user" data-uid="${esc(
             user.id || user.uid || target
           )}">关注</button>`
     }</section>
@@ -1747,13 +1809,20 @@ function attachTimHandlers(chat, TIM, credential) {
     (event.data || []).forEach((message) => {
       const peer = String(message.from || "");
       const text = (message.payload && message.payload.text) || "[新消息]";
+      const active = peer && peer === String(S.activePeer);
+      const current = S.conversations.find((item) => conversationPeer(item) === peer);
+      updateConversationActivity(peer, {
+        lastMessage: text,
+        unreadCount: active ? 0 : Number(current?.unread_count || current?.unread || 0) + 1,
+      });
       addImMessage(text, peer === String(credential.userID) ? "mine" : "", peer);
-      if (peer && peer === String(S.activePeer)) {
+      if (active) {
         markConversationRead(peer);
       } else if (peer) {
         S.readConversationPeers.delete(peer);
         toast(`收到来自 ${peer} 的新消息`);
       }
+      refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
     });
   };
   if (TIM.EVENT?.MESSAGE_RECEIVED) chat.on(TIM.EVENT.MESSAGE_RECEIVED, S.imHandler);
@@ -2036,7 +2105,7 @@ async function ensureTimConnected({ force = false } = {}) {
           S.imMode = "rest";
           S.imLastError = "";
           addImMessage(
-            "已启用 REST 发送通道（BFF → 腾讯 openim/sendmsg）。可发送文本；对方回复请点刷新查看历史。",
+            "已启用 REST 发送通道（BFF → 腾讯 openim/sendmsg），新消息将自动同步。",
             "system"
           );
           toast("已启用 REST 发信通道", "info", 4200);
@@ -2062,6 +2131,7 @@ async function ensureTimConnected({ force = false } = {}) {
       return false;
     } finally {
       S._imConnecting = null;
+      S.imNextReconnectAt = S.imConnected ? 0 : Date.now() + 30000;
       setImConnectingUi(false);
     }
   })();
@@ -2138,6 +2208,7 @@ async function logout() {
   } finally {
     if (S.routeController) S.routeController.abort();
     stopPresenceTimer();
+    stopMessageSyncTimer();
     await cleanupIM();
     S.authenticated = false;
     S.user = null;
@@ -2159,14 +2230,6 @@ async function logout() {
 
 async function handleAction(action, button) {
   if (action === "refresh-route") {
-    if (S.route === "msg") {
-      const tasks = [refreshConversationSummary({ force: true })];
-      if (S.activePeer) tasks.push(loadConversationMessages(S.activePeer, { force: true }));
-      await Promise.allSettled(tasks);
-      refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
-      toast("消息已刷新");
-      return;
-    }
     return go(S.route, { force: true });
   }
   if (action === "logout") return logout();
@@ -2176,6 +2239,10 @@ async function handleAction(action, button) {
     if (!uid) throw new Error("缺少对方 UID");
     S.activePeer = uid;
     S.activePeerName = button.dataset.name || `用户 ${uid}`;
+    ensureConversationForPeer(uid, {
+      name: S.activePeerName,
+      avatar: button.dataset.avatar || "",
+    });
     markConversationRead(uid);
     closeProfileDialog();
     if (S.route !== "msg") {
@@ -2183,7 +2250,7 @@ async function handleAction(action, button) {
     } else {
       refreshMessageConversationRegion({
         focusComposer: action === "select-conversation",
-        refreshList: false,
+        refreshList: true,
       });
       void loadConversationMessages(uid);
     }
@@ -2343,19 +2410,6 @@ async function handleAction(action, button) {
   if (action === "referral-get") {
     const { data } = await api("/api/referral");
     setPanel("me-result", operationView(data, "推荐码信息已读取"));
-    return;
-  }
-  if (action === "im-connect") {
-    const connected = await ensureTimConnected({ force: true });
-    const sdkOk = Boolean(resolveTimApi());
-    setPanel(
-      "im-info",
-      connected
-        ? `<div class="notice">消息服务已连接。UserSig 仅用于 SDK 登录，不会在页面明文展示。</div>`
-        : `<div class="notice warn">连接失败。SDK=${sdkOk ? "已加载" : "未加载"}${S.imLastError ? ` · ${esc(S.imLastError)}` : ""}。请强制刷新(Ctrl+F5)后重试。</div>`
-    );
-    toast(connected ? "消息通道已连接" : S.imLastError || "消息服务连接失败", connected ? "info" : "error", 4200);
-    refreshMessageConversationRegion();
     return;
   }
   if (action === "im-rong") {
@@ -2555,20 +2609,11 @@ async function handleProductForm(form, submitter) {
     }
 
     addImMessage(text, "mine", peer);
-    const existing = S.conversations.find((item) => conversationPeer(item) === peer);
-    if (existing) {
-      Object.assign(existing, { last_message: text, content: text, timestamp: Date.now(), source: existing.source || "local" });
-    } else {
-      S.conversations.unshift({
-        conversation_id: `C2C${peer}`,
-        conversation_type: "C2C",
-        source: "local",
-        peer_id: peer,
-        nickname: S.activePeerName || `用户 ${peer}`,
-        last_message: text,
-        timestamp: Date.now(),
-      });
-    }
+    updateConversationActivity(peer, {
+      name: S.activePeerName || `用户 ${peer}`,
+      lastMessage: text,
+      unreadCount: 0,
+    });
     const input = $("im-text");
     if (input) input.value = "";
     if (S.route === "msg") {
@@ -2577,6 +2622,7 @@ async function handleProductForm(form, submitter) {
         log.innerHTML = chatLogHtml();
         log.scrollTop = log.scrollHeight;
       }
+      refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
     }
     return;
   }
@@ -2690,6 +2736,7 @@ $("login-form").addEventListener("submit", (event) => {
     updatePresence(!document.hidden);
     buildNav();
     void warmConversationSummary();
+    startMessageSyncTimer();
     const desired = hashRoute();
     go(isRouteAllowed(desired) ? desired : "nearby", { replace: !isRouteAllowed(desired), force: true });
     toast("登录成功");
@@ -2745,18 +2792,6 @@ document.addEventListener(
 $("open-menu").addEventListener("click", openDrawer);
 $("close-menu").addEventListener("click", () => closeDrawer(true));
 $("drawer-mask").addEventListener("click", () => closeDrawer(true));
-$("reload-page").addEventListener("click", (event) => {
-  void withPending(event.currentTarget, async () => {
-    if (S.route === "msg") {
-      const tasks = [refreshConversationSummary({ force: true })];
-      if (S.activePeer) tasks.push(loadConversationMessages(S.activePeer, { force: true }));
-      await Promise.allSettled(tasks);
-      refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
-      return;
-    }
-    go(S.route, { force: true });
-  });
-});
 $("logout-side").addEventListener("click", (event) => {
   void withPending(event.currentTarget, logout);
 });
@@ -2780,10 +2815,18 @@ window.addEventListener("hashchange", () => {
 document.addEventListener("visibilitychange", () => {
   if (!S.authenticated) return;
   updatePresence(!document.hidden);
+  if (!document.hidden) void syncMessagesInBackground();
+});
+
+window.addEventListener("pageshow", (event) => {
+  if (!event.persisted || !S.authenticated) return;
+  startMessageSyncTimer();
+  void syncMessagesInBackground();
 });
 
 window.addEventListener("pagehide", () => {
   stopPresenceTimer();
+  stopMessageSyncTimer();
   if (S.authenticated) {
     const options = {
       method: "POST",
@@ -2820,6 +2863,7 @@ window.addEventListener("pagehide", () => {
       S.serverHeartbeat = Boolean(data.auto_heartbeat ?? S.serverHeartbeat);
       updatePresence(!document.hidden);
       void warmConversationSummary();
+      startMessageSyncTimer();
       const desired = hashRoute();
       go(isRouteAllowed(desired) ? desired : "nearby", { replace: !isRouteAllowed(desired), force: true });
       return;

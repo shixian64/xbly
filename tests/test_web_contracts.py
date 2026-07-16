@@ -400,6 +400,20 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("系统客服消息无需回复", app_js)
         self.assertIn("if (isSystemCustomerServicePeer(peer))", app_js)
 
+    def test_message_page_uses_automatic_sync_and_local_conversation_creation(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        index_html = (root / "bbw_web" / "static" / "index.html").read_text(encoding="utf-8")
+        chat_pane = app_js.split("function chatPaneHtml()", 1)[1].split("function refreshMessageConversationRegion", 1)[0]
+
+        self.assertIn("messageSyncTimer: null", app_js)
+        self.assertIn("ensureConversationForPeer(uid", app_js)
+        self.assertIn("updateConversationActivity(peer", app_js)
+        self.assertNotIn('data-action="im-connect"', app_js)
+        self.assertNotIn('id="reload-page"', index_html)
+        self.assertNotIn("avatarHtml(", chat_pane)
+        self.assertNotIn("UID ${esc", chat_pane)
+
 
 if __name__ == "__main__":
     unittest.main()

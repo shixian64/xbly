@@ -1407,12 +1407,7 @@ summary:focus-visible {
   background: #faf9fc;
 }
 
-.chat-head .avatar {
-  width: 42px;
-  height: 42px;
-}
-
-.chat-head > div:not(.avatar) {
+.chat-head > div {
   min-width: 0;
   flex: 1;
 }
