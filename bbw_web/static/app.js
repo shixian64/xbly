@@ -27,11 +27,13 @@ const S = {
   labEnabled: false,
   routeController: null,
   routeSeq: 0,
+  pageCache: new Map(),
   socialTab: "follows",
   visitorTab: "seen_me",
   activePeer: "",
   activePeerName: "",
   conversations: [],
+  conversationRefreshPromise: null,
   readConversationPeers: new Map(),
   unreadTotal: 0,
   profileSeq: 0,
@@ -44,6 +46,8 @@ const S = {
   imConnecting: false,
   imLastError: "",
   imMessages: [],
+  imMessageLoadingPeers: new Set(),
+  imMessageLoadedPeers: new Set(),
   smsTimer: null,
   presenceTimer: null,
   serverHeartbeat: false,
@@ -385,15 +389,25 @@ function updateUnreadBadges() {
   });
 }
 
-async function warmConversationSummary() {
-  try {
-    const { data } = await api("/api/im/conversations?page=1", { timeout: 7000 });
-    const items = itemsOf(data);
-    S.conversations = mergeConversationSources(items, S.conversations);
-    recalculateUnreadTotal();
-  } catch {
-    // Navigation remains usable when the optional unread summary is unavailable.
-  }
+function refreshConversationSummary({ force = false } = {}) {
+  if (S.conversationRefreshPromise && !force) return S.conversationRefreshPromise;
+  const task = api("/api/im/conversations?page=1", { timeout: 9000 })
+    .then(({ data }) => {
+      S.conversations = mergeConversationSources(itemsOf(data), S.conversations);
+      recalculateUnreadTotal();
+      refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
+      return S.conversations;
+    })
+    .catch(() => S.conversations)
+    .finally(() => {
+      if (S.conversationRefreshPromise === task) S.conversationRefreshPromise = null;
+    });
+  S.conversationRefreshPromise = task;
+  return task;
+}
+
+function warmConversationSummary() {
+  return refreshConversationSummary();
 }
 
 function buildNav() {
@@ -444,15 +458,21 @@ function go(id, options = {}) {
   const hash = `#/${target}`;
   if (options.replace) {
     history.replaceState(null, "", hash);
-    void activateRoute(target);
+    void activateRoute(target, { force: Boolean(options.force) });
   } else if (location.hash !== hash) {
     location.hash = hash;
   } else if (options.force) {
-    void activateRoute(target);
+    void activateRoute(target, { force: true });
   }
 }
 
-async function activateRoute(id) {
+function routeCacheKey(route) {
+  if (route === "social") return `${route}:${S.socialTab}`;
+  if (route === "visitors") return `${route}:${S.visitorTab}`;
+  return route;
+}
+
+async function activateRoute(id, { force = false } = {}) {
   if (!S.authenticated) return;
   const target = isRouteAllowed(id) ? id : "nearby";
   if (target !== id) {
@@ -466,13 +486,22 @@ async function activateRoute(id) {
   S.route = target;
   syncNav();
   closeDrawer();
+  const cacheKey = routeCacheKey(target);
+  const cached = S.pageCache.get(cacheKey);
+  if (!force && target !== "msg" && cached && Date.now() - cached.time < 30000) {
+    root().innerHTML = cached.html;
+    root().focus({ preventScroll: true });
+    return;
+  }
   root().innerHTML = loadingState("正在准备页面…");
   window.scrollTo({ top: 0, behavior: "auto" });
   try {
     const page = PAGE_RENDERERS[target] || pageNearby;
     const html = await page(controller.signal);
     if (controller.signal.aborted || seq !== S.routeSeq) return;
-    root().innerHTML = `<div class="page-enter">${html}</div>`;
+    const rendered = `<div class="page-enter">${html}</div>`;
+    root().innerHTML = rendered;
+    if (target !== "msg") S.pageCache.set(cacheKey, { html: rendered, time: Date.now() });
     root().focus({ preventScroll: true });
     if (target === "msg" && !S.imConnected) {
       // Load vendor SDK if needed, then login with BFF UserSig.
@@ -931,9 +960,16 @@ function chatLogHtml() {
     (entry) => entry.type !== "system" && (!entry.peer || !S.activePeer || entry.peer === S.activePeer)
   );
   if (!entries.length) {
+    if (S.activePeer && S.imMessageLoadingPeers.has(S.activePeer)) {
+      return `<div class="chat-line system">正在加载聊天记录…</div>`;
+    }
+    if (S.activePeer && S.imMessageLoadedPeers.has(S.activePeer)) {
+      return `<div class="chat-line system">暂无历史消息</div>`;
+    }
     return `<div class="chat-line system">${S.imConnected ? "还没有消息，礼貌地打个招呼吧" : "连接消息服务后可发送新消息"}</div>`;
   }
   return entries
+    .sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0))
     .map((entry) => `<div class="chat-line ${entry.type || ""}">${esc(entry.text)}</div>`)
     .join("");
 }
@@ -949,6 +985,75 @@ function addImMessage(text, type = "system", peer = "") {
   if (log) {
     log.innerHTML = chatLogHtml();
     log.scrollTop = log.scrollHeight;
+  }
+}
+
+function refreshChatLog() {
+  const log = $("im-log");
+  if (!log) return;
+  log.innerHTML = chatLogHtml();
+  log.scrollTop = log.scrollHeight;
+}
+
+function mergePeerMessages(peer, incoming) {
+  const target = String(peer || "");
+  const otherPeers = S.imMessages.filter((entry) => entry.peer !== target);
+  const byKey = new Map();
+  [...S.imMessages.filter((entry) => entry.peer === target), ...incoming].forEach((entry) => {
+    const key = entry.id || `${entry.type}|${entry.timestamp || ""}|${entry.text}`;
+    byKey.set(key, entry);
+  });
+  S.imMessages = [...otherPeers, ...byKey.values()];
+  if (S.imMessages.length > 500) S.imMessages.splice(0, S.imMessages.length - 500);
+}
+
+async function loadConversationMessages(peer, { force = false } = {}) {
+  const target = String(peer || "").trim();
+  if (!target || S.imMessageLoadingPeers.has(target)) return;
+  if (!force && S.imMessageLoadedPeers.has(target)) return;
+  S.imMessageLoadingPeers.add(target);
+  refreshChatLog();
+  const me = String(S.user?.uid || S.user?.id || "");
+  const tasks = [
+    api(`/api/im/messages?peer=${encodeURIComponent(target)}`, { timeout: 10000 }).then(({ data }) =>
+      itemsOf(data).map((item) => ({
+        id: String(item.id || ""),
+        text: String(item.text || item.content || "[消息]"),
+        type: String(item.from_user_id || "") === me ? "mine" : "",
+        peer: target,
+        timestamp: conversationTimestamp(item),
+        source: "http",
+      }))
+    ),
+  ];
+  if (S.imMode === "sdk" && S.chat && typeof S.chat.getMessageList === "function") {
+    tasks.push(
+      withTimeout(
+        S.chat.getMessageList({ conversationID: `C2C${target}`, count: 30 }),
+        8000,
+        "拉取 TIM 消息"
+      ).then((result) => {
+        const list = result?.data?.messageList || result?.messageList || [];
+        return (Array.isArray(list) ? list : []).map((message) => ({
+          id: String(message.ID || message.id || message.sequence || ""),
+          text: String(message.payload?.text || message.messageForShow || "[消息]"),
+          type: message.flow === "out" || String(message.from || "") === me ? "mine" : "",
+          peer: target,
+          timestamp: Number(message.time || message.timestamp || 0) *
+            (String(message.time || message.timestamp || "").length === 10 ? 1000 : 1),
+          source: "tim",
+        }));
+      })
+    );
+  }
+  try {
+    const results = await Promise.allSettled(tasks);
+    const incoming = results.flatMap((result) => (result.status === "fulfilled" ? result.value : []));
+    mergePeerMessages(target, incoming);
+    S.imMessageLoadedPeers.add(target);
+  } finally {
+    S.imMessageLoadingPeers.delete(target);
+    if (S.activePeer === target) refreshChatLog();
   }
 }
 
@@ -991,7 +1096,11 @@ function chatPaneHtml() {
     }>发送</button></form>`;
 }
 
-function refreshMessageConversationRegion({ focusComposer = false } = {}) {
+function refreshMessageConversationRegion({
+  focusComposer = false,
+  refreshList = true,
+  refreshPane = true,
+} = {}) {
   if (S.route !== "msg") return false;
   const page = document.querySelector(".message-page");
   const layout = document.querySelector(".conversation-layout");
@@ -1000,8 +1109,16 @@ function refreshMessageConversationRegion({ focusComposer = false } = {}) {
   if (!page || !layout || !list || !pane) return false;
   page.classList.toggle("conversation-open", Boolean(S.activePeer));
   layout.classList.toggle("has-active", Boolean(S.activePeer));
-  list.innerHTML = conversationListHtml();
-  pane.innerHTML = chatPaneHtml();
+  if (refreshList) {
+    list.innerHTML = conversationListHtml();
+  } else {
+    list.querySelectorAll(".conversation-card").forEach((card) => {
+      const active = String(card.dataset.uid || "") === String(S.activePeer || "");
+      card.classList.toggle("on", active);
+      if (active) card.querySelector(".unread-badge")?.remove();
+    });
+  }
+  if (refreshPane) pane.innerHTML = chatPaneHtml();
   const count = document.querySelector("[data-conversation-count]");
   if (count) count.textContent = S.conversations.length ? `${S.conversations.length} 个最近会话` : "最近联系的人会显示在这里";
   if (focusComposer) $("im-text")?.focus({ preventScroll: true });
@@ -1065,19 +1182,16 @@ async function pageNearby(signal) {
 }
 
 async function pageMessages(signal) {
-  let history = [];
-  try {
-    const { data } = await api("/api/im/conversations?page=1", { signal });
-    history = itemsOf(data);
-  } catch (error) {
-    if (error instanceof AuthExpiredError || error?.name === "AbortError") throw error;
-  }
-  S.conversations = mergeConversationSources(history, S.conversations);
+  void signal;
+  // Render cached summaries immediately; refresh in the background so entering
+  // the message page never waits on the upstream history service.
+  void refreshConversationSummary();
   recalculateUnreadTotal();
   const active = activeConversation();
   if (active && !S.activePeerName) {
     S.activePeerName = active.nickname || active.peer_name || active.user?.nickname || `用户 ${S.activePeer}`;
   }
+  if (S.activePeer) void loadConversationMessages(S.activePeer);
   const ready = Boolean(resolveTimApi());
   const connectionText = S.imConnected
     ? S.imMode === "rest"
@@ -1641,7 +1755,7 @@ function attachTimHandlers(chat, TIM, credential) {
         .filter((item) => item.peer_id && isC2CConversation(item));
       S.conversations = mergeConversationSources(S.conversations, updated);
       recalculateUnreadTotal();
-      refreshMessageConversationRegion();
+      refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
     };
     try {
       chat.on(TIM.EVENT.CONVERSATION_LIST_UPDATED, S.imConversationHandler);
@@ -1794,7 +1908,7 @@ async function connectTIM(credential) {
             .filter((item) => item.peer_id && isC2CConversation(item));
           S.conversations = mergeConversationSources(S.conversations, updated);
           recalculateUnreadTotal();
-          refreshMessageConversationRegion();
+          refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
         }
       } catch {
         /* HTTP history remains available */
@@ -2017,7 +2131,10 @@ async function logout() {
     await cleanupIM();
     S.authenticated = false;
     S.user = null;
+    S.pageCache.clear();
     S.imMessages = [];
+    S.imMessageLoadingPeers.clear();
+    S.imMessageLoadedPeers.clear();
     S.conversations = [];
     S.readConversationPeers.clear();
     S.unreadTotal = 0;
@@ -2031,7 +2148,17 @@ async function logout() {
 }
 
 async function handleAction(action, button) {
-  if (action === "refresh-route") return go(S.route, { force: true });
+  if (action === "refresh-route") {
+    if (S.route === "msg") {
+      const tasks = [refreshConversationSummary({ force: true })];
+      if (S.activePeer) tasks.push(loadConversationMessages(S.activePeer, { force: true }));
+      await Promise.allSettled(tasks);
+      refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
+      toast("消息已刷新");
+      return;
+    }
+    return go(S.route, { force: true });
+  }
   if (action === "logout") return logout();
   if (action === "open-profile") return openProfile(button.dataset.uid);
   if (action === "open-chat" || action === "select-conversation") {
@@ -2044,14 +2171,18 @@ async function handleAction(action, button) {
     if (S.route !== "msg") {
       go("msg", { force: true });
     } else {
-      refreshMessageConversationRegion({ focusComposer: action === "select-conversation" });
+      refreshMessageConversationRegion({
+        focusComposer: action === "select-conversation",
+        refreshList: false,
+      });
+      void loadConversationMessages(uid);
     }
     return;
   }
   if (action === "close-conversation") {
     S.activePeer = "";
     S.activePeerName = "";
-    refreshMessageConversationRegion();
+    refreshMessageConversationRegion({ refreshList: false });
     return;
   }
   if (action === "visitor-tab") {
@@ -2121,7 +2252,7 @@ async function handleAction(action, button) {
     S.unreadTotal = 0;
     updateUnreadBadges();
     toast(canSyncRead ? "全部消息已标为已读" : "已清除当前未读提示");
-    refreshMessageConversationRegion();
+    refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
     return;
   }
   if (action === "focus-nickname") {
@@ -2590,7 +2721,16 @@ $("open-menu").addEventListener("click", openDrawer);
 $("close-menu").addEventListener("click", () => closeDrawer(true));
 $("drawer-mask").addEventListener("click", () => closeDrawer(true));
 $("reload-page").addEventListener("click", (event) => {
-  void withPending(event.currentTarget, async () => go(S.route, { force: true }));
+  void withPending(event.currentTarget, async () => {
+    if (S.route === "msg") {
+      const tasks = [refreshConversationSummary({ force: true })];
+      if (S.activePeer) tasks.push(loadConversationMessages(S.activePeer, { force: true }));
+      await Promise.allSettled(tasks);
+      refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
+      return;
+    }
+    go(S.route, { force: true });
+  });
 });
 $("logout-side").addEventListener("click", (event) => {
   void withPending(event.currentTarget, logout);

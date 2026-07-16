@@ -164,6 +164,7 @@ def _as_list(x: Any) -> List[Any]:
         "conversationList",
         "messages",
         "message_list",
+        "messageList",
         "items",
         "result",
         "rows",
@@ -481,6 +482,73 @@ def normalize_conversation(item: Any) -> Optional[Dict[str, Any]]:
 
 def normalize_conversations(data: Any) -> List[Dict[str, Any]]:
     return _normalize_many(data, normalize_conversation)
+
+
+def normalize_message(item: Any) -> Optional[Dict[str, Any]]:
+    """Normalize one Message_detail/TIM-style C2C message."""
+    d = _entity_dict(item, ("message", "info"))
+    if not d:
+        return None
+    payload = _first(d, ["payload", "msgContent", "msg_content"], None)
+    payload_dict = payload if isinstance(payload, dict) else _as_dict(payload)
+    text = str(
+        _first(
+            d,
+            ["content", "text", "message", "msg", "body"],
+            _first(payload_dict or {}, ["text", "Text", "content", "data"], ""),
+        )
+    )
+    from_id = str(
+        _first(
+            d,
+            [
+                "fromUserId",
+                "from_user_id",
+                "from_id",
+                "sendUserId",
+                "senderId",
+                "from",
+                "sender",
+                "from_account",
+            ],
+            "",
+        )
+    )
+    to_id = str(
+        _first(
+            d,
+            [
+                "toUserId",
+                "to_user_id",
+                "to_id",
+                "receiveUserId",
+                "receiverId",
+                "to",
+                "receiver",
+                "to_account",
+            ],
+            "",
+        )
+    )
+    timestamp = str(
+        _first(d, ["msgTimestamp", "msg_timestamp", "timestamp", "sent_time", "time", "msg_time"], "")
+    )
+    message_id = str(_first(d, ["msgUID", "msg_uid", "message_uid", "id", "msg_id"], ""))
+    if not any((text, from_id, to_id, timestamp, message_id)):
+        return None
+    return {
+        "id": message_id,
+        "text": text,
+        "content": text,
+        "from_user_id": from_id,
+        "to_user_id": to_id,
+        "timestamp": timestamp,
+        "object_name": str(_first(d, ["objectName", "object_name", "msg_type", "type"], "")),
+    }
+
+
+def normalize_messages(data: Any) -> List[Dict[str, Any]]:
+    return _normalize_many(data, normalize_message)
 
 
 def _entity_dict(item: Any, nested_keys: Tuple[str, ...] = ()) -> Optional[Dict[str, Any]]:

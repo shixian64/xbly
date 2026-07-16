@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from typing import Any, Optional
+from urllib.parse import quote
 
 from .. import sign
-from ..client import RONG_REGISTER, TXIM_SIGN, ApiResult, ProtocolClient
+from ..client import APPLET, RONG_REGISTER, TXIM_SIGN, ApiResult, ProtocolClient
 
 
 class ImAPI:
@@ -49,6 +50,19 @@ class ImAPI:
     def history_conversations(self, page: str = "1") -> ApiResult:
         """Return the server-side conversation/history summary used by the APK."""
         return self.c.call("getHistoryConversation", page=page)
+
+    def history_messages(self, peer_id: str) -> ApiResult:
+        """Return the APK message-detail timeline for one C2C peer."""
+        peer = str(peer_id or "").strip()
+        if not peer:
+            raise ValueError("peer_id is required")
+        # APK v154 uses the i=888 Message_detail URL with yourid in the query
+        # string and without the usual a=webapp parameter.
+        url = (
+            f"{APPLET}?i=888&c=entry&do=Message_detail&m=socialchat"
+            f"&yourid={quote(peer, safe='')}"
+        )
+        return self.c.request(url, method="GET")
 
     def raw(self, action: str, **params: Any) -> ApiResult:
         return self.c.call(action, params)

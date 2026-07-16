@@ -20,6 +20,7 @@ from bbw_web import bff_server as BFF  # noqa: E402
 from bbw_web.normalize import (  # noqa: E402
     normalize_bottles,
     normalize_conversations,
+    normalize_messages,
     normalize_rooms,
     normalize_slides,
     normalize_songs,
@@ -233,6 +234,22 @@ class NormalizerContractTests(unittest.TestCase):
         self.assertEqual(nested_self["nickname"], "9")
         self.assertIsNone(nested_self["user"])
 
+        message = normalize_messages(
+            {
+                "messageList": [
+                    {
+                        "msgUID": "m2",
+                        "fromUserId": "42",
+                        "toUserId": "9",
+                        "msgTimestamp": "1710000001",
+                        "payload": {"text": "历史消息"},
+                    }
+                ]
+            }
+        )[0]
+        self.assertEqual(message["id"], "m2")
+        self.assertEqual(message["text"], "历史消息")
+
 
 class SocialAndImRoutingContractTests(unittest.TestCase):
     class FakeClient:
@@ -249,8 +266,8 @@ class SocialAndImRoutingContractTests(unittest.TestCase):
         def url(self, action, **kwargs):
             return (action, kwargs)
 
-        def request(self, url, body):
-            self.calls.append((url, body))
+        def request(self, url, body=None, **kwargs):
+            self.calls.append((url, body, kwargs))
             return SimpleNamespace(ok=True)
 
     def test_friend_and_visit_actions_match_apk_v154(self) -> None:
@@ -290,6 +307,14 @@ class SocialAndImRoutingContractTests(unittest.TestCase):
         client = self.FakeClient()
         ImAPI(client).history_conversations("3")
         self.assertEqual(client.calls, [("getHistoryConversation", {"page": "3"})])
+
+    def test_history_messages_uses_apk_message_detail_url(self) -> None:
+        client = self.FakeClient()
+        ImAPI(client).history_messages("9")
+        url, body, kwargs = client.calls[0]
+        self.assertIn("i=888&c=entry&do=Message_detail&m=socialchat&yourid=9", url)
+        self.assertIsNone(body)
+        self.assertEqual(kwargs, {"method": "GET"})
 
 
 class FakeApp:

@@ -207,6 +207,7 @@ class SocialBffRoutingTests(unittest.TestCase):
             im=SimpleNamespace(
                 history_conversations=lambda page: calls.append(("conversations", page))
                 or result,
+                history_messages=lambda peer: calls.append(("messages", peer)) or result,
             ),
         )
         web_user = SimpleNamespace(app=app)
@@ -284,6 +285,10 @@ class SocialBffRoutingTests(unittest.TestCase):
         self.assertEqual(calls, [("conversations", "3")])
         self.assertEqual(response[1]["entity"], "conversation")
 
+        calls, response = self._run_get("/api/im/messages?peer=9")
+        self.assertEqual(calls, [("messages", "9")])
+        self.assertEqual(response[1]["entity"], "message")
+
         calls, response = self._run_visit_post({"uid": "9"})
         self.assertEqual(calls, [("visit", "9")])
         self.assertEqual(response[0], 200)
@@ -299,6 +304,7 @@ class SocialFrontendContractTests(unittest.TestCase):
             self.assertIn(route, app_js)
         for endpoint in (
             "/api/im/conversations",
+            "/api/im/messages",
             "/api/social/friends",
             "/api/social/visitors",
             "/api/social/visit",
@@ -309,7 +315,7 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('mediaUrl(user.avatar || user.portrait)', app_js)
         self.assertIn('avatar.appendChild(image)', app_js)
         self.assertIn('readConversationPeers: new Map()', app_js)
-        self.assertIn('refreshMessageConversationRegion({ focusComposer:', app_js)
+        self.assertIn('refreshList: false', app_js)
 
 
 if __name__ == "__main__":

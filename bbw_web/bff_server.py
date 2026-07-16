@@ -166,6 +166,7 @@ ENTITY_NORMALIZERS = {
     "bottle": N.normalize_bottles,
     "sticker": N.normalize_stickers,
     "conversation": N.normalize_conversations,
+    "message": N.normalize_messages,
 }
 
 
@@ -720,6 +721,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.ok(
                 RE(app.im.history_conversations(q("page", "1")), "conversation")
             )
+        if path == "/api/im/messages":
+            peer = q("peer") or q("uid") or q("yourid")
+            if not peer:
+                return self.ok({"ok": False, "error": "缺少聊天对象 UID"}, 400)
+            return self.ok(RE(app.im.history_messages(peer), "message"))
 
         if path == "/api/heartbeat":
             return self.ok(u.heartbeat.status() if u.heartbeat else {"running": False})
