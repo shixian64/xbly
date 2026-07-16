@@ -165,6 +165,7 @@ ENTITY_NORMALIZERS = {
     "song": N.normalize_songs,
     "bottle": N.normalize_bottles,
     "sticker": N.normalize_stickers,
+    "conversation": N.normalize_conversations,
 }
 
 
@@ -529,6 +530,21 @@ class Handler(BaseHTTPRequestHandler):
             return self.ok(RL(app.social.follow_list(q("uid") or q("id") or None)))
         if path == "/api/social/friend-apply":
             return self.ok(RL(app.social.friend_apply_list(q("page", "1"))))
+        if path == "/api/social/friends":
+            return self.ok(RL(app.social.friends()))
+        if path == "/api/social/visitors":
+            visit_type = q("type", "seen_me")
+            page = q("page", q("pageindex", "0"))
+            if visit_type == "seen_me":
+                result = app.social.viewed_me(page)
+            elif visit_type == "seen_by_me":
+                result = app.social.i_viewed(page)
+            else:
+                return self.ok(
+                    {"ok": False, "error": "type 仅支持 seen_me 或 seen_by_me"},
+                    400,
+                )
+            return self.ok(RL(result))
         if path == "/api/social/blacklist":
             return self.ok(RL(app.social.my_blacklist()))
         if path == "/api/social/blacklist-me":
@@ -645,6 +661,10 @@ class Handler(BaseHTTPRequestHandler):
                 )
         if path == "/api/im/stickers":
             return self.ok(RE(app.im.stickers(), "sticker"))
+        if path == "/api/im/conversations":
+            return self.ok(
+                RE(app.im.history_conversations(q("page", "1")), "conversation")
+            )
 
         if path == "/api/heartbeat":
             return self.ok(u.heartbeat.status() if u.heartbeat else {"running": False})
@@ -856,6 +876,11 @@ class Handler(BaseHTTPRequestHandler):
                 )
             if path == "/api/social/delete-friend":
                 return self.ok(R(app.social.delete_friend(**_params(data))))
+            if path == "/api/social/visit":
+                target_uid = str(data.get("uid") or data.get("yourid") or "").strip()
+                if not target_uid:
+                    return self.ok({"ok": False, "error": "缺少对方 UID"}, 400)
+                return self.ok(R(app.social.record_profile_view(target_uid)))
             if path == "/api/social/blacklist-add":
                 return self.ok(R(app.social.add_blacklist(**_params(data))))
             if path == "/api/social/blacklist-del":
@@ -1205,12 +1230,14 @@ def _features() -> List[Dict[str, str]]:
 
 
 FEATURES: List[Dict[str, str]] = [
-    {"id": "nearby", "name": "身边", "desc": "附近推荐、发现与礼物"},
-    {"id": "msg", "name": "消息", "desc": "受控 IM 凭证与文本会话"},
+    {"id": "nearby", "name": "身边", "desc": "在线用户、资料与聊天入口"},
+    {"id": "msg", "name": "消息", "desc": "历史会话、未读数与受控实时聊天"},
     {"id": "match", "name": "匹配", "desc": "在线同城、漂流瓶与约会"},
     {"id": "moments", "name": "动态", "desc": "推荐、轮播与话题"},
-    {"id": "me", "name": "我的", "desc": "资料、实名、礼仪与设置"},
-    {"id": "social", "name": "社交关系", "desc": "关注、粉丝、好友与黑名单"},
+    {"id": "me", "name": "我的", "desc": "关系统计、资料、实名与设置"},
+    {"id": "friends", "name": "好友列表", "desc": "好友通讯录与新朋友"},
+    {"id": "visitors", "name": "访客足迹", "desc": "谁看过我与我看过谁"},
+    {"id": "social", "name": "关注与粉丝", "desc": "关注、粉丝、申请与黑名单"},
     {"id": "room", "name": "语音房间", "desc": "房间榜、建房与点歌"},
     {"id": "wallet", "name": "钱包会员", "desc": "礼物、VIP、充值与提现"},
     {"id": "tasks", "name": "成长任务", "desc": "任务列表与奖励领取"},

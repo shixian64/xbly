@@ -46,5 +46,9 @@ class ImAPI:
     def history_message_insert(self, **params: Any) -> ApiResult:
         return self.c.call("insertTencentHistoryMessage", params)
 
+    def history_conversations(self, page: str = "1") -> ApiResult:
+        """Return the server-side conversation/history summary used by the APK."""
+        return self.c.call("getHistoryConversation", page=page)
+
     def raw(self, action: str, **params: Any) -> ApiResult:
         return self.c.call(action, params)

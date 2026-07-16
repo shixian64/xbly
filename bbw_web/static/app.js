@@ -9,7 +9,9 @@ const PRIMARY_NAV = [
 ];
 
 const SECONDARY_NAV = [
-  { id: "social", name: "社交关系", desc: "关注、粉丝与好友" },
+  { id: "friends", name: "好友列表", desc: "联系好友与查看新朋友" },
+  { id: "visitors", name: "访客足迹", desc: "谁看过我与我看过谁" },
+  { id: "social", name: "关注与粉丝", desc: "关注、粉丝、申请与黑名单" },
   { id: "room", name: "语音房间", desc: "房间榜与点歌" },
   { id: "wallet", name: "钱包会员", desc: "乐园币、会员与礼物" },
   { id: "tasks", name: "成长任务", desc: "完成任务领取奖励" },
@@ -26,8 +28,16 @@ const S = {
   routeController: null,
   routeSeq: 0,
   socialTab: "follows",
+  visitorTab: "seen_me",
+  activePeer: "",
+  activePeerName: "",
+  conversations: [],
+  unreadTotal: 0,
+  profileSeq: 0,
+  profileController: null,
   chat: null,
   imHandler: null,
+  imConversationHandler: null,
   imConnected: false,
   imMessages: [],
   smsTimer: null,
@@ -235,19 +245,50 @@ function isRouteAllowed(id) {
   return navItems().some((item) => item.id === id);
 }
 
+function navParentRoute(id) {
+  if (id === "friends") return "msg";
+  if (id === "visitors" || id === "social" || id === "wallet" || id === "tasks") return "me";
+  if (id === "room") return "match";
+  return id;
+}
+
 function navButton(item, bottom = false) {
+  const current = item.id === S.route;
+  const on = item.id === S.route || (PRIMARY_NAV.some((nav) => nav.id === item.id) && navParentRoute(S.route) === item.id);
+  const unread = item.id === "msg" ? `<small class="nav-unread${S.unreadTotal ? "" : " hide"}" data-unread-badge>${esc(
+    S.unreadTotal > 99 ? "99+" : S.unreadTotal
+  )}</small>` : "";
   if (bottom) {
-    return `<button type="button" class="bottom-item${S.route === item.id ? " on" : ""}" data-route="${item.id}" aria-label="${esc(
+    return `<button type="button" class="bottom-item${on ? " on" : ""}" data-route="${item.id}" aria-label="${esc(
       item.name
-    )}" ${S.route === item.id ? 'aria-current="page"' : ""}>
-      <span>${item.name}</span>
+    )}" ${current ? 'aria-current="page"' : ""}>
+      <span>${item.name}</span>${unread}
     </button>`;
   }
-  return `<button type="button" class="nav-item${S.route === item.id ? " on" : ""}" data-route="${item.id}" ${
-    S.route === item.id ? 'aria-current="page"' : ""
+  return `<button type="button" class="nav-item${on ? " on" : ""}" data-route="${item.id}" ${
+    current ? 'aria-current="page"' : ""
   }>
-    <span>${item.name}</span>
+    <span>${item.name}</span>${unread}
   </button>`;
+}
+
+function updateUnreadBadges() {
+  document.querySelectorAll("[data-unread-badge]").forEach((badge) => {
+    badge.textContent = S.unreadTotal > 99 ? "99+" : String(S.unreadTotal || 0);
+    badge.classList.toggle("hide", !S.unreadTotal);
+  });
+}
+
+async function warmConversationSummary() {
+  try {
+    const { data } = await api("/api/im/conversations?page=1", { timeout: 7000 });
+    const items = itemsOf(data);
+    S.conversations = mergeConversationSources(items, S.conversations);
+    S.unreadTotal = S.conversations.reduce((sum, item) => sum + Number(item.unread_count || item.unread || 0), 0);
+    updateUnreadBadges();
+  } catch {
+    // Navigation remains usable when the optional unread summary is unavailable.
+  }
 }
 
 function buildNav() {
@@ -258,10 +299,11 @@ function buildNav() {
 }
 
 function syncNav() {
-  document.querySelectorAll("[data-route]").forEach((button) => {
-    const on = button.dataset.route === S.route;
+  document.querySelectorAll("#primary-nav [data-route], #secondary-nav [data-route], #bottom-nav [data-route]").forEach((button) => {
+    const route = button.dataset.route;
+    const on = route === S.route || (PRIMARY_NAV.some((item) => item.id === route) && navParentRoute(S.route) === route);
     button.classList.toggle("on", on);
-    if (on) button.setAttribute("aria-current", "page");
+    if (route === S.route) button.setAttribute("aria-current", "page");
     else button.removeAttribute("aria-current");
   });
   const nav = navItems().find((item) => item.id === S.route) || PRIMARY_NAV[0];
@@ -293,6 +335,7 @@ function hashRoute() {
 function go(id, options = {}) {
   const target = isRouteAllowed(id) ? id : "nearby";
   closeDrawer();
+  closeProfileDialog();
   const hash = `#/${target}`;
   if (options.replace) {
     history.replaceState(null, "", hash);
@@ -376,30 +419,213 @@ function actionRoute(action) {
 
 function avatarHtml(name, url) {
   const src = mediaUrl(url);
-  return `<div class="avatar" aria-hidden="true"><span>${esc(firstChar(name, "贝"))}</span>${
+  return `<span class="avatar" aria-hidden="true"><span>${esc(firstChar(name, "贝"))}</span>${
     src
       ? `<img src="${esc(src)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-media />`
       : ""
-  }</div>`;
+  }</span>`;
 }
 
 function userCard(item, options = {}) {
   const user = item && typeof item === "object" ? item : { nickname: String(item || "用户") };
-  const id = String(user.id || user.uid || "");
+  const id = String(user.user_id || user.uid || user.id || "");
   const name = user.nickname || user.name || "乐园用户";
   const subtitle = user.subtitle || [id && `UID ${id}`, user.city, user.signature].filter(Boolean).join(" · ") || "等待一次友好的相遇";
   const actions = [];
   if (options.accept && id) {
     actions.push(`<button type="button" class="btn primary small" data-action="agree-friend" data-id="${esc(id)}">同意</button>`);
   }
-  if (options.follow !== false && id) {
+  if (options.chat && id) {
+    actions.push(`<button type="button" class="btn primary small" data-action="open-chat" data-uid="${esc(id)}" data-name="${esc(
+      name
+    )}">聊天</button>`);
+  }
+  if (options.follow && id) {
     actions.push(`<button type="button" class="btn soft small" data-action="follow-user" data-uid="${esc(id)}">关注</button>`);
+  }
+  if (options.unfollow && id) {
+    actions.push(`<button type="button" class="btn secondary small" data-action="unfollow-user" data-uid="${esc(id)}">取消关注</button>`);
+  }
+  if (options.unblock && id) {
+    actions.push(`<button type="button" class="btn secondary small" data-action="unblock-user" data-uid="${esc(id)}">移出黑名单</button>`);
+  }
+  if (options.profile !== false && id) {
+    actions.push(`<button type="button" class="btn soft small" data-action="open-profile" data-uid="${esc(id)}">资料</button>`);
   }
   return `<article class="user-card">
     ${avatarHtml(name, user.avatar || user.portrait)}
     <div class="card-copy"><strong>${esc(name)}</strong><span>${esc(subtitle)}</span></div>
     ${actions.length ? `<div class="card-actions">${actions.join("")}</div>` : ""}
   </article>`;
+}
+
+function formatSocialTime(value) {
+  if (value == null || value === "") return "";
+  const raw = String(value).trim();
+  let date;
+  if (/^\d{10,13}$/.test(raw)) {
+    const numeric = Number(raw);
+    date = new Date(raw.length === 10 ? numeric * 1000 : numeric);
+  } else {
+    date = new Date(raw);
+    if (Number.isNaN(date.getTime())) date = new Date(raw.replace(/-/g, "/"));
+  }
+  if (Number.isNaN(date.getTime())) return raw;
+  const now = new Date();
+  if (date.toDateString() === now.toDateString()) {
+    return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+  }
+  return date.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" });
+}
+
+function conversationPeer(item) {
+  const conversation = item && typeof item === "object" ? item : {};
+  const me = String(S.user?.uid || S.user?.id || "");
+  const from = String(conversation.from_user_id || conversation.fromUserId || "");
+  const to = String(conversation.to_user_id || conversation.toUserId || "");
+  return String(
+    conversation.peer_id ||
+      conversation.user_id ||
+      conversation.conversation_user ||
+      (from && from !== me ? from : "") ||
+      (to && to !== me ? to : "") ||
+      conversation.id ||
+      ""
+  );
+}
+
+function normalizeTimConversation(item) {
+  const conversation = item && typeof item === "object" ? item : {};
+  const profile = conversation.userProfile || conversation.groupProfile || {};
+  const conversationID = String(conversation.conversationID || "");
+  const peer = String(profile.userID || profile.groupID || conversationID.replace(/^(C2C|GROUP)/, ""));
+  const conversationType = profile.groupID || conversationID.startsWith("GROUP") ? "GROUP" : "C2C";
+  const last = conversation.lastMessage || {};
+  return {
+    conversation_id: conversationID,
+    conversation_type: conversationType,
+    source: "tim",
+    peer_id: peer,
+    nickname: profile.nick || profile.name || profile.userID || peer,
+    avatar: profile.avatar || "",
+    last_message: last.messageForShow || last.payload?.text || last.message || "",
+    timestamp: last.lastTime || last.time || conversation.lastMessage?.lastTime || "",
+    unread_count: conversation.unreadCount || 0,
+  };
+}
+
+function isC2CConversation(item) {
+  const type = String(item?.conversation_type || item?.channel_type || item?.channelType || "").toUpperCase();
+  const id = String(item?.conversation_id || item?.conversationID || "").toUpperCase();
+  return !type.includes("GROUP") && !id.startsWith("GROUP");
+}
+
+function conversationTimestamp(item) {
+  const raw = item?.updated_at || item?.timestamp || item?.msg_timestamp || item?.msgTimestamp || item?.time || 0;
+  const numeric = Number(raw);
+  if (Number.isFinite(numeric) && numeric > 0) return String(Math.trunc(numeric)).length === 10 ? numeric * 1000 : numeric;
+  const parsed = Date.parse(String(raw || ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function mergeConversationSources(history, cached) {
+  const byPeer = new Map();
+  history.filter(isC2CConversation).forEach((item) => {
+    const peer = conversationPeer(item);
+    if (peer) byPeer.set(peer, item);
+  });
+  cached.filter(isC2CConversation).forEach((item) => {
+    const peer = conversationPeer(item);
+    if (!peer) return;
+    const current = byPeer.get(peer);
+    if (!current || item.source === "tim" || conversationTimestamp(item) > conversationTimestamp(current)) {
+      byPeer.set(peer, item);
+    }
+  });
+  return [...byPeer.values()].sort((a, b) => conversationTimestamp(b) - conversationTimestamp(a));
+}
+
+function conversationCard(item) {
+  const conversation = item && typeof item === "object" ? item : {};
+  const peer = conversationPeer(conversation);
+  const nestedUser = conversation.user || conversation.user_info || {};
+  const name =
+    conversation.nickname ||
+    conversation.peer_name ||
+    nestedUser.nickname ||
+    nestedUser.name ||
+    (peer ? `用户 ${peer}` : "聊天");
+  const avatar = conversation.avatar || conversation.portrait || nestedUser.avatar || nestedUser.portrait;
+  const preview =
+    conversation.last_message ||
+    conversation.message ||
+    conversation.content ||
+    conversation.text ||
+    "打开对话继续聊聊";
+  const time = formatSocialTime(
+    conversation.updated_at ||
+      conversation.timestamp ||
+      conversation.msg_timestamp ||
+      conversation.msgTimestamp ||
+      conversation.time ||
+      conversation.created_at
+  );
+  const unread = Number(conversation.unread_count || conversation.unread || 0);
+  const active = peer && peer === S.activePeer;
+  return `<button type="button" class="conversation-card${active ? " on" : ""}" data-action="select-conversation" data-uid="${esc(
+    peer
+  )}" data-name="${esc(name)}">
+    ${avatarHtml(name, avatar)}
+    <span class="conversation-copy"><strong>${esc(name)}</strong><span>${esc(preview)}</span></span>
+    <span class="conversation-meta">${time ? `<time>${esc(time)}</time>` : ""}${
+    unread > 0 ? `<span class="unread-badge" aria-label="${esc(unread)} 条未读">${esc(unread > 99 ? "99+" : unread)}</span>` : ""
+  }</span>
+  </button>`;
+}
+
+function visitorCard(item) {
+  const user = item && typeof item === "object" ? item : {};
+  const visitTime = formatSocialTime(user.visited_at || user.visit_time || user.time || user.created_at);
+  const copy = { ...user };
+  if (visitTime) copy.subtitle = [user.subtitle, visitTime].filter(Boolean).join(" · ");
+  return userCard(copy, { chat: true, profile: true });
+}
+
+function friendListHtml(items) {
+  if (!items.length) {
+    return `<div class="empty-state"><div><strong>好友列表还是空的</strong><span>同意好友申请后，对方会出现在这里</span><button type="button" class="btn soft small" data-action="social-open-tab" data-tab="apply">查看新朋友</button></div></div>`;
+  }
+  const groups = new Map();
+  items.forEach((item) => {
+    const name = item.nickname || item.name || "用户";
+    const rawLetter = String(item.letter || item.letters || firstChar(name, "#")).trim().toUpperCase();
+    const letter = /^[A-Z]$/.test(rawLetter) ? rawLetter : "#";
+    if (!groups.has(letter)) groups.set(letter, []);
+    groups.get(letter).push(item);
+  });
+  const letters = [...groups.keys()].sort((a, b) => (a === "#" ? 1 : b === "#" ? -1 : a.localeCompare(b)));
+  return `<div class="contact-book">${letters
+    .map(
+      (letter) => `<section class="contact-group"><h3>${esc(letter)}</h3><div class="stack">${groups
+        .get(letter)
+        .map((item) => {
+          const searchText = [item.nickname, item.name, item.id, item.uid, item.city].filter(Boolean).join(" ").toLowerCase();
+          return `<div data-friend-row data-search-text="${esc(searchText)}">${userCard(item, {
+            chat: true,
+            profile: true,
+          })}</div>`;
+        })
+        .join("")}</div></section>`
+    )
+    .join("")}</div><div id="friend-search-empty" class="empty-state compact-empty hide"><div><strong>没有找到好友</strong><span>换一个昵称或 UID 试试</span></div></div>`;
+}
+
+function socialCardForTab(item, tab) {
+  if (tab === "follows") return userCard(item, { profile: true, unfollow: true });
+  if (tab === "fans") return userCard(item, { profile: true, follow: !item?.is_follower });
+  if (tab === "apply") return userCard(item, { profile: true, accept: true });
+  if (tab === "black") return userCard(item, { profile: true, unblock: true });
+  return userCard(item, { profile: true });
 }
 
 function giftCard(item) {
@@ -558,13 +784,6 @@ function operationView(data, successTitle = "操作已提交") {
   return `<div class="notice"><strong>${esc(successTitle)}</strong><div>${esc(notice)}</div></div>${detailsView(data, "订单/操作信息")}`;
 }
 
-function servicesHtml() {
-  return `<div class="service-grid">${SECONDARY_NAV.map(
-    (item) =>
-      `<button type="button" class="service-card" data-route="${item.id}"><span><strong>${item.name}</strong><span>${item.desc}</span></span></button>`
-  ).join("")}</div>`;
-}
-
 function statCard(value, label) {
   return `<div class="stat-card"><div class="stat-value">${esc(value ?? "—")}</div><div class="stat-label">${esc(label)}</div></div>`;
 }
@@ -584,14 +803,17 @@ function membershipText(value) {
 }
 
 function chatLogHtml() {
-  if (!S.imMessages.length) return `<div class="chat-line system">连接后，消息会显示在这里</div>`;
-  return S.imMessages
+  const entries = S.imMessages.filter((entry) => !entry.peer || !S.activePeer || entry.peer === S.activePeer);
+  if (!entries.length) {
+    return `<div class="chat-line system">${S.imConnected ? "还没有消息，礼貌地打个招呼吧" : "连接消息服务后可发送新消息"}</div>`;
+  }
+  return entries
     .map((entry) => `<div class="chat-line ${entry.type || ""}">${esc(entry.text)}</div>`)
     .join("");
 }
 
-function addImMessage(text, type = "system") {
-  S.imMessages.push({ text: String(text), type });
+function addImMessage(text, type = "system", peer = "") {
+  S.imMessages.push({ text: String(text), type, peer: String(peer || "") });
   if (S.imMessages.length > 100) S.imMessages.splice(0, S.imMessages.length - 100);
   const log = $("im-log");
   if (log) {
@@ -601,8 +823,9 @@ function addImMessage(text, type = "system") {
 }
 
 async function pageNearby(signal) {
-  const [homeResult, slideResult] = await Promise.allSettled([
+  const [homeResult, peopleResult, slideResult] = await Promise.allSettled([
     api("/api/home", { signal }),
+    api("/api/match/online-users?page=1", { signal }),
     api("/api/slide", { signal }),
   ]);
   if (homeResult.status !== "fulfilled") throw homeResult.reason;
@@ -610,54 +833,95 @@ async function pageNearby(signal) {
   if (data.user) applyUser(data.user);
   const user = data.user || S.user || {};
   const name = user.nickname || "新朋友";
-  const heartbeat = data.heartbeat && data.heartbeat.running ? `在线 · 心跳 ${data.heartbeat.ticks || 0}` : "当前在线";
-  const gifts = itemsOf(data.gifts);
+  const heartbeat = data.heartbeat && data.heartbeat.running ? "在线状态已同步" : "当前在线";
+  const people = peopleResult.status === "fulfilled" ? itemsOf(peopleResult.value.data) : [];
   const slides = slideResult.status === "fulfilled" ? itemsOf(slideResult.value.data) : [];
-  return `<section class="hero-card"><div class="hero-copy"><p class="eyebrow">AROUND YOU</p><h2>嗨，${esc(
-    name
-  )}，今天也去认识有趣的人吧</h2><p>${esc(heartbeat)} · ${user.is_realname ? "已完成实名" : "完成实名后可体验更多匹配能力"}</p></div>
-    <div class="hero-actions"><button type="button" class="btn primary" data-route="match">开始匹配</button><button type="button" class="btn secondary" data-route="moments">看看动态</button></div></section>
-    <section class="section"><div class="section-head"><div><h2>常用服务</h2><p>关系、房间、钱包与成长任务</p></div></div>${servicesHtml()}</section>
+  return `<section class="welcome-strip"><div><span>${esc(heartbeat)}</span><h2>${esc(name)}，看看现在谁在线</h2><p>${
+    user.is_realname ? "可以从资料、共同话题或一条礼貌的消息开始认识对方。" : "完成实名后可使用更多匹配和互动能力。"
+  }</p></div><button type="button" class="btn primary" data-route="match">开始匹配</button></section>
+    <section class="quick-entry-grid" aria-label="常用社交入口">
+      <button type="button" class="quick-entry" data-route="msg"><strong>聊天列表</strong><span>继续最近的对话</span></button>
+      <button type="button" class="quick-entry" data-route="friends"><strong>好友列表</strong><span>联系已添加的好友</span></button>
+      <button type="button" class="quick-entry" data-route="visitors"><strong>访客足迹</strong><span>查看彼此的访问记录</span></button>
+      <button type="button" class="quick-entry" data-route="moments"><strong>动态广场</strong><span>从共同话题开始</span></button>
+    </section>
+    <section class="section"><div class="section-head"><div><h2>此刻在线</h2><p>看看谁也在寻找新的相遇</p></div><button type="button" class="btn secondary small" data-action="refresh-route">换一批</button></div>${
+      people.length
+        ? `<div class="people-grid">${people
+            .slice(0, 18)
+            .map((item) => userCard(item, { chat: true, profile: true }))
+            .join("")}</div>`
+        : emptyState("暂时没有发现在线用户", "可以先去匹配页，稍后再回来看看", "match")
+    }</section>
     ${
       slides.length
-        ? `<section class="section"><div class="section-head"><div><h2>今日发现</h2><p>乐园里正在发生的新鲜事</p></div></div><div class="slide-scroll">${slides
+        ? `<section class="section"><div class="section-head"><div><h2>今日话题</h2><p>找一个自然的开场方式</p></div></div><div class="slide-scroll">${slides
             .map(slideCard)
             .join("")}</div></section>`
         : ""
     }
-    <section class="section"><div class="section-head"><div><h2>乐园推荐</h2><p>为你推荐值得了解的内容</p></div><button type="button" class="btn secondary small" data-action="refresh-route">换一批</button></div>${envelopeHtml(
-      data.recommend,
-      (item) => slideCard(item),
-      "暂时没有推荐内容",
-      "稍后再回来看看"
-    )}</section>
-    ${
-      gifts.length
-        ? `<section class="section"><div class="section-head"><div><h2>人气礼物</h2><p>用小小心意开启话题</p></div></div><div class="gift-scroll">${gifts
-            .slice(0, 24)
-            .map(giftCard)
-            .join("")}</div></section>`
-        : ""
-    }`;
+    `;
 }
 
-async function pageMessages() {
+async function pageMessages(signal) {
+  let history = [];
+  try {
+    const { data } = await api("/api/im/conversations?page=1", { signal });
+    history = itemsOf(data);
+  } catch (error) {
+    if (error instanceof AuthExpiredError || error?.name === "AbortError") throw error;
+  }
+  S.conversations = mergeConversationSources(history, S.conversations);
+  S.unreadTotal = S.conversations.reduce((sum, item) => sum + Number(item.unread_count || item.unread || 0), 0);
+  updateUnreadBadges();
+  const active = S.conversations.find((item) => conversationPeer(item) === S.activePeer);
+  if (active && !S.activePeerName) {
+    S.activePeerName = active.nickname || active.peer_name || active.user?.nickname || `用户 ${S.activePeer}`;
+  }
   const ready = Boolean(window.TIM);
-  return `<section class="hero-card"><div class="hero-copy"><p class="eyebrow">MESSAGES</p><h2>${
-    S.imConnected ? "消息通道已连接" : "继续一段聊得来的相遇"
-  }</h2><p>${
-    ready
-      ? "检测到宿主已提供 TIM SDK，可获取凭证并连接。"
-      : "当前页面未预装 TIM SDK；可获取凭证，但不会动态加载不受控的外部脚本。"
-  }</p></div><div class="hero-actions"><button type="button" class="btn primary" data-action="im-connect">${
-    S.imConnected ? "重新连接" : "连接 TIM"
-  }</button><button type="button" class="btn secondary" data-action="im-rong">检查融云凭证</button></div></section>
-    <section class="section"><div class="section-head"><div><h2>即时对话</h2><p>当前仅提供 C2C 文本消息能力</p></div><span class="badge ${S.imConnected ? "green" : "orange"}">${
-    S.imConnected ? "已连接" : "未连接"
-  }</span></div><div class="chat-log" id="im-log" aria-live="polite">${chatLogHtml()}</div>
-      <form class="inline-form mt-sm" data-form="im-send"><div class="field"><label for="im-peer">对方 UserID</label><input id="im-peer" name="peer" autocomplete="off" placeholder="输入对方 uid" required /></div><div class="field"><label for="im-text">消息</label><input id="im-text" name="text" autocomplete="off" placeholder="说点什么…" required /></div><button type="submit" class="btn primary" ${
-        S.imConnected ? "" : "disabled"
-      }>发送</button></form><div id="im-info" class="result-panel"></div></section>`;
+  const connectionText = S.imConnected ? "消息服务已连接" : ready ? "消息服务待连接" : "当前仅可查看历史会话";
+  return `<div class="message-page${S.activePeer ? " conversation-open" : ""}"><section class="message-toolbar"><div><h2>消息</h2><p>${esc(connectionText)}</p></div><div class="button-row compact-row">
+      <button type="button" class="btn secondary small" data-action="mark-all-read" ${S.imConnected ? "" : "disabled"}>全部已读</button>
+      <button type="button" class="btn ${S.imConnected ? "secondary" : "primary"} small" data-action="im-connect">${
+    S.imConnected ? "重新连接" : "连接消息服务"
+  }</button>
+    </div></section>
+    <section class="message-shortcuts" aria-label="消息快捷入口">
+      <button type="button" data-action="social-open-tab" data-tab="fans"><strong>新粉丝</strong><span>查看关注你的人</span></button>
+      <button type="button" data-route="visitors"><strong>谁看过我</strong><span>查看最近访客</span></button>
+      <button type="button" data-action="social-open-tab" data-tab="apply"><strong>新朋友</strong><span>处理好友申请</span></button>
+      <button type="button" data-route="friends"><strong>通讯录</strong><span>查看好友列表</span></button>
+      <button type="button" data-route="room"><strong>语音房间</strong><span>进入热门房间</span></button>
+      <button type="button" data-route="match"><strong>匹配记录</strong><span>继续新的相遇</span></button>
+    </section>
+    <section class="conversation-layout${S.activePeer ? " has-active" : ""}">
+      <aside class="conversation-list-pane" aria-label="聊天列表">
+        <div class="pane-head"><div><h2>聊天列表</h2><p>${S.conversations.length ? `${S.conversations.length} 个最近会话` : "最近联系的人会显示在这里"}</p></div><button type="button" class="utility-btn" data-action="refresh-route">刷新</button></div>
+        <div class="conversation-list">${
+          S.conversations.length
+            ? S.conversations.map(conversationCard).join("")
+            : emptyState("还没有聊天记录", "可以从好友列表或身边的人开始一段对话", "friends")
+        }</div>
+      </aside>
+      <div class="chat-pane">
+        ${
+          S.activePeer
+            ? `<div class="chat-head"><button type="button" class="utility-btn mobile-only" data-action="close-conversation">返回</button>${avatarHtml(
+                S.activePeerName || `用户 ${S.activePeer}`,
+                active?.avatar || active?.portrait || active?.user?.avatar
+              )}<div><h2>${esc(S.activePeerName || `用户 ${S.activePeer}`)}</h2><p>UID ${esc(S.activePeer)}</p></div><button type="button" class="utility-btn chat-profile" data-action="open-profile" data-uid="${esc(
+                S.activePeer
+              )}">资料</button></div>
+              <div class="chat-log" id="im-log" aria-live="polite">${chatLogHtml()}</div>
+              <form class="chat-composer" data-form="im-send"><input type="hidden" name="peer" value="${esc(
+                S.activePeer
+              )}" /><label class="sr-only" for="im-text">消息</label><textarea id="im-text" name="text" rows="1" autocomplete="off" placeholder="输入消息" required></textarea><button type="submit" class="btn primary" ${
+                S.imConnected ? "" : "disabled"
+              }>发送</button></form>`
+            : `<div class="chat-placeholder"><div><strong>选择一段聊天</strong><span>在左侧打开最近会话，或从好友列表开始聊天。</span><button type="button" class="btn primary small" data-route="friends">打开好友列表</button></div></div>`
+        }
+      </div>
+    </section><div id="im-info" class="result-panel"></div></div>`;
 }
 
 async function pageMatch(signal) {
@@ -718,6 +982,48 @@ async function pageMoments(signal) {
     )}</section>`;
 }
 
+async function pageFriends(signal) {
+  const [friendResult, applyResult] = await Promise.allSettled([
+    api("/api/social/friends", { signal }),
+    api("/api/social/friend-apply?page=1", { signal }),
+  ]);
+  if (friendResult.status !== "fulfilled") throw friendResult.reason;
+  const data = friendResult.value.data;
+  const friends = itemsOf(data);
+  const applyCount = applyResult.status === "fulfilled" ? itemsOf(applyResult.value.data).length : 0;
+  return `<section class="relationship-toolbar"><div><h2>通讯录</h2><p>${friends.length ? `共有 ${friends.length} 位好友` : "好友会集中显示在这里"}</p></div><div class="button-row compact-row">
+      <button type="button" class="btn secondary small" data-action="social-open-tab" data-tab="apply">新朋友${
+        applyCount ? ` ${applyCount}` : ""
+      }</button>
+      <button type="button" class="btn secondary small" data-action="social-open-tab" data-tab="black">黑名单</button>
+    </div></section>
+    <section class="section contact-surface"><div class="contact-search"><label class="sr-only" for="friend-filter">搜索好友</label><input id="friend-filter" type="search" placeholder="搜索昵称或 UID" autocomplete="off" /></div>${friendListHtml(
+      friends
+    )}</section>`;
+}
+
+async function pageVisitors(signal) {
+  const type = S.visitorTab === "seen_by_me" ? "seen_by_me" : "seen_me";
+  const { data } = await api(`/api/social/visitors?type=${encodeURIComponent(type)}&page=0`, { signal });
+  const tabs = [
+    ["seen_me", "谁看过我"],
+    ["seen_by_me", "我看过谁"],
+  ];
+  const title = type === "seen_me" ? "最近看过你的人" : "你最近看过的人";
+  const detail = type === "seen_me" ? "对方访问你的资料后会显示在这里" : "在 Web 查看他人资料也会记录到这里";
+  return `<section class="relationship-toolbar"><div><h2>访客足迹</h2><p>了解彼此的关注，也尊重每个人的隐私边界</p></div></section>
+    <section class="section"><div class="tab-row visitor-tabs" role="tablist" aria-label="访客足迹">${tabs
+      .map(
+        ([id, label]) => `<button type="button" class="tab-chip${S.visitorTab === id ? " on" : ""}" data-action="visitor-tab" data-tab="${id}" role="tab" aria-selected="${
+          S.visitorTab === id
+        }">${label}</button>`
+      )
+      .join("")}</div>
+      <div class="section-head visitor-heading"><div><h2>${title}</h2><p>${detail}</p></div><button type="button" class="btn secondary small" data-action="refresh-route">刷新</button></div>
+      ${envelopeHtml(data, visitorCard, type === "seen_me" ? "暂时还没有访客" : "还没有浏览记录", detail)}
+    </section>`;
+}
+
 async function pageSocial(signal) {
   const paths = {
     follows: "/api/social/follows",
@@ -741,7 +1047,7 @@ async function pageSocial(signal) {
       )
       .join("")}</div><div class="mt-sm">${envelopeHtml(
     data,
-    (item) => userCard(item, { accept: S.socialTab === "apply" }),
+    (item) => socialCardForTab(item, S.socialTab),
     "列表还是空的",
     "新的关系会显示在这里"
   )}</div></section>
@@ -796,16 +1102,36 @@ async function pageTasks(signal) {
 }
 
 async function pageMe(signal) {
-  const { data } = await api("/api/profile/me", { signal });
+  const results = await Promise.allSettled([
+    api("/api/profile/me", { signal }),
+    api("/api/social/friends", { signal }),
+    api("/api/social/follows", { signal }),
+    api("/api/social/fans", { signal }),
+    api("/api/social/visitors?type=seen_me&page=0", { signal }),
+  ]);
+  if (results[0].status !== "fulfilled") throw results[0].reason;
+  const data = results[0].value.data;
   if (data.user) applyUser(data.user);
   const user = data.user || S.user || {};
   const name = user.nickname || "乐园用户";
-  return `<section class="surface-card"><div class="profile-head">${avatarHtml(name, user.avatar || user.portrait)}<div><h2>${esc(
+  const countAt = (index) => (results[index].status === "fulfilled" ? itemsOf(results[index].value.data).length : "—");
+  return `<section class="profile-summary-card"><div class="profile-head">${avatarHtml(name, user.avatar || user.portrait)}<div><h2>${esc(
     name
   )}</h2><p>UID ${esc(user.uid || user.id || "—")} · ${user.is_realname ? "已实名" : "未实名"} · 乐园币 ${esc(
     user.money ?? "0"
-  )}</p></div></div></section>
-    <section class="section"><div class="section-head"><div><h2>我的服务</h2><p>常用能力集中在这里</p></div></div>${servicesHtml()}</section>
+  )}</p></div><button type="button" class="btn secondary small profile-edit-button" data-action="focus-nickname">编辑资料</button></div>
+    <div class="profile-stats">
+      <button type="button" data-route="friends"><strong>${esc(countAt(1))}</strong><span>好友</span></button>
+      <button type="button" data-action="social-open-tab" data-tab="follows"><strong>${esc(countAt(2))}</strong><span>关注</span></button>
+      <button type="button" data-action="social-open-tab" data-tab="fans"><strong>${esc(countAt(3))}</strong><span>粉丝</span></button>
+      <button type="button" data-route="visitors"><strong>${esc(countAt(4))}</strong><span>谁看过我</span></button>
+    </div></section>
+    <section class="section"><div class="quick-entry-grid me-entry-grid">
+      <button type="button" class="quick-entry" data-route="msg"><strong>我的消息</strong><span>聊天与新朋友</span></button>
+      <button type="button" class="quick-entry" data-route="visitors"><strong>访客足迹</strong><span>谁看过我、我看过谁</span></button>
+      <button type="button" class="quick-entry" data-route="moments"><strong>我的动态</strong><span>话题与分享</span></button>
+      <button type="button" class="quick-entry" data-route="wallet"><strong>钱包会员</strong><span>乐园币、会员与礼物</span></button>
+    </div></section>
     <section class="section"><div class="form-grid">
       <form class="surface-card" data-form="profile-nick"><div class="section-head"><div><h2>修改昵称</h2><p>实名及修改次数限制由服务端决定</p></div></div><div class="field"><label for="nickname-new">新昵称</label><input id="nickname-new" name="name" maxlength="24" placeholder="输入新昵称" required /></div><button type="submit" class="btn primary full mt-sm">保存昵称</button></form>
       <div class="surface-card"><div class="section-head"><div><h2>账户信息</h2><p>仅展示必要的非敏感字段</p></div></div>${keyValueView({
@@ -833,6 +1159,8 @@ const PAGE_RENDERERS = {
   match: pageMatch,
   moments: pageMoments,
   me: pageMe,
+  friends: pageFriends,
+  visitors: pageVisitors,
   social: pageSocial,
   room: pageRoom,
   wallet: pageWallet,
@@ -843,6 +1171,84 @@ const PAGE_RENDERERS = {
 function setPanel(id, html) {
   const panel = $(id);
   if (panel) panel.innerHTML = html;
+}
+
+function closeProfileDialog() {
+  S.profileSeq += 1;
+  if (S.profileController) S.profileController.abort();
+  S.profileController = null;
+  const dialog = $("profile-dialog");
+  if (!dialog) return;
+  if (typeof dialog.close === "function" && dialog.open) dialog.close();
+  dialog.classList.remove("is-open");
+}
+
+async function openProfile(uid) {
+  const target = String(uid || "").trim();
+  if (!target) throw new Error("缺少用户 UID");
+  const dialog = $("profile-dialog");
+  const body = $("profile-dialog-body");
+  if (!dialog || !body) return;
+  if (S.profileController) S.profileController.abort();
+  const controller = new AbortController();
+  const seq = ++S.profileSeq;
+  S.profileController = controller;
+  body.innerHTML = loadingState("正在读取用户资料…");
+  if (typeof dialog.showModal === "function") {
+    if (!dialog.open) dialog.showModal();
+  } else {
+    dialog.classList.add("is-open");
+  }
+  const currentUid = String(S.user?.uid || S.user?.id || "");
+  const tasks = [api(`/api/profile/user?uid=${encodeURIComponent(target)}`, { signal: controller.signal })];
+  if (target !== currentUid) {
+    tasks.push(api("/api/social/visit", { method: "POST", body: JSON.stringify({ uid: target }), signal: controller.signal }));
+  }
+  const [profileResult] = await Promise.allSettled(tasks);
+  if (controller.signal.aborted || seq !== S.profileSeq) return;
+  S.profileController = null;
+  if (profileResult.status !== "fulfilled") {
+    if (profileResult.reason instanceof AuthExpiredError || profileResult.reason?.name === "AbortError") return;
+    body.innerHTML = errorState(profileResult.reason?.message || "资料读取失败");
+    return;
+  }
+  const data = profileResult.value.data;
+  const user = itemsOf(data)[0];
+  if (!user) {
+    const info = errorInfo(data, "未找到用户");
+    body.innerHTML = emptyState(info.title, info.detail || "请稍后重试");
+    return;
+  }
+  const name = user.nickname || user.name || `用户 ${target}`;
+  const isSelf = target === currentUid;
+  const details = [
+    user.age && `${user.age} 岁`,
+    user.sex || user.gender,
+    user.property,
+    user.city || user.region,
+    user.distance,
+  ].filter(Boolean);
+  body.innerHTML = `<section class="profile-dialog-hero">${avatarHtml(name, user.avatar || user.portrait)}<div><h2>${esc(
+    name
+  )}</h2><p>UID ${esc(user.id || user.uid || target)}</p>${details.length ? `<span>${esc(details.join(" · "))}</span>` : ""}</div></section>
+    <section class="profile-dialog-actions">${
+      isSelf
+        ? `<button type="button" class="btn primary" data-route="me">返回我的页面</button>`
+        : `<button type="button" class="btn primary" data-action="open-chat" data-uid="${esc(
+            user.id || user.uid || target
+          )}" data-name="${esc(name)}">聊天</button><button type="button" class="btn secondary" data-action="follow-user" data-uid="${esc(
+            user.id || user.uid || target
+          )}">关注</button>`
+    }</section>
+    <section class="profile-dialog-section"><h3>个人介绍</h3><p>${esc(user.signature || "对方还没有填写个人介绍")}</p></section>
+    <section class="profile-dialog-section"><h3>基本资料</h3>${keyValueView({
+      uid: user.id || user.uid || target,
+      age: user.age || "—",
+      gender: user.sex || user.gender || "—",
+      property: user.property || "—",
+      city: user.city || user.region || "—",
+      online: user.online || "—",
+    })}</section>`;
 }
 
 async function refreshMatchStats() {
@@ -865,7 +1271,7 @@ async function runMatch(path, body = {}) {
   setPanel("match-result", loadingState("正在寻找合适的人…"));
   const { data } = await api(path, { method: "POST", body: JSON.stringify(body) });
   toastEnv(data, "请求已完成");
-  const renderer = path.includes("bottle") ? bottleCard : (item) => userCard(item);
+  const renderer = path.includes("bottle") ? bottleCard : (item) => userCard(item, { chat: true, profile: true });
   setPanel("match-result", envelopeHtml(data, renderer, "暂时没有结果", "稍后再试，或检查匹配次数"));
   await refreshMatchStats();
 }
@@ -881,11 +1287,38 @@ async function connectTIM(credential) {
   if (typeof chat.setLogLevel === "function") chat.setLogLevel(1);
   S.imHandler = (event) => {
     (event.data || []).forEach((message) => {
-      addImMessage(`${message.from || "对方"}: ${(message.payload && message.payload.text) || "[新消息]"}`);
+      const peer = String(message.from || "");
+      const text = (message.payload && message.payload.text) || "[新消息]";
+      addImMessage(text, peer === String(credential.userID) ? "mine" : "", peer);
+      if (peer && peer !== S.activePeer) toast(`收到来自 ${peer} 的新消息`);
     });
   };
   chat.on(TIM.EVENT.MESSAGE_RECEIVED, S.imHandler);
   await chat.login({ userID: credential.userID, userSig: credential.userSig });
+  if (TIM.EVENT.CONVERSATION_LIST_UPDATED) {
+    S.imConversationHandler = (event) => {
+      S.conversations = (event.data || [])
+        .map(normalizeTimConversation)
+        .filter((item) => item.peer_id && isC2CConversation(item));
+      S.unreadTotal = S.conversations.reduce((sum, item) => sum + Number(item.unread_count || 0), 0);
+      updateUnreadBadges();
+      if (S.route === "msg") go("msg", { force: true });
+    };
+    chat.on(TIM.EVENT.CONVERSATION_LIST_UPDATED, S.imConversationHandler);
+  }
+  if (typeof chat.getConversationList === "function") {
+    try {
+      const result = await chat.getConversationList();
+      const list = result?.data?.conversationList || result?.conversationList || [];
+      if (Array.isArray(list) && list.length) {
+        S.conversations = list.map(normalizeTimConversation).filter((item) => item.peer_id && isC2CConversation(item));
+        S.unreadTotal = S.conversations.reduce((sum, item) => sum + Number(item.unread_count || 0), 0);
+        updateUnreadBadges();
+      }
+    } catch {
+      // The HTTP history list remains available when the realtime list is unavailable.
+    }
+  }
   S.chat = chat;
   S.imConnected = true;
   addImMessage("TIM 登录成功，可以发送文本消息。", "system");
@@ -901,10 +1334,14 @@ async function cleanupIM() {
     if (window.TIM && S.imHandler && typeof chat.off === "function") {
       chat.off(window.TIM.EVENT.MESSAGE_RECEIVED, S.imHandler);
     }
+    if (window.TIM?.EVENT?.CONVERSATION_LIST_UPDATED && S.imConversationHandler && typeof chat.off === "function") {
+      chat.off(window.TIM.EVENT.CONVERSATION_LIST_UPDATED, S.imConversationHandler);
+    }
   } catch {
     // Best-effort cleanup.
   }
   S.imHandler = null;
+  S.imConversationHandler = null;
   try {
     if (typeof chat.logout === "function") await chat.logout();
   } catch {
@@ -958,6 +1395,11 @@ async function logout() {
     S.authenticated = false;
     S.user = null;
     S.imMessages = [];
+    S.conversations = [];
+    S.unreadTotal = 0;
+    S.activePeer = "";
+    S.activePeerName = "";
+    closeProfileDialog();
     applyUser(null);
     showLogin(true, true);
     history.replaceState(null, "", "#/nearby");
@@ -967,6 +1409,32 @@ async function logout() {
 async function handleAction(action, button) {
   if (action === "refresh-route") return go(S.route, { force: true });
   if (action === "logout") return logout();
+  if (action === "open-profile") return openProfile(button.dataset.uid);
+  if (action === "open-chat" || action === "select-conversation") {
+    const uid = String(button.dataset.uid || "").trim();
+    if (!uid) throw new Error("缺少对方 UID");
+    S.activePeer = uid;
+    S.activePeerName = button.dataset.name || `用户 ${uid}`;
+    closeProfileDialog();
+    go("msg", { force: true });
+    return;
+  }
+  if (action === "close-conversation") {
+    S.activePeer = "";
+    S.activePeerName = "";
+    go("msg", { force: true });
+    return;
+  }
+  if (action === "visitor-tab") {
+    S.visitorTab = button.dataset.tab === "seen_by_me" ? "seen_by_me" : "seen_me";
+    go("visitors", { force: true });
+    return;
+  }
+  if (action === "social-open-tab") {
+    S.socialTab = button.dataset.tab || "follows";
+    go("social", { force: true });
+    return;
+  }
   if (action === "follow-user") {
     const uid = button.dataset.uid;
     const { data } = await api("/api/social/follow", { method: "POST", body: JSON.stringify({ uid }) });
@@ -975,6 +1443,21 @@ async function handleAction(action, button) {
       button.disabled = true;
       button.dataset.locked = "true";
     }
+    return;
+  }
+  if (action === "unfollow-user") {
+    const uid = button.dataset.uid;
+    const { data } = await api("/api/social/unfollow", { method: "POST", body: JSON.stringify({ uid }) });
+    if (toastEnv(data, "已取消关注")) go(S.route, { force: true });
+    return;
+  }
+  if (action === "unblock-user") {
+    const uid = String(button.dataset.uid || "");
+    const { data } = await api("/api/social/blacklist-del", {
+      method: "POST",
+      body: JSON.stringify({ myid: S.user?.uid || S.user?.id || "", yourid: uid }),
+    });
+    if (toastEnv(data, "已移出黑名单")) go("social", { force: true });
     return;
   }
   if (action === "agree-friend") {
@@ -990,13 +1473,37 @@ async function handleAction(action, button) {
     go("social", { force: true });
     return;
   }
+  if (action === "mark-all-read") {
+    if (!S.chat || typeof S.chat.setMessageRead !== "function") throw new Error("消息服务尚未连接");
+    await Promise.all(
+      S.conversations.map((item) => {
+        const peer = conversationPeer(item);
+        if (!peer) return Promise.resolve();
+        return S.chat.setMessageRead({ conversationID: item.conversation_id || `C2C${peer}` }).catch(() => {});
+      })
+    );
+    S.conversations = S.conversations.map((item) => ({ ...item, unread_count: 0, unread: 0 }));
+    S.unreadTotal = 0;
+    updateUnreadBadges();
+    toast("全部消息已标为已读");
+    go("msg", { force: true });
+    return;
+  }
+  if (action === "focus-nickname") {
+    const input = $("nickname-new");
+    if (input) {
+      input.scrollIntoView({ behavior: "smooth", block: "center" });
+      input.focus();
+    }
+    return;
+  }
   if (action === "match-online") return runMatch("/api/match/online");
   if (action === "match-local") return runMatch("/api/match/local");
   if (action === "match-pick") return runMatch("/api/match/bottle-pick");
   if (action === "match-users") {
     setPanel("match-result", loadingState("正在读取在线列表…"));
     const { data } = await api("/api/match/online-users");
-    setPanel("match-result", envelopeHtml(data, (item) => userCard(item), "暂无在线用户", "稍后再来看看"));
+    setPanel("match-result", envelopeHtml(data, (item) => userCard(item, { chat: true, profile: true }), "暂无在线用户", "稍后再来看看"));
     return;
   }
   if (action === "buy-card") {
@@ -1126,9 +1633,7 @@ async function handleProductForm(form, submitter) {
     const intent = submitter?.value || "view";
     if (!uid) throw new Error("请输入用户 UID");
     if (intent === "view") {
-      const { data } = await api(`/api/profile/user?uid=${encodeURIComponent(uid)}`);
-      setPanel("social-user-result", envelopeHtml(data, (item) => userCard(item), "未找到用户", "请检查 UID"));
-      return;
+      return openProfile(uid);
     }
     const path = intent === "unfollow" ? "/api/social/unfollow" : "/api/social/follow";
     const { data } = await api(path, { method: "POST", body: JSON.stringify({ uid }) });
@@ -1231,7 +1736,21 @@ async function handleProductForm(form, submitter) {
       payload: { text },
     });
     await S.chat.sendMessage(message);
-    addImMessage(`我: ${text}`, "mine");
+    addImMessage(text, "mine", peer);
+    const existing = S.conversations.find((item) => conversationPeer(item) === peer);
+    if (existing) {
+      Object.assign(existing, { last_message: text, content: text, timestamp: Date.now(), source: existing.source || "local" });
+    } else {
+      S.conversations.unshift({
+        conversation_id: `C2C${peer}`,
+        conversation_type: "C2C",
+        source: "local",
+        peer_id: peer,
+        nickname: S.activePeerName || `用户 ${peer}`,
+        last_message: text,
+        timestamp: Date.now(),
+      });
+    }
     const input = $("im-text");
     if (input) input.value = "";
     return;
@@ -1345,10 +1864,28 @@ $("login-form").addEventListener("submit", (event) => {
     showLogin(false, true);
     updatePresence(!document.hidden);
     buildNav();
+    void warmConversationSummary();
     const desired = hashRoute();
     go(isRouteAllowed(desired) ? desired : "nearby", { replace: !isRouteAllowed(desired), force: true });
     toast("登录成功");
   });
+});
+
+document.addEventListener("input", (event) => {
+  const input = event.target.closest && event.target.closest("#friend-filter");
+  if (!input) return;
+  const query = input.value.trim().toLowerCase();
+  let visible = 0;
+  document.querySelectorAll("[data-friend-row]").forEach((row) => {
+    const match = !query || String(row.dataset.searchText || "").includes(query);
+    row.hidden = !match;
+    if (match) visible += 1;
+  });
+  document.querySelectorAll(".contact-group").forEach((group) => {
+    group.hidden = !group.querySelector("[data-friend-row]:not([hidden])");
+  });
+  const empty = $("friend-search-empty");
+  if (empty) empty.classList.toggle("hide", visible > 0);
 });
 
 document.addEventListener("click", (event) => {
@@ -1388,6 +1925,14 @@ $("reload-page").addEventListener("click", (event) => {
 });
 $("logout-side").addEventListener("click", (event) => {
   void withPending(event.currentTarget, logout);
+});
+$("close-profile").addEventListener("click", closeProfileDialog);
+$("profile-dialog").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeProfileDialog();
+});
+$("profile-dialog").addEventListener("click", (event) => {
+  if (event.target === event.currentTarget) closeProfileDialog();
 });
 
 document.addEventListener("keydown", (event) => {
@@ -1440,6 +1985,7 @@ window.addEventListener("pagehide", () => {
       showLogin(false);
       S.serverHeartbeat = Boolean(data.auto_heartbeat ?? S.serverHeartbeat);
       updatePresence(!document.hidden);
+      void warmConversationSummary();
       const desired = hashRoute();
       go(isRouteAllowed(desired) ? desired : "nearby", { replace: !isRouteAllowed(desired), force: true });
       return;

@@ -128,6 +128,11 @@ def _as_list(x: Any) -> List[Any]:
         "info",
         "users",
         "userlist",
+        "conversations",
+        "conversation_list",
+        "conversationList",
+        "messages",
+        "message_list",
         "items",
         "result",
         "rows",
@@ -287,7 +292,7 @@ def normalize_user(item: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(item, dict):
         return None
     # unwrap one level
-    for k in ("user", "userinfo", "userInfo", "json_obj"):
+    for k in ("user", "userinfo", "userInfo", "userInfoList", "json_obj"):
         if isinstance(item.get(k), dict):
             item = {**item, **item[k]}
         elif isinstance(item.get(k), str):
@@ -298,7 +303,7 @@ def normalize_user(item: Any) -> Optional[Dict[str, Any]]:
     uid = str(
         _first(
             item,
-            ["id", "uid", "userId", "user_id", "userid", "myid", "ID", "Uuid"],
+            ["uid", "userId", "user_id", "userid", "myid", "ID", "Uuid", "id"],
             "",
         )
     )
@@ -326,9 +331,21 @@ def normalize_user(item: Any) -> Optional[Dict[str, Any]]:
         )
     )
     role = str(_first(item, ["user_role", "role", "identity"], ""))
-    city = str(_first(item, ["city", "area", "address", "location"], ""))
+    city = str(_first(item, ["city", "region", "real_region", "area", "address"], ""))
     sign = str(_first(item, ["signature", "sign", "desc", "description"], ""))
-    dist = str(_first(item, ["distance", "dist", "juli"], ""))
+    dist = str(_first(item, ["distance", "dist", "juli", "location"], ""))
+    visit_time = str(_first(item, ["visit_time", "visited_at", "time"], ""))
+    letter = str(_first(item, ["letters", "letter", "initial", "first_letter"], ""))
+    apply_id = str(
+        _first(
+            item,
+            ["apply_id", "applyId", "friend_apply_id", "friendsapply_id"],
+            "",
+        )
+    )
+    relation_id = str(
+        _first(item, ["relation_id", "relationId", "friend_relation_id", "subid"], "")
+    )
     sub_parts = [p for p in (uid and f"uid {uid}", role, city, dist, sign[:24]) if p]
     return {
         "id": uid,
@@ -338,9 +355,26 @@ def normalize_user(item: Any) -> Optional[Dict[str, Any]]:
         "role": role,
         "city": city,
         "signature": sign,
+        "distance": dist,
+        "online": str(_first(item, ["online", "online_status"], "")),
+        "hide_online": str(_first(item, ["hide_online"], "0")),
+        "visit_time": visit_time,
+        "custom_time": str(_first(item, ["custom_time"], "")),
+        "friend_remark": str(_first(item, ["friendsremark", "friend_remark", "remark"], "")),
+        "friend_tag": str(_first(item, ["friendstag", "friend_tag"], "")),
+        "letters": letter,
+        "letter": letter,
+        "apply_id": apply_id,
+        "relation_id": relation_id,
+        "leave_words": str(_first(item, ["yourleavewords", "leave_words", "leave_word"], "")),
+        "is_friend": _bool(_first(item, ["isFriend", "is_friend"], False)),
+        "is_friend_apply": _bool(_first(item, ["isFriendApply", "is_friend_apply"], False)),
+        "is_follower": _bool(_first(item, ["isFollower", "is_follower"], False)),
+        "is_fans": _bool(_first(item, ["isFans", "is_fans"], False)),
         "vip": str(_first(item, ["vip", "vip_time"], "0")),
         "svip": str(_first(item, ["svip", "svip_time"], "0")),
         "sex": str(_first(item, ["sex", "gender", "xingbie"], "")),
+        "property": str(_first(item, ["property"], "")),
         "age": str(_first(item, ["age"], "")),
     }
 
@@ -364,6 +398,48 @@ def normalize_users(data: Any) -> List[Dict[str, Any]]:
         if u:
             out.append(u)
     return out
+
+
+def normalize_conversation(item: Any) -> Optional[Dict[str, Any]]:
+    """Normalize the APK ``ReceiveMessageList`` conversation summary model."""
+    d = _entity_dict(item, ("conversation", "info"))
+    if not d:
+        return None
+
+    nested_user = _first(d, ["userInfoList", "user_info", "user", "userinfo"], None)
+    user = normalize_user(nested_user)
+    conversation_user = str(
+        _first(d, ["conversation_user", "conversationUser", "peer_id", "target_id"], "")
+    )
+    peer_id = str((user or {}).get("id") or conversation_user)
+    record_id = str(_first(d, ["id", "conversation_id", "conversationId"], ""))
+    content = str(_first(d, ["content", "last_message", "message", "text"], ""))
+    timestamp = str(
+        _first(d, ["msgTimestamp", "msg_timestamp", "timestamp", "sent_time", "time"], "")
+    )
+    if not any((record_id, peer_id, content, timestamp, user)):
+        return None
+    return {
+        "id": record_id or peer_id,
+        "conversation_user": conversation_user,
+        "peer_id": peer_id,
+        "nickname": str((user or {}).get("nickname") or peer_id or "用户"),
+        "avatar": str((user or {}).get("avatar") or ""),
+        "content": content,
+        "last_message": content,
+        "timestamp": timestamp,
+        "from_user_id": str(_first(d, ["fromUserId", "from_user_id", "from"], "")),
+        "to_user_id": str(_first(d, ["toUserId", "to_user_id", "to"], "")),
+        "object_name": str(_first(d, ["objectName", "object_name"], "")),
+        "channel_type": str(_first(d, ["channelType", "channel_type"], "")),
+        "msg_uid": str(_first(d, ["msgUID", "msg_uid", "message_uid"], "")),
+        "unread_count": _num(_first(d, ["unreadCount", "unread_count", "unread"], 0)),
+        "user": user,
+    }
+
+
+def normalize_conversations(data: Any) -> List[Dict[str, Any]]:
+    return _normalize_many(data, normalize_conversation)
 
 
 def _entity_dict(item: Any, nested_keys: Tuple[str, ...] = ()) -> Optional[Dict[str, Any]]:

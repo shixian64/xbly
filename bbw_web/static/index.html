@@ -15,7 +15,7 @@
     <section class="login-card" aria-labelledby="login-title">
       <div class="login-brand">
         <div>
-          <p class="eyebrow">WELCOME BACK</p>
+          <p class="eyebrow">欢迎回来</p>
           <h1 id="login-title">回到小贝乐园</h1>
           <p>发现新朋友，分享此刻的快乐。</p>
         </div>
@@ -96,6 +96,17 @@
 
     <nav id="bottom-nav" class="bottom-nav mobile-only" aria-label="底部主导航"></nav>
   </div>
+
+  <dialog id="profile-dialog" class="profile-dialog" aria-labelledby="profile-dialog-title">
+    <div class="profile-dialog-bar">
+      <div>
+        <strong id="profile-dialog-title">用户资料</strong>
+        <span>查看资料会记入双方的访客足迹</span>
+      </div>
+      <button type="button" class="utility-btn" id="close-profile">关闭</button>
+    </div>
+    <div id="profile-dialog-body" class="profile-dialog-body"></div>
+  </dialog>
 
   <script src="/static/app.js"></script>
 </body>

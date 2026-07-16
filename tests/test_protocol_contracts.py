@@ -14,15 +14,19 @@ if str(ROOT) not in sys.path:
 from bbw_protocol.adapters.pay import PayAdapter  # noqa: E402
 from bbw_protocol.cli import build_parser  # noqa: E402
 from bbw_protocol.client import ApiResult, _parse_result  # noqa: E402
+from bbw_protocol.modules.im import ImAPI  # noqa: E402
+from bbw_protocol.modules.social import SocialAPI  # noqa: E402
 from bbw_web import bff_server as BFF  # noqa: E402
 from bbw_web.normalize import (  # noqa: E402
     normalize_bottles,
+    normalize_conversations,
     normalize_rooms,
     normalize_slides,
     normalize_songs,
     normalize_stickers,
     normalize_task,
     normalize_topics,
+    normalize_users,
     normalize_value,
 )
 
@@ -146,6 +150,119 @@ class NormalizerContractTests(unittest.TestCase):
         obj = normalize_value('{"token":"abc"}')
         self.assertEqual(obj["value_type"], "object")
         self.assertEqual(obj["value"]["token"], "abc")
+
+    def test_social_user_fields_preserve_relationship_and_visit_metadata(self) -> None:
+        user = normalize_users(
+            [
+                {
+                    "id": "9",
+                    "nickname": "N",
+                    "portrait": "n.jpg",
+                    "region": "上海",
+                    "location": "2.4",
+                    "online": "在线",
+                    "time": "1710000000",
+                    "friendsremark": "同学",
+                    "friendstag": "熟人",
+                    "letters": "N",
+                    "apply_id": "apply-1",
+                    "subid": "relation-1",
+                    "isFriend": "1",
+                }
+            ]
+        )[0]
+        self.assertEqual(user["city"], "上海")
+        self.assertEqual(user["distance"], "2.4")
+        self.assertEqual(user["visit_time"], "1710000000")
+        self.assertEqual(user["friend_remark"], "同学")
+        self.assertEqual(user["friend_tag"], "熟人")
+        self.assertEqual(user["letters"], "N")
+        self.assertEqual(user["letter"], "N")
+        self.assertEqual(user["apply_id"], "apply-1")
+        self.assertEqual(user["relation_id"], "relation-1")
+        self.assertTrue(user["is_friend"])
+
+        relation = normalize_users([{"id": "relation-row", "uid": "9", "nickname": "N"}])[0]
+        self.assertEqual(relation["id"], "9")
+
+    def test_history_conversation_keeps_receive_message_fields(self) -> None:
+        item = normalize_conversations(
+            [
+                {
+                    "id": "r1",
+                    "conversation_user": "9",
+                    "fromUserId": "9",
+                    "toUserId": "42",
+                    "objectName": "TIMTextElem",
+                    "content": "你好",
+                    "channelType": "C2C",
+                    "msgTimestamp": "1710000000",
+                    "msgUID": "m1",
+                    "userInfoList": {"id": "9", "nickname": "N", "portrait": "n.jpg"},
+                }
+            ]
+        )[0]
+        self.assertEqual(item["peer_id"], "9")
+        self.assertEqual(item["nickname"], "N")
+        self.assertEqual(item["last_message"], "你好")
+        self.assertEqual(item["timestamp"], "1710000000")
+        self.assertEqual(item["msg_uid"], "m1")
+
+
+class SocialAndImRoutingContractTests(unittest.TestCase):
+    class FakeClient:
+        def __init__(self) -> None:
+            self.session = SimpleNamespace(uid="42", nickname="Me", portrait="me.jpg")
+            self.calls = []
+
+        def call(self, action, params=None, **kwargs):
+            body = dict(params or {})
+            body.update(kwargs)
+            self.calls.append((action, body))
+            return SimpleNamespace(ok=True)
+
+        def url(self, action, **kwargs):
+            return (action, kwargs)
+
+        def request(self, url, body):
+            self.calls.append((url, body))
+            return SimpleNamespace(ok=True)
+
+    def test_friend_and_visit_actions_match_apk_v154(self) -> None:
+        client = self.FakeClient()
+        api = SocialAPI(client)
+        api.friends()
+        api.viewed_me("0")
+        api.i_viewed("2")
+        api.record_profile_view("9")
+        self.assertEqual(client.calls[0], ("getAddFriend", {"uid": "42", "type": "好友"}))
+        self.assertEqual(
+            client.calls[1],
+            ("ISawAndSawMe", {"pageindex": "0", "type": "谁看过我"}),
+        )
+        self.assertEqual(
+            client.calls[2],
+            ("ISawAndSawMe", {"pageindex": "2", "type": "我看过谁"}),
+        )
+        # xbly v154 is authoritative for id direction: current viewer -> target.
+        # Display fields are retained only as compatibility extras for older code.
+        self.assertEqual(
+            client.calls[3],
+            (
+                "addsawme",
+                {
+                    "myid": "42",
+                    "yourid": "9",
+                    "yournickname": "Me",
+                    "yourportrait": "me.jpg",
+                },
+            ),
+        )
+
+    def test_history_conversation_uses_page_parameter(self) -> None:
+        client = self.FakeClient()
+        ImAPI(client).history_conversations("3")
+        self.assertEqual(client.calls, [("getHistoryConversation", {"page": "3"})])
 
 
 class FakeApp:
