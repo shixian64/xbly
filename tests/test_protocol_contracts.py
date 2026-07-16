@@ -20,6 +20,8 @@ from bbw_web import bff_server as BFF  # noqa: E402
 from bbw_web.normalize import (  # noqa: E402
     normalize_bottles,
     normalize_conversations,
+    normalize_friend_applications,
+    normalize_friends,
     normalize_messages,
     normalize_rooms,
     normalize_slides,
@@ -196,6 +198,38 @@ class NormalizerContractTests(unittest.TestCase):
         self.assertEqual(wrapped["id"], "10")
         self.assertTrue(wrapped["is_follower"])
         self.assertTrue(wrapped["is_fans"])
+
+        application = normalize_friend_applications(
+            [
+                {
+                    "id": "apply-1",
+                    "uid": "726285",
+                    "nickname": "当前用户",
+                    "friendid": "9",
+                    "friendnickname": "申请人",
+                    "friendportrait": "images/friend.jpg",
+                }
+            ],
+            current_uid="726285",
+        )[0]
+        self.assertEqual(application["id"], "9")
+        self.assertEqual(application["nickname"], "申请人")
+        self.assertEqual(application["apply_id"], "apply-1")
+
+        friend = normalize_friends(
+            [
+                {
+                    "id": "relation-1",
+                    "uid": "726285",
+                    "friendid": "9",
+                    "friendnickname": "好友",
+                }
+            ],
+            current_uid="726285",
+        )[0]
+        self.assertEqual(friend["id"], "9")
+        self.assertEqual(friend["nickname"], "好友")
+        self.assertEqual(friend["relation_id"], "relation-1")
 
     def test_history_conversation_keeps_receive_message_fields(self) -> None:
         item = normalize_conversations(

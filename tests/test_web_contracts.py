@@ -199,6 +199,7 @@ class SocialBffRoutingTests(unittest.TestCase):
         result = ApiResult(True, 200, "[]", data=[])
         calls = []
         app = SimpleNamespace(
+            session=SimpleNamespace(uid="42"),
             social=SimpleNamespace(
                 friends=lambda: calls.append(("friends", None)) or result,
                 viewed_me=lambda page: calls.append(("seen_me", page)) or result,
@@ -316,6 +317,8 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('avatar.appendChild(image)', app_js)
         self.assertIn('readConversationPeers: new Map()', app_js)
         self.assertIn('refreshList: false', app_js)
+        self.assertIn('data-action="agree-friend" data-id=', app_js)
+        self.assertIn('S.pageCache.delete("friends")', app_js)
 
 
 if __name__ == "__main__":

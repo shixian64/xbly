@@ -573,7 +573,10 @@ function userCard(item, options = {}) {
   const subtitle = user.subtitle || [id && `UID ${id}`, user.city, user.signature].filter(Boolean).join(" · ") || "等待一次友好的相遇";
   const actions = [];
   if (options.accept && id) {
-    actions.push(`<button type="button" class="btn primary small" data-action="agree-friend" data-id="${esc(id)}">同意</button>`);
+    const applyId = String(user.apply_id || user.relation_id || id);
+    actions.push(`<button type="button" class="btn primary small" data-action="agree-friend" data-id="${esc(
+      applyId
+    )}" data-uid="${esc(id)}">同意</button>`);
   }
   if (options.chat && id) {
     actions.push(`<button type="button" class="btn primary small" data-action="open-chat" data-uid="${esc(id)}" data-name="${esc(
@@ -2221,11 +2224,25 @@ async function handleAction(action, button) {
     return;
   }
   if (action === "agree-friend") {
+    const card = button.closest(".user-card");
+    const container = card?.parentElement || null;
     const { data } = await api("/api/social/agree-friend", {
       method: "POST",
-      body: JSON.stringify({ id: button.dataset.id }),
+      body: JSON.stringify({
+        id: button.dataset.id,
+        apply_id: button.dataset.id,
+        uid: button.dataset.uid,
+      }),
     });
-    if (toastEnv(data, "已同意好友申请")) go("social", { force: true });
+    if (toastEnv(data, "已同意好友申请")) {
+      S.pageCache.delete("friends");
+      S.pageCache.delete("social:apply");
+      S.pageCache.delete("me");
+      card?.remove();
+      if (container && !container.querySelector(".user-card")) {
+        container.innerHTML = emptyState("暂无好友申请", "新的好友申请会显示在这里");
+      }
+    }
     return;
   }
   if (action === "social-tab") {

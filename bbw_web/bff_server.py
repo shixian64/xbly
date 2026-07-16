@@ -158,6 +158,30 @@ def RT(r: Any) -> Dict[str, Any]:
     return d
 
 
+def _enrich_session_profile(web_user: Any, result: Any = None) -> Optional[Dict[str, Any]]:
+    """Fill placeholder login names/avatars from the authoritative profile API."""
+    try:
+        if result is None:
+            result = web_user.app.profile.get_me()
+        items = N.normalize_users(result.data)
+        current_uid = str(web_user.app.session.uid or "")
+        profile = next(
+            (item for item in items if str(item.get("id") or "") == current_uid),
+            items[0] if items else None,
+        )
+        if not profile:
+            return None
+        nickname = str(profile.get("nickname") or "").strip()
+        if nickname and nickname not in {current_uid, "用户", "游客"}:
+            web_user.app.session.nickname = nickname
+        if profile.get("avatar"):
+            web_user.app.session.portrait = str(profile["avatar"])
+        web_user.persist()
+        return profile
+    except Exception:
+        return None
+
+
 ENTITY_NORMALIZERS = {
     "slide": N.normalize_slides,
     "topic": N.normalize_topics,
@@ -440,6 +464,8 @@ class Handler(BaseHTTPRequestHandler):
             if not u:
                 return self.ok({"ok": False, "logged_in": False}, 401)
             with u.lock:
+                if str(u.app.session.nickname or "").strip() in {"", "用户", "游客"}:
+                    _enrich_session_profile(u)
                 pub = u.public()
                 user_dto = N.session_user_dto(u.app.whoami())
             return self.ok(
@@ -552,17 +578,31 @@ class Handler(BaseHTTPRequestHandler):
 
         # ---- social ----
         if path == "/api/social/follows":
-            # getFollowList is the APK's relationship list. getFollowUser has a
-            # different recommendation/paging shape and can normalize as empty.
+            # getFollowUser contains display profiles; getFollowList mostly
+            # contains relationship ids and therefore renders numeric names.
+            primary = app.social.follow_users(q("uid") or None, page=q("page", "1"))
+            payload = RL(primary)
+            if payload.get("items"):
+                return self.ok(payload)
             return self.ok(RL(app.social.follow_list(q("uid") or None)))
         if path == "/api/social/fans":
             return self.ok(RL(app.social.fans_users(q("uid") or None, page=q("page", "1"))))
         if path == "/api/social/follow-list":
             return self.ok(RL(app.social.follow_list(q("uid") or q("id") or None)))
         if path == "/api/social/friend-apply":
-            return self.ok(RL(app.social.friend_apply_list(q("page", "1"))))
+            result = app.social.friend_apply_list(q("page", "1"))
+            items = N.normalize_friend_applications(result.data, str(app.session.uid or ""))
+            payload = N.envelope(result, items=items)
+            payload["list"] = items
+            payload["status"] = result.status
+            return self.ok(payload)
         if path == "/api/social/friends":
-            return self.ok(RL(app.social.friends()))
+            result = app.social.friends()
+            items = N.normalize_friends(result.data, str(app.session.uid or ""))
+            payload = N.envelope(result, items=items)
+            payload["list"] = items
+            payload["status"] = result.status
+            return self.ok(payload)
         if path == "/api/social/visitors":
             visit_type = q("type", "seen_me")
             page = q("page", q("pageindex", "0"))
@@ -786,10 +826,13 @@ class Handler(BaseHTTPRequestHandler):
                     )
             except Exception as e:
                 return self.ok({"ok": False, "error": _safe_error(e, "登录失败")}, 400)
+            profile_result = None
             try:
-                user.app.bootstrap()
+                bootstrap_result = user.app.bootstrap()
+                profile_result = bootstrap_result.get("me")
             except Exception:
                 pass
+            _enrich_session_profile(user, profile_result)
             return self.ok({"ok": True, **user.public()}, set_cookie=user.web_sid)
 
         if path == "/api/auth/logout":
@@ -854,6 +897,7 @@ class Handler(BaseHTTPRequestHandler):
                             400,
                         )
                     user.app.session.password = ""
+                    _enrich_session_profile(user)
                     STORE.rotate_sid(user)
                     user.persist()
                     if STORE.auto_heartbeat:

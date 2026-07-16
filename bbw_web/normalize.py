@@ -159,6 +159,12 @@ def _as_list(x: Any) -> List[Any]:
         "fans_list",
         "followUsers",
         "fansUsers",
+        "friendList",
+        "friendsList",
+        "friend_list",
+        "friends_list",
+        "applyList",
+        "apply_list",
         "conversations",
         "conversation_list",
         "conversationList",
@@ -435,6 +441,147 @@ def normalize_users(data: Any) -> List[Dict[str, Any]]:
         u = normalize_user(it)
         if u:
             out.append(u)
+    return out
+
+
+def normalize_friend_application(item: Any, current_uid: str = "") -> Optional[Dict[str, Any]]:
+    """Normalize Friendsapply0 without mistaking the recipient for the applicant."""
+    d = _as_dict(item) if isinstance(item, str) else item
+    if not isinstance(d, dict):
+        return None
+    current = str(current_uid or "")
+    apply_id = str(
+        _first(
+            d,
+            ["apply_id", "applyId", "friend_apply_id", "friendsapply_id", "subid", "id"],
+            "",
+        )
+    )
+    applicant_id = ""
+    for key in (
+        "friendid",
+        "friendId",
+        "friendsid",
+        "yourid",
+        "your_id",
+        "youid",
+        "fromUserId",
+        "from_user_id",
+        "fromid",
+        "from_id",
+        "applicant_id",
+        "apply_uid",
+        "sender_id",
+        "userId",
+        "userid",
+        "uid",
+    ):
+        value = str(d.get(key) or "").strip()
+        if value and value != current:
+            applicant_id = value
+            break
+
+    nested = _first(
+        d,
+        ["friend", "applicant", "fromUser", "from_user", "applyUser", "userInfoList", "user"],
+        None,
+    )
+    nested_user = normalize_user(nested)
+    nested_id = str((nested_user or {}).get("id") or "")
+    if not applicant_id and nested_id and nested_id != current:
+        applicant_id = nested_id
+
+    generic = normalize_user(d) or {}
+    generic_id = str(generic.get("id") or "")
+    if not applicant_id and generic_id and generic_id != current and generic_id != apply_id:
+        applicant_id = generic_id
+
+    nickname = str(
+        _first(
+            d,
+            [
+                "friendnickname",
+                "friendNickname",
+                "yournickname",
+                "fromnickname",
+                "from_nickname",
+                "applicant_nickname",
+                "sender_name",
+            ],
+            "",
+        )
+    )
+    avatar = resolve_media_url(
+        _first(
+            d,
+            [
+                "friendportrait",
+                "friendPortrait",
+                "yourportrait",
+                "fromportrait",
+                "from_portrait",
+                "applicant_avatar",
+                "sender_avatar",
+            ],
+            "",
+        )
+    )
+    if nested_user and nested_id == applicant_id:
+        nickname = nickname or str(nested_user.get("nickname") or "")
+        avatar = avatar or str(nested_user.get("avatar") or "")
+    if generic_id == applicant_id:
+        nickname = nickname or str(generic.get("nickname") or "")
+        avatar = avatar or str(generic.get("avatar") or "")
+
+    if not applicant_id:
+        return None
+    return {
+        **generic,
+        "id": applicant_id,
+        "nickname": nickname or f"用户 {applicant_id}",
+        "avatar": avatar,
+        "subtitle": " · ".join(
+            part
+            for part in (
+                f"uid {applicant_id}",
+                str(_first(d, ["region", "city", "area"], "")),
+                str(_first(d, ["signature", "sign", "description"], ""))[:24],
+            )
+            if part
+        ),
+        "apply_id": apply_id or applicant_id,
+    }
+
+
+def normalize_friend_applications(data: Any, current_uid: str = "") -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for item in extract_list(data):
+        normalized = normalize_friend_application(item, current_uid)
+        if normalized:
+            out.append(normalized)
+    return out
+
+
+def normalize_friends(data: Any, current_uid: str = "") -> List[Dict[str, Any]]:
+    """Normalize getAddFriend relationship rows into the other user's profile."""
+    out: List[Dict[str, Any]] = []
+    current = str(current_uid or "")
+    for item in extract_list(data):
+        normalized = normalize_friend_application(item, current)
+        if normalized:
+            normalized["relation_id"] = str(
+                _first(
+                    item if isinstance(item, dict) else {},
+                    ["relation_id", "relationId", "subid", "id"],
+                    normalized.get("relation_id") or "",
+                )
+            )
+            normalized["apply_id"] = ""
+            out.append(normalized)
+            continue
+        user = normalize_user(item)
+        if user and user.get("id") and str(user["id"]) != current:
+            out.append(user)
     return out
 
 
