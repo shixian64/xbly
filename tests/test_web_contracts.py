@@ -202,6 +202,7 @@ class SocialBffRoutingTests(unittest.TestCase):
             session=SimpleNamespace(uid="42"),
             social=SimpleNamespace(
                 friends=lambda: calls.append(("friends", None)) or result,
+                friend_apply_list=lambda page: calls.append(("friend_apply", page)) or result,
                 viewed_me=lambda page: calls.append(("seen_me", page)) or result,
                 i_viewed=lambda page: calls.append(("seen_by_me", page)) or result,
             ),
@@ -271,6 +272,64 @@ class SocialBffRoutingTests(unittest.TestCase):
         bff_server.Handler.do_POST(harness)
         return calls, harness.response
 
+    def _run_agree_post(self, payload: dict):
+        calls = []
+        accepted = set()
+        application = {
+            "id": "apply-1",
+            "uid": "42",
+            "yourid": "9",
+            "yournickname": "申请人",
+        }
+
+        def agree_friend(value):
+            calls.append(("agree", value))
+            if value == "9":
+                accepted.add("9")
+            return ApiResult(True, 200, "T", data=True)
+
+        def friends():
+            calls.append(("friends", None))
+            rows = [{"id": "relation-1", "uid": "42", "friendid": "9", "friendnickname": "申请人"}] if accepted else []
+            return ApiResult(True, 200, "[]", data=rows)
+
+        app = SimpleNamespace(
+            session=SimpleNamespace(uid="42"),
+            social=SimpleNamespace(
+                agree_friend=agree_friend,
+                friends=friends,
+                friend_apply_list=lambda page: calls.append(("friend_apply", page))
+                or ApiResult(True, 200, "[]", data=[application]),
+            ),
+        )
+        web_user = SimpleNamespace(app=app)
+
+        class Harness:
+            path = "/api/social/agree-friend"
+
+            def __init__(self):
+                self.response = None
+
+            def _check_api_origin(self):
+                return True
+
+            def body(self):
+                return payload
+
+            def sid(self):
+                return "sid"
+
+            def user(self, _sid):
+                return web_user
+
+            def ok(self, obj, status=200, **_kwargs):
+                self.response = (status, obj)
+                return self.response
+
+        harness = Harness()
+        bff_server.Handler.do_POST(harness)
+        return calls, harness.response
+
     def test_social_and_conversation_routes(self) -> None:
         calls, response = self._run_get("/api/social/friends")
         self.assertEqual(calls, [("friends", None)])
@@ -293,6 +352,17 @@ class SocialBffRoutingTests(unittest.TestCase):
         calls, response = self._run_visit_post({"uid": "9"})
         self.assertEqual(calls, [("visit", "9")])
         self.assertEqual(response[0], 200)
+
+        calls, response = self._run_get("/api/social/friend-apply?page=1")
+        self.assertEqual(calls, [("friend_apply", "1"), ("friends", None)])
+        self.assertEqual(response[1]["items"], [])
+
+    def test_agree_friend_uses_applicant_uid_and_verifies_friend_state(self) -> None:
+        calls, response = self._run_agree_post({"uid": "9", "apply_id": "apply-1"})
+
+        self.assertEqual(calls[:2], [("agree", "9"), ("friends", None)])
+        self.assertTrue(response[1]["ok"])
+        self.assertTrue(response[1]["verified"])
 
 
 class SocialFrontendContractTests(unittest.TestCase):
@@ -319,6 +389,7 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('refreshList: false', app_js)
         self.assertIn('data-action="agree-friend" data-id=', app_js)
         self.assertIn('S.pageCache.delete("friends")', app_js)
+        self.assertNotIn("<strong>访客足迹</strong><span>谁看过我、我看过谁</span>", app_js)
 
     def test_system_customer_service_conversation_is_read_only(self) -> None:
         root = Path(__file__).resolve().parents[1]

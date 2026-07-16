@@ -444,6 +444,168 @@ def normalize_users(data: Any) -> List[Dict[str, Any]]:
     return out
 
 
+def normalize_social_user(item: Any, current_uid: str = "") -> Optional[Dict[str, Any]]:
+    """Normalize follow/fans relationship rows into the other user's profile."""
+    d = _as_dict(item) if isinstance(item, str) else item
+    if not isinstance(d, dict):
+        return None
+    current = str(current_uid or "")
+    peer_id = ""
+    for key in (
+        "yourid",
+        "your_id",
+        "you",
+        "friendid",
+        "friendId",
+        "fansid",
+        "fanid",
+        "followid",
+        "follow_uid",
+        "fans_uid",
+        "target_id",
+        "target_uid",
+        "fromUserId",
+        "from_user_id",
+        "toUserId",
+        "to_user_id",
+    ):
+        value = str(d.get(key) or "").strip()
+        if value and value != current:
+            peer_id = value
+            break
+
+    candidates: List[Dict[str, Any]] = []
+    for key in (
+        "userInfoList",
+        "user_info",
+        "user",
+        "friend",
+        "followUser",
+        "follow_user",
+        "fansUser",
+        "fans_user",
+        "targetUser",
+        "target_user",
+        "fromUser",
+        "from_user",
+        "toUser",
+        "to_user",
+    ):
+        candidate = normalize_user(d.get(key))
+        if candidate and candidate.get("id"):
+            candidates.append(candidate)
+
+    generic = normalize_user(d)
+    if generic and generic.get("id"):
+        candidates.append(generic)
+    if not peer_id:
+        peer_id = str(
+            next(
+                (
+                    candidate.get("id")
+                    for candidate in candidates
+                    if str(candidate.get("id") or "") != current
+                ),
+                "",
+            )
+        )
+    if not peer_id:
+        row_id = str(d.get("id") or "").strip()
+        row_uid = str(d.get("uid") or "").strip()
+        if row_id and row_id != current and row_uid == current:
+            peer_id = row_id
+    if not peer_id:
+        return None
+
+    profile = next(
+        (
+            candidate
+            for candidate in candidates
+            if str(candidate.get("id") or "") == peer_id
+        ),
+        {},
+    )
+    nickname = str(
+        _first(
+            d,
+            [
+                "yournickname",
+                "yourNickname",
+                "friendnickname",
+                "friendNickname",
+                "fansnickname",
+                "fan_nickname",
+                "follownickname",
+                "follow_nickname",
+                "target_nickname",
+                "fromUserNickName",
+                "from_nickname",
+                "toUserNickName",
+                "to_nickname",
+            ],
+            profile.get("nickname") or "",
+        )
+    ).strip()
+    avatar = resolve_media_url(
+        _first(
+            d,
+            [
+                "yourportrait",
+                "yourPortrait",
+                "friendportrait",
+                "friendPortrait",
+                "fansportrait",
+                "fan_avatar",
+                "followportrait",
+                "follow_avatar",
+                "target_avatar",
+                "fromUserAvatar",
+                "from_portrait",
+                "toUserAvatar",
+                "to_portrait",
+            ],
+            profile.get("avatar") or "",
+        )
+    )
+    base = dict(profile or {})
+    base.update(
+        {
+            "id": peer_id,
+            "nickname": nickname or f"用户 {peer_id}",
+            "avatar": avatar,
+            "_needs_profile": not bool(nickname),
+            "subtitle": " · ".join(
+                part
+                for part in (
+                    f"uid {peer_id}",
+                    str(_first(d, ["region", "city", "area"], profile.get("city") or "")),
+                    str(
+                        _first(
+                            d,
+                            ["signature", "sign", "description"],
+                            profile.get("signature") or "",
+                        )
+                    )[:24],
+                )
+                if part
+            ),
+        }
+    )
+    return base
+
+
+def normalize_social_users(data: Any, current_uid: str = "") -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in extract_list(data):
+        user = normalize_social_user(item, current_uid)
+        uid = str((user or {}).get("id") or "")
+        if user and uid and uid not in seen:
+            seen.add(uid)
+            out.append(user)
+    return out
+
+
 def normalize_friend_application(item: Any, current_uid: str = "") -> Optional[Dict[str, Any]]:
     """Normalize Friendsapply0 without mistaking the recipient for the applicant."""
     d = _as_dict(item) if isinstance(item, str) else item

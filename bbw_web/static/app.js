@@ -1443,7 +1443,6 @@ async function pageMe(signal) {
     </div></section>
     <section class="section"><div class="quick-entry-grid me-entry-grid">
       <button type="button" class="quick-entry" data-route="msg"><strong>我的消息</strong><span>聊天与新朋友</span></button>
-      <button type="button" class="quick-entry" data-route="visitors"><strong>访客足迹</strong><span>谁看过我、我看过谁</span></button>
       <button type="button" class="quick-entry" data-route="moments"><strong>我的动态</strong><span>话题与分享</span></button>
       <button type="button" class="quick-entry" data-route="wallet"><strong>钱包会员</strong><span>乐园币、会员与礼物</span></button>
     </div></section>

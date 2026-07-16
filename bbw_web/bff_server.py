@@ -144,6 +144,71 @@ def RL(r: Any) -> Dict[str, Any]:
     return d
 
 
+def _enrich_social_profiles(app: Any, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    for item in items[:20]:
+        needs_profile = bool(item.pop("_needs_profile", False))
+        uid = str(item.get("id") or "")
+        if not needs_profile or not uid:
+            continue
+        try:
+            result = app.profile.get_user(uid)
+            profiles = N.normalize_users(result.data)
+            profile = next(
+                (value for value in profiles if str(value.get("id") or "") == uid),
+                profiles[0] if profiles else None,
+            )
+            if not profile:
+                continue
+            item["nickname"] = profile.get("nickname") or item.get("nickname")
+            item["avatar"] = profile.get("avatar") or item.get("avatar")
+            item["city"] = profile.get("city") or item.get("city")
+            item["signature"] = profile.get("signature") or item.get("signature")
+            item["subtitle"] = profile.get("subtitle") or item.get("subtitle")
+        except Exception:
+            continue
+    for item in items[20:]:
+        item.pop("_needs_profile", None)
+    return items
+
+
+def RS(r: Any, current_uid: str = "", app: Any = None) -> Dict[str, Any]:
+    """Follow/fans endpoint normalized as the peer, never the logged-in user."""
+    items = N.normalize_social_users(getattr(r, "data", None), current_uid)
+    if app is not None:
+        items = _enrich_social_profiles(app, items)
+    else:
+        for item in items:
+            item.pop("_needs_profile", None)
+    d = N.envelope(r, items=items)
+    d["list"] = items
+    d["status"] = getattr(r, "status", 0)
+    return d
+
+
+def _accepted_friend_ids(app: Any, current_uid: str) -> Set[str]:
+    try:
+        result = app.social.friends()
+        if not getattr(result, "ok", False):
+            return set()
+        return {
+            str(item.get("id") or "")
+            for item in N.normalize_friends(result.data, current_uid)
+            if item.get("id")
+        }
+    except Exception:
+        return set()
+
+
+def _friend_applications(app: Any, current_uid: str, result: Any = None) -> Tuple[Any, List[Dict[str, Any]]]:
+    if result is None:
+        result = app.social.friend_apply_list("1")
+    items = N.normalize_friend_applications(result.data, current_uid)
+    accepted = _accepted_friend_ids(app, current_uid)
+    if accepted:
+        items = [item for item in items if str(item.get("id") or "") not in accepted]
+    return result, items
+
+
 def RG(r: Any) -> Dict[str, Any]:
     gifts = N.normalize_gifts(getattr(r, "data", None))
     d = N.envelope(r, items=gifts)
@@ -581,17 +646,29 @@ class Handler(BaseHTTPRequestHandler):
             # getFollowUser contains display profiles; getFollowList mostly
             # contains relationship ids and therefore renders numeric names.
             primary = app.social.follow_users(q("uid") or None, page=q("page", "1"))
-            payload = RL(primary)
+            payload = RS(primary, str(app.session.uid or ""), app)
             if payload.get("items"):
                 return self.ok(payload)
-            return self.ok(RL(app.social.follow_list(q("uid") or None)))
+            return self.ok(
+                RS(
+                    app.social.follow_list(q("uid") or None),
+                    str(app.session.uid or ""),
+                    app,
+                )
+            )
         if path == "/api/social/fans":
-            return self.ok(RL(app.social.fans_users(q("uid") or None, page=q("page", "1"))))
+            return self.ok(
+                RS(
+                    app.social.fans_users(q("uid") or None, page=q("page", "1")),
+                    str(app.session.uid or ""),
+                    app,
+                )
+            )
         if path == "/api/social/follow-list":
             return self.ok(RL(app.social.follow_list(q("uid") or q("id") or None)))
         if path == "/api/social/friend-apply":
             result = app.social.friend_apply_list(q("page", "1"))
-            items = N.normalize_friend_applications(result.data, str(app.session.uid or ""))
+            result, items = _friend_applications(app, str(app.session.uid or ""), result)
             payload = N.envelope(result, items=items)
             payload["list"] = items
             payload["status"] = result.status
@@ -976,9 +1053,42 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/social/unfollow":
                 return self.ok(R(app.social.unfollow(str(data.get("uid") or data.get("you") or ""))))
             if path == "/api/social/agree-friend":
-                return self.ok(
-                    R(app.social.agree_friend(str(data.get("id") or data.get("apply_id") or "")))
-                )
+                current_uid = str(app.session.uid or "")
+                applicant_uid = str(data.get("uid") or "").strip()
+                apply_id = str(data.get("apply_id") or data.get("id") or "").strip()
+                candidates = list(dict.fromkeys(value for value in (applicant_uid, apply_id) if value))
+                if not candidates:
+                    return self.ok({"ok": False, "error": "缺少好友申请 ID"}, 400)
+                result = None
+                verified = False
+                pending = True
+                for candidate in candidates:
+                    result = app.social.agree_friend(candidate)
+                    accepted = _accepted_friend_ids(app, current_uid)
+                    if applicant_uid and applicant_uid in accepted:
+                        verified = True
+                        pending = False
+                        break
+                    _, remaining = _friend_applications(app, current_uid)
+                    pending = any(
+                        str(item.get("id") or "") == applicant_uid
+                        or str(item.get("apply_id") or "") == apply_id
+                        for item in remaining
+                    )
+                    if not pending:
+                        verified = True
+                        break
+                payload = R(result)
+                payload["verified"] = verified
+                if verified:
+                    payload.update(ok=True, message="已同意好友申请", error=None)
+                elif getattr(result, "ok", False):
+                    payload.update(
+                        ok=False,
+                        message="好友申请状态未更新，请刷新后重试",
+                        error={"title": "好友申请状态未更新", "detail": "服务端仍返回这条申请"},
+                    )
+                return self.ok(payload)
             if path == "/api/social/delete-friend":
                 return self.ok(R(app.social.delete_friend(**_params(data))))
             if path == "/api/social/visit":

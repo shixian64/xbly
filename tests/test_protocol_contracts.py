@@ -25,6 +25,7 @@ from bbw_web.normalize import (  # noqa: E402
     normalize_messages,
     normalize_rooms,
     normalize_slides,
+    normalize_social_users,
     normalize_songs,
     normalize_stickers,
     normalize_task,
@@ -230,6 +231,26 @@ class NormalizerContractTests(unittest.TestCase):
         self.assertEqual(friend["id"], "9")
         self.assertEqual(friend["nickname"], "好友")
         self.assertEqual(friend["relation_id"], "relation-1")
+
+        relations = normalize_social_users(
+            [
+                {
+                    "id": "follow-row",
+                    "uid": "726285",
+                    "nickname": "当前用户",
+                    "yourid": "10",
+                    "yournickname": "关注对象",
+                    "yourportrait": "images/follow.jpg",
+                }
+            ],
+            current_uid="726285",
+        )
+        self.assertEqual(relations[0]["id"], "10")
+        self.assertEqual(relations[0]["nickname"], "关注对象")
+        self.assertEqual(
+            relations[0]["avatar"],
+            "https://oss.banghua.xin/images/follow.jpg",
+        )
 
     def test_history_conversation_keeps_receive_message_fields(self) -> None:
         item = normalize_conversations(
