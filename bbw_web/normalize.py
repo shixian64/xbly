@@ -9,6 +9,29 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+# APK serves relative paths like /images/999999/... from this host.
+MEDIA_BASE = "https://oss.banghua.xin"
+
+
+def resolve_media_url(value: Any) -> str:
+    """Turn relative APK media paths into absolute OSS URLs."""
+    raw = str(value or "").strip()
+    if not raw or raw in {"null", "undefined", "None"}:
+        return ""
+    if raw.startswith("data:image/"):
+        return raw
+    if raw.startswith("//"):
+        return "https:" + raw
+    if re.match(r"^https?://", raw, re.I):
+        return raw
+    if raw.startswith("/"):
+        return MEDIA_BASE + raw
+    if re.match(r"^(images|attachment|upload|uploads)/", raw, re.I):
+        return f"{MEDIA_BASE}/{raw}"
+    if "://" not in raw and not raw.startswith("{"):
+        return f"{MEDIA_BASE}/{raw.lstrip('./')}"
+    return ""
+
 
 # ---------------------------------------------------------------------------
 # Error catalogue (product copy)
@@ -314,7 +337,7 @@ def normalize_user(item: Any) -> Optional[Dict[str, Any]]:
             uid or "用户",
         )
     )
-    avatar = str(
+    avatar = resolve_media_url(
         _first(
             item,
             [
@@ -481,7 +504,7 @@ def normalize_slide(item: Any) -> Optional[Dict[str, Any]]:
     title = str(
         _first(d, ["title", "name", "slidename", "slide_name", "description", "desc"], "")
     )
-    image = str(
+    image = resolve_media_url(
         _first(
             d,
             [
@@ -533,7 +556,7 @@ def normalize_topic(item: Any) -> Optional[Dict[str, Any]]:
     tid = str(_first(d, ["id", "topicid", "topic_id", "topicId"], ""))
     name = str(_first(d, ["topic", "topic_name", "topicName", "name", "title"], ""))
     desc = str(_first(d, ["description", "desc", "content", "summary"], ""))
-    image = str(_first(d, ["image", "img", "pic", "cover", "thumb"], ""))
+    image = resolve_media_url(_first(d, ["image", "img", "pic", "cover", "thumb"], ""))
     if not any((tid, name, desc, image)):
         return None
     return {
@@ -556,7 +579,7 @@ def normalize_room(item: Any) -> Optional[Dict[str, Any]]:
         return None
     rid = str(_first(d, ["id", "roomId", "room_id", "roomid", "channel_id"], ""))
     name = str(_first(d, ["roomName", "room_name", "roomname", "name", "title"], ""))
-    cover = str(_first(d, ["cover", "image", "img", "pic", "roomCover", "portrait"], ""))
+    cover = resolve_media_url(_first(d, ["cover", "image", "img", "pic", "roomCover", "portrait"], ""))
     channel = str(_first(d, ["channel", "channelName", "channel_name", "channel_id"], ""))
     owner_id = str(_first(d, ["owner_id", "ownerId", "uid", "userId", "anchor_id", "myID"], ""))
     owner_name = str(_first(d, ["owner_name", "ownerName", "nickname", "anchor_name"], ""))
@@ -621,11 +644,11 @@ def normalize_bottle(item: Any) -> Optional[Dict[str, Any]]:
     user = normalize_user(_first(d, ["user", "userinfo", "userInfo"], None))
     user_id = str(_first(d, ["user_id", "userId", "uid", "myid", "owner_id"], ""))
     nickname = str(_first(d, ["nickname", "nick", "user_name", "name"], ""))
-    avatar = str(_first(d, ["avatar", "portrait", "head", "headimg"], ""))
+    avatar = resolve_media_url(_first(d, ["avatar", "portrait", "head", "headimg"], ""))
     if user:
         user_id = user_id or str(user.get("id") or "")
         nickname = nickname or str(user.get("nickname") or "")
-        avatar = avatar or str(user.get("avatar") or "")
+        avatar = avatar or resolve_media_url(user.get("avatar") or "")
     if not any((bid, content, user_id, nickname, avatar)):
         return None
     return {
@@ -662,8 +685,8 @@ def normalize_sticker(item: Any) -> Optional[Dict[str, Any]]:
         return None
     sid = str(_first(d, ["id", "stickerId", "sticker_id", "emoji_id"], ""))
     name = str(_first(d, ["name", "title", "stickerName", "sticker_name"], ""))
-    image = str(_first(d, ["image", "img", "pic", "sticker_url", "stickerUrl", "url"], ""))
-    thumb = str(_first(d, ["thumbnail", "thumb", "preview", "small_url"], ""))
+    image = resolve_media_url(_first(d, ["image", "img", "pic", "sticker_url", "stickerUrl", "url"], ""))
+    thumb = resolve_media_url(_first(d, ["thumbnail", "thumb", "preview", "small_url"], ""))
     if not any((sid, name, image, thumb)):
         return None
     return {
@@ -689,7 +712,7 @@ def normalize_gift(item: Any) -> Optional[Dict[str, Any]]:
             _first(item, ["giftname", "gift_name", "name", "title", "giftName"], "礼物")
         ),
         "price": str(_first(item, ["price", "money", "coin", "cost", "gold"], "")),
-        "icon": str(_first(item, ["icon", "image", "img", "picture", "url", "pic"], "")),
+        "icon": resolve_media_url(_first(item, ["icon", "image", "img", "picture", "url", "pic"], "")),
     }
 
 
@@ -906,14 +929,26 @@ def normalize_match_result(r: Any) -> Dict[str, Any]:
     return base
 
 
-def session_user_dto(who: Dict[str, Any]) -> Dict[str, Any]:
+def session_user_dto(
+    who: Dict[str, Any], profile: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Build the logged-in user DTO, optionally enriched by a profile response."""
+    profile_user = normalize_user(profile) if profile else None
     phone = str(who.get("phone") or "")
     if len(phone) >= 7:
         phone = f"{phone[:3]}****{phone[-4:]}"
+    avatar = resolve_media_url(
+        who.get("avatar")
+        or who.get("portrait")
+        or (profile_user or {}).get("avatar")
+        or ""
+    )
     return {
         "id": str(who.get("uid") or ""),
         "uid": str(who.get("uid") or ""),
-        "nickname": str(who.get("nickname") or "游客"),
+        "nickname": str(who.get("nickname") or (profile_user or {}).get("nickname") or "游客"),
+        "avatar": avatar,
+        "portrait": avatar,
         "phone": phone,
         "is_realname": bool(who.get("is_realname")),
         "money": str(who.get("money") or "0"),

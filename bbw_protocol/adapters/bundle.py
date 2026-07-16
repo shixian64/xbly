@@ -8,6 +8,7 @@ from ..app import BeibeiwuApp
 from .face import FaceAdapter
 from .im import ImAdapter
 from .pay import PayAdapter
+from .tim_rest import TimRestClient
 
 
 class NativeBundle:
@@ -18,6 +19,7 @@ class NativeBundle:
         self.im = ImAdapter(app)
         self.face = FaceAdapter(app)
         self.pay = PayAdapter(app)
+        self.tim_rest = TimRestClient()
 
     def status(self) -> Dict[str, Any]:
         """What can be done now with current session + adapters."""
@@ -31,6 +33,7 @@ class NativeBundle:
                 "tim_server": "tximsign.php",
                 "rong": "userregister.php + APP_KEY",
                 "realtime": "needs TIM/Rong Web or App SDK",
+                "rest_fallback": "openim/sendmsg via BFF when Web SDK login hangs",
             },
             "face": {
                 "http": "InitFaceVerify0 / DescribeFaceVerify0 / SaveRPVerifyInfo",

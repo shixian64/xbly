@@ -82,7 +82,14 @@ class Session:
         self.vip = str(user.get("vip") or "0")
         self.svip = str(user.get("svip") or "0")
         self.money = str(user.get("money") or "0")
-        self.portrait = str(user.get("portrait") or "")
+        portrait = (
+            user.get("portrait")
+            or user.get("avatar")
+            or user.get("headimg")
+            or user.get("head_img")
+        )
+        if portrait:
+            self.portrait = str(portrait)
         self.user_sign = str(user.get("userSign") or user.get("user_sign") or "")
         self.login_id = str(user.get("login_id") or "")
         phone = user.get("phone")
@@ -115,6 +122,7 @@ class Session:
             "logged_in": self.logged_in,
             "uid": self.uid,
             "nickname": self.nickname,
+            "portrait": self.portrait,
             "user_role": self.user_role,
             "rp_verify_time": self.rp_verify_time,
             "is_realname": self.is_realname,

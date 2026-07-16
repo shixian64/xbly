@@ -265,46 +265,58 @@ class Handler(BaseHTTPRequestHandler):
         clear_cookie: bool = False,
         cache_control: Optional[str] = None,
     ) -> None:
-        self.send_response(status)
-        self._cors()
-        self.send_header("Content-Type", ct)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
-        self.send_header(
-            "Permissions-Policy",
-            "camera=(self), microphone=(self), geolocation=(self), payment=(), usb=()",
-        )
-        req_path = urlparse(self.path).path
-        if cache_control is None:
-            cache_control = "no-store" if req_path.startswith("/api/") else "no-cache"
-        self.send_header("Cache-Control", cache_control)
-        if req_path.startswith("/api/"):
-            self.send_header("Pragma", "no-cache")
-        if ct.startswith("text/html"):
+        try:
+            self.send_response(status)
+            self._cors()
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
             self.send_header(
-                "Content-Security-Policy",
-                "default-src 'self'; script-src 'self'; "
-                "style-src 'self'; img-src 'self' data: https:; "
-                "connect-src 'self' https: wss:; object-src 'none'; base-uri 'self'; "
-                "frame-ancestors 'none'; form-action 'self'",
+                "Permissions-Policy",
+                "camera=(self), microphone=(self), geolocation=(self), payment=(), usb=()",
             )
-        if set_cookie:
-            secure = "; Secure" if COOKIE_SECURE else ""
-            self.send_header(
-                "Set-Cookie",
-                f"{COOKIE_NAME}={set_cookie}; Path=/; HttpOnly; SameSite=Strict{secure}",
-            )
-        if clear_cookie:
-            secure = "; Secure" if COOKIE_SECURE else ""
-            self.send_header(
-                "Set-Cookie",
-                f"{COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict{secure}",
-            )
-        self.end_headers()
-        self.wfile.write(body)
+            req_path = urlparse(self.path).path
+            if cache_control is None:
+                cache_control = "no-store" if req_path.startswith("/api/") else "no-cache"
+            self.send_header("Cache-Control", cache_control)
+            if req_path.startswith("/api/"):
+                self.send_header("Pragma", "no-cache")
+            if ct.startswith("text/html"):
+                self.send_header(
+                    "Content-Security-Policy",
+                    "default-src 'self'; script-src 'self'; "
+                    "style-src 'self'; img-src 'self' data: https:; "
+                    "connect-src 'self' https: wss:; "
+                    # tim-js-sdk@2.27.6 creates its WebSocket and timer workers
+                    # from blob: URLs. Blocking them leaves login() pending even
+                    # when a page-level WebSocket probe reports success.
+                    "worker-src 'self' blob:; child-src 'self' blob:; "
+                    "object-src 'none'; base-uri 'self'; "
+                    "frame-ancestors 'none'; form-action 'self'",
+                )
+            if set_cookie:
+                secure = "; Secure" if COOKIE_SECURE else ""
+                self.send_header(
+                    "Set-Cookie",
+                    f"{COOKIE_NAME}={set_cookie}; Path=/; HttpOnly; SameSite=Strict{secure}",
+                )
+            if clear_cookie:
+                secure = "; Secure" if COOKIE_SECURE else ""
+                self.send_header(
+                    "Set-Cookie",
+                    f"{COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict{secure}",
+                )
+            self.end_headers()
+            # HEAD must not include a body (RFC 9110).
+            if getattr(self, "command", "GET") == "HEAD":
+                return
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            # Browser navigated away / aborted the request mid-response.
+            return
 
     def ok(self, obj: Any, status: int = 200, **kw: Any) -> None:
         st, body, ct = _json_bytes(obj, status)
@@ -368,6 +380,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.ok({"ok": False, "error": "cross-origin request rejected"}, 403)
         self._send(204, b"", "text/plain; charset=utf-8", cache_control="no-store")
 
+    def do_HEAD(self) -> None:  # noqa: N802
+        """Browsers / probes sometimes HEAD static assets; BaseHTTPRequestHandler defaults to 501."""
+        self.do_GET()
+
     def do_GET(self) -> None:  # noqa: N802
         assert STORE is not None
         parsed = urlparse(self.path)
@@ -378,7 +394,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             return self.static("index.html")
         if path.startswith("/static/"):
-            return self.static(Path(path).name)
+            return self.static(path[len("/static/") :])
 
         if path.startswith("/api/") and not self._check_api_origin():
             return
@@ -465,12 +481,15 @@ class Handler(BaseHTTPRequestHandler):
                 for k, v in app.bootstrap().items()
             }
             try:
-                tim = u.native.im.tim_login_payload(
-                    prefer=_tim_preference(q("prefer", "server")),
-                    allow_local_fallback=LAB_ENABLED,
-                )
+                tim = {
+                    "ok": True,
+                    **u.native.im.tim_login_payload(
+                        prefer=_tim_preference(q("prefer", "local")),
+                        allow_local_fallback=True,
+                    ),
+                }
             except Exception as e:
-                tim = {"error": _safe_error(e, "TIM 凭证获取失败")}
+                tim = {"ok": False, "error": _safe_error(e, "TIM 凭证获取失败")}
             u.persist()
             return self.ok(
                 {
@@ -502,9 +521,18 @@ class Handler(BaseHTTPRequestHandler):
         # ---- profile ----
         if path == "/api/profile/me":
             r = app.profile.get_me()
-            u.persist()
-            who = N.session_user_dto(app.whoami())
             items = N.normalize_users(r.data)
+            current_uid = str(app.session.uid or "")
+            profile_user = next(
+                (item for item in items if str(item.get("id") or "") == current_uid),
+                items[0] if items else None,
+            )
+            if profile_user and profile_user.get("avatar"):
+                # Some login responses omit the portrait while the profile API has it.
+                # Cache it in the session so every later /api/* user DTO stays complete.
+                app.session.portrait = str(profile_user["avatar"])
+            u.persist()
+            who = N.session_user_dto(app.whoami(), profile_user)
             return self.ok({**R(r), "user": who, "items": items, "list": items})
         if path == "/api/profile/user":
             return self.ok(
@@ -628,14 +656,31 @@ class Handler(BaseHTTPRequestHandler):
 
         # ---- im ----
         if path == "/api/im/tim":
+            # Prefer server UserSig (tximsign.php puts sig in message=).
+            # Fall back to BFF-local mint (APK SECRETKEY, never sent to browser).
             try:
+                prefer = _tim_preference(q("prefer", "server"))
+                payload = u.native.im.tim_login_payload(
+                    prefer=prefer,
+                    allow_local_fallback=True,
+                )
+                if not payload.get("userSig") or not payload.get("userID"):
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "error": {
+                                "title": "TIM 凭证不完整",
+                                "detail": "缺少 userID 或 userSig，请重新登录后再试",
+                            },
+                        },
+                        400,
+                    )
+                # Never echo full userSig length into logs; client gets it once.
                 return self.ok(
                     {
                         "ok": True,
-                        **u.native.im.tim_login_payload(
-                            prefer=_tim_preference(q("prefer", "server")),
-                            allow_local_fallback=LAB_ENABLED,
-                        ),
+                        **payload,
+                        "sig_len": len(str(payload.get("userSig") or "")),
                     }
                 )
             except Exception as e:
@@ -646,12 +691,20 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/im/rong":
             c = u.native.im.rong_register()
             return self.ok({"ok": c.ok, **c.to_dict()})
+        if path == "/api/im/rest/health":
+            # Proves APK-derived secret works against Tencent REST (not browser WSS).
+            sample = str(app.session.uid or "1")
+            return self.ok(u.native.tim_rest.health(sample_uid=sample))
+        if path == "/api/im/rest/online":
+            uid = q("uid") or app.session.uid or ""
+            r = u.native.tim_rest.query_online([uid] if uid else ["1"])
+            return self.ok(r.to_dict(), 200 if r.ok else 400)
         if path == "/api/im/bootstrap":
             try:
                 return self.ok(
                     u.native.im.bootstrap(
-                        prefer_tim=_tim_preference(q("prefer", "server")),
-                        allow_local_fallback=LAB_ENABLED,
+                        prefer_tim=_tim_preference(q("prefer", "local")),
+                        allow_local_fallback=True,
                     )
                 )
             except Exception as e:
@@ -881,6 +934,39 @@ class Handler(BaseHTTPRequestHandler):
                 if not target_uid:
                     return self.ok({"ok": False, "error": "缺少对方 UID"}, 400)
                 return self.ok(R(app.social.record_profile_view(target_uid)))
+
+            # TIM REST fallback (when browser TIM.login hangs)
+            if path == "/api/im/rest/send":
+                to_uid = str(data.get("to") or data.get("peer") or data.get("uid") or "").strip()
+                text = str(data.get("text") or data.get("message") or "").strip()
+                if not to_uid or not text:
+                    return self.ok({"ok": False, "error": "需要对方 UID 与消息内容"}, 400)
+                from_uid = str(app.session.uid or "").strip()
+                if not from_uid:
+                    return self.ok({"ok": False, "error": "当前会话无 uid"}, 400)
+                r = u.native.tim_rest.send_text(from_uid, to_uid, text)
+                # Best-effort: also mirror into banghua history if action exists.
+                hist = None
+                try:
+                    hist = R(
+                        app.im.history_message_insert(
+                            from_id=from_uid,
+                            to_id=to_uid,
+                            content=text,
+                            type="text",
+                        )
+                    )
+                except Exception:
+                    hist = None
+                out = r.to_dict()
+                out["from"] = from_uid
+                out["to"] = to_uid
+                if hist is not None:
+                    out["history_mirror"] = hist
+                if r.ok:
+                    out["message"] = "已通过腾讯 IM REST 发送（非浏览器实时长连接）"
+                return self.ok(out, 200 if r.ok else 400)
+
             if path == "/api/social/blacklist-add":
                 return self.ok(R(app.social.add_blacklist(**_params(data))))
             if path == "/api/social/blacklist-del":
@@ -1167,7 +1253,17 @@ class Handler(BaseHTTPRequestHandler):
         self.ok({"ok": False, "error": "not found", "path": path}, 404)
 
     def static(self, name: str) -> None:
-        path = STATIC_DIR / Path(name).name
+        """Serve files under static/, including vendor/ subpaths (path-traversal safe)."""
+        rel = Path(str(name or "").replace("\\", "/").lstrip("/"))
+        if not rel.parts or ".." in rel.parts:
+            self._send(404, b"missing", "text/plain")
+            return
+        path = (STATIC_DIR / rel).resolve()
+        try:
+            path.relative_to(STATIC_DIR.resolve())
+        except ValueError:
+            self._send(404, b"missing", "text/plain")
+            return
         if not path.is_file():
             self._send(404, b"missing", "text/plain")
             return
@@ -1177,7 +1273,26 @@ class Handler(BaseHTTPRequestHandler):
             ct = "application/javascript; charset=utf-8"
         elif path.suffix == ".css":
             ct = "text/css; charset=utf-8"
-        cache = "no-cache" if path.suffix == ".html" else "public, max-age=300"
+        elif path.suffix == ".txt":
+            ct = "text/plain; charset=utf-8"
+        elif path.suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}:
+            ct = {
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".gif": "image/gif",
+                ".webp": "image/webp",
+                ".svg": "image/svg+xml",
+            }[path.suffix]
+        # Vendor SDK is large and immutable by version pin.  First-party HTML/JS
+        # must be revalidated on every load: an older cached IM connector can keep
+        # throwing before login even after the server-side file has been fixed.
+        if "vendor" in rel.parts:
+            cache = "public, max-age=86400"
+        elif path.suffix in {".html", ".js"}:
+            cache = "no-store"
+        else:
+            cache = "public, max-age=300"
         self._send(200, data, ct, cache_control=cache)
 
 
@@ -1200,10 +1315,10 @@ def _as_bool(value: Any) -> bool:
 
 
 def _tim_preference(value: Any) -> str:
-    """Use server-issued UserSig in product mode; local signing is lab-only."""
+    """TIM UserSig source: server (tximsign.php) or local (BFF mint)."""
     requested = str(value or "server").strip().lower()
-    if LAB_ENABLED and requested == "local":
-        return "local"
+    if requested in {"local", "server"}:
+        return requested
     return "server"
 
 

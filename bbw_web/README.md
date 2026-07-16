@@ -65,7 +65,7 @@ python -m bbw_web --auto-heartbeat
 | 类型 | Web 状态 |
 |---|---|
 | HTTP 业务能力 | 通过语义 BFF 覆盖主要流程；冷门 action 仅 Lab 可调 |
-| IM 实时体验 | 产品模式仅接受服务端签发 UserSig、不回退本地签名；不动态加载 `latest` CDN；正式接入需固定版本官方 SDK |
+| IM 实时体验 | 产品模式仅接受服务端签发 UserSig；固定版本官方 SDK 已 vendor 在 `static/vendor/tim-js.js`（tim-js-sdk@2.27.6）；进入消息页自动连接 |
 | 刷脸实名 | Web 展示状态并引导官方 App；活体仍依赖阿里云 ZIM |
 | 微信/支付宝 | 可校验并生成订单参数；收银、回调和到账仍依赖官方商户配置 |
 | RTC/语音房 | 可准备房间/Token 数据；实时音频仍需受控 RTC SDK |

@@ -108,7 +108,7 @@ class NormalizerContractTests(unittest.TestCase):
             {"slides": [{"id": "s1", "title": "活动", "image": "banner.jpg", "url": "/event"}]}
         )[0]
         self.assertEqual(slide["title"], "活动")
-        self.assertEqual(slide["image"], "banner.jpg")
+        self.assertEqual(slide["image"], "https://oss.banghua.xin/banner.jpg")
         self.assertEqual(slide["url"], "/event")
         self.assertNotIn("nickname", slide)
 
@@ -139,7 +139,7 @@ class NormalizerContractTests(unittest.TestCase):
         sticker = normalize_stickers(
             {"stickers": [{"stickerId": "e1", "stickerName": "笑", "stickerUrl": "e.png", "isFavorite": "1"}]}
         )[0]
-        self.assertEqual(sticker["image"], "e.png")
+        self.assertEqual(sticker["image"], "https://oss.banghua.xin/e.png")
         self.assertTrue(sticker["favorite"])
 
     def test_generic_value_preserves_scalar_and_object(self) -> None:

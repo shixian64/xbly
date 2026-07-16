@@ -123,6 +123,8 @@ class WebUser:
                 "logged_in": bool(who.get("logged_in")),
                 "uid": str(who.get("uid") or ""),
                 "nickname": str(who.get("nickname") or ""),
+                "avatar": str(who.get("portrait") or who.get("avatar") or ""),
+                "portrait": str(who.get("portrait") or who.get("avatar") or ""),
                 "user_role": str(who.get("user_role") or ""),
                 "rp_verify_time": str(who.get("rp_verify_time") or "0"),
                 "is_realname": bool(who.get("is_realname")),

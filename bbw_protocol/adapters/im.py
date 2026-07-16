@@ -61,6 +61,19 @@ class ImAdapter:
     def __init__(self, app: BeibeiwuApp):
         self.app = app
 
+    @staticmethod
+    def _looks_like_user_sig(value: str) -> bool:
+        """Heuristic: Tencent UserSig is zlib+base64url (often starts with eJ / eJwt)."""
+        s = str(value or "").strip()
+        if len(s) < 40:
+            return False
+        if s[0] in "{[<":
+            return False
+        # reject plain error messages
+        if any(x in s.lower() for x in ("fail", "error", "失败", "无效", "登录")):
+            return False
+        return True
+
     def tim_local(self, uid: Optional[str] = None, expire: int = 604800) -> TimCredentials:
         """Generate UserSig with APK-hardcoded SECRETKEY (BFF only — never ship key to browser)."""
         user_id = uid or self.app.session.uid
@@ -91,19 +104,37 @@ class ImAdapter:
         r = self.app.im.tencent_sign(user_id)
         sig = ""
         if isinstance(r.data, dict):
+            # tximsign.php returns: {"code":"200","message":"<UserSig>"}
+            # (UserSig lives in message, NOT a nested userSign field.)
             sig = (
                 r.data.get("userSign")
                 or r.data.get("usersig")
                 or r.data.get("UserSig")
                 or r.data.get("sig")
+                or r.data.get("user_sig")
                 or ""
             )
+            msg = r.data.get("message")
+            if not sig and isinstance(msg, str) and self._looks_like_user_sig(msg):
+                sig = msg
             if not sig and isinstance(r.data.get("data"), dict):
                 d = r.data["data"]
-                sig = d.get("userSign") or d.get("usersig") or d.get("UserSig") or ""
+                sig = (
+                    d.get("userSign")
+                    or d.get("usersig")
+                    or d.get("UserSig")
+                    or d.get("sig")
+                    or ""
+                )
+            if not sig and isinstance(r.data.get("data"), str) and self._looks_like_user_sig(
+                r.data["data"]
+            ):
+                sig = r.data["data"]
         if not sig and r.raw and len(r.raw) > 20 and r.raw.strip()[0] not in "{[<":
             # plain text sig
             sig = r.raw.strip()
+        if not sig and isinstance(r.message, str) and self._looks_like_user_sig(r.message):
+            sig = r.message
         if not sig:
             # session may already hold login-time userSign
             sig = getattr(self.app.session, "user_sign", "") or ""

@@ -8,12 +8,45 @@ from unittest.mock import patch
 from bbw_protocol.client import ApiResult
 from bbw_protocol.adapters.im import ImAdapter
 from bbw_protocol.modules.misc import MiscAPI
+from bbw_protocol.session import Session
 from bbw_web import bff_server
 from bbw_web.bff_server import R, RE
+from bbw_web.normalize import session_user_dto
 from bbw_web.store import WebUser, _session_path
 
 
 class BffEnvelopeTests(unittest.TestCase):
+    def test_logged_in_user_avatar_is_exposed_to_the_web_client(self) -> None:
+        session = Session(
+            uid="42",
+            token="token",
+            nickname="Me",
+            portrait="/images/users/me.jpg",
+        )
+        dto = session_user_dto(session.summary())
+
+        self.assertEqual(dto["avatar"], "https://oss.banghua.xin/images/users/me.jpg")
+        self.assertEqual(dto["portrait"], dto["avatar"])
+
+        web_user = WebUser(
+            web_sid="sid",
+            app=SimpleNamespace(whoami=session.summary),
+            native=SimpleNamespace(),
+        )
+        self.assertEqual(web_user.public()["user"]["avatar"], "/images/users/me.jpg")
+
+        session.update_from_user({"id": "42", "token": "token", "avatar": "images/new.jpg"})
+        self.assertEqual(session.portrait, "images/new.jpg")
+        session.update_from_user({"id": "42", "token": "token"})
+        self.assertEqual(session.portrait, "images/new.jpg")
+
+    def test_profile_avatar_fills_missing_login_avatar(self) -> None:
+        dto = session_user_dto(
+            {"uid": "42", "nickname": "Me", "logged_in": True},
+            {"id": "42", "nickname": "Me", "portrait": "images/users/me.jpg"},
+        )
+        self.assertEqual(dto["avatar"], "https://oss.banghua.xin/images/users/me.jpg")
+
     def test_scalar_value_is_preserved_for_product_endpoints(self) -> None:
         result = ApiResult(True, 200, "20978", data=20978, kind="json_other")
         payload = R(result, include_value=True)
@@ -51,7 +84,10 @@ class BffEnvelopeTests(unittest.TestCase):
         payload = RE(result, "slide")
         self.assertEqual(payload["entity"], "slide")
         self.assertEqual(payload["items"][0]["title"], "乐园招聘")
-        self.assertEqual(payload["items"][0]["image"], "images/banner.jpg")
+        self.assertEqual(
+            payload["items"][0]["image"],
+            "https://oss.banghua.xin/images/banner.jpg",
+        )
         self.assertNotIn("nickname", payload["items"][0])
 
     def test_sms_empty_transport_can_be_explicitly_accepted(self) -> None:
@@ -111,9 +147,9 @@ class SecurityHelperTests(unittest.TestCase):
         self.assertEqual(public["label"], "138****8000")
         self.assertEqual(public["user"]["phone"], "138****8000")
 
-    def test_tim_local_signing_is_lab_only(self) -> None:
+    def test_tim_local_signing_can_be_selected_by_the_bff(self) -> None:
         with patch.object(bff_server, "LAB_ENABLED", False):
-            self.assertEqual(bff_server._tim_preference("local"), "server")
+            self.assertEqual(bff_server._tim_preference("local"), "local")
         with patch.object(bff_server, "LAB_ENABLED", True):
             self.assertEqual(bff_server._tim_preference("local"), "local")
 
@@ -270,6 +306,8 @@ class SocialFrontendContractTests(unittest.TestCase):
             self.assertIn(endpoint, app_js)
         self.assertIn('class="conversation-layout', app_js)
         self.assertIn('id="profile-dialog"', index_html)
+        self.assertIn('mediaUrl(user.avatar || user.portrait)', app_js)
+        self.assertIn('avatar.appendChild(image)', app_js)
 
 
 if __name__ == "__main__":

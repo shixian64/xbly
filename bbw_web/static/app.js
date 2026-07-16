@@ -39,6 +39,9 @@ const S = {
   imHandler: null,
   imConversationHandler: null,
   imConnected: false,
+  imMode: "", // "sdk" | "rest" | ""
+  imConnecting: false,
+  imLastError: "",
   imMessages: [],
   smsTimer: null,
   presenceTimer: null,
@@ -60,17 +63,108 @@ function firstChar(value, fallback = "贝") {
   return Array.from(String(value || fallback))[0] || fallback;
 }
 
+/** Official OSS host used by APK for /images/... relative paths. */
+const MEDIA_BASE = "https://oss.banghua.xin";
+
 function mediaUrl(value) {
   const raw = String(value || "").trim();
-  if (!raw) return "";
-  try {
-    const url = new URL(raw, location.origin);
-    if (url.protocol === "http:" || url.protocol === "https:") return url.href;
-    if (url.protocol === "data:" && /^data:image\//i.test(raw)) return raw;
-  } catch {
-    return "";
+  if (!raw || raw === "null" || raw === "undefined") return "";
+  if (/^data:image\//i.test(raw)) return raw;
+  if (raw.startsWith("//")) return `https:${raw}`;
+  if (/^https?:\/\//i.test(raw)) return raw;
+  // API often returns site-relative paths like /images/999999/...
+  // Must NOT resolve against location.origin (would 404 on the BFF).
+  if (raw.startsWith("/")) return `${MEDIA_BASE}${raw}`;
+  if (/^(images|attachment|upload|uploads)\//i.test(raw)) return `${MEDIA_BASE}/${raw}`;
+  if (!raw.includes("://") && !raw.startsWith("{")) {
+    return `${MEDIA_BASE}/${raw.replace(/^\.\//, "")}`;
   }
   return "";
+}
+
+function resolveTimApi() {
+  if (window.TIM && typeof window.TIM.create === "function") return window.TIM;
+  if (window.TencentCloudChat && typeof window.TencentCloudChat.create === "function") {
+    return window.TencentCloudChat;
+  }
+  return null;
+}
+
+const TIM_SDK_SRC = "/static/vendor/tim-js.js";
+let _timSdkLoading = null;
+
+function withTimeout(promise, ms, label = "操作") {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label}超时（${Math.round(ms / 1000)}s）`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+/**
+ * Ensure the vendored TIM Web SDK is on window.TIM.
+ * Handles: slow network, script tag race, or index.html without the vendor tag.
+ */
+function ensureTimSdkLoaded() {
+  if (resolveTimApi()) return Promise.resolve(resolveTimApi());
+  if (_timSdkLoading) return _timSdkLoading;
+  _timSdkLoading = new Promise((resolve, reject) => {
+    const finish = (err) => {
+      _timSdkLoading = null;
+      const api = resolveTimApi();
+      if (api) resolve(api);
+      else reject(err || new Error("TIM SDK 已请求但未导出 window.TIM"));
+    };
+    const existing = document.querySelector("script[data-bbw-tim],script[src*='tim-js.js']");
+    if (existing) {
+      // Script tag present but not ready yet — poll briefly, then hard-reload once.
+      let n = 0;
+      const timer = setInterval(() => {
+        n += 1;
+        if (resolveTimApi()) {
+          clearInterval(timer);
+          finish();
+        } else if (n > 60) {
+          clearInterval(timer);
+          // Force a fresh inject (handles failed first load / wrong path).
+          const script = document.createElement("script");
+          script.src = `${TIM_SDK_SRC}?v=2.27.6`;
+          script.dataset.bbwTim = "1";
+          script.onload = () => finish();
+          script.onerror = () => finish(new Error(`无法加载 ${TIM_SDK_SRC}`));
+          document.head.appendChild(script);
+        }
+      }, 50);
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = `${TIM_SDK_SRC}?v=2.27.6`;
+    script.async = false;
+    script.dataset.bbwTim = "1";
+    script.onload = () => finish();
+    script.onerror = () => finish(new Error(`无法加载 ${TIM_SDK_SRC}（HTTP 失败）`));
+    document.head.appendChild(script);
+  });
+  return _timSdkLoading;
+}
+
+function setImConnectingUi(active, detail = "") {
+  S.imConnecting = Boolean(active);
+  S.imLastError = active ? "" : S.imLastError;
+  if (detail) S.imLastError = detail;
+  const btn = document.querySelector('[data-action="im-connect"]');
+  if (btn) {
+    btn.disabled = Boolean(active);
+    btn.textContent = active ? "连接中…" : S.imConnected ? "重新连接" : "连接消息服务";
+  }
+  const status = document.getElementById("im-conn-status");
+  if (status) {
+    if (active) status.textContent = "正在连接消息服务…";
+    else if (S.imConnected) status.textContent = "消息服务已连接";
+    else if (S.imLastError) status.textContent = S.imLastError;
+  }
 }
 
 function toast(message, type = "info", ms = 2600) {
@@ -213,17 +307,28 @@ function showLogin(show, clearSecrets = false) {
 
 function applyUser(user) {
   S.user = user || null;
+  const avatar = $("side-avatar");
   if (!user) {
     $("side-name").textContent = "游客";
     $("side-meta").textContent = "尚未登录";
-    $("side-avatar").textContent = "游";
+    avatar.textContent = "游";
     return;
   }
   const name = user.nickname || user.name || "乐园用户";
   const uid = user.uid || user.id || "—";
   $("side-name").textContent = name;
   $("side-meta").textContent = `UID ${uid} · ${user.is_realname ? "已实名" : "未实名"}`;
-  $("side-avatar").textContent = firstChar(name, "贝");
+  avatar.textContent = firstChar(name, "贝");
+  const src = mediaUrl(user.avatar || user.portrait);
+  if (src) {
+    const image = document.createElement("img");
+    image.src = src;
+    image.alt = "";
+    image.decoding = "async";
+    image.referrerPolicy = "no-referrer";
+    image.dataset.media = "";
+    avatar.appendChild(image);
+  }
 }
 
 function setLoginMode(mode) {
@@ -369,6 +474,12 @@ async function activateRoute(id) {
     if (controller.signal.aborted || seq !== S.routeSeq) return;
     root().innerHTML = `<div class="page-enter">${html}</div>`;
     root().focus({ preventScroll: true });
+    if (target === "msg" && !S.imConnected) {
+      // Load vendor SDK if needed, then login with BFF UserSig.
+      void ensureTimConnected().then((ok) => {
+        if (ok && S.route === "msg" && seq === S.routeSeq) go("msg", { force: true });
+      });
+    }
   } catch (error) {
     if (error && error.name === "AbortError") return;
     if (error instanceof AuthExpiredError) return;
@@ -421,7 +532,7 @@ function avatarHtml(name, url) {
   const src = mediaUrl(url);
   return `<span class="avatar" aria-hidden="true"><span>${esc(firstChar(name, "贝"))}</span>${
     src
-      ? `<img src="${esc(src)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-media />`
+      ? `<img src="${esc(src)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-media onerror="this.remove()" />`
       : ""
   }</span>`;
 }
@@ -803,7 +914,9 @@ function membershipText(value) {
 }
 
 function chatLogHtml() {
-  const entries = S.imMessages.filter((entry) => !entry.peer || !S.activePeer || entry.peer === S.activePeer);
+  const entries = S.imMessages.filter(
+    (entry) => entry.type !== "system" && (!entry.peer || !S.activePeer || entry.peer === S.activePeer)
+  );
   if (!entries.length) {
     return `<div class="chat-line system">${S.imConnected ? "还没有消息，礼貌地打个招呼吧" : "连接消息服务后可发送新消息"}</div>`;
   }
@@ -813,6 +926,10 @@ function chatLogHtml() {
 }
 
 function addImMessage(text, type = "system", peer = "") {
+  if (type === "system") {
+    console.info("[TIM]", String(text));
+    return;
+  }
   S.imMessages.push({ text: String(text), type, peer: String(peer || "") });
   if (S.imMessages.length > 100) S.imMessages.splice(0, S.imMessages.length - 100);
   const log = $("im-log");
@@ -878,12 +995,22 @@ async function pageMessages(signal) {
   if (active && !S.activePeerName) {
     S.activePeerName = active.nickname || active.peer_name || active.user?.nickname || `用户 ${S.activePeer}`;
   }
-  const ready = Boolean(window.TIM);
-  const connectionText = S.imConnected ? "消息服务已连接" : ready ? "消息服务待连接" : "当前仅可查看历史会话";
-  return `<div class="message-page${S.activePeer ? " conversation-open" : ""}"><section class="message-toolbar"><div><h2>消息</h2><p>${esc(connectionText)}</p></div><div class="button-row compact-row">
-      <button type="button" class="btn secondary small" data-action="mark-all-read" ${S.imConnected ? "" : "disabled"}>全部已读</button>
-      <button type="button" class="btn ${S.imConnected ? "secondary" : "primary"} small" data-action="im-connect">${
-    S.imConnected ? "重新连接" : "连接消息服务"
+  const ready = Boolean(resolveTimApi());
+  const connectionText = S.imConnected
+    ? S.imMode === "rest"
+      ? "REST 发送通道已启用（可发文本；收消息依赖刷新历史）"
+      : "消息服务已连接（TIM SDK 实时）"
+    : S.imConnecting
+      ? "正在连接消息服务…"
+      : S.imLastError
+        ? S.imLastError
+        : ready
+          ? "进入本页将自动连接；失败时会尝试 REST 发送通道"
+          : "将自动加载 TIM SDK；失败时回退 REST";
+  return `<div class="message-page${S.activePeer ? " conversation-open" : ""}"><section class="message-toolbar"><div><h2>消息</h2><p id="im-conn-status">${esc(connectionText)}</p></div><div class="button-row compact-row">
+      <button type="button" class="btn secondary small" data-action="mark-all-read" ${S.imConnected && S.imMode === "sdk" ? "" : "disabled"}>全部已读</button>
+      <button type="button" class="btn ${S.imConnected ? "secondary" : "primary"} small" data-action="im-connect" ${S.imConnecting ? "disabled" : ""}>${
+    S.imConnecting ? "连接中…" : S.imConnected ? "重新连接" : "连接消息服务"
   }</button>
     </div></section>
     <section class="message-shortcuts" aria-label="消息快捷入口">
@@ -1276,26 +1403,171 @@ async function runMatch(path, body = {}) {
   await refreshMatchStats();
 }
 
-async function connectTIM(credential) {
-  if (!window.TIM) {
-    addImMessage("凭证已获取，但当前页面未预装 TIM SDK。请由受信任的宿主提供固定版本 SDK。", "system");
-    return false;
+function formatTimLoginError(error, source = "") {
+  const raw = String(error?.message || error || "TIM 登录失败");
+  const lower = raw.toLowerCase();
+  if (raw.includes("超时") || lower.includes("timeout") || raw.includes("WebSocket")) {
+    return (
+      `${raw}。请检查：代理/VPN 是否拦截腾讯 IM（放行 wss.im.qcloud.com、wss.tim.qq.com、webim.tim.qq.com）；` +
+      `Clash 用户可把上述域名设为 DIRECT 或关闭 Fake-IP 后再试。` +
+      (source ? `（凭证: ${source}）` : "")
+    );
   }
-  await cleanupIM();
-  const TIM = window.TIM;
-  const chat = TIM.create({ SDKAppID: credential.SDKAppID });
-  if (typeof chat.setLogLevel === "function") chat.setLogLevel(1);
+  if (/70001|70003|70009|usersig|user.?sig|签名|校验/i.test(raw)) {
+    return `${raw}（UserSig 校验失败，请换 server/local 凭证重试）`;
+  }
+  return raw;
+}
+
+/** Browser-side WSS probe — login hangs when the proxy blocks TIM websockets. */
+function probeTimWebsocket(timeoutMs = 5000) {
+  const urls = ["wss://wss.im.qcloud.com/ws", "wss://wss.tim.qq.com/v4/ws"];
+  return new Promise((resolve) => {
+    let left = urls.length;
+    let opened = false;
+    const done = (ok, detail) => {
+      if (opened && ok) return;
+      if (ok) {
+        opened = true;
+        resolve({ ok: true, detail });
+        return;
+      }
+      left -= 1;
+      if (left <= 0 && !opened) resolve({ ok: false, detail: detail || "WebSocket 均无法连通" });
+    };
+    urls.forEach((url) => {
+      let settled = false;
+      let ws;
+      const finish = (ok, detail) => {
+        if (settled) return;
+        settled = true;
+        try {
+          if (ws && ws.readyState <= 1) ws.close();
+        } catch {
+          /* ignore */
+        }
+        done(ok, detail);
+      };
+      try {
+        ws = new WebSocket(url);
+      } catch (error) {
+        finish(false, `${url}: ${error?.message || error}`);
+        return;
+      }
+      const timer = setTimeout(() => finish(false, `${url}: 超时`), timeoutMs);
+      ws.onopen = () => {
+        clearTimeout(timer);
+        finish(true, url);
+      };
+      ws.onerror = () => {
+        clearTimeout(timer);
+        finish(false, `${url}: error`);
+      };
+      ws.onclose = () => {
+        clearTimeout(timer);
+        // close without open counts as failure for that url
+        finish(false, `${url}: closed`);
+      };
+    });
+  });
+}
+
+/** TIM 2.x opens its real transport from a blob: Web Worker. */
+function probeTimWorker(timeoutMs = 2500) {
+  return new Promise((resolve) => {
+    if (typeof Worker !== "function" || typeof Blob !== "function" || !window.URL?.createObjectURL) {
+      resolve({ ok: false, detail: "当前浏览器不支持 Web Worker/Blob URL" });
+      return;
+    }
+    let worker = null;
+    let objectUrl = "";
+    let timer = null;
+    let settled = false;
+    const finish = (ok, detail) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      try {
+        worker?.terminate();
+      } catch {
+        /* ignore */
+      }
+      try {
+        if (objectUrl) window.URL.revokeObjectURL(objectUrl);
+      } catch {
+        /* ignore */
+      }
+      resolve({ ok, detail });
+    };
+    try {
+      objectUrl = window.URL.createObjectURL(
+        new Blob(["self.onmessage=()=>self.postMessage('ok')"], {
+          type: "application/javascript",
+        })
+      );
+      worker = new Worker(objectUrl);
+      worker.onmessage = () => finish(true, "blob Worker 可用");
+      worker.onerror = (event) =>
+        finish(false, event?.message || "blob Worker 启动失败（可能被 CSP/安全软件拦截）");
+      timer = setTimeout(() => finish(false, "blob Worker 无响应（可能被 CSP 拦截）"), timeoutMs);
+      worker.postMessage("ping");
+    } catch (error) {
+      finish(false, error?.message || String(error));
+    }
+  });
+}
+
+async function fetchTimCredential(prefer) {
+  const { data } = await api(`/api/im/tim?prefer=${encodeURIComponent(prefer)}`, { timeout: 12000 });
+  if (!data.ok || !data.userSig || !data.userID || !data.SDKAppID) {
+    const info = errorInfo(data, "TIM 凭证不可用");
+    const detail = [info.title, info.detail].filter(Boolean).join(" · ") || "TIM 凭证不完整";
+    const err = new Error(detail);
+    err.credential = data;
+    throw err;
+  }
+  return data;
+}
+
+/**
+ * TIM Web SDK keeps ONE instance per SDKAppID (internal cache).
+ * If login() is still pending when our timeout fires, the next create/login
+ * reuses that stuck instance and will hang forever. Always destroy first,
+ * and never chain server→local login without a full destroy settle.
+ */
+async function destroyTimInstance(chat, TIM) {
+  if (!chat) return;
+  try {
+    if (typeof chat.logout === "function") {
+      await withTimeout(Promise.resolve(chat.logout()), 2500, "TIM 登出");
+    }
+  } catch {
+    /* ignore */
+  }
+  try {
+    if (typeof chat.destroy === "function") {
+      await withTimeout(Promise.resolve(chat.destroy()), 2500, "TIM 销毁");
+    }
+  } catch {
+    /* ignore */
+  }
+  // Give the singleton map a beat to drop SDKAppID before next create().
+  await new Promise((r) => setTimeout(r, 200));
+  void TIM;
+}
+
+function attachTimHandlers(chat, TIM, credential) {
   S.imHandler = (event) => {
     (event.data || []).forEach((message) => {
       const peer = String(message.from || "");
       const text = (message.payload && message.payload.text) || "[新消息]";
       addImMessage(text, peer === String(credential.userID) ? "mine" : "", peer);
-      if (peer && peer !== S.activePeer) toast(`收到来自 ${peer} 的新消息`);
+      if (peer && peer !== String(S.activePeer)) toast(`收到来自 ${peer} 的新消息`);
     });
   };
-  chat.on(TIM.EVENT.MESSAGE_RECEIVED, S.imHandler);
-  await chat.login({ userID: credential.userID, userSig: credential.userSig });
-  if (TIM.EVENT.CONVERSATION_LIST_UPDATED) {
+  if (TIM.EVENT?.MESSAGE_RECEIVED) chat.on(TIM.EVENT.MESSAGE_RECEIVED, S.imHandler);
+
+  if (TIM.EVENT?.CONVERSATION_LIST_UPDATED) {
     S.imConversationHandler = (event) => {
       S.conversations = (event.data || [])
         .map(normalizeTimConversation)
@@ -1304,38 +1576,320 @@ async function connectTIM(credential) {
       updateUnreadBadges();
       if (S.route === "msg") go("msg", { force: true });
     };
-    chat.on(TIM.EVENT.CONVERSATION_LIST_UPDATED, S.imConversationHandler);
-  }
-  if (typeof chat.getConversationList === "function") {
     try {
-      const result = await chat.getConversationList();
-      const list = result?.data?.conversationList || result?.conversationList || [];
-      if (Array.isArray(list) && list.length) {
-        S.conversations = list.map(normalizeTimConversation).filter((item) => item.peer_id && isC2CConversation(item));
-        S.unreadTotal = S.conversations.reduce((sum, item) => sum + Number(item.unread_count || 0), 0);
-        updateUnreadBadges();
-      }
+      chat.on(TIM.EVENT.CONVERSATION_LIST_UPDATED, S.imConversationHandler);
     } catch {
-      // The HTTP history list remains available when the realtime list is unavailable.
+      /* ignore */
     }
   }
+}
+
+async function connectTIM(credential) {
+  const TIM = resolveTimApi();
+  if (!TIM) {
+    const msg = "未加载本地 TIM SDK（/static/vendor/tim-js.js）。请强制刷新后重试。";
+    addImMessage(msg, "system");
+    S.imLastError = msg;
+    return false;
+  }
+  if (!credential?.userID || !credential?.userSig || !credential?.SDKAppID) {
+    const msg = "TIM 凭证不完整，无法连接消息服务。";
+    addImMessage(msg, "system");
+    S.imLastError = msg;
+    return false;
+  }
+
+  // Always tear down previous singleton before a new login attempt.
+  await cleanupIM();
+  await destroyTimInstance(S.chat, TIM);
+
+  const sdkAppId = Number(credential.SDKAppID) || credential.SDKAppID;
+  let chat;
+  try {
+    chat = TIM.create({ SDKAppID: sdkAppId });
+  } catch (error) {
+    const msg = `TIM.create 异常：${error?.message || error}`;
+    addImMessage(msg, "system");
+    S.imLastError = msg;
+    return false;
+  }
+  if (!chat) {
+    const msg = "TIM.create 失败，请检查 SDKAppID。";
+    addImMessage(msg, "system");
+    S.imLastError = msg;
+    return false;
+  }
+  // Hold reference early so cleanupIM can destroy even if login times out.
   S.chat = chat;
-  S.imConnected = true;
-  addImMessage("TIM 登录成功，可以发送文本消息。", "system");
-  return true;
+  if (typeof chat.setLogLevel === "function") chat.setLogLevel(1);
+
+  let sdkErrorText = "";
+  let readyPollTimer = null;
+  let resolveSdkReady = null;
+  const sdkReadySignal = new Promise((resolve) => {
+    resolveSdkReady = resolve;
+  });
+  const stopReadyPoll = () => {
+    if (readyPollTimer != null) {
+      clearInterval(readyPollTimer);
+      readyPollTimer = null;
+    }
+  };
+  const markSdkReady = (via) => {
+    if (!resolveSdkReady) return;
+    const resolve = resolveSdkReady;
+    resolveSdkReady = null;
+    stopReadyPoll();
+    resolve({ via });
+  };
+  const onSdkError = (event) => {
+    try {
+      const d = event?.data;
+      const code = d?.code ?? d?.errorCode;
+      const message = d?.message || d?.errorInfo || d?.msg || "";
+      sdkErrorText = [code != null ? `code=${code}` : "", message].filter(Boolean).join(" ");
+      if (sdkErrorText) addImMessage(`TIM SDK 事件：${sdkErrorText}`, "system");
+    } catch {
+      /* ignore */
+    }
+  };
+  const onReady = () => {
+    markSdkReady("sdk_ready");
+  };
+  if (TIM.EVENT?.ERROR && typeof chat.on === "function") chat.on(TIM.EVENT.ERROR, onSdkError);
+  if (TIM.EVENT?.SDK_READY && typeof chat.on === "function") chat.on(TIM.EVENT.SDK_READY, onReady);
+  if (TIM.EVENT?.KICKED_OUT && typeof chat.on === "function") {
+    chat.on(TIM.EVENT.KICKED_OUT, () => addImMessage("TIM 被踢下线（可能在其他端登录）", "system"));
+  }
+
+  attachTimHandlers(chat, TIM, credential);
+
+  // Race: login promise vs SDK_READY vs hard timeout.
+  // Some environments never settle login() even after the socket is up.
+  const loginPromise = Promise.resolve(
+    chat.login({
+      userID: String(credential.userID),
+      userSig: String(credential.userSig),
+    })
+  ).then((loginResult) => {
+    const code = loginResult?.code ?? loginResult?.data?.code;
+    if (code != null && Number(code) !== 0) {
+      const message =
+        loginResult?.message ||
+        loginResult?.data?.message ||
+        `TIM 登录失败 (code=${code})`;
+      throw new Error(message);
+    }
+    return { via: "login", loginResult };
+  });
+
+  // Poll is only a compatibility fallback. The resolver is initialized before
+  // listeners are attached, so no Promise can reference itself during creation.
+  const checkSdkReady = () => {
+    try {
+      if (typeof chat.isReady === "function" && chat.isReady()) markSdkReady("isReady");
+    } catch {
+      /* ignore */
+    }
+  };
+  readyPollTimer = setInterval(checkSdkReady, 200);
+  checkSdkReady();
+
+  let raceTimer = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    raceTimer = setTimeout(() => {
+      reject(new Error("TIM 登录超时（15s）"));
+    }, 15000);
+  });
+
+  try {
+    const result = await Promise.race([loginPromise, sdkReadySignal, timeoutPromise]);
+    if (raceTimer) clearTimeout(raceTimer);
+    stopReadyPoll();
+
+    S.imConnected = true;
+    S.imMode = "sdk";
+    S.imLastError = "";
+    addImMessage(
+      `消息服务已连接（via=${result?.via || "ok"} uid=${credential.userID} sig=${credential.source || "?"}）。`,
+      "system"
+    );
+
+    // Background conversation sync — never block connected UI.
+    void (async () => {
+      if (typeof chat.getConversationList !== "function") return;
+      try {
+        const listResult = await withTimeout(chat.getConversationList(), 8000, "拉取会话列表");
+        const list = listResult?.data?.conversationList || listResult?.conversationList || [];
+        if (Array.isArray(list) && list.length) {
+          S.conversations = list
+            .map(normalizeTimConversation)
+            .filter((item) => item.peer_id && isC2CConversation(item));
+          S.unreadTotal = S.conversations.reduce((sum, item) => sum + Number(item.unread_count || 0), 0);
+          updateUnreadBadges();
+          if (S.route === "msg") go("msg", { force: true });
+        }
+      } catch {
+        /* HTTP history remains available */
+      }
+    })();
+    return true;
+  } catch (error) {
+    if (raceTimer) clearTimeout(raceTimer);
+    stopReadyPoll();
+    let msg = formatTimLoginError(error, credential.source || "");
+    if (sdkErrorText) msg = `${msg} · SDK: ${sdkErrorText}`;
+    if (String(error?.message || "").includes("超时") && !sdkErrorText) {
+      msg +=
+        " · 若确认未开系统代理仍超时，请看是否有浏览器扩展/安全软件拦截；" +
+        "也可在无痕窗口重试。历史会话仍可用。";
+    }
+    addImMessage(msg, "system");
+    S.imLastError = msg;
+    S.imConnected = false;
+    try {
+      if (TIM.EVENT?.ERROR && typeof chat.off === "function") chat.off(TIM.EVENT.ERROR, onSdkError);
+    } catch {
+      /* ignore */
+    }
+    await destroyTimInstance(chat, TIM);
+    S.chat = null;
+    return false;
+  }
+}
+
+/** Fetch BFF UserSig and login TIM (idempotent when already connected). */
+async function ensureTimConnected({ force = false } = {}) {
+  if (S.imConnected && S.chat && !force) return true;
+  if (S._imConnecting) return S._imConnecting;
+  setImConnectingUi(true);
+  S._imConnecting = (async () => {
+    try {
+      try {
+        await withTimeout(ensureTimSdkLoaded(), 10000, "加载 TIM SDK");
+      } catch (sdkErr) {
+        const msg = sdkErr?.message || "TIM SDK 未加载";
+        S.imLastError = msg;
+        addImMessage(msg, "system");
+        toast(msg, "error", 4200);
+        return false;
+      }
+
+      addImMessage("检测 TIM Web Worker…", "system");
+      const worker = await probeTimWorker();
+      if (!worker.ok) {
+        const msg =
+          `TIM Web Worker 不可用：${worker.detail}。` +
+          "TIM SDK 依赖 blob Worker 建立真实消息连接，请确认页面 CSP 包含 worker-src blob:。";
+        S.imLastError = msg;
+        addImMessage(msg, "system");
+        toast("TIM Web Worker 被拦截", "error", 5600);
+        return false;
+      }
+      addImMessage(`TIM Web Worker 可用：${worker.detail}`, "system");
+
+      addImMessage("检测腾讯 IM WebSocket…", "system");
+      const net = await probeTimWebsocket(5000);
+      if (!net.ok) {
+        const msg = formatTimLoginError(
+          new Error(`浏览器无法连通腾讯 IM WebSocket（${net.detail || "失败"}）`),
+          ""
+        );
+        S.imLastError = msg;
+        addImMessage(msg, "system");
+        toast("消息通道被网络/代理拦截", "error", 5600);
+        return false;
+      }
+      addImMessage(`WebSocket 可达：${net.detail}`, "system");
+      addImMessage(
+        "提示：裸 WSS 握手成功不等于 TIM 登录成功；Clash Fake-IP 下常出现「可达但 login 超时」。",
+        "system"
+      );
+
+      // Prefer server sig only (official). Local is a single fallback after full destroy.
+      // Do NOT loop many times — singleton + pending login makes retries worse.
+      const order = ["server", "local"];
+      let lastErr = "";
+      for (const prefer of order) {
+        try {
+          setImConnectingUi(true, `正在使用 ${prefer} 凭证登录…`);
+          addImMessage(`获取 TIM 凭证（${prefer}）…`, "system");
+          const cred = await fetchTimCredential(prefer);
+          addImMessage(
+            `凭证就绪 source=${cred.source || prefer} uid=${cred.userID} sig_len=${cred.sig_len || String(cred.userSig).length}`,
+            "system"
+          );
+          const ok = await connectTIM(cred);
+          if (ok) {
+            toast("消息通道已连接", "info", 3200);
+            return true;
+          }
+          lastErr = S.imLastError || `${prefer} 登录失败`;
+          // Wait after failed attempt so destroy settles before next source.
+          await new Promise((r) => setTimeout(r, 400));
+        } catch (error) {
+          if (error instanceof AuthExpiredError) throw error;
+          lastErr = error?.message || String(error);
+          addImMessage(`凭证 ${prefer} 失败：${lastErr}`, "system");
+        }
+      }
+
+      // Degraded mode: keep HTTP conversation history usable without realtime TIM.
+      // REST fallback: APK secret works against console.tim.qq.com (verified on this machine).
+      // Enables send without browser TIM.login; receive still via history refresh.
+      try {
+        addImMessage("浏览器 TIM.login 失败，尝试启用 REST 发送通道…", "system");
+        const { data: h } = await api("/api/im/rest/health", { timeout: 12000 });
+        if (h && (h.ok === true || Number(h.error_code) === 0)) {
+          S.imConnected = true;
+          S.imMode = "rest";
+          S.imLastError = "";
+          addImMessage(
+            "已启用 REST 发送通道（BFF → 腾讯 openim/sendmsg）。可发送文本；对方回复请点刷新查看历史。",
+            "system"
+          );
+          toast("已启用 REST 发信通道", "info", 4200);
+          return true;
+        }
+        addImMessage(`REST 健康检查未通过：${(h && (h.error_info || h.error_code)) || "unknown"}`, "system");
+      } catch (restErr) {
+        addImMessage(`REST 回退失败：${restErr?.message || restErr}`, "system");
+      }
+
+      S.imLastError =
+        (lastErr || "TIM 实时登录失败") +
+        " · REST 回退也未成功。历史会话仍可用。";
+      addImMessage(S.imLastError, "system");
+      toast("实时消息暂不可用，历史会话仍可用", "error", 5200);
+      return false;
+    } catch (error) {
+      if (error instanceof AuthExpiredError) throw error;
+      const msg = error?.message || "消息服务连接失败";
+      S.imLastError = msg;
+      addImMessage(msg, "system");
+      toast(msg, "error", 4200);
+      return false;
+    } finally {
+      S._imConnecting = null;
+      setImConnectingUi(false);
+    }
+  })();
+  return S._imConnecting;
 }
 
 async function cleanupIM() {
   const chat = S.chat;
+  const TIM = resolveTimApi();
   S.chat = null;
   S.imConnected = false;
+  S.imMode = "";
   if (!chat) return;
   try {
-    if (window.TIM && S.imHandler && typeof chat.off === "function") {
-      chat.off(window.TIM.EVENT.MESSAGE_RECEIVED, S.imHandler);
+    if (TIM && S.imHandler && typeof chat.off === "function" && TIM.EVENT?.MESSAGE_RECEIVED) {
+      chat.off(TIM.EVENT.MESSAGE_RECEIVED, S.imHandler);
     }
-    if (window.TIM?.EVENT?.CONVERSATION_LIST_UPDATED && S.imConversationHandler && typeof chat.off === "function") {
-      chat.off(window.TIM.EVENT.CONVERSATION_LIST_UPDATED, S.imConversationHandler);
+    if (TIM?.EVENT?.CONVERSATION_LIST_UPDATED && S.imConversationHandler && typeof chat.off === "function") {
+      chat.off(TIM.EVENT.CONVERSATION_LIST_UPDATED, S.imConversationHandler);
     }
   } catch {
     // Best-effort cleanup.
@@ -1343,9 +1897,11 @@ async function cleanupIM() {
   S.imHandler = null;
   S.imConversationHandler = null;
   try {
-    if (typeof chat.logout === "function") await chat.logout();
+    if (typeof chat.logout === "function") {
+      await withTimeout(Promise.resolve(chat.logout()), 3000, "TIM 登出");
+    }
   } catch {
-    // Best-effort cleanup.
+    // Best-effort cleanup — never block UI on hung logout.
   }
   try {
     if (typeof chat.destroy === "function") chat.destroy();
@@ -1556,16 +2112,17 @@ async function handleAction(action, button) {
     return;
   }
   if (action === "im-connect") {
-    const { data } = await api("/api/im/tim?prefer=server");
-    if (!data.ok || !data.userSig) {
-      setPanel("im-info", operationView(data, "TIM 凭证读取结果"));
-      toastEnv(data, "TIM 凭证已读取");
-      return;
-    }
-    setPanel("im-info", `<div class="notice">凭证已安全获取：SDKAppID ${esc(data.SDKAppID)} · UserID ${esc(data.userID)}。页面不会显示 UserSig。</div>`);
-    const connected = await connectTIM(data);
-    toast(connected ? "消息通道已连接" : "凭证可用，但未检测到受信任的 TIM SDK", connected ? "info" : "error", 3800);
-    if (connected) go("msg", { force: true });
+    const connected = await ensureTimConnected({ force: true });
+    const sdkOk = Boolean(resolveTimApi());
+    setPanel(
+      "im-info",
+      connected
+        ? `<div class="notice">消息服务已连接。UserSig 仅用于 SDK 登录，不会在页面明文展示。</div>`
+        : `<div class="notice warn">连接失败。SDK=${sdkOk ? "已加载" : "未加载"}${S.imLastError ? ` · ${esc(S.imLastError)}` : ""}。请强制刷新(Ctrl+F5)后重试。</div>`
+    );
+    toast(connected ? "消息通道已连接" : S.imLastError || "消息服务连接失败", connected ? "info" : "error", 4200);
+    // Always re-render so button text leaves "连接中…"
+    go("msg", { force: true });
     return;
   }
   if (action === "im-rong") {
@@ -1726,16 +2283,43 @@ async function handleProductForm(form, submitter) {
     return;
   }
   if (kind === "im-send") {
-    if (!S.chat || !window.TIM || !S.imConnected) throw new Error("消息通道尚未连接");
-    const peer = String(values.peer || "").trim();
+    const peer = String(values.peer || S.activePeer || "").trim();
     const text = String(values.text || "").trim();
     if (!peer || !text) throw new Error("请输入对方 UserID 和消息内容");
-    const message = S.chat.createTextMessage({
-      to: peer,
-      conversationType: window.TIM.TYPES.CONV_C2C,
-      payload: { text },
-    });
-    await S.chat.sendMessage(message);
+
+    if (S.imConnected && S.imMode === "sdk" && S.chat && resolveTimApi()) {
+      const TIM = resolveTimApi();
+      const message = S.chat.createTextMessage({
+        to: peer,
+        conversationType: TIM.TYPES.CONV_C2C,
+        payload: { text },
+      });
+      await S.chat.sendMessage(message);
+    } else if (S.imConnected && S.imMode === "rest") {
+      const { data } = await api("/api/im/rest/send", {
+        method: "POST",
+        body: JSON.stringify({ to: peer, text }),
+        timeout: 15000,
+      });
+      if (!data.ok) {
+        const info = errorInfo(data, "REST 发送失败");
+        throw new Error([info.title, info.detail || data.error_info].filter(Boolean).join(" · "));
+      }
+    } else if (!S.imConnected) {
+      // One-shot: try REST without prior connect.
+      const { data } = await api("/api/im/rest/send", {
+        method: "POST",
+        body: JSON.stringify({ to: peer, text }),
+        timeout: 15000,
+      });
+      if (!data.ok) throw new Error(errorInfo(data, "发送失败").title);
+      S.imConnected = true;
+      S.imMode = "rest";
+      toast("已通过 REST 发送（未建立 TIM 长连接）");
+    } else {
+      throw new Error("消息通道尚未连接");
+    }
+
     addImMessage(text, "mine", peer);
     const existing = S.conversations.find((item) => conversationPeer(item) === peer);
     if (existing) {
@@ -1753,6 +2337,13 @@ async function handleProductForm(form, submitter) {
     }
     const input = $("im-text");
     if (input) input.value = "";
+    if (S.route === "msg") {
+      const log = $("im-log");
+      if (log) {
+        log.innerHTML = chatLogHtml();
+        log.scrollTop = log.scrollHeight;
+      }
+    }
     return;
   }
   if (kind === "lab-call") {

@@ -1,0 +1,4 @@
+tim-js-sdk@2.27.6
+Source: https://cdn.jsdelivr.net/npm/tim-js-sdk@2.27.6/tim-js.js
+Global: window.TIM (UMD)
+Purpose: fixed-version vendor for product Web IM; do not replace with unpinned "latest".
