@@ -557,7 +557,7 @@ class ProtocolRoutingTests(unittest.TestCase):
                 return SimpleNamespace(ok=True)
 
         SocialAPI(FakeClient()).posts("附近", "99", filter_region="上海")
-        self.assertEqual(calls[0][0], "99999:Luntan0")
+        self.assertEqual(calls[0][0], "999999:luntannewnewnew")
         self.assertEqual(calls[0][1]["platename"], "同城")
         self.assertEqual(calls[0][1]["pageindex"], "99")
         self.assertEqual(calls[0][1]["filter_region"], "上海")

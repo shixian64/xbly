@@ -142,15 +142,17 @@ class SocialAPI:
         filter_property: str = "不限",
         filter_region: str = "不限",
     ) -> ApiResult:
-        """Read the v154 Dynamic feed used by the APK's five top tabs.
+        """Read the v154 Dynamic feed used by the active APK navigation graph.
 
-        The visible Web labels are product copy. The APK sends ``精华`` for
-        推荐, ``同城`` for 附近 and ``首页`` for 最新. Pagination starts at
-        ``1`` and subsequent requests use the last post id as ``pageindex``.
+        ``Main4Branch.LuntanFragment`` sends ``精华`` for 推荐, ``同城`` for
+        附近 and ``首页`` for 最新 to ``luntannewnewnew``. Pagination starts
+        at ``1`` and subsequent requests use the last post id as ``pageindex``.
         """
         platename = DYNAMIC_TAB_PLATENAMES.get(str(tab or "推荐"), str(tab or "推荐"))
         return self.c.request(
-            self.c.url("Luntan0", i="99999"),
+            # dongtai_graph starts at LuntanFragment. Luntan0 belongs to the
+            # retained Main4Activity/LuntanNewFragment flow and is not this UI.
+            self.c.url("luntannewnewnew", i="999999"),
             {
                 "type": "getPostlist",
                 "myid": self.c.session.uid,
