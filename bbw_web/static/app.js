@@ -32,6 +32,7 @@ const S = {
   activePeer: "",
   activePeerName: "",
   conversations: [],
+  readConversationPeers: new Map(),
   unreadTotal: 0,
   profileSeq: 0,
   profileController: null,
@@ -389,8 +390,7 @@ async function warmConversationSummary() {
     const { data } = await api("/api/im/conversations?page=1", { timeout: 7000 });
     const items = itemsOf(data);
     S.conversations = mergeConversationSources(items, S.conversations);
-    S.unreadTotal = S.conversations.reduce((sum, item) => sum + Number(item.unread_count || item.unread || 0), 0);
-    updateUnreadBadges();
+    recalculateUnreadTotal();
   } catch {
     // Navigation remains usable when the optional unread summary is unavailable.
   }
@@ -477,7 +477,7 @@ async function activateRoute(id) {
     if (target === "msg" && !S.imConnected) {
       // Load vendor SDK if needed, then login with BFF UserSig.
       void ensureTimConnected().then((ok) => {
-        if (ok && S.route === "msg" && seq === S.routeSeq) go("msg", { force: true });
+        if (ok && S.route === "msg" && seq === S.routeSeq) refreshMessageConversationRegion();
       });
     }
   } catch (error) {
@@ -594,15 +594,14 @@ function conversationPeer(item) {
   const me = String(S.user?.uid || S.user?.id || "");
   const from = String(conversation.from_user_id || conversation.fromUserId || "");
   const to = String(conversation.to_user_id || conversation.toUserId || "");
-  return String(
-    conversation.peer_id ||
-      conversation.user_id ||
-      conversation.conversation_user ||
-      (from && from !== me ? from : "") ||
-      (to && to !== me ? to : "") ||
-      conversation.id ||
-      ""
-  );
+  const candidates = [
+    conversation.conversation_user,
+    from && from !== me ? from : "",
+    to && to !== me ? to : "",
+    conversation.peer_id,
+    conversation.user_id,
+  ];
+  return String(candidates.find((value) => value != null && String(value) && String(value) !== me) || "");
 }
 
 function normalizeTimConversation(item) {
@@ -639,18 +638,32 @@ function conversationTimestamp(item) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function applyConversationReadOverride(peer, item) {
+  if (!S.readConversationPeers.has(peer)) return item;
+  const readThrough = Number(S.readConversationPeers.get(peer) || 0);
+  const latest = conversationTimestamp(item);
+  if (latest > readThrough) {
+    S.readConversationPeers.delete(peer);
+    return item;
+  }
+  return { ...item, unread_count: 0, unread: 0 };
+}
+
 function mergeConversationSources(history, cached) {
   const byPeer = new Map();
   history.filter(isC2CConversation).forEach((item) => {
     const peer = conversationPeer(item);
-    if (peer) byPeer.set(peer, item);
+    if (peer) {
+      byPeer.set(peer, applyConversationReadOverride(peer, item));
+    }
   });
   cached.filter(isC2CConversation).forEach((item) => {
     const peer = conversationPeer(item);
     if (!peer) return;
+    const normalized = applyConversationReadOverride(peer, item);
     const current = byPeer.get(peer);
     if (!current || item.source === "tim" || conversationTimestamp(item) > conversationTimestamp(current)) {
-      byPeer.set(peer, item);
+      byPeer.set(peer, normalized);
     }
   });
   return [...byPeer.values()].sort((a, b) => conversationTimestamp(b) - conversationTimestamp(a));
@@ -939,6 +952,77 @@ function addImMessage(text, type = "system", peer = "") {
   }
 }
 
+function recalculateUnreadTotal() {
+  S.unreadTotal = S.conversations.reduce(
+    (sum, item) => sum + Number(item.unread_count || item.unread || 0),
+    0
+  );
+  updateUnreadBadges();
+}
+
+function activeConversation() {
+  return S.conversations.find((item) => conversationPeer(item) === S.activePeer) || null;
+}
+
+function conversationListHtml() {
+  return S.conversations.length
+    ? S.conversations.map(conversationCard).join("")
+    : emptyState("还没有聊天记录", "可以从好友列表或身边的人开始一段对话", "friends");
+}
+
+function chatPaneHtml() {
+  const active = activeConversation();
+  if (!S.activePeer) {
+    return `<div class="chat-placeholder"><div><strong>选择一段聊天</strong><span>在左侧打开最近会话，或从好友列表开始聊天。</span><button type="button" class="btn primary small" data-route="friends">打开好友列表</button></div></div>`;
+  }
+  return `<div class="chat-head"><button type="button" class="utility-btn mobile-only" data-action="close-conversation">返回</button>${avatarHtml(
+    S.activePeerName || `用户 ${S.activePeer}`,
+    active?.avatar || active?.portrait || active?.user?.avatar
+  )}<div><h2>${esc(S.activePeerName || `用户 ${S.activePeer}`)}</h2><p>UID ${esc(
+    S.activePeer
+  )}</p></div><button type="button" class="utility-btn chat-profile" data-action="open-profile" data-uid="${esc(
+    S.activePeer
+  )}">资料</button></div>
+    <div class="chat-log" id="im-log" aria-live="polite">${chatLogHtml()}</div>
+    <form class="chat-composer" data-form="im-send"><input type="hidden" name="peer" value="${esc(
+      S.activePeer
+    )}" /><label class="sr-only" for="im-text">消息</label><textarea id="im-text" name="text" rows="1" autocomplete="off" placeholder="输入消息" required></textarea><button type="submit" class="btn primary" ${
+      S.imConnected ? "" : "disabled"
+    }>发送</button></form>`;
+}
+
+function refreshMessageConversationRegion({ focusComposer = false } = {}) {
+  if (S.route !== "msg") return false;
+  const page = document.querySelector(".message-page");
+  const layout = document.querySelector(".conversation-layout");
+  const list = document.querySelector(".conversation-list");
+  const pane = document.querySelector(".chat-pane");
+  if (!page || !layout || !list || !pane) return false;
+  page.classList.toggle("conversation-open", Boolean(S.activePeer));
+  layout.classList.toggle("has-active", Boolean(S.activePeer));
+  list.innerHTML = conversationListHtml();
+  pane.innerHTML = chatPaneHtml();
+  const count = document.querySelector("[data-conversation-count]");
+  if (count) count.textContent = S.conversations.length ? `${S.conversations.length} 个最近会话` : "最近联系的人会显示在这里";
+  if (focusComposer) $("im-text")?.focus({ preventScroll: true });
+  return true;
+}
+
+function markConversationRead(peer) {
+  const target = String(peer || "").trim();
+  if (!target) return;
+  const current = S.conversations.find((item) => conversationPeer(item) === target);
+  S.readConversationPeers.set(target, Math.max(conversationTimestamp(current), Date.now()));
+  S.conversations = S.conversations.map((item) =>
+    conversationPeer(item) === target ? { ...item, unread_count: 0, unread: 0 } : item
+  );
+  recalculateUnreadTotal();
+  if (S.imMode === "sdk" && S.chat && typeof S.chat.setMessageRead === "function") {
+    const conversationID = current?.conversation_id || `C2C${target}`;
+    void Promise.resolve(S.chat.setMessageRead({ conversationID })).catch(() => {});
+  }
+}
+
 async function pageNearby(signal) {
   const [homeResult, peopleResult, slideResult] = await Promise.allSettled([
     api("/api/home", { signal }),
@@ -989,9 +1073,8 @@ async function pageMessages(signal) {
     if (error instanceof AuthExpiredError || error?.name === "AbortError") throw error;
   }
   S.conversations = mergeConversationSources(history, S.conversations);
-  S.unreadTotal = S.conversations.reduce((sum, item) => sum + Number(item.unread_count || item.unread || 0), 0);
-  updateUnreadBadges();
-  const active = S.conversations.find((item) => conversationPeer(item) === S.activePeer);
+  recalculateUnreadTotal();
+  const active = activeConversation();
   if (active && !S.activePeerName) {
     S.activePeerName = active.nickname || active.peer_name || active.user?.nickname || `用户 ${S.activePeer}`;
   }
@@ -1008,7 +1091,7 @@ async function pageMessages(signal) {
           ? "进入本页将自动连接；失败时会尝试 REST 发送通道"
           : "将自动加载 TIM SDK；失败时回退 REST";
   return `<div class="message-page${S.activePeer ? " conversation-open" : ""}"><section class="message-toolbar"><div><h2>消息</h2><p id="im-conn-status">${esc(connectionText)}</p></div><div class="button-row compact-row">
-      <button type="button" class="btn secondary small" data-action="mark-all-read" ${S.imConnected && S.imMode === "sdk" ? "" : "disabled"}>全部已读</button>
+      <button type="button" class="btn secondary small" data-action="mark-all-read" ${S.conversations.length ? "" : "disabled"}>全部已读</button>
       <button type="button" class="btn ${S.imConnected ? "secondary" : "primary"} small" data-action="im-connect" ${S.imConnecting ? "disabled" : ""}>${
     S.imConnecting ? "连接中…" : S.imConnected ? "重新连接" : "连接消息服务"
   }</button>
@@ -1023,31 +1106,10 @@ async function pageMessages(signal) {
     </section>
     <section class="conversation-layout${S.activePeer ? " has-active" : ""}">
       <aside class="conversation-list-pane" aria-label="聊天列表">
-        <div class="pane-head"><div><h2>聊天列表</h2><p>${S.conversations.length ? `${S.conversations.length} 个最近会话` : "最近联系的人会显示在这里"}</p></div><button type="button" class="utility-btn" data-action="refresh-route">刷新</button></div>
-        <div class="conversation-list">${
-          S.conversations.length
-            ? S.conversations.map(conversationCard).join("")
-            : emptyState("还没有聊天记录", "可以从好友列表或身边的人开始一段对话", "friends")
-        }</div>
+        <div class="pane-head"><div><h2>聊天列表</h2><p data-conversation-count>${S.conversations.length ? `${S.conversations.length} 个最近会话` : "最近联系的人会显示在这里"}</p></div><button type="button" class="utility-btn" data-action="refresh-route">刷新</button></div>
+        <div class="conversation-list">${conversationListHtml()}</div>
       </aside>
-      <div class="chat-pane">
-        ${
-          S.activePeer
-            ? `<div class="chat-head"><button type="button" class="utility-btn mobile-only" data-action="close-conversation">返回</button>${avatarHtml(
-                S.activePeerName || `用户 ${S.activePeer}`,
-                active?.avatar || active?.portrait || active?.user?.avatar
-              )}<div><h2>${esc(S.activePeerName || `用户 ${S.activePeer}`)}</h2><p>UID ${esc(S.activePeer)}</p></div><button type="button" class="utility-btn chat-profile" data-action="open-profile" data-uid="${esc(
-                S.activePeer
-              )}">资料</button></div>
-              <div class="chat-log" id="im-log" aria-live="polite">${chatLogHtml()}</div>
-              <form class="chat-composer" data-form="im-send"><input type="hidden" name="peer" value="${esc(
-                S.activePeer
-              )}" /><label class="sr-only" for="im-text">消息</label><textarea id="im-text" name="text" rows="1" autocomplete="off" placeholder="输入消息" required></textarea><button type="submit" class="btn primary" ${
-                S.imConnected ? "" : "disabled"
-              }>发送</button></form>`
-            : `<div class="chat-placeholder"><div><strong>选择一段聊天</strong><span>在左侧打开最近会话，或从好友列表开始聊天。</span><button type="button" class="btn primary small" data-route="friends">打开好友列表</button></div></div>`
-        }
-      </div>
+      <div class="chat-pane">${chatPaneHtml()}</div>
     </section><div id="im-info" class="result-panel"></div></div>`;
 }
 
@@ -1562,19 +1624,24 @@ function attachTimHandlers(chat, TIM, credential) {
       const peer = String(message.from || "");
       const text = (message.payload && message.payload.text) || "[新消息]";
       addImMessage(text, peer === String(credential.userID) ? "mine" : "", peer);
-      if (peer && peer !== String(S.activePeer)) toast(`收到来自 ${peer} 的新消息`);
+      if (peer && peer === String(S.activePeer)) {
+        markConversationRead(peer);
+      } else if (peer) {
+        S.readConversationPeers.delete(peer);
+        toast(`收到来自 ${peer} 的新消息`);
+      }
     });
   };
   if (TIM.EVENT?.MESSAGE_RECEIVED) chat.on(TIM.EVENT.MESSAGE_RECEIVED, S.imHandler);
 
   if (TIM.EVENT?.CONVERSATION_LIST_UPDATED) {
     S.imConversationHandler = (event) => {
-      S.conversations = (event.data || [])
+      const updated = (event.data || [])
         .map(normalizeTimConversation)
         .filter((item) => item.peer_id && isC2CConversation(item));
-      S.unreadTotal = S.conversations.reduce((sum, item) => sum + Number(item.unread_count || 0), 0);
-      updateUnreadBadges();
-      if (S.route === "msg") go("msg", { force: true });
+      S.conversations = mergeConversationSources(S.conversations, updated);
+      recalculateUnreadTotal();
+      refreshMessageConversationRegion();
     };
     try {
       chat.on(TIM.EVENT.CONVERSATION_LIST_UPDATED, S.imConversationHandler);
@@ -1722,12 +1789,12 @@ async function connectTIM(credential) {
         const listResult = await withTimeout(chat.getConversationList(), 8000, "拉取会话列表");
         const list = listResult?.data?.conversationList || listResult?.conversationList || [];
         if (Array.isArray(list) && list.length) {
-          S.conversations = list
+          const updated = list
             .map(normalizeTimConversation)
             .filter((item) => item.peer_id && isC2CConversation(item));
-          S.unreadTotal = S.conversations.reduce((sum, item) => sum + Number(item.unread_count || 0), 0);
-          updateUnreadBadges();
-          if (S.route === "msg") go("msg", { force: true });
+          S.conversations = mergeConversationSources(S.conversations, updated);
+          recalculateUnreadTotal();
+          refreshMessageConversationRegion();
         }
       } catch {
         /* HTTP history remains available */
@@ -1952,6 +2019,7 @@ async function logout() {
     S.user = null;
     S.imMessages = [];
     S.conversations = [];
+    S.readConversationPeers.clear();
     S.unreadTotal = 0;
     S.activePeer = "";
     S.activePeerName = "";
@@ -1971,14 +2039,19 @@ async function handleAction(action, button) {
     if (!uid) throw new Error("缺少对方 UID");
     S.activePeer = uid;
     S.activePeerName = button.dataset.name || `用户 ${uid}`;
+    markConversationRead(uid);
     closeProfileDialog();
-    go("msg", { force: true });
+    if (S.route !== "msg") {
+      go("msg", { force: true });
+    } else {
+      refreshMessageConversationRegion({ focusComposer: action === "select-conversation" });
+    }
     return;
   }
   if (action === "close-conversation") {
     S.activePeer = "";
     S.activePeerName = "";
-    go("msg", { force: true });
+    refreshMessageConversationRegion();
     return;
   }
   if (action === "visitor-tab") {
@@ -2030,19 +2103,25 @@ async function handleAction(action, button) {
     return;
   }
   if (action === "mark-all-read") {
-    if (!S.chat || typeof S.chat.setMessageRead !== "function") throw new Error("消息服务尚未连接");
-    await Promise.all(
-      S.conversations.map((item) => {
-        const peer = conversationPeer(item);
-        if (!peer) return Promise.resolve();
-        return S.chat.setMessageRead({ conversationID: item.conversation_id || `C2C${peer}` }).catch(() => {});
-      })
-    );
+    const canSyncRead = S.imMode === "sdk" && S.chat && typeof S.chat.setMessageRead === "function";
+    if (canSyncRead) {
+      await Promise.all(
+        S.conversations.map((item) => {
+          const peer = conversationPeer(item);
+          if (!peer) return Promise.resolve();
+          return S.chat.setMessageRead({ conversationID: item.conversation_id || `C2C${peer}` }).catch(() => {});
+        })
+      );
+    }
     S.conversations = S.conversations.map((item) => ({ ...item, unread_count: 0, unread: 0 }));
+    S.conversations.forEach((item) => {
+      const peer = conversationPeer(item);
+      if (peer) S.readConversationPeers.set(peer, Math.max(conversationTimestamp(item), Date.now()));
+    });
     S.unreadTotal = 0;
     updateUnreadBadges();
-    toast("全部消息已标为已读");
-    go("msg", { force: true });
+    toast(canSyncRead ? "全部消息已标为已读" : "已清除当前未读提示");
+    refreshMessageConversationRegion();
     return;
   }
   if (action === "focus-nickname") {
@@ -2121,8 +2200,7 @@ async function handleAction(action, button) {
         : `<div class="notice warn">连接失败。SDK=${sdkOk ? "已加载" : "未加载"}${S.imLastError ? ` · ${esc(S.imLastError)}` : ""}。请强制刷新(Ctrl+F5)后重试。</div>`
     );
     toast(connected ? "消息通道已连接" : S.imLastError || "消息服务连接失败", connected ? "info" : "error", 4200);
-    // Always re-render so button text leaves "连接中…"
-    go("msg", { force: true });
+    refreshMessageConversationRegion();
     return;
   }
   if (action === "im-rong") {

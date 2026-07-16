@@ -308,6 +308,8 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('id="profile-dialog"', index_html)
         self.assertIn('mediaUrl(user.avatar || user.portrait)', app_js)
         self.assertIn('avatar.appendChild(image)', app_js)
+        self.assertIn('readConversationPeers: new Map()', app_js)
+        self.assertIn('refreshMessageConversationRegion({ focusComposer:', app_js)
 
 
 if __name__ == "__main__":

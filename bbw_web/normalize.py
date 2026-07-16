@@ -151,6 +151,14 @@ def _as_list(x: Any) -> List[Any]:
         "info",
         "users",
         "userlist",
+        "userInfoList",
+        "user_info_list",
+        "followList",
+        "follow_list",
+        "fansList",
+        "fans_list",
+        "followUsers",
+        "fansUsers",
         "conversations",
         "conversation_list",
         "conversationList",
@@ -392,8 +400,14 @@ def normalize_user(item: Any) -> Optional[Dict[str, Any]]:
         "leave_words": str(_first(item, ["yourleavewords", "leave_words", "leave_word"], "")),
         "is_friend": _bool(_first(item, ["isFriend", "is_friend"], False)),
         "is_friend_apply": _bool(_first(item, ["isFriendApply", "is_friend_apply"], False)),
-        "is_follower": _bool(_first(item, ["isFollower", "is_follower"], False)),
-        "is_fans": _bool(_first(item, ["isFans", "is_fans"], False)),
+        "is_follower": _bool(
+            _first(
+                item,
+                ["isFollower", "is_follower", "isFollow", "is_follow", "followed"],
+                False,
+            )
+        ),
+        "is_fans": _bool(_first(item, ["isFans", "is_fans", "isFan", "is_fan"], False)),
         "vip": str(_first(item, ["vip", "vip_time"], "0")),
         "svip": str(_first(item, ["svip", "svip_time"], "0")),
         "sex": str(_first(item, ["sex", "gender", "xingbie"], "")),
@@ -434,7 +448,11 @@ def normalize_conversation(item: Any) -> Optional[Dict[str, Any]]:
     conversation_user = str(
         _first(d, ["conversation_user", "conversationUser", "peer_id", "target_id"], "")
     )
-    peer_id = str((user or {}).get("id") or conversation_user)
+    # conversation_user is the target chosen by the APK. Some responses put the
+    # logged-in user's profile in userInfoList, so preferring that nested id makes
+    # a bogus self-conversation appear in the Web list.
+    peer_id = str(conversation_user or (user or {}).get("id") or "")
+    peer_user = user if not user or not peer_id or str(user.get("id") or "") == peer_id else None
     record_id = str(_first(d, ["id", "conversation_id", "conversationId"], ""))
     content = str(_first(d, ["content", "last_message", "message", "text"], ""))
     timestamp = str(
@@ -446,8 +464,8 @@ def normalize_conversation(item: Any) -> Optional[Dict[str, Any]]:
         "id": record_id or peer_id,
         "conversation_user": conversation_user,
         "peer_id": peer_id,
-        "nickname": str((user or {}).get("nickname") or peer_id or "用户"),
-        "avatar": str((user or {}).get("avatar") or ""),
+        "nickname": str((peer_user or {}).get("nickname") or peer_id or "用户"),
+        "avatar": str((peer_user or {}).get("avatar") or ""),
         "content": content,
         "last_message": content,
         "timestamp": timestamp,
@@ -457,7 +475,7 @@ def normalize_conversation(item: Any) -> Optional[Dict[str, Any]]:
         "channel_type": str(_first(d, ["channelType", "channel_type"], "")),
         "msg_uid": str(_first(d, ["msgUID", "msg_uid", "message_uid"], "")),
         "unread_count": _num(_first(d, ["unreadCount", "unread_count", "unread"], 0)),
-        "user": user,
+        "user": peer_user,
     }
 
 

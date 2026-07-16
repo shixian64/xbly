@@ -551,7 +551,9 @@ class Handler(BaseHTTPRequestHandler):
 
         # ---- social ----
         if path == "/api/social/follows":
-            return self.ok(RL(app.social.follow_users(q("uid") or None, page=q("page", "1"))))
+            # getFollowList is the APK's relationship list. getFollowUser has a
+            # different recommendation/paging shape and can normalize as empty.
+            return self.ok(RL(app.social.follow_list(q("uid") or None)))
         if path == "/api/social/fans":
             return self.ok(RL(app.social.fans_users(q("uid") or None, page=q("page", "1"))))
         if path == "/api/social/follow-list":

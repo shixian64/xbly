@@ -185,6 +185,17 @@ class NormalizerContractTests(unittest.TestCase):
         relation = normalize_users([{"id": "relation-row", "uid": "9", "nickname": "N"}])[0]
         self.assertEqual(relation["id"], "9")
 
+        wrapped = normalize_users(
+            {
+                "userInfoList": [
+                    {"uid": "10", "nickname": "F", "isFollow": "1", "isFan": "1"}
+                ]
+            }
+        )[0]
+        self.assertEqual(wrapped["id"], "10")
+        self.assertTrue(wrapped["is_follower"])
+        self.assertTrue(wrapped["is_fans"])
+
     def test_history_conversation_keeps_receive_message_fields(self) -> None:
         item = normalize_conversations(
             [
@@ -207,6 +218,20 @@ class NormalizerContractTests(unittest.TestCase):
         self.assertEqual(item["last_message"], "你好")
         self.assertEqual(item["timestamp"], "1710000000")
         self.assertEqual(item["msg_uid"], "m1")
+
+        nested_self = normalize_conversations(
+            [
+                {
+                    "conversation_user": "9",
+                    "fromUserId": "9",
+                    "toUserId": "42",
+                    "userInfoList": {"id": "42", "nickname": "Me"},
+                }
+            ]
+        )[0]
+        self.assertEqual(nested_self["peer_id"], "9")
+        self.assertEqual(nested_self["nickname"], "9")
+        self.assertIsNone(nested_self["user"])
 
 
 class SocialAndImRoutingContractTests(unittest.TestCase):
@@ -231,23 +256,25 @@ class SocialAndImRoutingContractTests(unittest.TestCase):
     def test_friend_and_visit_actions_match_apk_v154(self) -> None:
         client = self.FakeClient()
         api = SocialAPI(client)
+        api.follow_list()
         api.friends()
         api.viewed_me("0")
         api.i_viewed("2")
         api.record_profile_view("9")
-        self.assertEqual(client.calls[0], ("getAddFriend", {"uid": "42", "type": "好友"}))
+        self.assertEqual(client.calls[0], ("getFollowList", {"id": "42"}))
+        self.assertEqual(client.calls[1], ("getAddFriend", {"uid": "42", "type": "好友"}))
         self.assertEqual(
-            client.calls[1],
+            client.calls[2],
             ("ISawAndSawMe", {"pageindex": "0", "type": "谁看过我"}),
         )
         self.assertEqual(
-            client.calls[2],
+            client.calls[3],
             ("ISawAndSawMe", {"pageindex": "2", "type": "我看过谁"}),
         )
         # xbly v154 is authoritative for id direction: current viewer -> target.
         # Display fields are retained only as compatibility extras for older code.
         self.assertEqual(
-            client.calls[3],
+            client.calls[4],
             (
                 "addsawme",
                 {
