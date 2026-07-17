@@ -2085,7 +2085,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
             1,
         )[1].split("@media (any-pointer: coarse)", 1)[0]
         short_media = app_css.split(
-            "@media (max-height: 560px) and (max-width: 960px) and (any-pointer: coarse)",
+            "@media (max-height: 560px) and (max-width: 960px) and (min-aspect-ratio: 4 / 3)",
             1,
         )[1].split("html.keyboard-visible", 1)[0]
 
@@ -2154,6 +2154,42 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         ):
             self.assertNotIn(marker, app_js)
 
+    def test_responsive_navigation_is_exclusive_and_keeps_mine_children_available(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
+        mobile_media = app_css.split("@media (max-width: 960px)", 1)[1].split(
+            "@media (min-width: 961px)", 1
+        )[0]
+        short_landscape_media = app_css.split(
+            "@media (max-height: 560px) and (max-width: 960px) and (min-aspect-ratio: 4 / 3)",
+            1,
+        )[1].split("html.keyboard-visible", 1)[0]
+
+        for marker in (
+            'function navigationMode()',
+            'function syncNavigationMode()',
+            'function withMineSubnav(route, html)',
+            'data-action="logout"',
+            'window.addEventListener("resize", syncNavigationMode',
+            'sidebar.inert = sidebarHidden',
+            'bottomNav.inert = mode !== "bottom"',
+        ):
+            self.assertIn(marker, app_js)
+        for route in ('id: "me"', 'id: "social"', 'id: "wallet"', 'id: "tasks"'):
+            self.assertIn(route, app_js)
+
+        self.assertIn("display: none !important", mobile_media)
+        self.assertIn("#open-menu", mobile_media)
+        self.assertIn(".drawer-mask", mobile_media)
+        self.assertIn(".bottom-nav", mobile_media)
+        self.assertIn("display: flex !important", mobile_media)
+        self.assertIn(".mine-subnav", mobile_media)
+        self.assertIn(".sidebar", short_landscape_media)
+        self.assertIn("display: flex !important", short_landscape_media)
+        self.assertIn(".bottom-nav", short_landscape_media)
+        self.assertIn("display: none !important", short_landscape_media)
+
     def test_static_asset_cache_versions_match_mobile_media_release(self) -> None:
         root = Path(__file__).resolve().parents[1]
         index_html = (root / "bbw_web" / "static" / "index.html").read_text(encoding="utf-8")
@@ -2162,6 +2198,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         js_version = index_html.split('/static/app.js?v=', 1)[1].split('"', 1)[0]
         self.assertEqual(css_version, js_version)
         self.assertIn("mobile-media-retry-secure-viewport", css_version)
+        self.assertIn("responsive-nav-exclusive-mine-subnav", css_version)
 
 
 class FlashPhotoBffContractTests(unittest.TestCase):

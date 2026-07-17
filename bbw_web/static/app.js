@@ -21,6 +21,11 @@ const PRIMARY_NAV = [
   },
 ];
 
+const MINE_NAV = [
+  { id: "me", name: "我的主页" },
+  ...(PRIMARY_NAV.find((item) => item.id === "me")?.children || []),
+];
+
 const LAB_NAV = { id: "lab", name: "协议台", desc: "仅限已启用的调试环境" };
 const LEGACY_RELATION_ROUTES = { friends: "friends", visitors: "visitors" };
 const LEGACY_MATCH_ROUTES = { room: "room" };
@@ -1131,6 +1136,7 @@ function isRouteAllowed(id) {
 }
 
 function navParentRoute(id) {
+  if (id === "lab" && S.labEnabled) return "me";
   const parent = PRIMARY_NAV.find(
     (item) => item.id === id || (item.children || []).some((child) => child.id === id)
   );
@@ -1147,7 +1153,7 @@ function navButton(item, bottom = false) {
   if (bottom) {
     return `<button type="button" class="bottom-item${on ? " on" : ""}" data-route="${item.id}" aria-label="${esc(
       item.name
-    )}" ${current ? 'aria-current="page"' : ""}>
+    )}" ${on ? 'aria-current="page"' : ""}>
       <span>${item.name}</span>${unread}
     </button>`;
   }
@@ -1165,6 +1171,23 @@ function navGroup(item) {
       ? `<div class="nav-children">${children.map((child) => navButton({ ...child, child: true })).join("")}</div>`
       : ""
   }</div>`;
+}
+
+function mineSubnavHtml(activeRoute = S.route) {
+  const items = S.labEnabled ? [...MINE_NAV, LAB_NAV] : MINE_NAV;
+  return `<nav class="mine-subnav tab-row ui-scrollbar ui-scrollbar--compact" aria-label="我的功能">${items
+    .map((item) => {
+      const active = item.id === activeRoute;
+      return `<button type="button" class="tab-chip${active ? " on" : ""}" data-route="${item.id}" ${
+        active ? 'aria-current="page"' : ""
+      }>${esc(item.name)}</button>`;
+    })
+    .join("")}<button type="button" class="tab-chip mine-subnav-logout" data-action="logout">退出</button></nav>`;
+}
+
+function withMineSubnav(route, html) {
+  const showMineSubnav = MINE_NAV.some((item) => item.id === route) || (route === "lab" && S.labEnabled);
+  return showMineSubnav ? `${mineSubnavHtml(route)}${html}` : html;
 }
 
 function updateUnreadBadges() {
@@ -1375,9 +1398,10 @@ function syncNav() {
     const route = button.dataset.route;
     const current = route === S.route;
     const branchOn = PRIMARY_NAV.some((item) => item.id === route) && navParentRoute(S.route) === route;
-    button.classList.toggle("on", current || (button.classList.contains("bottom-item") && branchOn));
+    const bottomBranchOn = button.classList.contains("bottom-item") && branchOn;
+    button.classList.toggle("on", current || bottomBranchOn);
     button.classList.toggle("branch-on", !button.classList.contains("bottom-item") && !current && branchOn);
-    if (route === S.route) button.setAttribute("aria-current", "page");
+    if (current || bottomBranchOn) button.setAttribute("aria-current", "page");
     else button.removeAttribute("aria-current");
   });
   const nav = navItems().find((item) => item.id === S.route) || PRIMARY_NAV[0];
@@ -1395,20 +1419,59 @@ function centerActiveRelationshipTab() {
   });
 }
 
+function navigationMode() {
+  if (!window.matchMedia("(max-width: 960px)").matches) return "side";
+  return window.matchMedia("(max-height: 560px) and (max-width: 960px) and (min-aspect-ratio: 4/3)").matches
+    ? "drawer"
+    : "bottom";
+}
+
+function applyNavigationAccessibility(mode = navigationMode()) {
+  const sidebar = $("sidebar");
+  const bottomNav = $("bottom-nav");
+  const openMenu = $("open-menu");
+  const drawerOpen = mode === "drawer" && sidebar.classList.contains("open");
+  const sidebarHidden = mode === "bottom" || (mode === "drawer" && !drawerOpen);
+
+  document.documentElement.dataset.navigationMode = mode;
+  sidebar.inert = sidebarHidden;
+  sidebar.setAttribute("aria-hidden", String(sidebarHidden));
+  bottomNav.inert = mode !== "bottom";
+  bottomNav.setAttribute("aria-hidden", String(mode !== "bottom"));
+  openMenu.inert = mode !== "drawer";
+  $("drawer-mask").setAttribute("aria-hidden", String(!drawerOpen));
+}
+
+function syncNavigationMode() {
+  const mode = navigationMode();
+  if (mode !== "drawer") {
+    $("sidebar").classList.remove("open");
+    $("drawer-mask").classList.add("hide");
+    $("open-menu").setAttribute("aria-expanded", "false");
+    document.body.classList.remove("drawer-open");
+  }
+  applyNavigationAccessibility(mode);
+}
+
 function openDrawer() {
+  if (navigationMode() !== "drawer") return;
   $("sidebar").classList.add("open");
   $("drawer-mask").classList.remove("hide");
   $("open-menu").setAttribute("aria-expanded", "true");
   document.body.classList.add("drawer-open");
+  applyNavigationAccessibility("drawer");
   setTimeout(() => $("close-menu").focus(), 0);
 }
 
 function closeDrawer(returnFocus = false) {
+  const mode = navigationMode();
+  const wasOpen = $("sidebar").classList.contains("open");
   $("sidebar").classList.remove("open");
   $("drawer-mask").classList.add("hide");
   $("open-menu").setAttribute("aria-expanded", "false");
   document.body.classList.remove("drawer-open");
-  if (returnFocus && !$("open-menu").classList.contains("hide")) $("open-menu").focus();
+  applyNavigationAccessibility(mode);
+  if (returnFocus && wasOpen && mode === "drawer") $("open-menu").focus();
 }
 
 function hashRoute() {
@@ -1588,13 +1651,13 @@ async function activateRoute(id, { force = false } = {}) {
     void refreshVisiblePeerPresence();
     return;
   }
-  root().innerHTML = loadingState("正在准备页面…");
+  root().innerHTML = withMineSubnav(target, loadingState("正在准备页面…"));
   window.scrollTo({ top: 0, behavior: "auto" });
   try {
     const page = PAGE_RENDERERS[target] || pageNearby;
     const html = await page(controller.signal);
     if (controller.signal.aborted || seq !== S.routeSeq) return;
-    const rendered = `<div class="page-enter">${html}</div>`;
+    const rendered = `<div class="page-enter">${withMineSubnav(target, html)}</div>`;
     root().innerHTML = rendered;
     if (target !== "msg" && !permissionSensitiveRoute) {
       S.pageCache.set(cacheKey, { html: rendered, time: Date.now() });
@@ -1614,7 +1677,10 @@ async function activateRoute(id, { force = false } = {}) {
     if (error && error.name === "AbortError") return;
     if (error instanceof AuthExpiredError) return;
     if (seq !== S.routeSeq) return;
-    root().innerHTML = errorState(error.message || String(error), target);
+    root().innerHTML = withMineSubnav(
+      target,
+      errorState(error.message || String(error), target)
+    );
     if (S.authenticatedServicesPending) scheduleAuthenticatedServices(1000);
   }
 }
@@ -8673,6 +8739,7 @@ window.addEventListener("hashchange", () => {
 });
 
 window.addEventListener("resize", syncVisualViewport, { passive: true });
+window.addEventListener("resize", syncNavigationMode, { passive: true });
 window.visualViewport?.addEventListener("resize", syncVisualViewport, { passive: true });
 window.visualViewport?.addEventListener("scroll", syncVisualViewport, { passive: true });
 
@@ -8758,6 +8825,7 @@ window.addEventListener("pagehide", (event) => {
 });
 
 syncVisualViewport();
+syncNavigationMode();
 
 (async function boot() {
   setLoginMode("password");

@@ -4170,6 +4170,14 @@ html.flash-viewing body {
   font-weight: 800;
 }
 
+.mine-subnav {
+  display: none;
+}
+
+.mine-subnav-logout {
+  color: var(--danger);
+}
+
 @media (max-width: 960px) {
   .app-shell {
     grid-template-columns: 1fr;
@@ -4180,6 +4188,7 @@ html.flash-viewing body {
   }
 
   .sidebar {
+    display: none !important;
     position: fixed;
     right: auto;
     bottom: 0;
@@ -4189,13 +4198,19 @@ html.flash-viewing body {
     transition: transform 0.2s ease;
   }
 
+  #open-menu,
+  #close-menu,
+  .drawer-mask {
+    display: none !important;
+  }
+
   .sidebar.open {
     transform: none;
     box-shadow: 14px 0 45px rgba(40, 29, 55, 0.18);
   }
 
   body.drawer-open {
-    overflow: hidden;
+    overflow: visible;
   }
 
   .topbar {
@@ -4213,6 +4228,30 @@ html.flash-viewing body {
 
   .bottom-nav {
     display: flex !important;
+  }
+
+  .mine-subnav {
+    display: flex;
+    margin: 0 0 0.9rem;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--surface-soft);
+    padding: 0.35rem;
+    scroll-padding-inline: 0.35rem;
+  }
+
+  .mine-subnav .tab-chip {
+    min-height: 40px;
+    background: transparent;
+    white-space: nowrap;
+  }
+
+  .mine-subnav .tab-chip.on {
+    background: var(--brand);
+  }
+
+  .mine-subnav .mine-subnav-logout {
+    color: var(--danger);
   }
 
   .service-grid {
@@ -4240,6 +4279,10 @@ html.flash-viewing body {
 
   .bottom-nav,
   .mobile-only {
+    display: none !important;
+  }
+
+  .drawer-mask {
     display: none !important;
   }
 }
@@ -4646,9 +4689,30 @@ html.flash-viewing body {
   }
 }
 
-@media (max-height: 560px) and (max-width: 960px) and (any-pointer: coarse) {
+@media (max-height: 560px) and (max-width: 960px) and (min-aspect-ratio: 4 / 3) {
+  .sidebar {
+    display: flex !important;
+  }
+
+  #open-menu,
+  #close-menu {
+    display: inline-flex !important;
+  }
+
+  .drawer-mask:not(.hide) {
+    display: block !important;
+  }
+
+  body.drawer-open {
+    overflow: hidden;
+  }
+
   .bottom-nav {
     display: none !important;
+  }
+
+  .mine-subnav {
+    display: none;
   }
 
   .page-root,
