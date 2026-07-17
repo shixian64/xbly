@@ -2223,6 +2223,8 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertNotIn('class="quick-entry-grid"', nearby_page)
         self.assertNotIn('data-action="match-users"', matching)
         self.assertNotIn("在线列表", matching)
+        self.assertNotIn('data-form="dating-publish"', matching)
+        self.assertNotIn("发布约会邀请", matching)
         self.assertIn("return userCard(user, {", nearby)
         self.assertIn("addFriend: true", nearby)
         self.assertIn("if (options.addFriend && id)", user_card)

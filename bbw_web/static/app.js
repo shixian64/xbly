@@ -7574,8 +7574,6 @@ async function pageMatching(signal) {
       </form>
     </section>
 
-    <section class="section"><div class="section-head match-section-head"><div><h2>发布约会邀请</h2><p>真诚具体的内容，更容易获得回应</p></div></div><form class="surface-card match-compose-card" data-form="dating-publish"><div class="match-compose-head"><span>约会邀请</span><h3>描述想一起做的事</h3><p>说明时间、活动或你的期待。</p></div><div class="field"><label for="dating-text">约会说明</label><input id="dating-text" name="text" maxlength="160" placeholder="例如：周末一起看展或散步" required /></div><button type="submit" class="btn secondary full">发布约会</button></form></section>
-
     <section class="section match-result-section"><div class="section-head match-section-head"><div><h2>匹配结果</h2><p>新的相遇会集中显示在这里</p></div></div><div id="match-result" class="match-result-surface">${emptyState(
       "准备好后开始匹配",
       "设置条件并选择匹配方式，结果会显示在这里"
