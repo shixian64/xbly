@@ -1739,6 +1739,11 @@ summary:focus-visible {
   gap: 0.35rem;
 }
 
+.card-actions > .presence-badge {
+  align-self: center;
+  margin-top: 0;
+}
+
 .badge {
   display: inline-flex;
   align-items: center;
@@ -2260,7 +2265,6 @@ summary:focus-visible {
   font-size: 0.72rem;
 }
 
-.card-title-line .presence-badge,
 .conversation-title-line .presence-badge {
   margin-top: 0;
 }

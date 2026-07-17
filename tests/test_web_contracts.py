@@ -2158,6 +2158,11 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("conversation-read-state", app_css)
         self.assertIn("presence-badge", app_css)
 
+        user_card = app_js.split("function userCard", 1)[1].split("function formatSocialTime", 1)[0]
+        self.assertIn('<div class="card-actions">${presence}${actions.join("")}</div>', user_card)
+        self.assertNotIn('<strong>${esc(name)}</strong>${presence}', user_card)
+        self.assertIn(".card-actions > .presence-badge", app_css)
+
     def test_message_composer_supports_ctrl_enter_to_send(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")

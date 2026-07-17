@@ -2160,8 +2160,8 @@ function userCard(item, options = {}) {
   const presence = options.presence && id ? presenceBadgeHtml(id, user) : "";
   return `<article class="user-card">
     ${avatarHtml(user.avatar || user.portrait)}
-    <div class="card-copy"><div class="card-title-line"><strong>${esc(name)}</strong>${presence}</div><span>${esc(subtitle)}</span></div>
-    ${actions.length ? `<div class="card-actions">${actions.join("")}</div>` : ""}
+    <div class="card-copy"><div class="card-title-line"><strong>${esc(name)}</strong></div><span>${esc(subtitle)}</span></div>
+    ${actions.length || presence ? `<div class="card-actions">${presence}${actions.join("")}</div>` : ""}
   </article>`;
 }
 
