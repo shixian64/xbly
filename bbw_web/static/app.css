@@ -195,6 +195,31 @@ summary:focus-visible {
   display: none !important;
 }
 
+.boot-screen {
+  display: grid;
+  min-height: 100vh;
+  min-height: 100dvh;
+  place-items: center;
+  padding: calc(1.2rem + var(--safe-top)) 1.2rem calc(1.2rem + var(--safe-bottom));
+}
+
+.boot-status {
+  display: grid;
+  gap: 0.4rem;
+  text-align: center;
+}
+
+.boot-status strong {
+  color: var(--brand-dark);
+  font-size: 1.2rem;
+  letter-spacing: 0.08em;
+}
+
+.boot-status span {
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
 .sr-only {
   position: absolute !important;
   width: 1px !important;

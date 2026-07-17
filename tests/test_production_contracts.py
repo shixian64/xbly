@@ -322,6 +322,31 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn("normalized_phone = account_context.normalized_phone", api)
         self.assertIn('"invite_login": INVITE_LOGIN_ENABLED', bff)
 
+    def test_user_session_bootstrap_does_not_flash_the_login_screen(self) -> None:
+        html = self.read("bbw_web/static/index.html")
+        css = self.read("bbw_web/static/app.css")
+        js = self.read("bbw_web/static/app.js")
+
+        self.assertIn('id="screen-boot" class="boot-screen"', html)
+        self.assertIn('id="screen-login" class="login-screen hide"', html)
+        self.assertIn('id="screen-app" class="app-shell hide"', html)
+        self.assertIn(".boot-screen", css)
+        hide_rule = css.split(".hide {", 1)[1].split("}", 1)[0]
+        self.assertIn("display: none !important", hide_rule)
+        self.assertIn("auth-bootstrap", html)
+
+        show_login = js.split("function showLogin", 1)[1].split("function applyUser", 1)[0]
+        self.assertIn('bootScreen.classList.add("hide")', show_login)
+        self.assertIn('bootScreen.setAttribute("aria-busy", "false")', show_login)
+        self.assertIn('$("screen-login").classList.toggle("hide", !show)', show_login)
+        self.assertIn('$("screen-app").classList.toggle("hide", show)', show_login)
+
+        boot = js.split("(async function boot()", 1)[1].split("})();", 1)[0]
+        self.assertIn("await Promise.all([", boot)
+        self.assertNotIn("await loadFeatures();", boot)
+        self.assertLess(boot.index('api("/api/me"'), boot.index("showLogin(false)"))
+        self.assertIn("showLogin(true, true)", boot)
+
     def test_model_and_migration_owner_and_audit_constraints(self) -> None:
         models = self.read("bbw_prod/models.py")
         migration = self.read("migrations/versions/20260716_0001_initial_production.py")

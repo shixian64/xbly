@@ -1014,6 +1014,11 @@ async function clearSensitiveBrowserStorage() {
 }
 
 function showLogin(show, clearSecrets = false) {
+  const bootScreen = $("screen-boot");
+  if (bootScreen) {
+    bootScreen.classList.add("hide");
+    bootScreen.setAttribute("aria-busy", "false");
+  }
   $("screen-login").classList.toggle("hide", !show);
   $("screen-app").classList.toggle("hide", show);
   if (show) closeDrawer();
@@ -8756,9 +8761,11 @@ syncVisualViewport();
 
 (async function boot() {
   setLoginMode("password");
-  await loadFeatures();
   try {
-    const { status, data } = await api("/api/me", { authOptional: true, timeout: 8000 });
+    const [, { status, data }] = await Promise.all([
+      loadFeatures(),
+      api("/api/me", { authOptional: true, timeout: 8000 }),
+    ]);
     if (status === 200 && data.ok && data.user?.logged_in) {
       S.sessionGeneration += 1;
       S.authenticated = true;

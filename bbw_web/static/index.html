@@ -6,12 +6,19 @@
   <meta name="theme-color" content="#f8f5ff" />
   <meta name="color-scheme" content="light" />
   <title>XBLY</title>
-  <link rel="stylesheet" href="/static/app.css?v=20260716-mobile-media-retry-secure-viewport-no-text-icons-match-voice-tabs-adaptive-sidebar-message-list-avatar-clean-message-header-message-time-fix-scrollbar-component-csp-avatar-events-message-wide-partial-match-tabs-tim-profile-avatar-zh-ui-partial-social-moments-tabs-feed-fix2-invite-archive-secure-logout-turnstile-message-bootstrap-profile-moments-compact-cards-two-step-login-match-pool-permission" />
+  <link rel="stylesheet" href="/static/app.css?v=20260716-mobile-media-retry-secure-viewport-no-text-icons-match-voice-tabs-adaptive-sidebar-message-list-avatar-clean-message-header-message-time-fix-scrollbar-component-csp-avatar-events-message-wide-partial-match-tabs-tim-profile-avatar-zh-ui-partial-social-moments-tabs-feed-fix2-invite-archive-secure-logout-turnstile-message-bootstrap-profile-moments-compact-cards-two-step-login-match-pool-permission-auth-bootstrap" />
 </head>
 <body>
   <div id="toast" class="toast hide" role="status" aria-live="polite" aria-atomic="true"></div>
 
-  <main id="screen-login" class="login-screen">
+  <main id="screen-boot" class="boot-screen" role="status" aria-live="polite" aria-busy="true">
+    <div class="boot-status">
+      <strong>XBLY</strong>
+      <span>正在恢复登录状态…</span>
+    </div>
+  </main>
+
+  <main id="screen-login" class="login-screen hide">
     <section class="login-card" aria-labelledby="login-title">
       <div class="login-brand">
         <div>
@@ -134,6 +141,6 @@
   </dialog>
 
   <!-- Message services initialize in the background after authentication so unread state is ready on every route. -->
-  <script src="/static/app.js?v=20260716-mobile-media-retry-secure-viewport-no-text-icons-match-voice-tabs-adaptive-sidebar-message-list-avatar-clean-message-header-message-time-fix-scrollbar-component-csp-avatar-events-message-wide-partial-match-tabs-tim-profile-avatar-zh-ui-partial-social-moments-tabs-feed-fix2-invite-archive-secure-logout-turnstile-message-bootstrap-profile-moments-compact-cards-two-step-login-match-pool-permission"></script>
+  <script src="/static/app.js?v=20260716-mobile-media-retry-secure-viewport-no-text-icons-match-voice-tabs-adaptive-sidebar-message-list-avatar-clean-message-header-message-time-fix-scrollbar-component-csp-avatar-events-message-wide-partial-match-tabs-tim-profile-avatar-zh-ui-partial-social-moments-tabs-feed-fix2-invite-archive-secure-logout-turnstile-message-bootstrap-profile-moments-compact-cards-two-step-login-match-pool-permission-auth-bootstrap"></script>
 </body>
 </html>
