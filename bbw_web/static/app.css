@@ -263,7 +263,8 @@ summary:focus-visible {
   min-height: 100dvh;
   place-items: center;
   padding: calc(1.2rem + var(--safe-top)) 1.2rem calc(1.2rem + var(--safe-bottom));
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .login-screen::before,
@@ -355,6 +356,17 @@ summary:focus-visible {
   color: var(--muted);
   font-size: 0.8rem;
   font-weight: 650;
+}
+
+#turnstile-widget {
+  min-height: 65px;
+  overflow: hidden;
+}
+
+.field-help {
+  margin: 0.35rem 0 0;
+  color: var(--muted);
+  font-size: 0.76rem;
 }
 
 .input-action {

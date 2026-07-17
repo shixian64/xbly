@@ -9,16 +9,16 @@
 
 | 项 | 值 |
 |---|---|
-| 手机号（研究用） | `19122614669` |
+| 手机号（研究用） | `YOUR_PHONE` |
 | 登录密码 | **本地自管，勿写入仓库** |
-| 用户 uid | `726285` |
+| 用户 uid | `YOUR_UID` |
 | 包名 | `xin.banghua.beiyuan0` |
 | version_code | `154` |
 
 登录：
 
 ```powershell
-python -m bbw_protocol.cli login --phone 19122614669 --password "YOUR_PASSWORD"
+python -m bbw_protocol.cli login --phone YOUR_PHONE --password "YOUR_PASSWORD"
 python -m bbw_protocol.cli whoami
 ```
 

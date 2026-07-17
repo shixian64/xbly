@@ -231,12 +231,12 @@ Body: uid, vip_id, coupon_id, token
 
 ```
 SDKAppID  = 1600039823
-SECRETKEY = c064eea5978cf60af28dcbbe9dd7c35e...
+SECRETKEY = [REDACTED, migrated to Docker Secret]
 expire    = 604800
 算法      = TLS 2.0 + HmacSHA256 + zlib + base64url 变体
 ```
 
-脚本：`python bbw_client.py usersig --uid 726285`
+脚本：`python bbw_client.py usersig --uid YOUR_UID`
 
 登录响应里的 `userSign` 为服务端下发版本；客户端 `GenerateTestUserSig` 亦可。
 

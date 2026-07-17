@@ -5,15 +5,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Dict, Optional, Tuple
 
-PHONE = "19122614669"
-PASSWORD = "YOUR_PASSWORD"  # set locally; do not commit real secrets
-UID_HINT = "726285"
+PHONE = os.getenv("BBW_TEST_PHONE", "").strip()
+PASSWORD = os.getenv("BBW_TEST_PASSWORD", "")
+UID_HINT = os.getenv("BBW_TEST_UID", "").strip()
 APPLET = "https://applet.banghua.xin/app/index.php"
 
 
@@ -125,6 +126,10 @@ def login() -> Tuple[str, str, dict]:
 
 
 def main() -> None:
+    if not PHONE or not PASSWORD or not UID_HINT:
+        raise SystemExit(
+            "set BBW_TEST_PHONE, BBW_TEST_PASSWORD and BBW_TEST_UID before running this live probe"
+        )
     uid, token, before = login()
     print(
         "BEFORE:",

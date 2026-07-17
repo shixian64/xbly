@@ -75,7 +75,7 @@ class ImAdapter:
         return True
 
     def tim_local(self, uid: Optional[str] = None, expire: int = 604800) -> TimCredentials:
-        """Generate UserSig with APK-hardcoded SECRETKEY (BFF only — never ship key to browser)."""
+        """Generate UserSig with the server-side configured secret (never ship it to the browser)."""
         user_id = uid or self.app.session.uid
         if not user_id:
             raise ValueError("uid empty; login first")

@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="referrer" content="no-referrer" />
+  <meta name="robots" content="noindex, nofollow, noarchive" />
+  <meta name="color-scheme" content="light" />
+  <meta http-equiv="Cache-Control" content="no-store" />
+  <title>系统管理</title>
+  <link rel="stylesheet" href="/static/admin.css?v=20260717-admin-security-v3" />
+</head>
+<body>
+  <noscript><p class="admin-noscript">管理端需要启用 JavaScript，当前页面不会提交或保存登录信息。</p></noscript>
+  <div id="admin-toast" class="admin-toast" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+
+  <main id="admin-login-screen" class="admin-login-screen">
+    <section class="admin-login-card" aria-labelledby="admin-login-title">
+      <header>
+        <p class="admin-eyebrow">受限访问</p>
+        <h1 id="admin-login-title">系统管理</h1>
+        <p>仅限授权管理员使用。登录、数据查看和敏感操作都会写入审计日志。</p>
+      </header>
+      <form id="admin-login-form" class="admin-form" method="post" action="/admin" novalidate>
+        <div class="admin-field">
+          <label for="admin-username">管理员账号</label>
+          <input id="admin-username" name="username" type="text" autocomplete="username" maxlength="80" required />
+        </div>
+        <div class="admin-field">
+          <label for="admin-password">管理员密码</label>
+          <input id="admin-password" name="password" type="password" autocomplete="current-password" maxlength="1024" required />
+        </div>
+        <button id="admin-login-submit" class="admin-button admin-button-primary admin-button-full" type="submit">登录管理端</button>
+        <p id="admin-login-message" class="admin-form-message" role="alert"></p>
+      </form>
+    </section>
+  </main>
+
+  <div id="admin-shell" class="admin-shell" hidden>
+    <header class="admin-topbar">
+      <div>
+        <p class="admin-eyebrow">XBLY</p>
+        <h1>系统管理</h1>
+      </div>
+      <div class="admin-topbar-session">
+        <div class="admin-session-copy">
+          <strong id="admin-identity">管理员</strong>
+          <span id="admin-session-status">会话已验证</span>
+          <span id="admin-unlock-status" class="admin-unlock-status" hidden>敏感访问已锁定</span>
+        </div>
+        <button id="admin-lock-sensitive" class="admin-button admin-button-secondary" type="button" hidden>锁定敏感访问</button>
+        <button id="admin-refresh" class="admin-button admin-button-secondary" type="button">刷新当前页面</button>
+        <button id="admin-logout" class="admin-button admin-button-danger" type="button">退出管理端</button>
+      </div>
+    </header>
+
+    <div class="admin-layout">
+      <aside class="admin-sidebar" aria-label="管理功能">
+        <nav id="admin-navigation" class="admin-navigation">
+          <button type="button" data-admin-view="overview" aria-current="page">概览</button>
+          <button type="button" data-admin-view="invites">邀请码</button>
+          <button type="button" data-admin-view="users">用户数据</button>
+          <button type="button" data-admin-view="audit">审计日志</button>
+          <button type="button" data-admin-view="security">安全设置</button>
+        </nav>
+        <p class="admin-sidebar-note">管理端不会在浏览器持久存储任何登录信息或敏感数据。</p>
+      </aside>
+
+      <main id="admin-content" class="admin-content" tabindex="-1">
+        <section id="admin-view-overview" class="admin-view" data-view="overview" aria-labelledby="admin-overview-title">
+          <header class="admin-section-header">
+            <div>
+              <h2 id="admin-overview-title">运行概览</h2>
+              <p>查看用户、存储、同步任务和近期运行状态。</p>
+            </div>
+          </header>
+          <div id="admin-overview-metrics" class="admin-metric-grid" aria-live="polite"></div>
+          <div class="admin-panel-grid">
+            <section class="admin-panel" aria-labelledby="admin-storage-title">
+              <h3 id="admin-storage-title">媒体存储</h3>
+              <div id="admin-overview-storage"></div>
+            </section>
+            <section class="admin-panel" aria-labelledby="admin-jobs-title">
+              <h3 id="admin-jobs-title">会话与归档</h3>
+              <div id="admin-overview-jobs"></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="admin-view-invites" class="admin-view" data-view="invites" aria-labelledby="admin-invites-title" hidden>
+          <header class="admin-section-header">
+            <div>
+              <h2 id="admin-invites-title">邀请码管理</h2>
+              <p>创建、查询和禁用邀请码。邀请码原码只在创建成功时显示一次。</p>
+            </div>
+          </header>
+          <section class="admin-panel" aria-labelledby="admin-invite-create-title">
+            <h3 id="admin-invite-create-title">创建邀请码</h3>
+            <form id="admin-invite-create-form" class="admin-inline-form" method="post" action="/admin" novalidate>
+              <div class="admin-field">
+                <label for="admin-invite-label">用途说明</label>
+                <input id="admin-invite-label" name="label" type="text" maxlength="120" placeholder="例如内部测试用户" />
+              </div>
+              <div class="admin-field">
+                <label for="admin-invite-max-uses">最大使用次数</label>
+                <input id="admin-invite-max-uses" name="max_uses" type="number" inputmode="numeric" min="1" max="10000" value="1" required />
+              </div>
+              <div class="admin-field">
+                <label for="admin-invite-expires">失效时间</label>
+                <input id="admin-invite-expires" name="expires_at" type="datetime-local" />
+              </div>
+              <button id="admin-invite-create-submit" class="admin-button admin-button-primary" type="submit">创建邀请码</button>
+            </form>
+          </section>
+          <section class="admin-panel" aria-labelledby="admin-invite-list-title">
+            <div class="admin-panel-heading">
+              <h3 id="admin-invite-list-title">邀请码列表</h3>
+              <form id="admin-invite-filter-form" class="admin-filter-form" method="post" action="/admin">
+                <label for="admin-invite-status">状态</label>
+                <select id="admin-invite-status" name="status">
+                  <option value="">全部</option>
+                  <option value="active">可使用</option>
+                  <option value="exhausted">已用尽</option>
+                  <option value="expired">已过期</option>
+                  <option value="disabled">已禁用</option>
+                </select>
+                <button class="admin-button admin-button-secondary" type="submit">筛选</button>
+              </form>
+            </div>
+            <div id="admin-invite-table" class="admin-table-region" aria-live="polite"></div>
+            <div id="admin-invite-pagination" class="admin-pagination"></div>
+          </section>
+        </section>
+
+        <section id="admin-view-users" class="admin-view" data-view="users" aria-labelledby="admin-users-title" hidden>
+          <header class="admin-section-header">
+            <div>
+              <h2 id="admin-users-title">用户数据</h2>
+              <p>查看用户资料、聊天、媒体、关系、活动、原始响应及受保护的登录凭据。</p>
+            </div>
+          </header>
+          <section id="admin-user-list-panel" class="admin-panel" aria-labelledby="admin-user-list-title">
+            <div class="admin-panel-heading">
+              <h3 id="admin-user-list-title">用户列表</h3>
+              <form id="admin-user-filter-form" class="admin-filter-form" method="post" action="/admin">
+                <div class="admin-field admin-field-compact">
+                  <label for="admin-user-query">搜索</label>
+                  <input id="admin-user-query" name="q" type="search" maxlength="160" placeholder="昵称、内部编号或上游编号" />
+                </div>
+                <div class="admin-field admin-field-compact">
+                  <label for="admin-user-status">状态</label>
+                  <select id="admin-user-status" name="status">
+                    <option value="">全部</option>
+                    <option value="active">正常</option>
+                    <option value="disabled">已停用</option>
+                  </select>
+                </div>
+                <button class="admin-button admin-button-secondary" type="submit">筛选</button>
+              </form>
+            </div>
+            <div id="admin-user-table" class="admin-table-region" aria-live="polite"></div>
+            <div id="admin-user-pagination" class="admin-pagination"></div>
+          </section>
+
+          <section id="admin-user-detail" class="admin-user-detail" aria-labelledby="admin-user-detail-title" hidden>
+            <header class="admin-detail-header">
+              <div>
+                <p class="admin-eyebrow">用户详情</p>
+                <h3 id="admin-user-detail-title">用户数据</h3>
+                <p id="admin-user-detail-subtitle"></p>
+              </div>
+              <button id="admin-user-detail-close" class="admin-button admin-button-secondary" type="button">返回用户列表</button>
+            </header>
+            <nav id="admin-user-tabs" class="admin-tabs" aria-label="用户数据分类">
+              <button type="button" data-user-tab="profile" aria-current="page">资料</button>
+              <button type="button" data-user-tab="messages">聊天记录</button>
+              <button type="button" data-user-tab="media">媒体</button>
+              <button type="button" data-user-tab="relationships">关系</button>
+              <button type="button" data-user-tab="activities">活动</button>
+              <button type="button" data-user-tab="raw">原始响应</button>
+              <button type="button" data-user-tab="credentials">登录凭据</button>
+            </nav>
+            <div id="admin-user-detail-content" class="admin-panel admin-detail-content" aria-live="polite"></div>
+            <div id="admin-user-detail-pagination" class="admin-pagination"></div>
+          </section>
+        </section>
+
+        <section id="admin-view-audit" class="admin-view" data-view="audit" aria-labelledby="admin-audit-title" hidden>
+          <header class="admin-section-header">
+            <div>
+              <h2 id="admin-audit-title">审计日志</h2>
+              <p>日志默认保存一百八十天，管理端不提供删除功能。</p>
+            </div>
+          </header>
+          <section class="admin-panel">
+            <form id="admin-audit-filter-form" class="admin-filter-form admin-filter-form-wide" method="post" action="/admin">
+              <div class="admin-field admin-field-compact">
+                <label for="admin-audit-action">操作类型</label>
+                <input id="admin-audit-action" name="action" type="search" maxlength="96" placeholder="例如 credentials.view" />
+              </div>
+              <div class="admin-field admin-field-compact">
+                <label for="admin-audit-target">目标用户内部编号</label>
+                <input id="admin-audit-target" name="target_user_id" type="text" maxlength="64" />
+              </div>
+              <button class="admin-button admin-button-secondary" type="submit">筛选</button>
+            </form>
+            <div id="admin-audit-table" class="admin-table-region" aria-live="polite"></div>
+            <div id="admin-audit-pagination" class="admin-pagination"></div>
+          </section>
+        </section>
+
+        <section id="admin-view-security" class="admin-view" data-view="security" aria-labelledby="admin-security-title" hidden>
+          <header class="admin-section-header">
+            <div>
+              <h2 id="admin-security-title">安全设置</h2>
+              <p>管理身份验证器和管理员密码。身份验证器是查看用户明文登录凭据和原始响应内容的必要条件。</p>
+            </div>
+          </header>
+          <div class="admin-panel-grid">
+            <section class="admin-panel" aria-labelledby="admin-totp-title">
+              <h3 id="admin-totp-title">身份验证器</h3>
+              <div id="admin-totp-status"></div>
+              <form id="admin-totp-start-form" class="admin-form admin-form-compact" method="post" action="/admin" novalidate>
+                <div class="admin-field">
+                  <label for="admin-totp-start-password">管理员密码</label>
+                  <input id="admin-totp-start-password" name="password" type="password" autocomplete="current-password" maxlength="1024" required />
+                </div>
+                <div class="admin-field">
+                  <label for="admin-totp-current-code">当前身份验证器验证码</label>
+                  <input id="admin-totp-current-code" name="current_totp" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" />
+                  <p class="admin-field-note">首次绑定时留空；重新绑定时填写当前验证码。</p>
+                </div>
+                <button id="admin-totp-start" class="admin-button admin-button-secondary" type="submit">开始绑定身份验证器</button>
+              </form>
+              <div id="admin-totp-enrollment" class="admin-sensitive-panel" hidden>
+                <p><strong>请立即添加到身份验证器，并妥善保管密钥。</strong></p>
+                <div class="admin-field">
+                  <label for="admin-totp-secret">手动输入密钥</label>
+                  <textarea id="admin-totp-secret" rows="2" readonly></textarea>
+                </div>
+                <button id="admin-totp-copy-secret" class="admin-button admin-button-secondary" type="button">复制手动输入密钥</button>
+                <div class="admin-field">
+                  <label for="admin-totp-uri">配置地址</label>
+                  <textarea id="admin-totp-uri" rows="4" readonly></textarea>
+                </div>
+                <button id="admin-totp-copy-uri" class="admin-button admin-button-secondary" type="button">复制配置地址</button>
+                <form id="admin-totp-confirm-form" class="admin-form admin-form-compact" method="post" action="/admin" novalidate>
+                  <div class="admin-field">
+                    <label for="admin-totp-confirm-code">身份验证器验证码</label>
+                    <input id="admin-totp-confirm-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required />
+                  </div>
+                  <button class="admin-button admin-button-primary" type="submit">确认绑定</button>
+                  <button id="admin-totp-cancel" class="admin-button admin-button-secondary" type="button">清除本次绑定信息</button>
+                </form>
+              </div>
+            </section>
+
+            <section class="admin-panel" aria-labelledby="admin-password-title">
+              <h3 id="admin-password-title">修改管理员密码</h3>
+              <form id="admin-password-form" class="admin-form" method="post" action="/admin" novalidate>
+                <div class="admin-field">
+                  <label for="admin-current-password">当前密码</label>
+                  <input id="admin-current-password" name="current_password" type="password" autocomplete="current-password" maxlength="1024" required />
+                </div>
+                <div class="admin-field">
+                  <label for="admin-new-password">新密码</label>
+                  <input id="admin-new-password" name="new_password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required />
+                  <p class="admin-field-note">至少十二个字符；不足二十个字符时需包含至少三类字符，且不能包含管理员账号。</p>
+                </div>
+                <div class="admin-field">
+                  <label for="admin-new-password-confirm">再次输入新密码</label>
+                  <input id="admin-new-password-confirm" name="new_password_confirm" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required />
+                </div>
+                <button id="admin-password-submit" class="admin-button admin-button-danger" type="submit">修改密码并重新登录</button>
+              </form>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <dialog id="admin-invite-result-dialog" class="admin-dialog" aria-labelledby="admin-invite-result-title">
+    <form method="dialog" class="admin-dialog-card">
+      <header>
+        <h2 id="admin-invite-result-title">邀请码已创建</h2>
+        <p>原码只显示这一次。请立即安全保存，关闭后无法再次查看。</p>
+      </header>
+      <div class="admin-field">
+        <label for="admin-created-invite-code">邀请码原码</label>
+        <textarea id="admin-created-invite-code" rows="3" readonly></textarea>
+      </div>
+      <div class="admin-dialog-actions">
+        <button id="admin-copy-invite" class="admin-button admin-button-primary" type="button">复制邀请码</button>
+        <button id="admin-close-invite-result" class="admin-button admin-button-secondary" value="close">已安全保存并关闭</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="admin-unlock-dialog" class="admin-dialog" aria-labelledby="admin-unlock-title">
+    <form id="admin-unlock-form" class="admin-dialog-card" method="post" action="/admin" novalidate>
+      <header>
+        <h2 id="admin-unlock-title">解锁敏感访问</h2>
+        <p>查看明文凭据或原始响应内容前，需要重新验证管理员密码和身份验证器。解锁最长持续十五分钟，每次查看都会写入审计。</p>
+      </header>
+      <div class="admin-field">
+        <label for="admin-unlock-password">管理员密码</label>
+        <input id="admin-unlock-password" name="password" type="password" autocomplete="current-password" maxlength="1024" required />
+      </div>
+      <div class="admin-field">
+        <label for="admin-unlock-totp">身份验证器验证码</label>
+        <input id="admin-unlock-totp" name="totp_code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required />
+      </div>
+      <div class="admin-field">
+        <label for="admin-unlock-reason">查看理由</label>
+        <textarea id="admin-unlock-reason" name="reason" rows="3" maxlength="500" required></textarea>
+      </div>
+      <p id="admin-unlock-message" class="admin-form-message" role="alert"></p>
+      <div class="admin-dialog-actions">
+        <button id="admin-unlock-submit" class="admin-button admin-button-primary" type="submit">验证并解锁</button>
+        <button id="admin-unlock-cancel" class="admin-button admin-button-secondary" type="button">取消</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="admin-credentials-dialog" class="admin-dialog admin-dialog-wide" aria-labelledby="admin-credentials-title">
+    <div class="admin-dialog-card">
+      <header>
+        <h2 id="admin-credentials-title">用户明文登录凭据</h2>
+        <p>这些内容仅用于当前受审计操作。关闭窗口、切换页面、页面隐藏或解锁到期后会立即清空。</p>
+      </header>
+      <div id="admin-credentials-content" class="admin-credentials-content"></div>
+      <div class="admin-dialog-actions">
+        <button id="admin-credentials-close" class="admin-button admin-button-primary" type="button">关闭并清空</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="admin-user-status-dialog" class="admin-dialog" aria-labelledby="admin-user-status-title">
+    <form id="admin-user-status-form" class="admin-dialog-card" method="post" action="/admin" novalidate>
+      <header>
+        <h2 id="admin-user-status-title">修改用户状态</h2>
+        <p id="admin-user-status-description"></p>
+      </header>
+      <div class="admin-field">
+        <label for="admin-user-status-reason">操作理由</label>
+        <textarea id="admin-user-status-reason" name="reason" rows="3" minlength="3" maxlength="500" required></textarea>
+      </div>
+      <div class="admin-dialog-actions">
+        <button id="admin-user-status-submit" class="admin-button admin-button-danger" type="submit">确认修改状态</button>
+        <button id="admin-user-status-cancel" class="admin-button admin-button-secondary" type="button">取消</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/static/admin.js?v=20260717-admin-security-v3"></script>
+</body>
+</html>

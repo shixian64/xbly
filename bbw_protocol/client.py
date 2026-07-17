@@ -7,7 +7,7 @@ import mimetypes
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 from urllib import error, parse, request
 
 from . import sign
@@ -213,6 +213,13 @@ class ProtocolClient:
         self.session = session or Session()
         self.timeout = timeout
         self.last: Optional[ApiResult] = None
+        # Production BFF hooks.  The protocol package remains usable without
+        # them by CLI/tests; the Web runtime attaches per-account callbacks.
+        self.response_hook: Optional[
+            Callable[[Dict[str, Any], ApiResult], None]
+        ] = None
+        self.reauth_callback: Optional[Callable[[], bool]] = None
+        self._reauthing = False
 
     # ---- URL helpers ----
     def url(
@@ -241,6 +248,7 @@ class ProtocolClient:
         with_author_sig: bool = False,
         uid: Optional[str] = None,
         token: Optional[str] = None,
+        _allow_reauth: bool = True,
     ) -> ApiResult:
         uid = uid if uid is not None else self.session.uid
         token = token if token is not None else self.session.token
@@ -276,7 +284,70 @@ class ProtocolClient:
             result = ApiResult(False, -1, f"EXC:{e}", kind="error", message=str(e))
 
         self.last = result
+        request_meta = {
+            "url": url,
+            "method": method,
+            # Hooks need field names for diagnostics, never local file bytes.
+            "field_names": sorted(str(k) for k in (multipart or body or {}).keys()),
+            "file_fields": sorted(str(k) for k in (files or {}).keys()),
+            "status": result.status,
+        }
+        if self.response_hook is not None:
+            try:
+                self.response_hook(request_meta, result)
+            except Exception:
+                # Archival/observability must not change protocol outcomes.
+                pass
+
+        if (
+            _allow_reauth
+            and not self._reauthing
+            and self.reauth_callback is not None
+            and self._looks_auth_expired(result)
+        ):
+            try:
+                self._reauthing = True
+                refreshed = bool(self.reauth_callback())
+            except Exception:
+                refreshed = False
+            finally:
+                self._reauthing = False
+            if refreshed:
+                return self.request(
+                    url,
+                    body,
+                    method=method,
+                    multipart=multipart,
+                    files=files,
+                    with_author_sig=with_author_sig,
+                    uid=None,
+                    token=None,
+                    _allow_reauth=False,
+                )
         return result
+
+    @staticmethod
+    def _looks_auth_expired(result: ApiResult) -> bool:
+        """Conservatively recognize an expired login without retrying business 403s."""
+        if int(result.status or 0) == 401:
+            return True
+        text = " ".join(
+            str(value or "")
+            for value in (result.code, result.message, result.extra, result.raw[:300])
+        ).lower()
+        return any(
+            marker in text
+            for marker in (
+                "登录失效",
+                "登录已失效",
+                "请先登录",
+                "尚未登录",
+                "token失效",
+                "token expired",
+                "invalid token",
+                "not logged in",
+            )
+        )
 
     def _encode_multipart(
         self, fields: Dict[str, Any], files: Dict[str, Union[str, Path]]

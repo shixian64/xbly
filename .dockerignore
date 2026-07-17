@@ -1,0 +1,58 @@
+# Deny by default, then admit only runtime files explicitly needed by the
+# Dockerfile.  This prevents future APKs, captures, dumps or local credentials
+# from silently entering the build context.
+**
+
+!requirements.txt
+!alembic.ini
+
+!bbw_protocol/
+!bbw_protocol/**
+!bbw_web/
+!bbw_web/**
+!bbw_prod/
+!bbw_prod/**
+
+!docs/
+!docs/api_catalog.json
+
+!migrations/
+!migrations/**
+
+!docker/
+!docker/entrypoint.sh
+!docker/healthcheck.py
+
+# Runtime and developer artifacts remain excluded even under admitted trees.
+**/__pycache__/
+**/*.py[cod]
+bbw_protocol/smoke_test.py
+bbw_protocol/README.md
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+bbw_web/data/
+bbw_web/data/**
+**/session.json
+**/sessions/
+**/sessions/**
+docker/secrets/
+docker/secrets/**
+
+# Explicit high-risk exclusions for review visibility.
+.git/
+.git/**
+*.apk
+*.aab
+*.keystore
+*.jks
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+.env.*
+!.env.example
+*.sql
+*.dump
+*.backup

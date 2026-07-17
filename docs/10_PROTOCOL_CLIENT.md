@@ -31,7 +31,7 @@
 cd <repo-root>
 
 # 登录（保存 session.json）
-python -m bbw_protocol.cli login --phone 19122614669 --password "YOUR_PASSWORD"
+python -m bbw_protocol.cli login --phone YOUR_PHONE --password "YOUR_PASSWORD"
 
 # 查看身份
 python -m bbw_protocol.cli whoami
@@ -48,8 +48,8 @@ python -m bbw_protocol.cli online
 
 # 任意接口（全量覆盖）
 python -m bbw_protocol.cli call getRoomTop
-python -m bbw_protocol.cli call getFollowList id=726285
-python -m bbw_protocol.cli call-redis getUserRoomInfo uid=726285
+python -m bbw_protocol.cli call getFollowList id=YOUR_UID
+python -m bbw_protocol.cli call-redis getUserRoomInfo uid=YOUR_UID
 python -m bbw_protocol.cli actions --cat social
 
 # 交互
@@ -62,7 +62,7 @@ python -m bbw_protocol.cli repl
 from bbw_protocol import BeibeiwuApp
 
 app = BeibeiwuApp.load()
-app.auth.login_password("19122614669", "YOUR_PASSWORD")
+app.auth.login_password("YOUR_PHONE", "YOUR_PASSWORD")
 app.save()
 
 app.content.gift_list()
@@ -162,7 +162,7 @@ python -m bbw_protocol.cli call <ActionName> k=v k2=v2
 
 ## 5. 冒烟结果（2026-07-15）
 
-账号 `19122614669` / uid `726285`：
+账号 `YOUR_PHONE` / uid `YOUR_UID`：
 
 | 步骤 | 结果 |
 |---|---|

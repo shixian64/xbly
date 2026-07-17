@@ -283,14 +283,14 @@ class NormalizerContractTests(unittest.TestCase):
             [
                 {
                     "id": "apply-1",
-                    "uid": "726285",
+                    "uid": "10001",
                     "nickname": "当前用户",
                     "friendid": "9",
                     "friendnickname": "申请人",
                     "friendportrait": "images/friend.jpg",
                 }
             ],
-            current_uid="726285",
+            current_uid="10001",
         )[0]
         self.assertEqual(application["id"], "9")
         self.assertEqual(application["nickname"], "申请人")
@@ -300,13 +300,13 @@ class NormalizerContractTests(unittest.TestCase):
             [
                 {
                     "id": "relation-1",
-                    "uid": "726285",
+                    "uid": "10001",
                     "friendid": "9",
                     "friendnickname": "好友",
                     "friendonline": "Online",
                 }
             ],
-            current_uid="726285",
+            current_uid="10001",
         )[0]
         self.assertEqual(friend["id"], "9")
         self.assertEqual(friend["nickname"], "好友")
@@ -317,14 +317,14 @@ class NormalizerContractTests(unittest.TestCase):
             [
                 {
                     "id": "follow-row",
-                    "uid": "726285",
+                    "uid": "10001",
                     "nickname": "当前用户",
                     "yourid": "10",
                     "yournickname": "关注对象",
                     "yourportrait": "images/follow.jpg",
                 }
             ],
-            current_uid="726285",
+            current_uid="10001",
         )
         self.assertEqual(relations[0]["id"], "10")
         self.assertEqual(relations[0]["nickname"], "关注对象")

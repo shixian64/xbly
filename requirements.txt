@@ -1,0 +1,23 @@
+# Web / ASGI
+fastapi>=0.116,<1.0
+uvicorn>=0.35,<1.0
+python-multipart>=0.0.20,<1.0
+pydantic>=2.11,<3.0
+
+# Database and migrations
+SQLAlchemy>=2.0.41,<3.0
+psycopg[binary,pool]>=3.2.9,<4.0
+alembic>=1.16,<2.0
+
+# Redis jobs and scheduling
+redis>=6.2,<7.0
+rq>=2.4,<3.0
+
+# R2 / security / media
+boto3>=1.39,<2.0
+cryptography>=45,<47
+argon2-cffi>=25.1,<26
+Pillow>=11.3,<13
+
+# Upstream HTTP client
+httpx>=0.28,<1.0

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -12,8 +13,8 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, Optional, Tuple
 
-PHONE = "19122614669"
-PASSWORD = "YOUR_PASSWORD"  # set locally; do not commit real secrets
+PHONE = os.getenv("BBW_TEST_PHONE", "").strip()
+PASSWORD = os.getenv("BBW_TEST_PASSWORD", "")
 VERSION_CODE = "154"
 PACKAGE = "xin.banghua.beiyuan0"
 
@@ -157,6 +158,8 @@ def try_signup_variants() -> None:
 
 
 def main() -> None:
+    if not PHONE or not PASSWORD:
+        raise SystemExit("set BBW_TEST_PHONE and BBW_TEST_PASSWORD before running this live probe")
     cmd = sys.argv[1] if len(sys.argv) > 1 else "probe"
 
     if cmd == "probe":

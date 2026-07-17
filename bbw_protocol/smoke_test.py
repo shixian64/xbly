@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -11,11 +12,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bbw_protocol import BeibeiwuApp
 
-PHONE = "19122614669"
-PASSWORD = "YOUR_PASSWORD"  # set locally; do not commit real secrets
+PHONE = os.getenv("BBW_TEST_PHONE", "").strip()
+PASSWORD = os.getenv("BBW_TEST_PASSWORD", "")
 
 
 def main() -> int:
+    if not PHONE or not PASSWORD:
+        print("set BBW_TEST_PHONE and BBW_TEST_PASSWORD before running the live smoke test", file=sys.stderr)
+        return 2
     app = BeibeiwuApp()
     results = {}
 

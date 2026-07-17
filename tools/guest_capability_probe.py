@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 import urllib.error
 import urllib.parse
@@ -12,9 +13,9 @@ import urllib.request
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
-PHONE = "19122614669"
-PASSWORD = "YOUR_PASSWORD"  # set locally; do not commit real secrets
-UID_HINT = "726285"
+PHONE = os.getenv("BBW_TEST_PHONE", "").strip()
+PASSWORD = os.getenv("BBW_TEST_PASSWORD", "")
+UID_HINT = os.getenv("BBW_TEST_UID", "").strip()
 APPLET = "https://applet.banghua.xin/app/index.php"
 OUT = r"D:\project\AI\bbw\analysis\guest_capability_results.json"
 
@@ -177,6 +178,10 @@ def run_suite(tier: str, uid: str, token: str, sample_other_uid: str = "1") -> L
 
 
 def main() -> None:
+    if not PHONE or not PASSWORD or not UID_HINT:
+        raise SystemExit(
+            "set BBW_TEST_PHONE, BBW_TEST_PASSWORD and BBW_TEST_UID before running this live probe"
+        )
     results: Dict[str, Any] = {"tiers": {}, "account": {}}
 
     # Tier A: not logged in

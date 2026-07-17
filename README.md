@@ -7,7 +7,7 @@
 | 包名 | `xin.banghua.beiyuan0` |
 | 客户端版本 | **154**（`xbly.apk`）· 基线 148（`beibeiwu.apk`） |
 | 后端 | 微擎 `do=` · `applet.banghua.xin` / `redis.banghua.xin` |
-| 依赖 | Python 3 · 仅标准库 |
+| 依赖 | 协议核为 Python 3 标准库；生产 Web 依赖 FastAPI、PostgreSQL、Redis、R2 等 |
 
 > 仅供安全研究、CTF 与**自有账号**协议验证。禁止未授权访问、扫号、伪造实名/支付。
 
@@ -25,7 +25,8 @@
 | IM 实时收发 | ⚠️ 需官方 SDK | `bbw_web` + TIM |
 | 刷脸实名 | ⚠️ 仅 HTTP 编排 | `app.native.face` · 活体靠阿里云 |
 | 支付下单 | ⚠️ 仅 order 参数 | `app.native.pay` · 收银官方 |
-| 产品化 Web App（PC/手机） | ✅ 主流程 | `python -m bbw_web` · 五主导航对齐 v154 APK，原生能力明确降级 |
+| 产品化 Web App（PC/手机） | ✅ 主流程 | 本地：`python -m bbw_web`；生产：`compose.yaml` + `bbw_web.api` |
+| 多用户持久化与管理端 | ✅ | PostgreSQL、Redis、私有 R2；管理入口 `/admin` |
 
 ---
 
@@ -42,7 +43,12 @@ xbly/
 ├── bbw_web/               # 多用户 BFF + 静态页（与核隔离）
 │   ├── store.py           # web_sid → BeibeiwuApp
 │   ├── bff_server.py
+│   ├── api.py             # FastAPI 生产入口
+│   ├── admin_api.py       # 单超级管理员、TOTP、审计和数据管理 API
 │   └── static/
+├── bbw_prod/              # PostgreSQL 模型、加密、Session 和业务服务
+├── migrations/            # Alembic 数据库迁移
+├── compose.yaml           # App/PostgreSQL/Redis/RQ/Caddy 单机部署
 ├── docs/                  # 分析文档 + api_catalog.json
 ├── tools/                 # 可选早期探测脚本
 ├── session.json           # CLI 会话（本地，不入库）
@@ -50,6 +56,10 @@ xbly/
 ```
 
 **隔离约定：** `bbw_protocol` 只做协议；`bbw_web` 负责 Cookie / 多租户 / 页面。核不依赖 Web。
+
+生产部署、Secret、Cloudflare R2、资源预算和验收步骤见
+[docs/14_PRODUCTION_DEPLOYMENT.md](docs/14_PRODUCTION_DEPLOYMENT.md)。不要把本地
+`python -m bbw_web` 的内存会话模式直接暴露到公网。
 
 ---
 
@@ -112,7 +122,7 @@ Browser SPA（社交娱乐风 · PC 侧栏 / 手机五项底栏）
 
 - **Web 目标**：按 APK 的“身边 / 消息 / 匹配 / 动态 / 我的”组织主流程；匹配页顶部通过“匹配 / 语音房”标签切换下方功能区，关系中心、钱包与会员、任务与奖励归入我的。
 - **产品与研究隔离**：默认关闭协议台、任意 action、会话列表和弱一键登录；仅 `--enable-lab` 显式开启。
-- **会话安全**：SID 只存在 HttpOnly Cookie；CORS 默认关闭；Web 会话默认仅内存保存。
+- **会话安全**：SID 只存在 HttpOnly Cookie；CORS 默认关闭。本地入口默认使用内存会话，生产 FastAPI 入口使用 PostgreSQL 与 Redis 持久 Session。
 - **原生边界**：IM 长连接 / 刷脸活体 / 微信收银仍依赖厂商 SDK 或官方 App。
 
 ---
@@ -124,7 +134,7 @@ Browser SPA（社交娱乐风 · PC 侧栏 / 手机五项底栏）
 | ID | 要点 | 级别 |
 |---|---|---|
 | F-001 | `SigninOneKeyLogin1` 可仅凭手机号登录 | P0 |
-| F-002 | 腾讯 IM SECRETKEY 硬编码，可本地 gen UserSig | P0 |
+| F-002 | 历史客户端/源码曾包含腾讯 IM SECRETKEY，可本地 gen UserSig；生产运行时已迁移 Docker Secret，旧值仍需上游轮换 | P0 |
 | F-003 | SIGN/EXPIRE 等客户端签名可完全复现 | P0 |
 | — | 未实名硬门禁：改资料 / 提现等服务端 403 | 业务 |
 | — | 假刷脸 certifyId 不改 `rp_verify_time` | 服务端有效 |
@@ -151,6 +161,7 @@ Browser SPA（社交娱乐风 · PC 侧栏 / 手机五项底栏）
 | [11 功能与实名覆盖](docs/11_FEATURE_REALNAME_AND_COVERAGE.md) | 门禁与覆盖 |
 | [12 原生集成](docs/12_NATIVE_INTEGRATION.md) | IM / 刷脸 / 支付 |
 | [13 v154 diff](docs/13_APK_V154_DIFF.md) | 148→154 |
+| [14 生产部署](docs/14_PRODUCTION_DEPLOYMENT.md) | Docker、PostgreSQL、Redis、R2、管理端与运维 |
 | [api_catalog.json](docs/api_catalog.json) | action 目录 |
 
 包内手册：
@@ -163,8 +174,9 @@ Browser SPA（社交娱乐风 · PC 侧栏 / 手机五项底栏）
 
 ## 安全与隐私
 
-- **不入库：** `*.apk`、`session.json`、`sessions/`、密码、有效 token（见 `.gitignore`）。
-- 文档中的测试手机号/uid 仅作研究记录；公开仓库勿写明文密码。
+- **不进入 Git/镜像：** `*.apk`、`session.json`、`sessions/`、Docker Secret 和本地运行数据（见 `.gitignore`、`.dockerignore`）。
+- 生产数据库会按已确认需求保存上游账号、密码和 Token，但仅保存 AES-256-GCM 信封密文；管理员查看明文必须通过密码、TOTP 和审计理由解锁。
+- 文档和工具中的测试手机号/uid 已改为占位符；真实账号、密码和 Token 只能通过本地环境或 Secret 提供。
 - 第三方密钥硬编码为客户端侧问题，记录在 Findings，勿二次传播滥用。
 - 默认 BFF 绑定 `127.0.0.1`，勿对公网裸奔。
 

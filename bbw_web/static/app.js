@@ -31,6 +31,8 @@ const MESSAGE_SYNC_TICK_MS = 2000;
 const MESSAGE_SUMMARY_SYNC_MS = 12000;
 const MESSAGE_PEER_SYNC_REALTIME_MS = 12000;
 const MESSAGE_PEER_SYNC_FALLBACK_MS = 4000;
+const MESSAGE_ARCHIVE_RETRY_DELAYS_MS = [1500, 5000];
+const MESSAGE_ARCHIVE_MAX_IN_FLIGHT = 2;
 // Tencent Chat Web SDK defaults to a 2-minute client recall window. The
 // application console may extend it; the admin REST recall route has no fixed
 // time limit while the message is still inside its roaming-storage lifetime.
@@ -43,6 +45,7 @@ const MATCH_PROPERTIES = ["双", "Z", "B"];
 const S = {
   user: null,
   authenticated: false,
+  sessionGeneration: 0,
   route: "nearby",
   loginMode: "password",
   labEnabled: false,
@@ -80,6 +83,8 @@ const S = {
   imConnected: false,
   imMode: "", // "sdk" | "rest" | ""
   imConnecting: false,
+  _imConnecting: null,
+  imConnectingGeneration: -1,
   imNextReconnectAt: 0,
   imLastError: "",
   imMessages: [],
@@ -104,7 +109,17 @@ const S = {
   messageLastSummarySyncAt: 0,
   messageLastPeerSyncAt: 0,
   messageLastPeerSyncPeer: "",
+  archiveQueue: new Map(),
+  archivePersistedKeys: new Set(),
+  archiveInFlight: 0,
+  archiveDrainTimer: null,
+  archiveGeneration: 0,
   smsTimer: null,
+  turnstileRequired: false,
+  turnstileSiteKey: "",
+  turnstileToken: "",
+  turnstileWidgetId: null,
+  turnstileScriptPromise: null,
   presenceTimer: null,
   serverHeartbeat: false,
 };
@@ -456,8 +471,17 @@ async function api(path, options = {}) {
 
     if (response.status === 401 && !authOptional && !path.includes("/api/auth/")) {
       S.authenticated = false;
+      S.sessionGeneration += 1;
       S.user = null;
-      void cleanupIM();
+      stopPresenceTimer();
+      stopMessageSyncTimer();
+      clearPeerMediaReconcile();
+      clearMessageArchiveDeliveryState();
+      S._imConnecting = null;
+      S.imConnectingGeneration = -1;
+      scrubAuthenticatedDom();
+      applyUser(null);
+      void cleanupIM().finally(() => clearSensitiveBrowserStorage());
       showLogin(true, true);
       toast("登录已失效，请重新登录", "error");
       throw new AuthExpiredError("登录已失效");
@@ -476,6 +500,220 @@ async function api(path, options = {}) {
     clearTimeout(timer);
     if (outerSignal) outerSignal.removeEventListener("abort", onOuterAbort);
   }
+}
+
+function archiveHash(value) {
+  const input = String(value || "");
+  let first = 0xdeadbeef ^ input.length;
+  let second = 0x41c6ce57 ^ input.length;
+  for (let index = 0; index < input.length; index += 1) {
+    const code = input.charCodeAt(index);
+    first = Math.imul(first ^ code, 2654435761);
+    second = Math.imul(second ^ code, 1597334677);
+  }
+  first = Math.imul(first ^ (first >>> 16), 2246822507) ^ Math.imul(second ^ (second >>> 13), 3266489909);
+  second = Math.imul(second ^ (second >>> 16), 2246822507) ^ Math.imul(first ^ (first >>> 13), 3266489909);
+  return `${(second >>> 0).toString(36)}${(first >>> 0).toString(36)}`;
+}
+
+function archiveTimestamp(value) {
+  let timestamp = Number(value || 0);
+  if (Number.isFinite(timestamp) && timestamp > 0 && timestamp < 1e12) timestamp *= 1000;
+  if (!Number.isFinite(timestamp) || timestamp <= 0) timestamp = Date.now();
+  const date = new Date(timestamp);
+  return Number.isNaN(date.getTime()) ? Date.now() / 1000 : date.getTime() / 1000;
+}
+
+function archiveRemoteUrl(value) {
+  const resolved = mediaUrl(value);
+  return /^https?:\/\//i.test(resolved) ? resolved.slice(0, 4096) : "";
+}
+
+function archiveMediaPayload(entry) {
+  const media = entry?.media && typeof entry.media === "object" ? entry.media : {};
+  const result = {
+    url: archiveRemoteUrl(media.url),
+    thumbnail: archiveRemoteUrl(media.thumbnail),
+    poster: archiveRemoteUrl(media.poster),
+    name: String(media.name || "").slice(0, 255),
+    mime: String(media.mime || media.type || "").slice(0, 128),
+    size: Math.max(0, Number(media.size || media.fileSize || 0) || 0),
+    duration: Math.max(0, Number(media.duration || 0) || 0),
+    width: Math.max(0, Number(media.width || 0) || 0),
+    height: Math.max(0, Number(media.height || 0) || 0),
+    uuid: String(media.uuid || "").slice(0, 256),
+    face_index: Math.max(0, Math.trunc(Number(media.index || entry?.payload?.index || 0) || 0)),
+    face_url: archiveRemoteUrl(media.data),
+  };
+  return Object.fromEntries(
+    Object.entries(result).filter(([, value]) => value !== "" && value !== 0 && value !== null && value !== undefined)
+  );
+}
+
+function messageArchivePayload(entry, direction = "") {
+  if (!entry || typeof entry !== "object") return null;
+  const peer = String(entry.peer || "").trim();
+  if (!peer || entry.type === "system") return null;
+  const normalizedDirection = direction || (entry.type === "mine" ? "outgoing" : "incoming");
+  const rawSource = String(entry.source || "tim").trim().toLowerCase();
+  const source = ["tim", "sdk", "tim_sdk"].includes(rawSource)
+    ? "tim_sdk"
+    : ["http", "history"].includes(rawSource)
+      ? "history"
+      : rawSource === "rest"
+        ? "rest"
+        : "browser";
+  const upstreamMessageId = String(entry.id || "").trim().slice(0, 512);
+  const upstreamMessageKey = String(entry.msgKey || "").trim().slice(0, 512);
+  const sentAt = archiveTimestamp(entry.timestamp);
+  const media = archiveMediaPayload(entry);
+  const identity = upstreamMessageId || upstreamMessageKey || [peer, sentAt, entry.kind, entry.text, media.url || media.uuid || ""].join("|");
+  const clientMessageKey = `web-message:${archiveHash(`${normalizedDirection}|${identity}`)}`;
+  const revision = archiveHash(
+    JSON.stringify({
+      revoked: Boolean(entry.revoked),
+      delivery: String(entry.delivery || ""),
+      text: String(entry.text || ""),
+      media,
+      flash_id: String(entry.flashId || ""),
+    })
+  );
+  return {
+    schema_version: 1,
+    idempotency_key: `${clientMessageKey}:${revision}`,
+    client_message_key: clientMessageKey,
+    source,
+    direction: normalizedDirection,
+    upstream_message_id: upstreamMessageId,
+    upstream_message_key: upstreamMessageKey,
+    message_key: upstreamMessageKey || clientMessageKey,
+    peer_uid: peer,
+    conversation_id: `C2C${peer}`,
+    message_type: String(entry.kind || "text").slice(0, 64),
+    object_name: String(entry.objectName || "").slice(0, 128),
+    text: String(entry.text || "").slice(0, 20000),
+    sent_at: sentAt,
+    observed_at: new Date().toISOString(),
+    delivery: String(entry.delivery || "").slice(0, 64),
+    revoked: Boolean(entry.revoked),
+    flash_id: String(entry.flashId || "").slice(0, 512),
+    media,
+  };
+}
+
+function rememberArchivedMessageKey(key) {
+  S.archivePersistedKeys.add(key);
+  if (S.archivePersistedKeys.size > 1500) {
+    const oldest = S.archivePersistedKeys.values().next().value;
+    S.archivePersistedKeys.delete(oldest);
+  }
+}
+
+function scheduleMessageArchiveDrain(delay = 0) {
+  if (!S.authenticated) return;
+  const normalizedDelay = Math.max(0, Number(delay) || 0);
+  if (S.archiveDrainTimer) {
+    if (normalizedDelay > 0) return;
+    clearTimeout(S.archiveDrainTimer);
+    S.archiveDrainTimer = null;
+  }
+  S.archiveDrainTimer = setTimeout(() => {
+    S.archiveDrainTimer = null;
+    drainMessageArchiveQueue();
+  }, normalizedDelay);
+}
+
+async function dispatchArchivedMessage(item, generation) {
+  S.archiveInFlight += 1;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch("/api/archive/messages", {
+      method: "POST",
+      credentials: "include",
+      keepalive: true,
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+      },
+      body: JSON.stringify(item.payload),
+      signal: controller.signal,
+    });
+    if (generation !== S.archiveGeneration) return;
+    if (response.ok || response.status === 409) {
+      S.archiveQueue.delete(item.payload.idempotency_key);
+      rememberArchivedMessageKey(item.payload.idempotency_key);
+      return;
+    }
+    if ([400, 401, 403, 404, 405, 413, 422].includes(response.status)) {
+      S.archiveQueue.delete(item.payload.idempotency_key);
+      return;
+    }
+    if (response.status === 429) {
+      item.attempt += 1;
+      if (item.attempt > MESSAGE_ARCHIVE_RETRY_DELAYS_MS.length || !S.authenticated) {
+        S.archiveQueue.delete(item.payload.idempotency_key);
+        return;
+      }
+      const retryAfter = Number(response.headers.get("Retry-After") || 0);
+      item.availableAt = Date.now() + (Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 30000);
+      return;
+    }
+    throw new Error(`消息归档接口返回状态码 ${response.status}`);
+  } catch {
+    if (generation !== S.archiveGeneration) return;
+    item.attempt += 1;
+    if (item.attempt > MESSAGE_ARCHIVE_RETRY_DELAYS_MS.length || !S.authenticated) {
+      S.archiveQueue.delete(item.payload.idempotency_key);
+      return;
+    }
+    item.availableAt = Date.now() + MESSAGE_ARCHIVE_RETRY_DELAYS_MS[item.attempt - 1];
+  } finally {
+    clearTimeout(timeout);
+    if (generation === S.archiveGeneration) {
+      S.archiveInFlight = Math.max(0, S.archiveInFlight - 1);
+      scheduleMessageArchiveDrain();
+    }
+  }
+}
+
+function drainMessageArchiveQueue() {
+  if (!S.authenticated) return;
+  const generation = S.archiveGeneration;
+  const now = Date.now();
+  let nextAvailableAt = Number.POSITIVE_INFINITY;
+  for (const item of S.archiveQueue.values()) {
+    if (S.archiveInFlight >= MESSAGE_ARCHIVE_MAX_IN_FLIGHT) break;
+    if (item.inFlight) continue;
+    if (item.availableAt > now) {
+      nextAvailableAt = Math.min(nextAvailableAt, item.availableAt);
+      continue;
+    }
+    item.inFlight = true;
+    void dispatchArchivedMessage(item, generation).finally(() => {
+      if (generation !== S.archiveGeneration) return;
+      item.inFlight = false;
+    });
+  }
+  if (Number.isFinite(nextAvailableAt)) scheduleMessageArchiveDrain(Math.max(50, nextAvailableAt - now));
+}
+
+function archiveMessageBestEffort(entry, direction = "") {
+  if (!S.authenticated) return;
+  const payload = messageArchivePayload(entry, direction);
+  if (!payload || S.archivePersistedKeys.has(payload.idempotency_key) || S.archiveQueue.has(payload.idempotency_key)) return;
+  S.archiveQueue.set(payload.idempotency_key, { payload, attempt: 0, availableAt: Date.now(), inFlight: false });
+  scheduleMessageArchiveDrain();
+}
+
+function clearMessageArchiveDeliveryState() {
+  S.archiveGeneration += 1;
+  clearTimeout(S.archiveDrainTimer);
+  S.archiveDrainTimer = null;
+  S.archiveQueue.clear();
+  S.archivePersistedKeys.clear();
+  S.archiveInFlight = 0;
 }
 
 async function withPending(button, task) {
@@ -499,14 +737,238 @@ async function withPending(button, task) {
   }
 }
 
+function resetLoginInputs() {
+  clearInterval(S.smsTimer);
+  S.smsTimer = null;
+  ["phone", "password", "sms-code", "invite-code"].forEach((id) => {
+    const input = $(id);
+    if (input) input.value = "";
+  });
+  const message = $("login-message");
+  if (message) message.textContent = "";
+  const smsButton = $("send-sms");
+  if (smsButton) {
+    smsButton.dataset.locked = "false";
+    smsButton.dataset.pending = "false";
+    smsButton.disabled = false;
+    smsButton.classList.remove("pending");
+    smsButton.removeAttribute("aria-busy");
+    smsButton.textContent = "获取验证码";
+  }
+  resetTurnstileChallenge({ hide: true });
+  setLoginMode("password");
+}
+
+function resetTurnstileChallenge({ hide = false } = {}) {
+  S.turnstileToken = "";
+  if (S.turnstileWidgetId != null && window.turnstile?.reset) {
+    try {
+      window.turnstile.reset(S.turnstileWidgetId);
+    } catch {
+      /* The widget may already have been removed by navigation. */
+    }
+  }
+  if (hide) {
+    S.turnstileRequired = false;
+    const field = $("turnstile-field");
+    if (field) field.classList.add("hide");
+  }
+}
+
+function loadTurnstileScript() {
+  if (window.turnstile?.render) return Promise.resolve(window.turnstile);
+  if (S.turnstileScriptPromise) return S.turnstileScriptPromise;
+  S.turnstileScriptPromise = new Promise((resolve, reject) => {
+    const existing = document.getElementById("cf-turnstile-script");
+    const script = existing || document.createElement("script");
+    const onLoad = () => {
+      if (window.turnstile?.render) resolve(window.turnstile);
+      else reject(new Error("安全验证组件加载失败"));
+    };
+    const onError = () => reject(new Error("安全验证组件加载失败"));
+    script.addEventListener("load", onLoad, { once: true });
+    script.addEventListener("error", onError, { once: true });
+    if (!existing) {
+      script.id = "cf-turnstile-script";
+      script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+      script.async = true;
+      script.defer = true;
+      document.head.appendChild(script);
+    }
+  }).catch((error) => {
+    S.turnstileScriptPromise = null;
+    throw error;
+  });
+  return S.turnstileScriptPromise;
+}
+
+async function refreshLoginSecurity(phone) {
+  const normalizedPhone = String(phone || "").trim();
+  if (!/^\d{6,18}$/.test(normalizedPhone)) {
+    resetTurnstileChallenge({ hide: true });
+    return { required: false, token: "" };
+  }
+  const { data } = await api(`/api/auth/security?phone=${encodeURIComponent(normalizedPhone)}`, {
+    authOptional: true,
+    timeout: 6000,
+  });
+  const required = Boolean(data?.ok && data?.enabled && data?.required && data?.site_key);
+  S.turnstileRequired = required;
+  const field = $("turnstile-field");
+  if (!required) {
+    resetTurnstileChallenge({ hide: true });
+    return { required: false, token: "" };
+  }
+
+  if (field) field.classList.remove("hide");
+  const siteKey = String(data.site_key || "");
+  const turnstile = await loadTurnstileScript();
+  const container = $("turnstile-widget");
+  if (!container) throw new Error("安全验证区域不可用");
+  if (S.turnstileWidgetId == null || S.turnstileSiteKey !== siteKey) {
+    if (S.turnstileWidgetId != null && turnstile.remove) {
+      try {
+        turnstile.remove(S.turnstileWidgetId);
+      } catch {
+        /* Replace the container below if the old widget is already gone. */
+      }
+    }
+    container.replaceChildren();
+    S.turnstileSiteKey = siteKey;
+    S.turnstileToken = "";
+    S.turnstileWidgetId = turnstile.render(container, {
+      sitekey: siteKey,
+      theme: "light",
+      callback: (token) => {
+        S.turnstileToken = String(token || "");
+        $("login-message").textContent = "";
+      },
+      "expired-callback": () => {
+        S.turnstileToken = "";
+      },
+      "error-callback": () => {
+        S.turnstileToken = "";
+        $("login-message").textContent = "安全验证暂时不可用，请稍后重试";
+      },
+    });
+  }
+  return { required: true, token: S.turnstileToken };
+}
+
+function scrubAuthenticatedDom() {
+  document.querySelectorAll("#screen-app input, #screen-app textarea, #screen-app select").forEach((element) => {
+    if (element instanceof HTMLInputElement && ["checkbox", "radio"].includes(element.type)) element.checked = false;
+    else element.value = "";
+  });
+  document.querySelectorAll("audio, video").forEach((media) => {
+    try {
+      media.pause();
+      media.removeAttribute("src");
+      media.load();
+    } catch {
+      /* Continue clearing the remaining media elements. */
+    }
+  });
+  const page = root();
+  if (page) page.replaceChildren();
+  ["primary-nav", "secondary-nav", "bottom-nav"].forEach((id) => {
+    const element = $(id);
+    if (element) element.replaceChildren();
+  });
+  const tools = $("tools-nav-section");
+  if (tools) tools.classList.add("hide");
+  const profileBody = $("profile-dialog-body");
+  if (profileBody) profileBody.replaceChildren();
+  const title = $("page-title");
+  if (title) title.textContent = "身边";
+  const subtitle = $("page-subtitle");
+  if (subtitle) subtitle.textContent = "看看此刻谁也在这里";
+  const toastElement = $("toast");
+  if (toastElement) {
+    toastElement.textContent = "";
+    toastElement.classList.add("hide");
+  }
+  ["chat-media-viewer", "chat-flash-confirm"].forEach((id) => {
+    const dialog = $(id);
+    if (!dialog) return;
+    if (dialog.open) dialog.close();
+    dialog.replaceChildren();
+  });
+}
+
+function deleteOriginDatabase(name) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, 1200);
+    try {
+      const request = indexedDB.deleteDatabase(name);
+      request.onsuccess = finish;
+      request.onerror = finish;
+      request.onblocked = finish;
+    } catch {
+      finish();
+    }
+  });
+}
+
+async function clearSensitiveBrowserStorage() {
+  try {
+    localStorage.clear();
+  } catch {
+    /* Storage can be unavailable in private browsing. */
+  }
+  try {
+    sessionStorage.clear();
+  } catch {
+    /* Storage can be unavailable in private browsing. */
+  }
+  const tasks = [];
+  try {
+    if (window.caches?.keys) {
+      tasks.push(
+        caches.keys().then((names) => Promise.allSettled(names.map((name) => caches.delete(name))))
+      );
+    }
+  } catch {
+    /* Cache Storage is optional. */
+  }
+  try {
+    if (window.indexedDB?.databases) {
+      tasks.push(
+        indexedDB
+          .databases()
+          .then((databases) =>
+            Promise.allSettled(
+              databases
+                .map((database) => String(database?.name || ""))
+                .filter(Boolean)
+                .map(deleteOriginDatabase)
+            )
+          )
+      );
+    }
+  } catch {
+    /* IndexedDB enumeration is not supported by every browser. */
+  }
+  if (tasks.length) {
+    await Promise.race([
+      Promise.allSettled(tasks),
+      new Promise((resolve) => setTimeout(resolve, 1800)),
+    ]);
+  }
+}
+
 function showLogin(show, clearSecrets = false) {
   $("screen-login").classList.toggle("hide", !show);
   $("screen-app").classList.toggle("hide", show);
   if (show) closeDrawer();
-  if (clearSecrets) {
-    $("password").value = "";
-    $("sms-code").value = "";
-  }
+  if (clearSecrets) resetLoginInputs();
   if (show) setTimeout(() => $("phone").focus(), 0);
 }
 
@@ -3138,6 +3600,17 @@ async function loadConversationMessages(peer, { force = false } = {}) {
     const results = await Promise.allSettled(tasks);
     const incoming = results.flatMap((result) => (result.status === "fulfilled" ? result.value : []));
     mergePeerMessages(target, incoming);
+    const archiveCandidates = new Map();
+    incoming.forEach((entry) => {
+      const identity = String(entry.id || entry.msgKey || `${entry.type}|${entry.kind}|${entry.timestamp}|${entry.text}`);
+      const remoteMedia = archiveRemoteUrl(entry.media?.url) || archiveRemoteUrl(entry.media?.thumbnail);
+      const score = (remoteMedia ? 4 : 0) + (entry.rawMessage ? 2 : 0) + (entry.text ? 1 : 0);
+      const previous = archiveCandidates.get(identity);
+      if (!previous || score > previous.score) archiveCandidates.set(identity, { entry, score });
+    });
+    archiveCandidates.forEach(({ entry }) =>
+      archiveMessageBestEffort(entry, entry.type === "mine" ? "outgoing" : "incoming")
+    );
     S.imMessageLoadedPeers.add(target);
   } finally {
     S.imMessageLoadingPeers.delete(target);
@@ -3733,7 +4206,8 @@ async function revokeChatMessage(id) {
       }
       try {
         await withTimeout(Promise.resolve(S.chat.revokeMessage(entry.rawMessage)), 12000, "撤回消息");
-        markLocalMessageRevoked(entry);
+        const revoked = markLocalMessageRevoked(entry);
+        archiveMessageBestEffort(revoked, "outgoing");
         toast("消息已撤回");
         return true;
       } catch (error) {
@@ -3757,7 +4231,8 @@ async function revokeChatMessage(id) {
             : info.detail || data?.error_info;
         throw new Error([info.title, detail].filter(Boolean).join(" · "));
       }
-      markLocalMessageRevoked(entry);
+      const revoked = markLocalMessageRevoked(entry);
+      archiveMessageBestEffort(revoked, "outgoing");
       toast("消息已撤回");
       return true;
     } catch (error) {
@@ -4021,6 +4496,7 @@ async function sendTimMediaFile(kind, file, meta = {}) {
       unreadCount: 0,
     });
     refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
+    archiveMessageBestEffort(replacement, "outgoing");
     return replacement;
   } catch (error) {
     updateLocalMessage(pendingID, {
@@ -4205,7 +4681,7 @@ async function sendFlashPhoto(file, { retryMessageId = "" } = {}) {
       throw new Error([info.title, info.detail].filter(Boolean).join(" · "));
     }
     const flashId = String(data.uniqueid || data.unique_id || data.flash_id || data.flashId || "");
-    updateLocalMessage(pendingID, {
+    const archived = {
       ...pending,
       id: String(data.message_id || data.msg_uid || pendingID),
       flashId,
@@ -4215,7 +4691,9 @@ async function sendFlashPhoto(file, { retryMessageId = "" } = {}) {
       retryFile: null,
       retryMeta: null,
       retryError: "",
-    });
+    };
+    updateLocalMessage(pendingID, archived);
+    archiveMessageBestEffort(archived, "outgoing");
     toast("闪图已发送");
   } catch (error) {
     updateLocalMessage(pendingID, {
@@ -4292,7 +4770,7 @@ async function sendChatSticker(index, data, { retryMessageId = "" } = {}) {
     const result = await chat.sendMessage(message);
     const sentMessage = result?.data?.message || result?.message || message;
     const sent = timMessageEntry(sentMessage, peer);
-    updateLocalMessage(pendingID, {
+    const archived = {
       ...pending,
       ...sent,
       id: sent.id || pendingID,
@@ -4305,7 +4783,9 @@ async function sendChatSticker(index, data, { retryMessageId = "" } = {}) {
       progress: 1,
       retryMeta: null,
       retryError: "",
-    });
+    };
+    updateLocalMessage(pendingID, archived);
+    archiveMessageBestEffort(archived, "outgoing");
     updateConversationActivity(peer, { name: S.activePeerName || `用户 ${peer}`, lastMessage: "[表情包]", unreadCount: 0 });
     refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
   } catch (error) {
@@ -5809,6 +6289,7 @@ function applyMessageRevokedEvent(event, me = String(S.user?.uid || S.user?.id |
     revoked.media = {};
     revoked.flashId = "";
     revoked.preview = "[消息已撤回]";
+    let archived = revoked;
     const index = S.imMessages.findIndex(
       (entry) =>
         String(entry.peer || "") === String(peer || "") &&
@@ -5818,7 +6299,7 @@ function applyMessageRevokedEvent(event, me = String(S.user?.uid || S.user?.id |
     if (index >= 0) {
       const previous = S.imMessages[index];
       releaseMessageLocalMedia(previous);
-      S.imMessages[index] = {
+      archived = {
         ...previous,
         ...revoked,
         type: previous.type || revoked.type,
@@ -5831,9 +6312,11 @@ function applyMessageRevokedEvent(event, me = String(S.user?.uid || S.user?.id |
           revoked.recalledText,
         revoked: true,
       };
+      S.imMessages[index] = archived;
     } else if (revoked.id || revoked.msgKey) {
       S.imMessages.push(revoked);
     }
+    archiveMessageBestEffort(archived, archived.type === "mine" ? "outgoing" : "incoming");
     if (peer) changedPeers.add(String(peer));
   });
   if (!changedPeers.size) return;
@@ -5856,6 +6339,7 @@ function attachTimHandlers(chat, TIM, credential) {
         unreadCount: entry.type === "mine" ? currentUnread : active ? 0 : currentUnread + 1,
       });
       addImMessage(entry.text, entry.type, peer, entry);
+      archiveMessageBestEffort(entry, entry.type === "mine" ? "outgoing" : "incoming");
       if (["image", "audio", "video", "file", "face"].includes(entry.kind)) schedulePeerMediaReconcile(peer);
       if (active && entry.type !== "mine") {
         markConversationRead(peer);
@@ -5875,6 +6359,7 @@ function attachTimHandlers(chat, TIM, credential) {
         if (!peer) return;
         const entry = timMessageEntry(message, peer, String(credential.userID));
         mergePeerMessages(peer, [entry]);
+        archiveMessageBestEffort(entry, entry.type === "mine" ? "outgoing" : "incoming");
         if (entry.revoked) updateConversationPreviewFromMessages(peer);
         else updateConversationActivity(peer, { lastMessage: messagePreview(entry) });
         if (peer === String(S.activePeer)) refreshChatLog();
@@ -5958,7 +6443,12 @@ function attachTimHandlers(chat, TIM, credential) {
   }
 }
 
-async function connectTIM(credential) {
+function isCurrentAuthenticatedSession(generation) {
+  return Boolean(S.authenticated && Number(generation) === Number(S.sessionGeneration));
+}
+
+async function connectTIM(credential, sessionGeneration = S.sessionGeneration) {
+  if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
   const TIM = resolveTimApi();
   if (!TIM) {
     const msg = "实时消息组件未加载，请刷新页面后重试。";
@@ -5975,6 +6465,7 @@ async function connectTIM(credential) {
 
   // Always tear down previous singleton before a new login attempt.
   await cleanupIM();
+  if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
   await destroyTimInstance(S.chat, TIM);
 
   const sdkAppId = Number(credential.SDKAppID) || credential.SDKAppID;
@@ -5992,6 +6483,10 @@ async function connectTIM(credential) {
     const msg = "实时消息组件初始化失败，请重新登录后重试。";
     addImMessage(msg, "system");
     S.imLastError = msg;
+    return false;
+  }
+  if (!isCurrentAuthenticatedSession(sessionGeneration)) {
+    await destroyTimInstance(chat, TIM);
     return false;
   }
   // Hold reference early so cleanupIM can destroy even if login times out.
@@ -6086,6 +6581,12 @@ async function connectTIM(credential) {
     if (raceTimer) clearTimeout(raceTimer);
     stopReadyPoll();
 
+    if (!isCurrentAuthenticatedSession(sessionGeneration)) {
+      await destroyTimInstance(chat, TIM);
+      if (S.chat === chat) S.chat = null;
+      return false;
+    }
+
     S.imConnected = true;
     S.imMode = "sdk";
     S.imLastError = "";
@@ -6120,6 +6621,11 @@ async function connectTIM(credential) {
   } catch (error) {
     if (raceTimer) clearTimeout(raceTimer);
     stopReadyPoll();
+    if (!isCurrentAuthenticatedSession(sessionGeneration)) {
+      await destroyTimInstance(chat, TIM);
+      if (S.chat === chat) S.chat = null;
+      return false;
+    }
     let msg = formatTimLoginError(error, credential.source || "");
     if (sdkErrorText) console.info("[TIM]", sdkErrorText);
     if (String(error?.message || "").includes("超时") && !sdkErrorText) {
@@ -6143,9 +6649,13 @@ async function connectTIM(credential) {
 
 /** Fetch BFF UserSig and login TIM (idempotent when already connected). */
 async function ensureTimConnected({ force = false } = {}) {
+  const sessionGeneration = S.sessionGeneration;
+  if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
   if (S.imConnected && S.chat && !force) return true;
-  if (S._imConnecting) return S._imConnecting;
+  if (S._imConnecting && S.imConnectingGeneration === sessionGeneration) return S._imConnecting;
+  if (S._imConnecting && S.imConnectingGeneration !== sessionGeneration) S._imConnecting = null;
   setImConnectingUi(true);
+  S.imConnectingGeneration = sessionGeneration;
   S._imConnecting = (async () => {
     try {
       try {
@@ -6157,6 +6667,7 @@ async function ensureTimConnected({ force = false } = {}) {
         toast(msg, "error", 4200);
         return false;
       }
+      if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
 
       try {
         await withTimeout(ensureTimUploadPluginLoaded(), 8000, "加载媒体上传组件");
@@ -6167,6 +6678,7 @@ async function ensureTimConnected({ force = false } = {}) {
 
       addImMessage("检测 TIM Web Worker…", "system");
       const worker = await probeTimWorker();
+      if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
       if (!worker.ok) {
         const msg = `后台消息组件不可用：${localizedUiText(worker.detail)}。请检查浏览器或安全软件设置。`;
         S.imLastError = msg;
@@ -6178,6 +6690,7 @@ async function ensureTimConnected({ force = false } = {}) {
 
       addImMessage("检测腾讯 IM WebSocket…", "system");
       const net = await probeTimWebsocket(5000);
+      if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
       if (!net.ok) {
         const msg = formatTimLoginError(
           new Error(`浏览器无法连通实时消息网络通道（${net.detail || "失败"}）`),
@@ -6199,15 +6712,18 @@ async function ensureTimConnected({ force = false } = {}) {
       const order = ["server", "local"];
       let lastErr = "";
       for (const prefer of order) {
+        if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
         try {
           setImConnectingUi(true, "正在验证消息登录凭证…");
           addImMessage(`获取 TIM 凭证（${prefer}）…`, "system");
           const cred = await fetchTimCredential(prefer);
+          if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
           addImMessage(
             `凭证就绪 source=${cred.source || prefer} uid=${cred.userID} sig_len=${cred.sig_len || String(cred.userSig).length}`,
             "system"
           );
-          const ok = await connectTIM(cred);
+          const ok = await connectTIM(cred, sessionGeneration);
+          if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
           if (ok) {
             toast("消息通道已连接", "info", 3200);
             return true;
@@ -6228,6 +6744,7 @@ async function ensureTimConnected({ force = false } = {}) {
       try {
         addImMessage("实时消息连接失败，尝试启用文本备用通道…", "system");
         const { data: h } = await api("/api/im/rest/health", { timeout: 12000 });
+        if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
         if (h && (h.ok === true || Number(h.error_code) === 0)) {
           S.imConnected = true;
           S.imMode = "rest";
@@ -6259,9 +6776,12 @@ async function ensureTimConnected({ force = false } = {}) {
       toast(msg, "error", 4200);
       return false;
     } finally {
-      S._imConnecting = null;
-      S.imNextReconnectAt = S.imConnected ? 0 : Date.now() + 30000;
-      setImConnectingUi(false);
+      if (S.imConnectingGeneration === sessionGeneration) {
+        S._imConnecting = null;
+        S.imConnectingGeneration = -1;
+        S.imNextReconnectAt = S.imConnected ? 0 : Date.now() + 30000;
+        setImConnectingUi(false);
+      }
     }
   })();
   return S._imConnecting;
@@ -6338,7 +6858,9 @@ async function cleanupIM() {
     // Best-effort cleanup — never block UI on hung logout.
   }
   try {
-    if (typeof chat.destroy === "function") chat.destroy();
+    if (typeof chat.destroy === "function") {
+      await withTimeout(Promise.resolve(chat.destroy()), 3000, "消息服务清理");
+    }
   } catch {
     // Best-effort cleanup.
   }
@@ -6380,16 +6902,31 @@ async function logout() {
     toast(`服务端退出未确认：${error.message || error}`, "error", 3600);
   } finally {
     if (S.routeController) S.routeController.abort();
+    S.routeController = null;
+    if (S.profileController) S.profileController.abort();
+    S.profileController = null;
+    S.authenticated = false;
+    S.sessionGeneration += 1;
+    S.user = null;
     finishVoiceRecording(null, true);
     closeFlashViewer();
     closeChatMediaViewer();
     stopPresenceTimer();
     stopMessageSyncTimer();
     clearPeerMediaReconcile();
+    clearMessageArchiveDeliveryState();
     await cleanupIM();
+    await clearSensitiveBrowserStorage();
     revokeAllChatObjectUrls();
-    S.authenticated = false;
-    S.user = null;
+    S.routeSeq += 1;
+    S.profileSeq += 1;
+    S.route = "nearby";
+    S.matchTab = "match";
+    S.momentsTab = "推荐";
+    S.momentsSearch = "";
+    S.momentsFeedSeq = 0;
+    S.socialTab = "friends";
+    S.visitorTab = "seen_me";
     S.pageCache.clear();
     S.imMessages = [];
     S.imMessageLoadingPeers.clear();
@@ -6402,10 +6939,16 @@ async function logout() {
     S.imStickersLoaded = false;
     S.imRecordingState = null;
     S.imMediaRetryState.clear();
+    S.imConnecting = false;
+    S._imConnecting = null;
+    S.imConnectingGeneration = -1;
+    S.imNextReconnectAt = 0;
+    S.imLastError = "";
     S.presenceByUid.clear();
     S.presenceLoadingUids.clear();
     S.subscribedPresenceUids.clear();
     S.conversations = [];
+    S.conversationRefreshPromise = null;
     S.conversationProfilesByUid.clear();
     S.conversationProfileLoadingUids.clear();
     S.readConversationPeers.clear();
@@ -6415,7 +6958,10 @@ async function logout() {
     S.messageLastPeerSyncPeer = "";
     S.activePeer = "";
     S.activePeerName = "";
+    S.conversationListCollapsed = false;
+    S.serverHeartbeat = false;
     closeProfileDialog();
+    scrubAuthenticatedDom();
     applyUser(null);
     showLogin(true, true);
     history.replaceState(null, "", "#/nearby");
@@ -7214,7 +7760,8 @@ async function handleProductForm(form, submitter) {
       throw new Error("消息通道尚未连接");
     }
 
-    addImMessage(text, "mine", peer, sentEntry || { peerRead: false, delivery: "sent" });
+    const archived = addImMessage(text, "mine", peer, sentEntry || { peerRead: false, delivery: "sent" });
+    archiveMessageBestEffort(archived, "outgoing");
     updateConversationActivity(peer, {
       name: S.activePeerName || `用户 ${peer}`,
       lastMessage: text,
@@ -7293,14 +7840,22 @@ $("login-tabs").addEventListener("click", (event) => {
   if (button) setLoginMode(button.dataset.mode);
 });
 
+$("phone").addEventListener("blur", () => {
+  void refreshLoginSecurity($("phone").value).catch(() => {
+    /* Login submission performs the same check and will show a useful error. */
+  });
+});
+
 $("send-sms").addEventListener("click", (event) => {
   const button = event.currentTarget;
   void withPending(button, async () => {
     const phone = $("phone").value.trim();
+    const inviteCode = $("invite-code").value.trim();
     if (!/^\d{6,18}$/.test(phone)) throw new Error("请输入有效手机号");
+    if (!inviteCode) throw new Error("请输入有效邀请码");
     const { data } = await api("/api/auth/sms-send", {
       method: "POST",
-      body: JSON.stringify({ phone }),
+      body: JSON.stringify({ phone, invite_code: inviteCode }),
       authOptional: true,
     });
     if (toastEnv(data, "验证码已发送")) startSmsCountdown(button);
@@ -7314,29 +7869,51 @@ $("login-form").addEventListener("submit", (event) => {
     const phone = $("phone").value.trim();
     const password = $("password").value;
     const code = $("sms-code").value.trim();
+    const inviteCode = $("invite-code").value.trim();
     $("login-message").textContent = "";
     if (!/^\d{6,18}$/.test(phone)) throw new Error("请输入有效手机号");
+    if (!inviteCode) throw new Error("请输入有效邀请码");
+    const security = await refreshLoginSecurity(phone);
+    if (security.required && !security.token) {
+      throw new Error("请先完成人机验证");
+    }
+    const turnstileToken = security.token || "";
     let result;
     if (S.loginMode === "sms") {
       if (!code) throw new Error("请输入短信验证码");
       result = await api("/api/auth/sms-login", {
         method: "POST",
-        body: JSON.stringify({ phone, code }),
+        body: JSON.stringify({
+          phone,
+          code,
+          invite_code: inviteCode,
+          turnstile_token: turnstileToken,
+        }),
         authOptional: true,
       });
     } else {
       if (!password) throw new Error("请输入密码");
       result = await api("/api/auth/login", {
         method: "POST",
-        body: JSON.stringify({ phone, password, mode: "password" }),
+        body: JSON.stringify({
+          phone,
+          password,
+          mode: "password",
+          invite_code: inviteCode,
+          turnstile_token: turnstileToken,
+        }),
         authOptional: true,
       });
     }
     if (!result.data.ok) {
       const info = errorInfo(result.data, "登录失败");
       $("login-message").textContent = info.title;
+      resetTurnstileChallenge();
+      void refreshLoginSecurity(phone).catch(() => {});
       return;
     }
+    resetTurnstileChallenge({ hide: true });
+    S.sessionGeneration += 1;
     S.authenticated = true;
     applyUser(result.data.user);
     showLogin(false, true);
@@ -7660,6 +8237,7 @@ syncVisualViewport();
   try {
     const { status, data } = await api("/api/me", { authOptional: true, timeout: 8000 });
     if (status === 200 && data.ok && data.user?.logged_in) {
+      S.sessionGeneration += 1;
       S.authenticated = true;
       applyUser(data.user);
       showLogin(false);

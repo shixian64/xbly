@@ -160,14 +160,14 @@ if ("T".equals(infoList.getMessage())) {
 ## 4. 实测记录（2026-07-15）
 
 脚本：`analysis/rp_verify_probe.py`  
-账号：uid `726285`，登录后 `rp_verify_time=0`。
+账号：uid `YOUR_UID`，登录后 `rp_verify_time=0`。
 
 | # | 请求 | 响应摘要 | 重登后 rp_verify_time | resetNew |
 |---|---|---|---|---|
 | 1 | `SaveRPVerifyInfo` result=`T/F/true/1/PASS/...` | 均 `{"code":"200","message":"T"}` | 仍 `0` | 仍 403 |
 | 2 | `DescribeFaceVerify0` certifyId=空/fake/0/T/1000/... | 均 `{"code":"200","message":"T"}` | 仍 `0` | 仍 403 |
 | 3 | `InitFaceVerify0` metaInfo=`{}` 假证件 | `400 实名调用失败，请联系客服` | — | — |
-| 4 | `checkAge` 假号 | `200 message=726285`（含义待解） | — | — |
+| 4 | `checkAge` 假号 | `200 message=YOUR_UID`（含义待解） | — | — |
 | 5 | `applyManualVerify` 假材料 | `200 提交成功，请耐心等待...` | 仍 `0`（即时） | 仍 403 |
 
 ### 4.1 关键解读

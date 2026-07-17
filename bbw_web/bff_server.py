@@ -1299,7 +1299,7 @@ class Handler(BaseHTTPRequestHandler):
         # ---- im ----
         if path == "/api/im/tim":
             # Prefer server UserSig (tximsign.php puts sig in message=).
-            # Fall back to BFF-local mint (APK SECRETKEY, never sent to browser).
+            # Fall back to a BFF-local mint using the server-side configured secret.
             try:
                 prefer = _tim_preference(q("prefer", "server"))
                 payload = u.native.im.tim_login_payload(

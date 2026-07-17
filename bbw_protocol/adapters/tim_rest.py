@@ -1,6 +1,6 @@
 """Tencent Cloud IM REST (server-side) fallback when browser TIM Web SDK cannot login.
 
-Uses the APK-derived SDKAppID + SECRETKEY only inside the BFF/protocol process.
+Uses the SDKAppID plus an externally configured secret only inside the BFF/protocol process.
 Docs: https://cloud.tencent.com/document/product/269/2282
 """
 

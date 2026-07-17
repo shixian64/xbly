@@ -53,7 +53,7 @@
 用测试手机号验证注册/登录协议。
 
 ### 账号
-- 手机：`19122614669`
+- 手机：`YOUR_PHONE`
 - 目标密码：`YOUR_PASSWORD`
 
 ### 测试矩阵
@@ -62,14 +62,14 @@
 |---|---|---|
 | 1 | `signin0` 密码登录 | `400 账号或密码错误` |
 | 2 | `sms_beibeiwu.php` 发短信 | HTTP 200，body 空 |
-| 3 | `signup` | 纯文本 `手机号已存在`；另一次返回过 `726285`（疑似已有 uid） |
+| 3 | `signup` | 纯文本 `手机号已存在`；另一次返回过 `YOUR_UID`（疑似已有 uid） |
 | 4 | `smsVerify0 code=0000` | `400 验证码错误` |
-| 5 | `SigninOneKeyLogin1` **无短信** | **`200 登录成功`**，uid=`726285` |
-| 6 | `SigninOneKeyLogin` | `error=0 登陆成功 userID=726285` |
+| 5 | `SigninOneKeyLogin1` **无短信** | **`200 登录成功`**，uid=`YOUR_UID` |
+| 6 | `SigninOneKeyLogin` | `error=0 登陆成功 userID=YOUR_UID` |
 | 7 | `findpassword` 无 token | `700 登录失效...` |
 
 ### 结论
-1. 手机号**已注册**，uid=`726285`。  
+1. 手机号**已注册**，uid=`YOUR_UID`。
 2. **一键登录接口无需验证码即可登录（P0）。**  
 3. 改密必须先有有效 `AUTHOR-TOKEN`。
 
@@ -103,7 +103,7 @@
 
 ### 登录成功样例字段（摘要）
 ```
-uid        = 726285
+uid        = YOUR_UID
 nickname   = 游客
 user_role  = 普通用户
 vip/svip   = 0/0
@@ -260,10 +260,10 @@ userSign   = eJwt...            # 腾讯 IM
 - `10_PROTOCOL_CLIENT.md`、`bbw_protocol/README.md`
 - `session.json`：登录持久化
 
-### 冒烟（账号 19122614669）
+### 冒烟（账号 YOUR_PHONE）
 | 项 | 结果 |
 |---|---|
-| login | 200 成功，uid=726285 |
+| login | 200 成功，uid=YOUR_UID |
 | gifts/recommend/ads/online/me | 正常 |
 | follow | 400 已关注（正常业务） |
 | nick | 403 未实名 |
@@ -363,7 +363,7 @@ HTTP 主路径已协议化；通用 `call` 覆盖全部枚举 action。原生 SD
 - CLI：`native-status` `im-tim` `im-rong` `pay-coin` `face-*`
 - 文档：`12_NATIVE_INTEGRATION.md`
 
-**冒烟（本机 session uid=726285）：**
+**冒烟（本机 session uid=YOUR_UID）：**
 
 | 项 | 结果 |
 |---|---|

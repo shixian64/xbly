@@ -17,9 +17,11 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import random
 import time
 import zlib
+from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 
@@ -41,14 +43,23 @@ AGORA_RTM_URL = (
     "RtmTokenBuilderSampleXiaobei.php"
 )
 
-# From BuildConfig / GenerateTestUserSig
-RONG_APP_KEY = "m7ua80gbmo0km"
-BUSINESS_TOKEN = "lymM6dNKREIknE5VJGskfU"
+def _optional_secret(name: str) -> str:
+    direct = str(os.getenv(name) or "").strip()
+    file_path = str(os.getenv(f"{name}_FILE") or "").strip()
+    if direct and file_path:
+        raise RuntimeError(f"configure only one of {name} and {name}_FILE")
+    if file_path:
+        return Path(file_path).read_text(encoding="utf-8").strip()
+    return direct
+
+
+# Recovered values are intentionally not retained in source.  Use the same
+# environment/Docker-secret names as the production deployment.
+RONG_APP_KEY = _optional_secret("BBW_ROOMKIT_APP_KEY")
+BUSINESS_TOKEN = _optional_secret("BBW_ROOMKIT_BUSINESS_TOKEN")
 BASE_SERVER = "https://redis.banghua.xin:8080/"
 TXIM_SDKAPPID = 1600039823
-TXIM_SECRETKEY = (
-    "c064eea5978cf60af28dcbbe9dd7c35e110734fcf1a5662ead3e87e2eb8a554e"
-)
+TXIM_SECRETKEY = _optional_secret("BBW_TXIM_SECRET_KEY")
 WX_APP_ID_BEIYUAN0 = "wxf057dbbb960d9c39"
 WX_APP_ID_BEIYUAN = "wxb8adb92718082e0b"
 PACKAGE_NAME = "xin.banghua.beiyuan0"
@@ -137,7 +148,7 @@ def redis_url(action: str, i: str = "888", m: str = "rediscache") -> str:
     return f"{REDIS_BASE}?i={i}&c=entry&a=webapp&do={action}&m={m}"
 
 
-# --- Tencent IM UserSig (client-side SECRETKEY hardcode) ---
+# --- Tencent IM UserSig (secret supplied through environment/Docker Secret) ---
 
 def _base64_url_encode(data: bytes) -> str:
     s = base64.b64encode(data).decode("ascii")
@@ -147,10 +158,13 @@ def _base64_url_encode(data: bytes) -> str:
 def gen_tls_user_sig(
     identifier: str,
     sdkappid: int = TXIM_SDKAPPID,
-    secret_key: str = TXIM_SECRETKEY,
+    secret_key: Optional[str] = None,
     expire: int = 604800,
 ) -> str:
     """GenerateTestUserSig.GenTLSSignature"""
+    secret_key = str(secret_key if secret_key is not None else TXIM_SECRETKEY).strip()
+    if not secret_key:
+        raise RuntimeError("configure BBW_TXIM_SECRET_KEY or BBW_TXIM_SECRET_KEY_FILE")
     now = int(time.time())
     content = (
         f"TLS.identifier:{identifier}\n"
@@ -319,11 +333,14 @@ def demo() -> None:
     print("EXPIRE-TOKEN   =", get_expire_token())
     print("UNIQUE-LOGIN   =", get_unique_login_token(uid))
     print("AUTHOR-SIG     =", get_author_signature(uid))
-    print("TXIM UserSig   =", gen_tls_user_sig(uid)[:80] + "...")
+    print(
+        "TXIM UserSig   =",
+        gen_tls_user_sig(uid)[:80] + "..." if TXIM_SECRETKEY else "not configured",
+    )
     print("\n=== Constants ===")
-    print("RONG_APP_KEY   =", RONG_APP_KEY)
+    print("ROOMKIT_APP_KEY configured =", bool(RONG_APP_KEY))
     print("TXIM_SDKAPPID  =", TXIM_SDKAPPID)
-    print("TXIM_SECRETKEY =", TXIM_SECRETKEY)
+    print("TXIM_SECRETKEY configured =", bool(TXIM_SECRETKEY))
     print("WX_APP_ID      =", WX_APP_ID_BEIYUAN0)
     print("PACKAGE        =", PACKAGE_NAME)
     print("\n=== Sample requests (templates only, no network) ===\n")

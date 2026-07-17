@@ -12,6 +12,16 @@ login_session.json
 rp_verify_probe_result.json
 guest_capability_results.json
 bbw_web/data/
+.env
+.env.*
+!.env.example
+docker/secrets/*
+!docker/secrets/.gitignore
+!docker/secrets/README.md
+backups/
+*.dump
+*.backup
+migration_*.tmp
 
 # Python
 __pycache__/

@@ -11,9 +11,12 @@ import time
 import zlib
 from typing import Dict, Optional
 
+from .secrets import ProtocolSecretError, read_protocol_secret
+
 TXIM_SDKAPPID = 1600039823
-TXIM_SECRETKEY = (
-    "c064eea5978cf60af28dcbbe9dd7c35e110734fcf1a5662ead3e87e2eb8a554e"
+TXIM_SECRETKEY = read_protocol_secret(
+    "BBW_TXIM_SECRET_KEY",
+    development_default="development-only-txim-secret-key",
 )
 SALT_SIGN = "socialchat"
 SALT_EXPIRE = "xiaobei"
@@ -94,9 +97,14 @@ def _b64url_tx(data: bytes) -> str:
 def gen_user_sig(
     identifier: str,
     sdkappid: int = TXIM_SDKAPPID,
-    secret_key: str = TXIM_SECRETKEY,
+    secret_key: Optional[str] = None,
     expire: int = 604800,
 ) -> str:
+    resolved_secret_key = (
+        TXIM_SECRETKEY if secret_key is None else str(secret_key).strip()
+    )
+    if not resolved_secret_key:
+        raise ProtocolSecretError("TIM secret key must not be empty")
     now = int(time.time())
     content = (
         f"TLS.identifier:{identifier}\n"
@@ -106,7 +114,7 @@ def gen_user_sig(
     )
     sig = base64.b64encode(
         hmac.new(
-            secret_key.encode("utf-8"),
+            resolved_secret_key.encode("utf-8"),
             content.encode("utf-8"),
             hashlib.sha256,
         ).digest()

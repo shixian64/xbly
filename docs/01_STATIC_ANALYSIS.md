@@ -64,9 +64,9 @@
 | 字段 | 值 |
 |---|---|
 | APPLICATION_ID | `xin.banghua.beiyuan0` |
-| APP_KEY（融云） | `m7ua80gbmo0km` |
+| APP_KEY（融云） | `[REDACTED，已迁移到 Docker Secret]` |
 | BASE_SERVER_ADDRES | `https://redis.banghua.xin:8080/` |
-| BUSINESS_TOKEN | `lymM6dNKREIknE5VJGskfU` |
+| BUSINESS_TOKEN | `[REDACTED，已迁移到 Docker Secret]` |
 | VERSION_CODE | `154`（`xbly.apk`；旧 `beibeiwu.apk` 为 148） |
 | FLAVOR | `official` |
 | DEBUG | `false` |
@@ -76,16 +76,16 @@
 | 类型 | 值 / 位置 |
 |---|---|
 | 腾讯 IM SDKAppID | `1600039823`（`GenerateTestUserSig`） |
-| 腾讯 IM SECRETKEY | `c064eea5978cf60af28dcbbe9dd7c35e110734fcf1a5662ead3e87e2eb8a554e` |
+| 腾讯 IM SECRETKEY | `[REDACTED，已迁移到 Docker Secret]` |
 | 微信 APP_ID（本包） | `wxf057dbbb960d9c39` |
 | 微信 APP_ID（旧包名） | `wxb8adb92718082e0b` |
 | 穿山甲 appId | `5435573` |
 | 阿里 HA appKey | `333510424` |
-| 阿里 HA appSecret | `ac4d390a63d645b79340e3b89efd8d3a` |
+| 阿里 HA appSecret | `[REDACTED, rotate old value]` |
 | 阿里号码认证 AUTH_SECRET | `xin.banghua.onekeylogin.Constant` 超长 base64 |
-| 小米推送 | `2882303761520239799` / `5112023917799` |
-| 魅族推送 | `124945` / `399a4bb4701046ffbff85a5505251abb` |
-| OPPO 推送 | `66634f0066b3427694b7c468f0263e8e` / `33ef499149634128a2a7e7fa1c0e824a` |
+| 小米推送 | `[REDACTED, rotate old credentials]` |
+| 魅族推送 | `[REDACTED, rotate old credentials]` |
+| OPPO 推送 | `[REDACTED, rotate old credentials]` |
 | OSS bucket | `newecs`，endpoint `oss-cn-shanghai.aliyuncs.com` |
 | OSS 签名 | 服务端 `do=getAliyunSignature` |
 

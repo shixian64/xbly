@@ -15,10 +15,13 @@ from urllib import error, parse, request
 
 from ..app import BeibeiwuApp
 from ..client import ApiResult
+from ..secrets import read_protocol_secret
 
 ROOMKIT_BASE_URL = "https://redis.banghua.xin:8080/"
-ROOMKIT_APP_KEY = "m7ua80gbmo0km"
-ROOMKIT_BUSINESS_TOKEN = "lymM6dNKREIknE5VJGskfU"
+ROOMKIT_BUSINESS_TOKEN = read_protocol_secret(
+    "BBW_ROOMKIT_BUSINESS_TOKEN",
+    development_default="development-only-roomkit-business-token",
+)
 ROOMKIT_CHANNEL = "WalleChannelReader.getChannel(this)"
 ROOMKIT_VOICE_TYPE = 1
 ROOMKIT_SUCCESS_CODES = {"", "0", "10000"}

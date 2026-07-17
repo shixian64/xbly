@@ -31,14 +31,14 @@ cd <repo-root>
 
 # CLI
 python -m bbw_protocol.cli whoami
-python -m bbw_protocol.cli login --phone 19122614669 --password "YOUR_PASS"
+python -m bbw_protocol.cli login --phone YOUR_PHONE --password "YOUR_PASS"
 python -m bbw_protocol.cli bootstrap
 python -m bbw_protocol.cli gifts
 python -m bbw_protocol.cli follow 1
 python -m bbw_protocol.cli me
 python -m bbw_protocol.cli nick Vom
 python -m bbw_protocol.cli call getGiftList
-python -m bbw_protocol.cli call follow me=726285 you=1 quietly_follow=1
+python -m bbw_protocol.cli call follow me=YOUR_UID you=1 quietly_follow=1
 python -m bbw_protocol.cli actions --cat social
 python -m bbw_protocol.cli repl
 ```
@@ -51,7 +51,7 @@ python -m bbw_protocol.cli repl
 from bbw_protocol import BeibeiwuApp
 
 app = BeibeiwuApp.load()
-app.auth.login_password("19122614669", "password")
+app.auth.login_password("YOUR_PHONE", "password")
 app.save()
 
 print(app.whoami())

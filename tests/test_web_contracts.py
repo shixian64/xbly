@@ -482,7 +482,7 @@ class BffEnvelopeTests(unittest.TestCase):
 
 class SecurityHelperTests(unittest.TestCase):
     def test_session_path_is_confined(self) -> None:
-        self.assertIsNotNone(_session_path("726285"))
+        self.assertIsNotNone(_session_path("10001"))
         self.assertIsNone(_session_path("../../outside"))
         self.assertIsNone(_session_path("a/b"))
 

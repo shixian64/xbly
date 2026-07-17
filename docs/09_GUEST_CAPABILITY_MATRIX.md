@@ -1,7 +1,7 @@
 # 09 · 游客能力矩阵与协议可落地性
 
 **最后更新：** 2026-07-15  
-**样本账号：** uid=`726285`，nickname=`游客`，user_role=`普通用户`，`rp_verify_time=0`，phone 已绑定（脱敏），vip/svip=0，money=0  
+**样本账号：** uid=`YOUR_UID`，nickname=`游客`，user_role=`普通用户`，`rp_verify_time=0`，phone 已绑定（脱敏），vip/svip=0，money=0
 **原始探测结果：** `guest_capability_results.json`  
 **脚本：** `guest_capability_probe.py`、`guest_gates_scan.py`
 

@@ -2,7 +2,7 @@
 
 **项目根：** 仓库根目录（`bbw_protocol` / `bbw_web` / `docs` / `tools`）  
 **客户端版本：** 154（`xbly.apk`）  
-**原则：** 分析结论落盘；密钥与 session 不入库。
+**原则：** 分析结论落盘；真实密钥与本地 session 不提交 Git。生产 Session 按部署文档写入 PostgreSQL/Redis。
 
 ---
 
@@ -12,7 +12,8 @@
 2. [02_PROTOCOL](./02_PROTOCOL.md) — 协议  
 3. [10_PROTOCOL_CLIENT](./10_PROTOCOL_CLIENT.md) — 怎么用客户端  
 4. [04_FINDINGS](./04_FINDINGS.md) — 风险清单  
-5. 专题：实名 [08](./08_RP_VERIFY_BYPASS_ANALYSIS.md) / 游客 [09](./09_GUEST_CAPABILITY_MATRIX.md) / 覆盖 [11](./11_FEATURE_REALNAME_AND_COVERAGE.md) / 原生 [12](./12_NATIVE_INTEGRATION.md) / v154 [13](./13_APK_V154_DIFF.md)
+5. 生产部署：[14](./14_PRODUCTION_DEPLOYMENT.md)
+6. 专题：实名 [08](./08_RP_VERIFY_BYPASS_ANALYSIS.md) / 游客 [09](./09_GUEST_CAPABILITY_MATRIX.md) / 覆盖 [11](./11_FEATURE_REALNAME_AND_COVERAGE.md) / 原生 [12](./12_NATIVE_INTEGRATION.md) / v154 [13](./13_APK_V154_DIFF.md)
 
 ---
 
@@ -34,6 +35,8 @@
 | [11_FEATURE_REALNAME_AND_COVERAGE.md](./11_FEATURE_REALNAME_AND_COVERAGE.md) | 实名门槛与覆盖 |
 | [12_NATIVE_INTEGRATION.md](./12_NATIVE_INTEGRATION.md) | IM / 刷脸 / 支付集成 |
 | [13_APK_V154_DIFF.md](./13_APK_V154_DIFF.md) | 148→154 差异 |
+| [14_PRODUCTION_DEPLOYMENT.md](./14_PRODUCTION_DEPLOYMENT.md) | Docker、PostgreSQL、Redis、R2、管理端、安全与运维 |
+| [15_APK_SECURITY_AUDIT.md](./15_APK_SECURITY_AUDIT.md) | APK 安全审计补充记录 |
 | [DEEP_DIVE.md](./DEEP_DIVE.md) | 早期深挖（已并入 01/02/04） |
 | [api_catalog.json](./api_catalog.json) | action 目录 |
 
@@ -45,6 +48,8 @@
 |---|---|
 | `.../bbw_protocol/` | 协议核 + CLI |
 | `.../bbw_web/` | 多用户 Web |
+| `.../bbw_prod/` | 生产持久化、加密、Session 和服务层 |
+| `../compose.yaml` | 生产 Docker Compose 拓扑 |
 | `../tools/` | 可选探测脚本 |
 
 ```powershell
