@@ -1843,22 +1843,31 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn(".conversation-layout.is-list-collapsed .conversation-list-pane", app_css)
         self.assertIn("display: none", app_css)
 
-    def test_message_page_uses_clean_chat_surface_and_topbar_read_action(self) -> None:
+    def test_message_page_uses_compact_chat_surface_and_list_read_action(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
         app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
         index_html = (root / "bbw_web" / "static" / "index.html").read_text(encoding="utf-8")
         page_messages = app_js.split("async function pageMessages", 1)[1].split("async function pageMatching", 1)[0]
 
-        self.assertIn('id="topbar-actions"', index_html)
-        self.assertIn('id="mark-all-read-top" data-action="mark-all-read"', index_html)
-        self.assertIn("function syncTopbarActions", app_js)
-        self.assertIn('S.route !== "msg"', app_js)
+        self.assertNotIn('id="mark-all-read-top"', index_html)
+        self.assertIn('class="pane-head-actions"', page_messages)
+        self.assertIn('id="mark-all-read-list" data-action="mark-all-read"', page_messages)
+        self.assertLess(
+            page_messages.index('id="mark-all-read-list"'),
+            page_messages.index('id="conversation-list"'),
+        )
+        self.assertIn("function syncMessageReadAction", app_js)
+        self.assertNotIn("function syncTopbarActions", app_js)
         self.assertNotIn("message-toolbar", page_messages)
         self.assertNotIn('id="im-conn-status"', page_messages)
         self.assertIn(".message-page > .conversation-layout", app_css)
         self.assertIn("--message-content-max: 1800px", app_css)
         self.assertIn('document.body.classList.toggle("message-route-active"', app_js)
+        self.assertIn("body.chat-conversation-open .topbar", app_css)
+        self.assertIn("body.chat-conversation-open .topbar-copy", app_css)
+        self.assertIn("top: calc(var(--app-viewport-offset-top, 0px) + 52px + var(--safe-top))", app_css)
+        self.assertIn(".chat-head {\n  min-height: 56px", app_css)
         self.assertIn("grid-template-columns: minmax(300px, 360px) minmax(0, 1fr)", app_css)
         self.assertNotIn(".message-toolbar", app_css)
 

@@ -1456,10 +1456,9 @@ function buildNav() {
   $("bottom-nav").innerHTML = PRIMARY_NAV.map((item) => navButton(item, true)).join("");
 }
 
-function syncTopbarActions() {
-  const markAllRead = $("mark-all-read-top");
+function syncMessageReadAction() {
+  const markAllRead = $("mark-all-read-list");
   if (!markAllRead) return;
-  markAllRead.hidden = !S.authenticated || S.route !== "msg";
   markAllRead.disabled = !S.conversations.length;
 }
 
@@ -1477,7 +1476,7 @@ function syncNav() {
   const nav = navItems().find((item) => item.id === S.route) || PRIMARY_NAV[0];
   $("page-title").textContent = nav.name;
   $("page-subtitle").textContent = nav.desc;
-  syncTopbarActions();
+  syncMessageReadAction();
 }
 
 function centerActiveRelationshipTab() {
@@ -4073,7 +4072,7 @@ function recalculateUnreadTotal() {
     0
   );
   updateUnreadBadges();
-  syncTopbarActions();
+  syncMessageReadAction();
 }
 
 function activeConversation() {
@@ -5971,7 +5970,7 @@ async function pageMessages(signal) {
   if (S.activePeer) void loadConversationMessages(S.activePeer);
   return `<div class="message-page${S.activePeer ? " conversation-open" : ""}"><section class="conversation-layout${S.activePeer ? " has-active" : ""}${S.conversationListCollapsed ? " is-list-collapsed" : ""}">
       <aside class="conversation-list-pane" aria-label="聊天列表">
-        <div class="pane-head"><div class="pane-head-copy"><h2>聊天列表</h2><p data-conversation-count>${S.conversations.length ? `${S.conversations.length} 个最近会话` : "最近联系的人会显示在这里"}</p></div><button type="button" class="utility-btn conversation-collapse-toggle" data-action="toggle-conversation-list" aria-controls="conversation-list" aria-expanded="${String(!S.conversationListCollapsed)}" aria-label="${S.conversationListCollapsed ? "横向展开聊天列表" : "横向收起聊天列表"}" title="${S.conversationListCollapsed ? "横向展开聊天列表" : "横向收起聊天列表"}">${S.conversationListCollapsed ? "展开" : "收起"}</button></div>
+        <div class="pane-head"><div class="pane-head-copy"><h2>聊天列表</h2><p data-conversation-count>${S.conversations.length ? `${S.conversations.length} 个最近会话` : "最近联系的人会显示在这里"}</p></div><div class="pane-head-actions"><button type="button" class="btn secondary small" id="mark-all-read-list" data-action="mark-all-read" aria-label="将所有会话标记为已读" ${S.conversations.length ? "" : "disabled"}>全部已读</button><button type="button" class="utility-btn conversation-collapse-toggle" data-action="toggle-conversation-list" aria-controls="conversation-list" aria-expanded="${String(!S.conversationListCollapsed)}" aria-label="${S.conversationListCollapsed ? "横向展开聊天列表" : "横向收起聊天列表"}" title="${S.conversationListCollapsed ? "横向展开聊天列表" : "横向收起聊天列表"}">${S.conversationListCollapsed ? "展开" : "收起"}</button></div></div>
         <div class="conversation-list ui-scrollbar" id="conversation-list">${conversationListHtml()}</div>
       </aside>
       <div class="chat-pane">${chatPaneHtml()}</div>
