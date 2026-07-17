@@ -53,7 +53,7 @@
 html {
   min-height: 100%;
   background: var(--bg);
-  scroll-behavior: smooth;
+  scrollbar-gutter: stable;
 }
 
 body {
@@ -795,8 +795,8 @@ summary:focus-visible {
 }
 
 @keyframes page-in {
-  from { opacity: 0; transform: translateY(5px); }
-  to { opacity: 1; transform: none; }
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 /* content */
@@ -4276,6 +4276,37 @@ html.flash-viewing body {
 .bottom-item.on {
   color: var(--brand-dark);
   font-weight: 800;
+}
+
+.mine-hub,
+.mine-tab-panel {
+  min-width: 0;
+}
+
+.mine-tab-panel {
+  position: relative;
+  transition: opacity 140ms ease;
+}
+
+.mine-tab-panel.is-loading {
+  pointer-events: none;
+  opacity: 0.62;
+}
+
+.mine-tab-panel.is-loading::before {
+  position: absolute;
+  z-index: 6;
+  top: 0.7rem;
+  right: 0.7rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface-solid);
+  box-shadow: var(--shadow-sm);
+  color: var(--muted);
+  padding: 0.28rem 0.58rem;
+  content: "正在切换内容";
+  font-size: 0.68rem;
+  font-weight: 700;
 }
 
 .mine-subnav {

@@ -2641,6 +2641,32 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn(".bottom-nav", short_landscape_media)
         self.assertIn("display: none !important", short_landscape_media)
 
+    def test_mine_tabs_are_stable_and_do_not_duplicate_moments_entry(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
+        page_me = app_js.split("async function pageMe(signal)", 1)[1].split(
+            "async function pageLab", 1
+        )[0]
+        switch_mine = app_js.split("async function switchMineTab", 1)[1].split(
+            "function routeCacheKey", 1
+        )[0]
+
+        self.assertIn('data-action="mine-tab"', app_js)
+        self.assertIn('id="mine-tab-panel"', app_js)
+        self.assertNotIn("MINE_MOMENTS_ROUTE", app_js)
+        self.assertNotIn("pageMineMoments", app_js)
+        self.assertIn('return [...MOMENT_TABS, "我的"]', app_js)
+        self.assertNotIn("我的消息", page_me)
+        self.assertNotIn("发布内容与权限管理", page_me)
+        self.assertNotIn("乐园币、会员与礼物", page_me)
+        self.assertIn("panel.innerHTML = html", switch_mine)
+        self.assertNotIn("root().innerHTML", switch_mine)
+        self.assertIn('panel.classList.add("is-loading")', switch_mine)
+        self.assertIn("isMineRoute(S.route) && isMineRoute(target)", app_js)
+        self.assertIn(".mine-tab-panel.is-loading", app_css)
+        self.assertIn("scrollbar-gutter: stable", app_css)
+
     def test_static_asset_cache_versions_match_mobile_media_release(self) -> None:
         root = Path(__file__).resolve().parents[1]
         index_html = (root / "bbw_web" / "static" / "index.html").read_text(encoding="utf-8")

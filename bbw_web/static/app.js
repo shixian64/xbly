@@ -1271,21 +1271,28 @@ function navGroup(item) {
   }</div>`;
 }
 
+function isMineRoute(id) {
+  return MINE_NAV.some((item) => item.id === id) || (id === "lab" && S.labEnabled);
+}
+
 function mineSubnavHtml(activeRoute = S.route) {
   const items = S.labEnabled ? [...MINE_NAV, LAB_NAV] : MINE_NAV;
-  return `<nav class="mine-subnav tab-row ui-scrollbar ui-scrollbar--compact" aria-label="我的功能">${items
+  return `<nav class="mine-subnav tab-row ui-scrollbar ui-scrollbar--compact" role="tablist" aria-label="我的功能">${items
     .map((item) => {
       const active = item.id === activeRoute;
-      return `<button type="button" class="tab-chip${active ? " on" : ""}" data-route="${item.id}" ${
-        active ? 'aria-current="page"' : ""
-      }>${esc(item.name)}</button>`;
+      return `<button type="button" id="mine-tab-${item.id}" role="tab" class="tab-chip${active ? " on" : ""}" data-action="mine-tab" data-tab="${item.id}" aria-selected="${String(
+        active
+      )}" aria-controls="mine-tab-panel" tabindex="${active ? "0" : "-1"}">${esc(item.name)}</button>`;
     })
     .join("")}<button type="button" class="tab-chip mine-subnav-logout" data-action="logout">退出</button></nav>`;
 }
 
 function withMineSubnav(route, html) {
-  const showMineSubnav = MINE_NAV.some((item) => item.id === route) || (route === "lab" && S.labEnabled);
-  return showMineSubnav ? `${mineSubnavHtml(route)}${html}` : html;
+  return isMineRoute(route)
+    ? `<div class="mine-hub">${mineSubnavHtml(route)}<div id="mine-tab-panel" class="mine-tab-panel" role="tabpanel" aria-labelledby="mine-tab-${esc(
+        route
+      )}">${html}</div></div>`
+    : html;
 }
 
 function updateUnreadBadges() {
@@ -1519,6 +1526,17 @@ function syncNav() {
   syncMessageReadAction();
 }
 
+function syncMineTabUI(route = S.route) {
+  root().querySelectorAll('.mine-subnav [data-action="mine-tab"]').forEach((button) => {
+    const active = button.dataset.tab === route;
+    button.classList.toggle("on", active);
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
+  });
+  const panel = $("mine-tab-panel");
+  if (panel) panel.setAttribute("aria-labelledby", `mine-tab-${route}`);
+}
+
 function centerActiveRelationshipTab() {
   requestAnimationFrame(() => {
     const tabs = root().querySelector(".relationship-tabs");
@@ -1614,6 +1632,12 @@ function socialRouteHash(tab = S.socialTab, visitorTab = S.visitorTab) {
   return `#/social?${params.toString()}`;
 }
 
+function routeHash(route) {
+  if (route === "social") return socialRouteHash();
+  if (route === "match") return matchRouteHash();
+  return `#/${route}`;
+}
+
 function go(id, options = {}) {
   const target = isRouteAllowed(id) ? id : "nearby";
   closeDrawer();
@@ -1631,7 +1655,7 @@ function go(id, options = {}) {
         (options.visitorTab || currentParams.get("view")) === "seen_by_me" ? "seen_by_me" : "seen_me";
     }
   }
-  const hash = target === "social" ? socialRouteHash() : target === "match" ? matchRouteHash() : `#/${target}`;
+  const hash = routeHash(target);
   if (options.replace) {
     history.replaceState(null, "", hash);
     void activateRoute(target, { force: Boolean(options.force) });
@@ -1639,6 +1663,59 @@ function go(id, options = {}) {
     location.hash = hash;
   } else if (options.force) {
     void activateRoute(target, { force: true });
+  }
+}
+
+async function switchMineTab(id, { force = false, replace = false } = {}) {
+  const target = isMineRoute(id) ? id : "me";
+  const panel = $("mine-tab-panel");
+  if (!isMineRoute(S.route) || !panel) {
+    go(target, { force, replace });
+    return;
+  }
+  if (target === S.route && !force) return;
+
+  if (S.routeController) S.routeController.abort();
+  const controller = new AbortController();
+  const seq = ++S.routeSeq;
+  const previousRoute = S.route;
+  S.routeController = controller;
+  S.route = target;
+  root().classList.remove("message-route");
+  document.body.classList.remove("message-route-active", "chat-conversation-open");
+  syncNav();
+  syncMineTabUI(target);
+  closeDrawer();
+  closeProfileDialog();
+
+  const hash = routeHash(target);
+  if (replace) history.replaceState(null, "", hash);
+  else if (location.hash !== hash) history.pushState(null, "", hash);
+
+  S.pageCache.delete(routeCacheKey(target));
+  panel.setAttribute("aria-busy", "true");
+  panel.classList.add("is-loading");
+
+  try {
+    const page = PAGE_RENDERERS[target] || pageMe;
+    const html = await page(controller.signal);
+    if (controller.signal.aborted || seq !== S.routeSeq || S.route !== target) return;
+    panel.innerHTML = html;
+    hydrateRenderedRoute(target, controller.signal, seq);
+    void refreshVisiblePeerPresence();
+  } catch (error) {
+    if (error?.name === "AbortError" || seq !== S.routeSeq || S.route !== target) return;
+    if (error instanceof AuthExpiredError) return;
+    S.route = previousRoute;
+    syncNav();
+    syncMineTabUI(previousRoute);
+    history.replaceState(null, "", routeHash(previousRoute));
+    toast(error?.message || "页面加载失败，请稍后重试", "error", 4200);
+  } finally {
+    if (seq === S.routeSeq) {
+      panel.classList.remove("is-loading");
+      panel.removeAttribute("aria-busy");
+    }
   }
 }
 
@@ -6741,6 +6818,10 @@ async function switchSocialTab(tab, { visitorTab = S.visitorTab, force = false }
   if (S.route !== "social" || !panel) {
     S.socialTab = activeTab;
     S.visitorTab = activeVisitorTab;
+    if (isMineRoute(S.route) && $("mine-tab-panel")) {
+      await switchMineTab("social", { force: true });
+      return;
+    }
     go("social", { force: true, tab: activeTab, visitorTab: activeVisitorTab });
     return;
   }
@@ -6933,11 +7014,6 @@ async function pageMe(signal) {
       <button type="button" data-action="social-open-tab" data-tab="follows"><strong data-me-stat="follows">${esc(countAt("follows"))}</strong><span>关注</span></button>
       <button type="button" data-action="social-open-tab" data-tab="fans"><strong data-me-stat="fans">${esc(countAt("fans"))}</strong><span>粉丝</span></button>
       <button type="button" data-action="social-open-tab" data-tab="visitors" data-visitor-tab="seen_me"><strong data-me-stat="visitors">${esc(countAt("visitors"))}</strong><span>谁看过我</span></button>
-    </div></section>
-    <section class="section"><div class="quick-entry-grid me-entry-grid">
-      <button type="button" class="quick-entry" data-route="msg"><strong>我的消息</strong><span>聊天与新朋友</span></button>
-      <button type="button" class="quick-entry" data-action="moment-open-mine"><strong>我的动态</strong><span>发布内容与权限管理</span></button>
-      <button type="button" class="quick-entry" data-route="wallet"><strong>钱包与会员</strong><span>乐园币、会员与礼物</span></button>
     </div></section>
     <section class="section"><div class="form-grid">
       <form class="surface-card" data-form="profile-nick"><div class="section-head"><div><h2>修改昵称</h2><p>实名及修改次数限制由服务端决定</p></div></div><div class="field"><label for="nickname-new">新昵称</label><input id="nickname-new" name="name" maxlength="24" placeholder="输入新昵称" required /></div><button type="submit" class="btn primary full mt-sm">保存昵称</button></form>
@@ -8173,8 +8249,9 @@ function momentCardForButton(button) {
 
 async function handleAction(action, button) {
   if (action === "refresh-route") {
-    return go(S.route, { force: true });
+    return isMineRoute(S.route) ? switchMineTab(S.route, { force: true }) : go(S.route, { force: true });
   }
+  if (action === "mine-tab") return switchMineTab(button.dataset.tab);
   if (action === "logout") return logout();
   if (action === "match-tab") {
     const tab = normalizeMatchTab(button.dataset.tab);
@@ -8185,11 +8262,6 @@ async function handleAction(action, button) {
     const hadSearch = Boolean(S.momentsSearch);
     S.momentsSearch = "";
     return switchMomentsTab(tab, { force: hadSearch });
-  }
-  if (action === "moment-open-mine") {
-    S.momentsSearch = "";
-    closeProfileDialog();
-    return switchMomentsTab("我的");
   }
   if (action === "moment-clear-search") {
     S.momentsSearch = "";
@@ -9462,7 +9534,9 @@ document.addEventListener("click", (event) => {
   const routeButton = event.target.closest("[data-route]");
   if (routeButton) {
     event.preventDefault();
-    go(routeButton.dataset.route);
+    const target = routeButton.dataset.route;
+    if (isMineRoute(S.route) && isMineRoute(target) && $("mine-tab-panel")) void switchMineTab(target);
+    else go(target);
     return;
   }
   const actionButton = event.target.closest("[data-action]");
