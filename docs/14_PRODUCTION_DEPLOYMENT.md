@@ -161,10 +161,18 @@ sudo env BBW_DATA_ROOT=/var/lib/bbw bash docker/prepare-host.sh
 
 ```bash
 docker compose config --quiet
-docker compose build --pull
+docker compose build --pull app
 docker compose up -d
 docker compose ps
 ```
+
+`app`、`migrate`、`worker`、`transcode-worker` 和 `scheduler` 共用同一个
+`APP_IMAGE` 与 Dockerfile。禁止在本项目中执行不带服务名的
+`docker compose build --pull`：Compose 会并行构建多个目标，多个 BuildKit
+导出器同时写入同一镜像标签时会发生竞态，常见报错为
+`image "docker.io/library/bbw-app:<tag>": already exists`。使用
+`docker compose build --pull app` 只导出一次镜像，随后 `docker compose up -d`
+会让其余服务复用该标签。
 
 `migrate` 是一次性容器，先执行 `alembic upgrade head`；迁移成功后 App 和 Worker 才启动。Scheduler 只等待 Redis 并负责入队，即使更早启动，Worker 也会在迁移完成前保持未运行。项目规则禁止代理自行执行编译/构建，因此上述构建命令需要由服务器管理员实际执行。
 
@@ -300,11 +308,17 @@ docker system df
 ```bash
 git pull --ff-only
 docker compose config --quiet
-docker compose build --pull
+docker compose build --pull app
 docker compose up -d
 docker compose ps
 docker compose logs --tail 100 migrate app worker transcode-worker scheduler
 ```
+
+每次发布先在 `.env` 中把 `APP_IMAGE` 改为新的不可变版本标签，例如
+`bbw-app:2026.07.17-4`，再只构建 `app`。不要为共用该标签的每个服务分别构建，
+也不要使用无服务名的全量构建命令；否则可能在镜像导出阶段遇到上述并发冲突。
+如果误执行全量构建并在最后报错，线上旧容器通常仍未受影响；确认新标签后，
+重新执行 `docker compose build app`，成功后再运行 `docker compose up -d`。
 
 数据库迁移必须向前兼容正在运行的旧代码。涉及删除列、重写大量数据或密钥轮换时，应拆为多次发布，不能在单次启动迁移中长时间锁表。
 

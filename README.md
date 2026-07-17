@@ -307,10 +307,16 @@ sudo env BBW_DATA_ROOT=/var/lib/bbw bash docker/prepare-host.sh
 
 ```bash
 docker compose config --quiet
-docker compose build --pull
+docker compose build --pull app
 docker compose up -d
 docker compose ps
 ```
+
+应用、迁移、普通 Worker、转码 Worker 和 Scheduler 共用同一个 `APP_IMAGE`。
+不要执行不带服务名的 `docker compose build --pull`：Compose 会并行构建这些服务，
+多个 BuildKit 导出器同时写入同一镜像标签时可能以
+`image "...": already exists` 失败。只构建一次 `app`，其余服务会在
+`docker compose up -d` 时复用该镜像。
 
 首次启动顺序为 PostgreSQL、Redis、数据库迁移、App/Worker/Transcode Worker/Scheduler、Caddy。查看日志：
 
