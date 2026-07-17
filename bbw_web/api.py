@@ -24,7 +24,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 from urllib.parse import urlencode, urlparse
 
 from fastapi import FastAPI, HTTPException, Request
@@ -165,6 +165,8 @@ class CapturingHandler(legacy.Handler):
         body: bytes,
         client_ip: str,
         match_pool_online_list_enabled: Optional[bool] = None,
+        message_peer_authorizer: Optional[Callable[[str], bool]] = None,
+        message_policy_match_peers: Iterable[str] = (),
     ) -> None:
         # BaseHTTPRequestHandler.__init__ immediately starts reading a socket;
         # intentionally do not call it here.
@@ -175,6 +177,8 @@ class CapturingHandler(legacy.Handler):
         self.wfile = io.BytesIO()
         self.client_address = (client_ip, 0)
         self._request_match_pool_online_list_enabled = match_pool_online_list_enabled
+        self._request_message_peer_authorizer = message_peer_authorizer
+        self._request_message_policy_match_peers = tuple(message_policy_match_peers)
         self.request_version = "HTTP/1.1"
         self.close_connection = True
         self._held_user_lock = None
@@ -469,33 +473,6 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
                 headers={"Retry-After": "60"},
             )
 
-    if (
-        path == "/api/match/online-users"
-        and identity is not None
-        and not identity.match_pool_online_list_enabled
-    ):
-        denied = {
-            "ok": False,
-            "code": "MATCH_POOL_ONLINE_LIST_FORBIDDEN",
-            "error": "匹配池在线列表仅向管理员授权的用户开放",
-            "capabilities": {"match_pool_online_list": False},
-        }
-        try:
-            persistence.capture_product_response(
-                sid=sid,
-                identity=identity,
-                method=request.method,
-                path=path,
-                query=dict(request.query_params),
-                request_data=request_json,
-                response_data=denied,
-                status=403,
-                client_ip=client_ip,
-            )
-        except Exception:
-            LOGGER.exception("match-pool permission denial capture failed")
-        return JSONResponse(denied, status_code=403)
-
     if sid and identity is not None and legacy.STORE is not None and legacy.STORE.get(sid) is None:
         restored = persistence.restore_web_user(sid)
         if restored is not None:
@@ -563,6 +540,15 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
                 headers={"Retry-After": "900"},
             )
 
+    message_policy_match_peers: tuple[str, ...] = ()
+    if identity is not None and path == "/api/im/message-policy":
+        try:
+            message_policy_match_peers = tuple(
+                persistence.message_policy_match_peers(identity)
+            )
+        except Exception:
+            LOGGER.exception("message policy match grant lookup failed")
+
     handler = CapturingHandler(
         method=request.method,
         path=_request_path(request),
@@ -572,6 +558,16 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
         match_pool_online_list_enabled=(
             identity.match_pool_online_list_enabled if identity is not None else None
         ),
+        message_peer_authorizer=(
+            (
+                lambda peer, request_identity=identity: persistence.can_message_peer(
+                    request_identity, peer
+                )
+            )
+            if identity is not None
+            else None
+        ),
+        message_policy_match_peers=message_policy_match_peers,
     )
     try:
         if request.method == "GET":
@@ -596,6 +592,49 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
 
     response_data = _response_json(response_headers, response_body)
     new_sid = _cookie_value(response_headers, cookie_name)
+
+    message_policy_paths = {
+        "/api/match/online",
+        "/api/match/local",
+        "/api/im/conversations",
+        "/api/im/rest/send",
+        "/api/im/flash/send",
+    }
+    if identity is not None and path in message_policy_paths:
+        try:
+            persistence.remember_message_policy_response(
+                identity=identity,
+                method=request.method,
+                path=path,
+                request_data=request_json,
+                response_data=response_data,
+                status=status,
+            )
+        except Exception:
+            LOGGER.exception("message policy response persistence failed")
+            if (
+                path in {"/api/match/online", "/api/match/local"}
+                and status < 400
+                and response_data.get("ok") is True
+            ):
+                web_user = (
+                    legacy.STORE.get(sid)
+                    if sid and legacy.STORE is not None
+                    else None
+                )
+                if web_user is not None:
+                    with web_user.lock:
+                        web_user.match_message_peers.difference_update(
+                            legacy._message_peer_ids(response_data)
+                        )
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "code": "MATCH_DM_GRANT_PERSISTENCE_FAILED",
+                        "error": "匹配结果暂时无法建立受控私信权限，请稍后重试",
+                    },
+                    status_code=503,
+                )
 
     is_login_path = path in {"/api/auth/login", "/api/auth/sms-login"}
     if is_login_path and not response_data.get("ok"):

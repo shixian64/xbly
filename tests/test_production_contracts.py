@@ -159,6 +159,34 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn('id="admin-match-pool-online-list-dialog"', html)
         self.assertIn('featureInput.setAttribute("role", "switch")', js)
         self.assertIn("user.match_pool_online_list_changed", api)
+        self.assertIn("修改非匹配主动私信授权", html)
+        self.assertIn("非匹配主动私信", js)
+        self.assertIn("在线用户列表、资料、动态和好友申请始终可用", js)
+
+    def test_private_message_policy_uses_server_owned_match_and_conversation_grants(self) -> None:
+        persistence = self.read("bbw_web/persistence.py")
+        api = self.read("bbw_web/api.py")
+
+        for marker in (
+            'MESSAGE_POLICY_PROVIDER = "web-policy"',
+            'MESSAGE_POLICY_MATCH_KIND = "match"',
+            'MESSAGE_POLICY_CONVERSATION_KIND = "message_peer"',
+            "def grant_message_peers(",
+            "def can_message_peer(",
+            "def message_policy_match_peers(",
+            "def remember_message_policy_response(",
+            '"/api/match/online"',
+            '"/api/match/local"',
+            '"/api/im/conversations"',
+            '"/api/im/rest/send"',
+            '"/api/im/flash/send"',
+        ):
+            self.assertIn(marker, persistence)
+        self.assertIn("identity.match_pool_online_list_enabled", persistence)
+        self.assertIn("metadata[\"server_owned\"] = True", persistence)
+        self.assertIn("persistence.can_message_peer(", api)
+        self.assertIn("MATCH_DM_GRANT_PERSISTENCE_FAILED", api)
+        self.assertIn("persistence.remember_message_policy_response(", api)
 
     def test_admin_user_detail_race_and_sensitive_field_contracts(self) -> None:
         js = self.read("bbw_web/static/admin.js")

@@ -158,8 +158,13 @@ class FlashBffRoutingTests(unittest.TestCase):
     def tearDown(self) -> None:
         bff_server.STORE = self.old_store
 
-    def _run(self, path, data, app, upload=None):
-        web_user = SimpleNamespace(app=app)
+    def _run(self, path, data, app, upload=None, permission=None, match_peers=None):
+        values = {"app": app}
+        if permission is not None:
+            values["match_pool_online_list_enabled"] = bool(permission)
+        if match_peers is not None:
+            values["match_message_peers"] = set(match_peers)
+        web_user = SimpleNamespace(**values)
 
         class Harness:
             def __init__(self):
@@ -215,7 +220,14 @@ class FlashBffRoutingTests(unittest.TestCase):
             "size": 5,
         }
         with patch.object(flash, "upload_image", return_value=uploaded):
-            response = self._run("/api/im/flash/send", {"peer": "9"}, app, upload)
+            response = self._run(
+                "/api/im/flash/send",
+                {"peer": "9"},
+                app,
+                upload,
+                permission=False,
+                match_peers={"9"},
+            )
 
         self.assertEqual(response[0], 200)
         self.assertTrue(response[1]["ok"])
@@ -244,6 +256,24 @@ class FlashBffRoutingTests(unittest.TestCase):
         self.assertEqual(response[1]["path"], "images/202607/a.png")
         self.assertEqual(response[1]["url"], "https://oss.banghua.xin/images/202607/a.png")
         self.assertNotIn("data", response[1])
+
+    def test_flash_send_is_denied_before_upload_without_permission_or_match(self) -> None:
+        app = SimpleNamespace(session=SimpleNamespace(uid="42"), im=SimpleNamespace())
+        upload = flash.UploadPart("x.jpg", "image/jpeg", b"\xff\xd8\xff\xe0x")
+
+        with patch.object(flash, "upload_image") as upload_image:
+            response = self._run(
+                "/api/im/flash/send",
+                {"peer": "9"},
+                app,
+                upload,
+                permission=False,
+                match_peers=set(),
+            )
+
+        self.assertEqual(response[0], 403)
+        self.assertEqual(response[1]["code"], "PRIVATE_MESSAGE_PERMISSION_REQUIRED")
+        upload_image.assert_not_called()
 
     def test_rest_fallback_rejects_non_text_without_sending(self) -> None:
         app = SimpleNamespace(session=SimpleNamespace(uid="42"))

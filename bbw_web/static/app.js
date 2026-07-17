@@ -35,6 +35,7 @@ const SYSTEM_CUSTOMER_SERVICE_UID = "1";
 const MESSAGE_SYNC_TICK_MS = 3000;
 const MESSAGE_SUMMARY_CHAT_MS = 25 * 1000;
 const MESSAGE_SUMMARY_BACKGROUND_MS = 60 * 1000;
+const MESSAGE_POLICY_SYNC_MS = 5000;
 const MESSAGE_PEER_SYNC_REALTIME_MS = 10 * 1000;
 const MESSAGE_PEER_SYNC_FALLBACK_MS = 8 * 1000;
 const CONVERSATION_REFRESH_MIN_MS = 8 * 1000;
@@ -65,7 +66,8 @@ const S = {
   inviteLoginAvailable: null,
   labEnabled: false,
   roomkitAvailable: false,
-  matchPoolOnlineListEnabled: false,
+  proactivePrivateMessageEnabled: false,
+  matchMessagePeers: new Set(),
   routeController: null,
   routeSeq: 0,
   pageCache: new Map(),
@@ -138,6 +140,7 @@ const S = {
   messageSyncChannel: null,
   authenticatedServicesTimer: null,
   authenticatedServicesPending: false,
+  messageLastPolicySyncAt: 0,
   messageLastSummarySyncAt: 0,
   messageLastPeerSyncAt: 0,
   messageLastPeerSyncPeer: "",
@@ -1112,7 +1115,8 @@ function applyUser(user) {
   avatar.replaceChildren();
   avatar.hidden = true;
   if (!user) {
-    S.matchPoolOnlineListEnabled = false;
+    S.proactivePrivateMessageEnabled = false;
+    S.matchMessagePeers.clear();
     $("side-name").textContent = "游客";
     $("side-meta").textContent = "尚未登录";
     return;
@@ -1150,14 +1154,23 @@ function applyUser(user) {
 
 function applyCapabilities(capabilities) {
   if (!capabilities || typeof capabilities !== "object") return;
-  if (Object.prototype.hasOwnProperty.call(capabilities, "match_pool_online_list")) {
-    const enabled = capabilities.match_pool_online_list === true;
-    if (enabled !== S.matchPoolOnlineListEnabled) {
-      S.matchPoolOnlineListEnabled = enabled;
+  if (Object.prototype.hasOwnProperty.call(capabilities, "proactive_private_message")) {
+    const enabled = capabilities.proactive_private_message === true;
+    if (enabled !== S.proactivePrivateMessageEnabled) {
+      S.proactivePrivateMessageEnabled = enabled;
       S.pageCache.delete("nearby");
       [...S.pageCache.keys()].forEach((key) => {
         if (String(key).startsWith("match:")) S.pageCache.delete(key);
       });
+      S.pageCache.clear();
+      syncPrivateMessageControls();
+      if (S.authenticated && (S.imMode || S.chat || S.imConnecting)) {
+        void cleanupIM().finally(() => {
+          if (!S.authenticated) return;
+          S.imNextReconnectAt = 0;
+          void ensureTimConnected({ force: true, background: true });
+        });
+      }
     }
   }
 }
@@ -1265,6 +1278,17 @@ function updateUnreadBadges() {
     badge.textContent = S.unreadTotal > 99 ? "99+" : String(S.unreadTotal || 0);
     badge.classList.toggle("hide", !S.unreadTotal);
   });
+}
+
+function refreshMessagePolicy() {
+  return api("/api/im/message-policy", { timeout: 6000 })
+    .then(({ data }) => {
+      applyCapabilities(data.capabilities);
+      rememberMessagePolicyMatchPeers(data.match_peers);
+      syncPrivateMessageControls({ refreshChat: false });
+      return data.capabilities || {};
+    })
+    .catch(() => ({}));
 }
 
 function messageSyncAccountId() {
@@ -1392,6 +1416,10 @@ function syncMessagesInBackground({ force = false } = {}) {
   if (!S.authenticated || document.hidden) return Promise.resolve([]);
   const now = Date.now();
   const tasks = [];
+  if (force || now - S.messageLastPolicySyncAt >= MESSAGE_POLICY_SYNC_MS) {
+    S.messageLastPolicySyncAt = now;
+    tasks.push(refreshMessagePolicy());
+  }
   if (S.route === "msg" && S.activePeer) {
     const peerInterval = S.imConnected && S.imMode === "sdk"
       ? MESSAGE_PEER_SYNC_REALTIME_MS
@@ -2006,6 +2034,69 @@ async function refreshVisiblePeerPresence({ force = false } = {}) {
   }
 }
 
+function hasExistingConversation(uid) {
+  const target = String(uid || "").trim();
+  if (!target) return false;
+  return S.conversations.some((item) => {
+    if (conversationPeer(item) !== target) return false;
+    if (String(item?.source || "").toLowerCase() !== "local") return true;
+    return Boolean(item?.last_message || item?.message || item?.content || item?.text);
+  });
+}
+
+function canStartPrivateChat(uid) {
+  const target = String(uid || "").trim();
+  const currentUid = String(S.user?.uid || S.user?.id || "").trim();
+  if (
+    !target ||
+    ["0", "none", "null"].includes(target.toLowerCase()) ||
+    target === currentUid ||
+    isSystemCustomerServicePeer(target)
+  ) {
+    return false;
+  }
+  return (
+    S.proactivePrivateMessageEnabled ||
+    S.matchMessagePeers.has(target) ||
+    hasExistingConversation(target)
+  );
+}
+
+function rememberMatchMessagePeers(data) {
+  if (!data || data.ok !== true) return;
+  rememberMessagePolicyMatchPeers(
+    itemsOf(data).map((item) => item?.user_id || item?.uid || item?.id)
+  );
+}
+
+function rememberMessagePolicyMatchPeers(values) {
+  (Array.isArray(values) ? values : []).forEach((value) => {
+    const uid = String(value || "").trim();
+    if (
+      uid &&
+      !["0", "none", "null"].includes(uid.toLowerCase()) &&
+      uid !== String(S.user?.uid || S.user?.id || "")
+    ) {
+      S.matchMessagePeers.add(uid);
+    }
+  });
+}
+
+function syncPrivateMessageControls({ refreshChat = true } = {}) {
+  document.querySelectorAll('[data-action="open-chat"]').forEach((button) => {
+    const allowed = canStartPrivateChat(button.dataset.uid);
+    button.hidden = !allowed;
+    button.classList.toggle("hide", !allowed);
+    button.setAttribute("aria-disabled", String(!allowed));
+  });
+  if (refreshChat && S.route === "msg") {
+    refreshMessageConversationRegion({
+      refreshList: false,
+      refreshPane: document.activeElement?.matches?.("#im-text") !== true,
+    });
+  }
+}
+
 function userCard(item, options = {}) {
   const user = item && typeof item === "object" ? item : { nickname: String(item || "用户") };
   const id = String(user.user_id || user.uid || user.id || "");
@@ -2018,10 +2109,27 @@ function userCard(item, options = {}) {
       applyId
     )}" data-uid="${esc(id)}">同意</button>`);
   }
+  if (options.addFriend && id) {
+    const isFriend = user.is_friend === true || String(user.is_friend || "") === "1";
+    const isApplied = user.is_friend_apply === true || String(user.is_friend_apply || "") === "1";
+    if (isFriend) {
+      actions.push('<button type="button" class="btn soft small" disabled>已是好友</button>');
+    } else if (isApplied) {
+      actions.push('<button type="button" class="btn soft small" disabled>已申请</button>');
+    } else {
+      actions.push(`<button type="button" class="btn soft small" data-action="add-friend" data-uid="${esc(
+        id
+      )}">申请好友</button>`);
+    }
+  }
+  const chatOrigin = String(options.chatOrigin || "").trim();
   if (options.chat && id) {
-    actions.push(`<button type="button" class="btn primary small" data-action="open-chat" data-uid="${esc(id)}" data-name="${esc(
+    const chatAllowed = canStartPrivateChat(id);
+    actions.push(`<button type="button" class="btn primary small${chatAllowed ? "" : " hide"}" data-action="open-chat" data-uid="${esc(id)}" data-name="${esc(
       name
-    )}" data-avatar="${esc(user.avatar || user.portrait || "")}">聊天</button>`);
+    )}" data-avatar="${esc(user.avatar || user.portrait || "")}"${
+      chatOrigin ? ` data-chat-origin="${esc(chatOrigin)}"` : ""
+    } aria-disabled="${String(!chatAllowed)}"${chatAllowed ? "" : " hidden"}>聊天</button>`);
   }
   if (options.follow && id) {
     actions.push(`<button type="button" class="btn soft small" data-action="follow-user" data-uid="${esc(id)}">关注</button>`);
@@ -2033,7 +2141,9 @@ function userCard(item, options = {}) {
     actions.push(`<button type="button" class="btn secondary small" data-action="unblock-user" data-uid="${esc(id)}">移出黑名单</button>`);
   }
   if (options.profile !== false && id) {
-    actions.push(`<button type="button" class="btn soft small" data-action="open-profile" data-uid="${esc(id)}">资料</button>`);
+    actions.push(`<button type="button" class="btn soft small" data-action="open-profile" data-uid="${esc(id)}"${
+      chatOrigin ? ` data-chat-origin="${esc(chatOrigin)}"` : ""
+    }>资料</button>`);
   }
   const presence = options.presence && id ? presenceBadgeHtml(id, user) : "";
   return `<article class="user-card">
@@ -4401,9 +4511,18 @@ function chatPaneHtml() {
     ? '<button type="button" class="utility-btn conversation-expand-toggle" data-action="toggle-conversation-list" aria-expanded="false" aria-label="横向展开聊天列表" title="横向展开聊天列表">展开聊天列表</button>'
     : "";
   if (!S.activePeer) {
-    return `<div class="chat-placeholder"><div><strong>选择一段聊天</strong><span>${S.conversationListCollapsed ? "展开聊天列表后选择最近会话，或从通讯录开始聊天。" : "在左侧打开最近会话，或从通讯录开始聊天。"}</span><div class="chat-placeholder-actions">${expandListButton}<button type="button" class="btn primary small" data-action="social-open-tab" data-tab="friends">打开通讯录</button></div></div></div>`;
+    const startHint = S.proactivePrivateMessageEnabled
+      ? "也可以从通讯录、访客或资料页主动发起私信。"
+      : "也可以先完成一次在线或同城匹配。";
+    const startAction = S.proactivePrivateMessageEnabled
+      ? '<button type="button" class="btn primary small" data-action="social-open-tab" data-tab="friends">打开通讯录</button>'
+      : '<button type="button" class="btn primary small" data-route="match">开始匹配</button>';
+    return `<div class="chat-placeholder"><div><strong>选择一段聊天</strong><span>${
+      S.conversationListCollapsed ? "展开聊天列表后选择最近会话。" : "在左侧打开最近会话。"
+    }${startHint}</span><div class="chat-placeholder-actions">${expandListButton}${startAction}</div></div></div>`;
   }
   const conversation = activeConversation() || {};
+  const canSendPrivateMessage = canStartPrivateChat(S.activePeer);
   return `<div class="chat-head"><button type="button" class="utility-btn mobile-only" data-action="close-conversation">返回</button>${expandListButton}<div><h2>${esc(
     S.activePeerName || `用户 ${S.activePeer}`
   )}</h2><p class="chat-peer-presence">${presenceBadgeHtml(
@@ -4417,7 +4536,9 @@ function chatPaneHtml() {
     ${
       isSystemCustomerServicePeer(S.activePeer)
         ? '<div class="chat-readonly-notice">系统客服消息无需回复</div>'
-        : chatComposerHtml()
+        : canSendPrivateMessage
+          ? chatComposerHtml()
+          : '<div class="chat-readonly-notice">该私信入口需要管理员授权；匹配成功后可以继续聊天</div>'
     }`;
 }
 
@@ -4952,6 +5073,10 @@ async function sendTimMediaFile(kind, file, meta = {}) {
     revokeChatObjectUrl(meta.localUrl);
     throw new Error("系统客服消息无需回复");
   }
+  if (!canStartPrivateChat(peer)) {
+    revokeChatObjectUrl(meta.localUrl);
+    throw new Error("该私信入口仅向管理员授权的用户开放");
+  }
   const retryMessageID = String(meta.retryMessageId || "");
   const previous = retryMessageID ? findChatMessage(retryMessageID, peer) : null;
   const pendingID = previous?.id || localMessageID(kind);
@@ -5192,6 +5317,7 @@ async function sendFlashPhoto(file, { retryMessageId = "" } = {}) {
   validateChatFile("flash", file);
   const peer = String(S.activePeer || "").trim();
   if (!peer) throw new Error("请先选择聊天对象");
+  if (!canStartPrivateChat(peer)) throw new Error("该私信入口仅向管理员授权的用户开放");
   const previous = retryMessageId ? findChatMessage(retryMessageId, peer) : null;
   const pendingID = previous?.id || localMessageID("flash");
   const pending = {
@@ -5286,6 +5412,7 @@ async function sendChatSticker(index, data, { retryMessageId = "" } = {}) {
   const peer = String(S.activePeer || "").trim();
   const faceData = String(data || "").trim();
   if (!peer || !faceData) throw new Error("表情包数据不完整");
+  if (!canStartPrivateChat(peer)) throw new Error("该私信入口仅向管理员授权的用户开放");
   const previous = retryMessageId ? findChatMessage(retryMessageId, peer) : null;
   const pendingID = previous?.id || localMessageID("face");
   const numericIndex = Math.max(0, Math.trunc(Number(index) || 0));
@@ -5910,7 +6037,7 @@ async function pageNearby(signal) {
   applyCapabilities(data.capabilities);
   if (data.user) applyUser(data.user);
   const [peopleResult, slideResult] = await Promise.allSettled([
-    S.matchPoolOnlineListEnabled ? api("/api/match/online-users?page=1", { signal }) : Promise.resolve(null),
+    api("/api/match/online-users?page=1", { signal }),
     api("/api/slide", { signal }),
   ]);
   if (peopleResult.status === "fulfilled" && peopleResult.value?.data) {
@@ -5920,13 +6047,18 @@ async function pageNearby(signal) {
   const name = user.nickname || "新朋友";
   const heartbeat = data.heartbeat && data.heartbeat.running ? "在线状态已同步" : "当前在线";
   const people =
-    S.matchPoolOnlineListEnabled && peopleResult.status === "fulfilled" && peopleResult.value
+    peopleResult.status === "fulfilled" && peopleResult.value
       ? itemsOf(peopleResult.value.data)
       : [];
   const slides = slideResult.status === "fulfilled" ? itemsOf(slideResult.value.data) : [];
-  const welcomeTitle = S.matchPoolOnlineListEnabled ? `${name}，看看现在谁在线` : `${name}，开始一次新的相遇`;
+  const welcomeTitle = `${name}，看看现在谁在线`;
+  const welcomeDetail = user.is_realname
+    ? S.proactivePrivateMessageEnabled
+      ? "可以从资料、共同话题或一条礼貌的消息开始认识对方。"
+      : "可以查看资料、动态或申请添加好友；匹配成功后可以向对方发起私信。"
+    : "完成实名后可使用更多匹配和互动能力。";
   return `<section class="welcome-strip"><div><span>${esc(heartbeat)}</span><h2>${esc(welcomeTitle)}</h2><p>${
-    user.is_realname ? "可以从资料、共同话题或一条礼貌的消息开始认识对方。" : "完成实名后可使用更多匹配和互动能力。"
+    welcomeDetail
   }</p></div><button type="button" class="btn primary" data-route="match">开始匹配</button></section>
     <section class="quick-entry-grid" aria-label="常用社交入口">
       <button type="button" class="quick-entry" data-route="msg"><strong>聊天列表</strong><span>继续最近的对话</span></button>
@@ -5934,18 +6066,14 @@ async function pageNearby(signal) {
       <button type="button" class="quick-entry" data-action="social-open-tab" data-tab="visitors"><strong>访客记录</strong><span>查看彼此的访问记录</span></button>
       <button type="button" class="quick-entry" data-route="moments"><strong>动态广场</strong><span>看看大家正在分享什么</span></button>
     </section>
-    ${
-      S.matchPoolOnlineListEnabled
-        ? `<section class="section"><div class="section-head"><div><h2>此刻在线</h2><p>看看谁也在寻找新的相遇</p></div><button type="button" class="btn secondary small" data-action="refresh-route">换一批</button></div>${
-            people.length
-              ? `<div class="people-grid">${people
-                  .slice(0, 18)
-                  .map((item) => userCard(item, { chat: true, profile: true }))
-                  .join("")}</div>`
-              : emptyState("暂时没有发现在线用户", "可以先去匹配页，稍后再回来看看", "match")
-          }</section>`
-        : ""
-    }
+    <section class="section"><div class="section-head"><div><h2>此刻在线</h2><p>可以查看资料、动态或申请添加好友</p></div><button type="button" class="btn secondary small" data-action="refresh-route">换一批</button></div>${
+      people.length
+        ? `<div class="people-grid">${people
+            .slice(0, 18)
+            .map((item) => userCard(item, { chat: true, profile: true, addFriend: true }))
+            .join("")}</div>`
+        : emptyState("暂时没有发现在线用户", "可以先去匹配页，稍后再回来看看", "match")
+    }</section>
     ${
       slides.length
         ? `<section class="section"><div class="section-head"><div><h2>今日话题</h2><p>找一个自然的开场方式</p></div></div><div class="slide-scroll ui-scrollbar ui-scrollbar--compact">${slides
@@ -6009,11 +6137,7 @@ async function pageMatching(signal) {
     <section class="section"><div class="section-head match-section-head"><div><h2>更多相遇方式</h2><p>换一种更轻松的方式开始交流</p></div></div><div class="match-mode-grid">
       <button type="button" class="match-mode-card is-disabled" disabled><span class="match-mode-tag">客户端专属</span><strong>语音匹配</strong><span>使用实时语音快速认识新朋友</span><small>需要官方客户端音频能力</small></button>
       <button type="button" class="match-mode-card" data-action="match-pick"><span class="match-mode-tag">轻社交</span><strong>捡漂流瓶</strong><span>读一段陌生人的心情和故事</span><small>立即捡一个漂流瓶</small></button>
-      ${
-        S.matchPoolOnlineListEnabled
-          ? '<button type="button" class="match-mode-card" data-action="match-users"><span class="match-mode-tag">匹配池</span><strong>在线列表</strong><span>看看此刻还有谁正在等待相遇</span><small>查看当前在线用户</small></button>'
-          : ""
-      }
+      <button type="button" class="match-mode-card" data-action="match-users"><span class="match-mode-tag">匹配池</span><strong>在线列表</strong><span>看看此刻还有谁正在等待相遇</span><small>可查看资料并申请添加好友</small></button>
     </div></section>
 
     <section class="section"><div class="section-head match-section-head"><div><h2>主动表达</h2><p>真诚具体的内容，更容易获得回应</p></div></div><div class="match-compose-grid">
@@ -6616,7 +6740,7 @@ function closeProfileDialog() {
   dialog.classList.remove("is-open");
 }
 
-async function openProfile(uid) {
+async function openProfile(uid, { chatOrigin = "" } = {}) {
   const target = String(uid || "").trim();
   if (!target) throw new Error("缺少用户 UID");
   const dialog = $("profile-dialog");
@@ -6634,6 +6758,7 @@ async function openProfile(uid) {
   }
   const currentUid = String(S.user?.uid || S.user?.id || "");
   const tasks = [api(`/api/profile/user?uid=${encodeURIComponent(target)}`, { signal: controller.signal })];
+  if (!canStartPrivateChat(target)) tasks.push(refreshMessagePolicy());
   if (target !== currentUid) {
     clearRelationshipCache("visitors");
     tasks.push(api("/api/social/visit", { method: "POST", body: JSON.stringify({ uid: target }), signal: controller.signal }));
@@ -6656,6 +6781,28 @@ async function openProfile(uid) {
   const name = user.nickname || user.name || `用户 ${target}`;
   const profileUid = String(user.id || user.uid || target);
   const isSelf = profileUid === currentUid;
+  const normalizedChatOrigin = String(chatOrigin || "").trim();
+  const chatAllowed = !isSelf && canStartPrivateChat(profileUid);
+  const profileIsFriend = user.is_friend === true || String(user.is_friend || "") === "1";
+  const profileFriendApplied =
+    user.is_friend_apply === true || String(user.is_friend_apply || "") === "1";
+  const chatAction =
+    !isSelf
+      ? `<button type="button" class="btn primary${chatAllowed ? "" : " hide"}" data-action="open-chat" data-uid="${esc(
+          profileUid
+        )}" data-name="${esc(name)}" data-avatar="${esc(user.avatar || user.portrait || "")}"${
+          normalizedChatOrigin ? ` data-chat-origin="${esc(normalizedChatOrigin)}"` : ""
+        } aria-disabled="${String(!chatAllowed)}"${chatAllowed ? "" : " hidden"}>聊天</button>`
+      : "";
+  const friendAction = isSelf
+    ? ""
+    : profileIsFriend
+      ? '<button type="button" class="btn soft" disabled>已是好友</button>'
+      : profileFriendApplied
+        ? '<button type="button" class="btn soft" disabled>已申请</button>'
+        : `<button type="button" class="btn soft" data-action="add-friend" data-uid="${esc(
+            profileUid
+          )}">申请好友</button>`;
   const details = [
     user.age && `${user.age} 岁`,
     user.sex || user.gender,
@@ -6669,9 +6816,7 @@ async function openProfile(uid) {
     <section class="profile-dialog-actions">${
       isSelf
         ? `<button type="button" class="btn primary" data-route="me">返回我的页面</button>`
-        : `<button type="button" class="btn primary" data-action="open-chat" data-uid="${esc(
-            profileUid
-          )}" data-name="${esc(name)}" data-avatar="${esc(user.avatar || user.portrait || "")}">聊天</button><button type="button" class="btn secondary" data-action="follow-user" data-uid="${esc(
+        : `${chatAction}${friendAction}<button type="button" class="btn secondary" data-action="follow-user" data-uid="${esc(
             profileUid
           )}">关注</button>`
     }<button type="button" class="btn soft profile-moments-button" data-action="profile-moments-toggle" data-uid="${esc(
@@ -6705,11 +6850,14 @@ async function refreshMatchStats() {
 async function runMatch(path, body = {}) {
   setPanel("match-result", loadingState("正在寻找合适的人…"));
   const { data } = await api(path, { method: "POST", body: JSON.stringify(body) });
+  if (!path.includes("bottle")) rememberMatchMessagePeers(data);
   const success = data.active_property && Array.isArray(data.filters?.properties) && data.filters.properties.length > 1
     ? `本次按属性 ${data.active_property} 匹配`
     : "请求已完成";
   toastEnv(data, success);
-  const renderer = path.includes("bottle") ? bottleCard : (item) => userCard(item, { chat: true, profile: true });
+  const renderer = path.includes("bottle")
+    ? bottleCard
+    : (item) => userCard(item, { chat: true, profile: true, chatOrigin: "match" });
   setPanel("match-result", envelopeHtml(data, renderer, "暂时没有结果", "稍后再试，或检查匹配次数"));
   await refreshMatchStats();
 }
@@ -7332,6 +7480,29 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
   S.imConnectingGeneration = sessionGeneration;
   S._imConnecting = (async () => {
     try {
+      if (!S.proactivePrivateMessageEnabled) {
+        try {
+          setImConnectingUi(true, "正在启用受控消息通道…");
+          const { data: health } = await api("/api/im/rest/health", { timeout: 12000 });
+          if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
+          if (health && (health.ok === true || Number(health.error_code) === 0)) {
+            S.imConnected = true;
+            S.imMode = "rest";
+            S.imLastError = "";
+            S.messageLastPeerSyncAt = 0;
+            addImMessage("已启用受控文本消息通道。匹配私信和已有会话可以继续使用。", "system");
+            return true;
+          }
+          S.imLastError = "受控消息通道暂时不可用；历史会话仍可查看。";
+          addImMessage(S.imLastError, "system");
+          return false;
+        } catch (error) {
+          if (error instanceof AuthExpiredError) throw error;
+          S.imLastError = error?.message || "受控消息通道连接失败";
+          addImMessage(S.imLastError, "system");
+          return false;
+        }
+      }
       try {
         await withTimeout(ensureTimSdkLoaded(), 10000, "加载实时消息组件");
       } catch (sdkErr) {
@@ -7361,11 +7532,13 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
       let lastErr = "";
       for (const prefer of order) {
         if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
+        if (!S.proactivePrivateMessageEnabled) return false;
         try {
           setImConnectingUi(true, "正在验证消息登录凭证…");
           addImMessage(`获取 TIM 凭证（${prefer}）…`, "system");
           const cred = await fetchTimCredential(prefer);
           if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
+          if (!S.proactivePrivateMessageEnabled) return false;
           addImMessage(
             `凭证就绪 source=${cred.source || prefer} uid=${cred.userID} sig_len=${cred.sig_len || String(cred.userSig).length}`,
             "system"
@@ -7373,6 +7546,10 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
           const ok = await connectTIM(cred, sessionGeneration);
           if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
           if (ok) {
+            if (!S.proactivePrivateMessageEnabled) {
+              await cleanupIM();
+              return false;
+            }
             void uploadPluginReady.then((ready) => {
               if (!ready || !S.chat || typeof S.chat.registerPlugin !== "function" || !window.TIMUploadPlugin) return;
               try {
@@ -7628,6 +7805,7 @@ async function logout() {
     S.conversationProfileLoadingUids.clear();
     S.readConversationPeers.clear();
     S.unreadTotal = 0;
+    S.messageLastPolicySyncAt = 0;
     S.messageLastSummarySyncAt = 0;
     S.messageLastPeerSyncAt = 0;
     S.messageLastPeerSyncPeer = "";
@@ -7835,7 +8013,11 @@ async function handleAction(action, button) {
     }
     return;
   }
-  if (action === "open-profile") return openProfile(button.dataset.uid);
+  if (action === "open-profile") {
+    return openProfile(button.dataset.uid, {
+      chatOrigin: button.dataset.chatOrigin || "",
+    });
+  }
   if (action === "revoke-chat-message") {
     await revokeChatMessage(button.dataset.messageId);
     return;
@@ -7955,6 +8137,10 @@ async function handleAction(action, button) {
   if (action === "open-chat" || action === "select-conversation") {
     const uid = String(button.dataset.uid || "").trim();
     if (!uid) throw new Error("缺少对方 UID");
+    if (action === "open-chat" && !canStartPrivateChat(uid)) {
+      toast("该私信入口仅向管理员授权的用户开放", "error", 4200);
+      return;
+    }
     if (uid !== S.activePeer) {
       S.imComposerPanel = "";
       setChatComposerDraft($("im-text")?.value ?? S.imComposerDraft);
@@ -8038,6 +8224,25 @@ async function handleAction(action, button) {
     }
     return;
   }
+  if (action === "add-friend") {
+    const uid = String(button.dataset.uid || "").trim();
+    if (!uid) throw new Error("缺少对方 UID");
+    const leaveWord = window.prompt("填写好友申请留言（最多 100 个字符）", "你好，想和你成为好友");
+    if (leaveWord == null) return;
+    const normalizedLeaveWord = String(leaveWord).trim();
+    if (normalizedLeaveWord.length > 100) throw new Error("好友申请留言不能超过 100 个字符");
+    const { data } = await api("/api/social/add-friend", {
+      method: "POST",
+      body: JSON.stringify({ uid, leave_word: normalizedLeaveWord }),
+    });
+    if (toastEnv(data, "好友申请已发送")) {
+      clearRelationshipCache(["friends", "apply"]);
+      button.textContent = "已申请";
+      button.disabled = true;
+      button.dataset.locked = "true";
+    }
+    return;
+  }
   if (action === "agree-friend") {
     const card = button.closest(".user-card");
     const container = card?.parentElement || null;
@@ -8095,19 +8300,18 @@ async function handleAction(action, button) {
   if (action === "match-local") return runMatch("/api/match/local");
   if (action === "match-pick") return runMatch("/api/match/bottle-pick");
   if (action === "match-users") {
-    if (!S.matchPoolOnlineListEnabled) {
-      setPanel("match-result", emptyState("在线列表未获授权", "该功能仅向管理员授权的用户开放"));
-      return;
-    }
     setPanel("match-result", loadingState("正在读取在线列表…"));
-    const { status, data } = await api("/api/match/online-users");
+    const { data } = await api("/api/match/online-users");
     applyCapabilities(data.capabilities);
-    if (status === 403 || !S.matchPoolOnlineListEnabled) {
-      button.closest(".match-mode-card")?.remove();
-      setPanel("match-result", emptyState("在线列表授权已撤销", "该功能仅向管理员授权的用户开放"));
-      return;
-    }
-    setPanel("match-result", envelopeHtml(data, (item) => userCard(item, { chat: true, profile: true }), "暂无在线用户", "稍后再来看看"));
+    setPanel(
+      "match-result",
+      envelopeHtml(
+        data,
+        (item) => userCard(item, { chat: true, profile: true, addFriend: true }),
+        "暂无在线用户",
+        "稍后再来看看"
+      )
+    );
     return;
   }
   if (action === "buy-card") {
@@ -8436,6 +8640,7 @@ async function handleProductForm(form, submitter) {
       submittedConversation.peer_name ||
       submittedConversation.user?.nickname ||
       `用户 ${peer}`;
+    if (!canStartPrivateChat(peer)) throw new Error("该私信入口仅向管理员授权的用户开放");
 
     let sentEntry = null;
     if (S.imConnected && S.imMode === "sdk" && S.chat && resolveTimApi()) {

@@ -134,7 +134,7 @@ class BeibeiwuApp:
         actions = set(cat.get("shorts", [])) | set(cat.get("dos", []))
         return sorted(actions)
 
-    def bootstrap(self) -> Dict[str, ApiResult]:
+    def bootstrap(self, *, include_im: bool = True) -> Dict[str, ApiResult]:
         """Pull common public + personal data after login (like app cold start)."""
         out: Dict[str, ApiResult] = {}
         out["ad"] = self.content.is_show_ad()
@@ -145,5 +145,6 @@ class BeibeiwuApp:
         if self.session.logged_in:
             out["me"] = self.profile.get_me()
             out["etiquette"] = self.profile.etiquette()
-            out["txim"] = self.im.tencent_sign()
+            if include_im:
+                out["txim"] = self.im.tencent_sign()
         return out

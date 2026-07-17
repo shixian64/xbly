@@ -1696,6 +1696,8 @@ def set_user_match_pool_online_list(
                     "old_enabled": old_enabled,
                     "new_enabled": new_enabled,
                     "changed": changed,
+                    "scope": ["proactive_private_message"],
+                    "online_list_always_available": True,
                 },
             )
             item = _user_public(user, account)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import unittest
 from pathlib import Path
@@ -1236,33 +1237,11 @@ class MatchRoutingContractTests(unittest.TestCase):
         bff_server.Handler.do_GET(harness)
         return calls, harness.response
 
-    def test_online_user_list_requires_explicit_administrator_grant(self) -> None:
-        for enabled in (None, False):
-            with self.subTest(enabled=enabled):
-                calls, response = self._run_online_users(
-                    enabled,
-                    "?enabled=true&admin=true",
-                )
-                self.assertEqual(calls, [])
-                self.assertEqual(response[0], 403)
-                self.assertFalse(response[1]["ok"])
-                self.assertEqual(
-                    response[1]["code"],
-                    "MATCH_POOL_ONLINE_LIST_FORBIDDEN",
-                )
-
-        calls, response = self._run_online_users(
-            True,
-            request_enabled=False,
-        )
-        self.assertEqual(calls, [])
-        self.assertEqual(response[0], 403)
-
-    def test_online_user_list_calls_upstream_only_after_grant(self) -> None:
+    def test_online_user_list_is_available_without_private_message_grant(self) -> None:
         calls, response = self._run_online_users(
             False,
-            "?page=2",
-            request_enabled=True,
+            "?page=2&enabled=true&admin=true",
+            request_enabled=False,
         )
 
         self.assertEqual(len(calls), 1)
@@ -1271,6 +1250,24 @@ class MatchRoutingContractTests(unittest.TestCase):
         self.assertEqual(response[0], 200)
         self.assertTrue(response[1]["ok"])
         self.assertTrue(response[1]["capabilities"]["match_pool_online_list"])
+        self.assertFalse(response[1]["capabilities"]["proactive_private_message"])
+
+    def test_online_user_list_reports_private_message_permission_separately(self) -> None:
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                calls, response = self._run_online_users(
+                    not enabled,
+                    request_enabled=enabled,
+                )
+
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(response[0], 200)
+                self.assertTrue(response[1]["ok"])
+                self.assertTrue(response[1]["capabilities"]["match_pool_online_list"])
+                self.assertIs(
+                    response[1]["capabilities"]["proactive_private_message"],
+                    enabled,
+                )
 
     def test_match_filter_is_saved_and_apk_profile_params_are_used(self) -> None:
         calls, session, response = self._run_match(
@@ -1363,6 +1360,216 @@ class MatchRoutingContractTests(unittest.TestCase):
         self.assertEqual(session.raw_user["match_property"], "B")
         self.assertEqual(session.raw_user["_web_match_properties_cursor"], 0)
         self.assertEqual(response[1]["active_property"], "B")
+
+
+class PrivateMessagePermissionBffContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.old_store = bff_server.STORE
+        bff_server.STORE = SimpleNamespace()
+
+    def tearDown(self) -> None:
+        bff_server.STORE = self.old_store
+
+    def _run_rest_send(self, *, enabled=False, match_peers=(), conversation_peers=(), authorizer=None):
+        calls = []
+        result = SimpleNamespace(
+            ok=True,
+            data={"MsgKey": "message-1"},
+            to_dict=lambda: {"ok": True, "error_code": 0, "data": {"MsgKey": "message-1"}},
+        )
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(
+                session=SimpleNamespace(uid="42"),
+                im=SimpleNamespace(
+                    history_message_insert=lambda **_kwargs: ApiResult(
+                        True, 200, "true", data=True
+                    )
+                ),
+            ),
+            native=SimpleNamespace(
+                tim_rest=SimpleNamespace(
+                    send_text=lambda sender, peer, text: calls.append((sender, peer, text)) or result
+                )
+            ),
+            match_pool_online_list_enabled=enabled,
+            match_message_peers=set(match_peers),
+            conversation_message_peers=set(conversation_peers),
+        )
+
+        class Harness:
+            path = "/api/im/rest/send"
+
+            def __init__(self):
+                self.response = None
+                if authorizer is not None:
+                    self._request_message_peer_authorizer = authorizer
+
+            def _check_api_origin(self):
+                return True
+
+            def body(self):
+                return {"peer": "9", "text": "你好"}
+
+            def sid(self):
+                return "sid"
+
+            def user(self, _sid):
+                return web_user
+
+            def ok(self, obj, status=200, **_kwargs):
+                self.response = (status, obj)
+                return self.response
+
+        harness = Harness()
+        bff_server.Handler.do_POST(harness)
+        return calls, harness.response
+
+    def test_non_match_new_private_message_is_denied_before_rest_send(self) -> None:
+        calls, response = self._run_rest_send()
+
+        self.assertEqual(calls, [])
+        self.assertEqual(response[0], 403)
+        self.assertEqual(response[1]["code"], "PRIVATE_MESSAGE_PERMISSION_REQUIRED")
+
+    def test_match_existing_conversation_and_live_authorizer_are_allowed(self) -> None:
+        for kwargs in (
+            {"match_peers": {"9"}},
+            {"conversation_peers": {"9"}},
+            {"authorizer": lambda peer: peer == "9"},
+        ):
+            with self.subTest(kwargs=kwargs):
+                calls, response = self._run_rest_send(**kwargs)
+                self.assertEqual(calls, [("42", "9", "你好")])
+                self.assertEqual(response[0], 200)
+                self.assertTrue(response[1]["ok"])
+
+    def test_broad_im_credentials_require_administrator_permission(self) -> None:
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(session=SimpleNamespace(uid="42")),
+            native=SimpleNamespace(
+                im=SimpleNamespace(
+                    tim_login_payload=lambda **_kwargs: self.fail("credential mint must not run")
+                )
+            ),
+            match_pool_online_list_enabled=False,
+        )
+
+        class Harness:
+            path = "/api/im/tim"
+
+            def __init__(self):
+                self.response = None
+
+            def _check_api_origin(self):
+                return True
+
+            def sid(self):
+                return "sid"
+
+            def user(self, _sid):
+                return web_user
+
+            def ok(self, obj, status=200, **_kwargs):
+                self.response = (status, obj)
+                return self.response
+
+        harness = Harness()
+        bff_server.Handler.do_GET(harness)
+
+        self.assertEqual(harness.response[0], 403)
+        self.assertEqual(harness.response[1]["code"], "IM_CREDENTIAL_PERMISSION_REQUIRED")
+
+    def test_message_policy_restores_durable_match_peers(self) -> None:
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(session=SimpleNamespace(uid="42")),
+            match_pool_online_list_enabled=False,
+            match_message_peers={"9"},
+        )
+
+        class Harness:
+            path = "/api/im/message-policy"
+
+            def __init__(self):
+                self.response = None
+                self._request_match_pool_online_list_enabled = False
+                self._request_message_policy_match_peers = ("10", "42")
+
+            def _check_api_origin(self):
+                return True
+
+            def sid(self):
+                return "sid"
+
+            def user(self, _sid):
+                return web_user
+
+            def ok(self, obj, status=200, **_kwargs):
+                self.response = (status, obj)
+                return self.response
+
+        harness = Harness()
+        bff_server.Handler.do_GET(harness)
+
+        self.assertEqual(harness.response[0], 200)
+        self.assertEqual(harness.response[1]["match_peers"], ["10", "9"])
+        self.assertFalse(
+            harness.response[1]["capabilities"]["proactive_private_message"]
+        )
+
+    def test_app_bootstrap_never_requests_or_leaks_tim_credential_when_disabled(self) -> None:
+        bootstrap_calls = []
+        credential_calls = []
+        ok = ApiResult(True, 200, "true", data=True)
+        app = SimpleNamespace(
+            session=SimpleNamespace(uid="42"),
+            bootstrap=lambda *, include_im: bootstrap_calls.append(include_im)
+            or {"me": ok},
+            whoami=lambda: {"uid": "42", "nickname": "N", "logged_in": True},
+        )
+        web_user = SimpleNamespace(
+            app=app,
+            native=SimpleNamespace(
+                im=SimpleNamespace(
+                    tim_login_payload=lambda **_kwargs: credential_calls.append(True)
+                    or {"userSig": "must-not-leak"}
+                )
+            ),
+            match_pool_online_list_enabled=False,
+            persist=lambda: None,
+        )
+
+        class Harness:
+            path = "/api/app/bootstrap"
+
+            def __init__(self):
+                self.response = None
+                self._request_match_pool_online_list_enabled = False
+
+            def _check_api_origin(self):
+                return True
+
+            def sid(self):
+                return "sid"
+
+            def user(self, _sid):
+                return web_user
+
+            def ok(self, obj, status=200, **_kwargs):
+                self.response = (status, obj)
+                return self.response
+
+        harness = Harness()
+        bff_server.Handler.do_GET(harness)
+
+        self.assertEqual(bootstrap_calls, [False])
+        self.assertEqual(credential_calls, [])
+        self.assertEqual(harness.response[0], 200)
+        self.assertEqual(
+            harness.response[1]["tim"]["code"],
+            "IM_CREDENTIAL_PERMISSION_REQUIRED",
+        )
+        self.assertNotIn("must-not-leak", json.dumps(harness.response[1]))
+        self.assertNotIn("txim", harness.response[1]["batch"])
 
 
 class ImRevokeBffContractTests(unittest.TestCase):
@@ -1511,11 +1718,10 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertTrue(match_hub_background.is_file())
         self.assertNotIn('statCard(display.online ?? "—", "在线免费")', app_js)
 
-    def test_match_pool_online_list_is_hidden_and_not_requested_without_grant(self) -> None:
+    def test_online_user_list_remains_available_for_profiles_and_friend_requests(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
         bff_server_py = (root / "bbw_web" / "bff_server.py").read_text(encoding="utf-8")
-        api_py = (root / "bbw_web" / "api.py").read_text(encoding="utf-8")
 
         nearby = app_js.split("async function pageNearby", 1)[1].split(
             "async function pageMessages", 1
@@ -1523,21 +1729,79 @@ class SocialFrontendContractTests(unittest.TestCase):
         matching = app_js.split("async function pageMatching", 1)[1].split(
             "function matchHubHeader", 1
         )[0]
-        self.assertIn("matchPoolOnlineListEnabled: false", app_js)
-        self.assertIn("applyCapabilities(data.capabilities)", nearby)
+        match_users_action = app_js.split('if (action === "match-users")', 1)[1].split(
+            'if (action === "buy-card")', 1
+        )[0]
+        user_card = app_js.split("function userCard(item, options = {})", 1)[1].split(
+            "function formatSocialTime", 1
+        )[0]
+
+        self.assertIn("proactivePrivateMessageEnabled: false", app_js)
+        self.assertIn('api("/api/match/online-users?page=1", { signal })', nearby)
+        self.assertNotIn("Promise.resolve(null)", nearby)
+        self.assertIn('data-action="match-users"', matching)
+        self.assertIn("可查看资料并申请添加好友", matching)
         self.assertIn(
-            'S.matchPoolOnlineListEnabled ? api("/api/match/online-users?page=1", { signal }) : Promise.resolve(null)',
+            "userCard(item, { chat: true, profile: true, addFriend: true })",
             nearby,
         )
-        self.assertIn("S.matchPoolOnlineListEnabled", matching)
-        self.assertIn('data-action="match-users"', matching)
+        self.assertIn(
+            "userCard(item, { chat: true, profile: true, addFriend: true })",
+            match_users_action,
+        )
+        self.assertIn("if (options.addFriend && id)", user_card)
+        self.assertIn('data-action="add-friend"', user_card)
+        self.assertIn('data-action="open-profile"', user_card)
+        self.assertIn('"match_pool_online_list": True', bff_server_py)
+        self.assertNotIn("MATCH_POOL_ONLINE_LIST_FORBIDDEN", bff_server_py)
+
+    def test_unprivileged_non_match_users_cannot_display_or_trigger_private_chat(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        bff_server_py = (root / "bbw_web" / "bff_server.py").read_text(encoding="utf-8")
+        api_py = (root / "bbw_web" / "api.py").read_text(encoding="utf-8")
+
+        can_start_private_chat = app_js.split("function canStartPrivateChat(uid)", 1)[1].split(
+            "function rememberMatchMessagePeers", 1
+        )[0]
+        user_card = app_js.split("function userCard(item, options = {})", 1)[1].split(
+            "function formatSocialTime", 1
+        )[0]
+        open_profile = app_js.split("async function openProfile", 1)[1].split(
+            "async function refreshMatchStats", 1
+        )[0]
+
+        self.assertIn("proactivePrivateMessageEnabled: false", app_js)
+        self.assertIn("matchMessagePeers: new Set()", app_js)
+        self.assertIn("S.proactivePrivateMessageEnabled", can_start_private_chat)
+        self.assertIn("S.matchMessagePeers.has(target)", can_start_private_chat)
+        self.assertIn("hasExistingConversation(target)", can_start_private_chat)
+        self.assertIn("function rememberMatchMessagePeers(data)", app_js)
+        self.assertIn("function rememberMessagePolicyMatchPeers(values)", app_js)
+        self.assertIn("rememberMessagePolicyMatchPeers(data.match_peers)", app_js)
+        self.assertIn('chatOrigin: "match"', app_js)
+        self.assertIn("const chatAllowed = canStartPrivateChat(id)", user_card)
+        self.assertIn('aria-disabled="${String(!chatAllowed)}"', user_card)
+        self.assertIn('${chatAllowed ? "" : " hidden"}>聊天</button>', user_card)
+        self.assertIn("button.hidden = !allowed", app_js)
+        self.assertIn('action === "open-chat" && !canStartPrivateChat(uid)', app_js)
+        self.assertIn("const chatAllowed = !isSelf && canStartPrivateChat(profileUid)", open_profile)
+        self.assertIn('${chatAllowed ? "" : " hidden"}>聊天</button>', open_profile)
+        self.assertIn('data-action="add-friend"', open_profile)
+        self.assertIn('api("/api/im/message-policy"', app_js)
+        self.assertIn("proactive_private_message", app_js)
+        self.assertNotIn("capabilities.match_pool_online_list === true", app_js)
         self.assertIn('S.pageCache.delete("nearby")', app_js)
-        self.assertIn('const permissionSensitiveRoute = target === "nearby" || target === "match"', app_js)
-        self.assertIn("!permissionSensitiveRoute", app_js)
-        self.assertIn("MATCH_POOL_ONLINE_LIST_FORBIDDEN", bff_server_py)
         self.assertIn("Handler.web_user_capabilities(self, u)", bff_server_py)
         self.assertIn('"_request_match_pool_online_list_enabled"', bff_server_py)
         self.assertIn("identity.match_pool_online_list_enabled", api_py)
+        self.assertIn('if path == "/api/im/message-policy"', bff_server_py)
+        self.assertIn('"match_peers": sorted(match_peers)[:5000]', bff_server_py)
+        self.assertIn("app.bootstrap(include_im=False)", bff_server_py)
+        self.assertIn("Handler.can_message_peer(self, u, to_uid)", bff_server_py)
+        self.assertIn("Handler.can_message_peer(self, u, target_id)", bff_server_py)
+        self.assertIn("IM_CREDENTIAL_PERMISSION_REQUIRED", bff_server_py)
+        self.assertIn("persistence.can_message_peer(", api_py)
 
     def test_moments_and_social_tabs_update_only_their_content_panels(self) -> None:
         root = Path(__file__).resolve().parents[1]

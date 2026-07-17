@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -1069,6 +1069,52 @@ class Handler(BaseHTTPRequestHandler):
             ),
         )
 
+    def can_message_peer(self, user: Any, peer: Any) -> bool:
+        target = str(peer or "").strip()
+        session = getattr(getattr(user, "app", None), "session", None)
+        current_uid = str(getattr(session, "uid", "") or "").strip()
+        if (
+            not target
+            or target.lower() in {"0", "none", "null"}
+            or len(target) > 128
+            or target == current_uid
+        ):
+            return False
+        if Handler.web_user_capabilities(self, user).get("proactive_private_message"):
+            return True
+        for attribute in ("match_message_peers", "conversation_message_peers"):
+            if target in set(getattr(user, attribute, set()) or set()):
+                return True
+        authorizer = getattr(self, "_request_message_peer_authorizer", None)
+        if callable(authorizer):
+            try:
+                return bool(authorizer(target))
+            except Exception:
+                return False
+        return False
+
+    def deny_private_message(self, capabilities: Dict[str, bool]) -> None:
+        self.ok(
+            {
+                "ok": False,
+                "code": "PRIVATE_MESSAGE_PERMISSION_REQUIRED",
+                "error": "该私信入口仅向管理员授权的用户开放；匹配成功的用户和已有会话不受影响",
+                "capabilities": capabilities,
+            },
+            403,
+        )
+
+    def deny_broad_im_credentials(self, capabilities: Dict[str, bool]) -> None:
+        self.ok(
+            {
+                "ok": False,
+                "code": "IM_CREDENTIAL_PERMISSION_REQUIRED",
+                "error": "实时私信凭证仅向管理员授权的用户开放；匹配私信和已有会话将使用受控消息通道",
+                "capabilities": capabilities,
+            },
+            403,
+        )
+
     def do_OPTIONS(self) -> None:  # noqa: N802
         if not self._origin_allowed():
             return self.ok({"ok": False, "error": "cross-origin request rejected"}, 403)
@@ -1190,20 +1236,28 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         if path == "/api/app/bootstrap":
+            capabilities = Handler.web_user_capabilities(self, u)
             batch = {
                 k: {"ok": v.ok, "code": v.code, "message": v.message}
-                for k, v in app.bootstrap().items()
+                for k, v in app.bootstrap(include_im=False).items()
             }
-            try:
+            if capabilities["proactive_private_message"]:
+                try:
+                    tim = {
+                        "ok": True,
+                        **u.native.im.tim_login_payload(
+                            prefer="server",
+                            allow_local_fallback=False,
+                        ),
+                    }
+                except Exception as e:
+                    tim = {"ok": False, "error": _safe_error(e, "消息登录凭证获取失败")}
+            else:
                 tim = {
-                    "ok": True,
-                    **u.native.im.tim_login_payload(
-                        prefer="server",
-                        allow_local_fallback=False,
-                    ),
+                    "ok": False,
+                    "code": "IM_CREDENTIAL_PERMISSION_REQUIRED",
+                    "error": "实时私信凭证仅向管理员授权的用户开放",
                 }
-            except Exception as e:
-                tim = {"ok": False, "error": _safe_error(e, "消息登录凭证获取失败")}
             u.persist()
             return self.ok(
                 {
@@ -1211,6 +1265,7 @@ class Handler(BaseHTTPRequestHandler):
                     "user": N.session_user_dto(app.whoami()),
                     "batch": batch,
                     "tim": tim,
+                    "capabilities": capabilities,
                 }
             )
 
@@ -1476,16 +1531,6 @@ class Handler(BaseHTTPRequestHandler):
             )
         if path == "/api/match/online-users":
             capabilities = Handler.web_user_capabilities(self, u)
-            if not capabilities["match_pool_online_list"]:
-                return self.ok(
-                    {
-                        "ok": False,
-                        "code": "MATCH_POOL_ONLINE_LIST_FORBIDDEN",
-                        "error": "匹配池在线列表仅向管理员授权的用户开放",
-                        "capabilities": capabilities,
-                    },
-                    403,
-                )
             profile = N.normalize_user(
                 getattr(app.session, "raw_user", {}) or {}
             ) or {}
@@ -1550,7 +1595,31 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         # ---- im ----
+        if path == "/api/im/message-policy":
+            match_peers = {
+                str(peer).strip()
+                for peer in (
+                    list(getattr(u, "match_message_peers", set()) or set())
+                    + list(
+                        getattr(self, "_request_message_policy_match_peers", ())
+                        or ()
+                    )
+                )
+                if str(peer).strip()
+                and str(peer).strip().lower() not in {"0", "none", "null"}
+                and str(peer).strip() != str(app.session.uid or "")
+            }
+            return self.ok(
+                {
+                    "ok": True,
+                    "capabilities": Handler.web_user_capabilities(self, u),
+                    "match_peers": sorted(match_peers)[:5000],
+                }
+            )
         if path == "/api/im/tim":
+            capabilities = Handler.web_user_capabilities(self, u)
+            if not capabilities["proactive_private_message"]:
+                return Handler.deny_broad_im_credentials(self, capabilities)
             # Prefer server UserSig (tximsign.php puts sig in message=).
             # Product routes must never mint a local UserSig implicitly.  Deployments
             # without control of the upstream TIM application degrade to HTTP history.
@@ -1584,6 +1653,9 @@ class Handler(BaseHTTPRequestHandler):
                     400,
                 )
         if path == "/api/im/rong":
+            capabilities = Handler.web_user_capabilities(self, u)
+            if not capabilities["proactive_private_message"]:
+                return Handler.deny_broad_im_credentials(self, capabilities)
             c = u.native.im.rong_register()
             return self.ok({"ok": c.ok, **c.to_dict()})
         if path == "/api/im/rest/health":
@@ -1674,6 +1746,9 @@ class Handler(BaseHTTPRequestHandler):
             }
             return self.ok(payload)
         if path == "/api/im/bootstrap":
+            capabilities = Handler.web_user_capabilities(self, u)
+            if not capabilities["proactive_private_message"]:
+                return Handler.deny_broad_im_credentials(self, capabilities)
             try:
                 return self.ok(
                     u.native.im.bootstrap(
@@ -1689,13 +1764,21 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/im/stickers":
             return self.ok(RE(app.im.stickers(), "sticker"))
         if path == "/api/im/conversations":
-            return self.ok(
-                conversation_envelope(
-                    app,
-                    app.im.history_conversations(q("page", "1")),
-                    u.profile_cache,
-                )
+            payload = conversation_envelope(
+                app,
+                app.im.history_conversations(q("page", "1")),
+                u.profile_cache,
             )
+            conversation_peers = getattr(u, "conversation_message_peers", None)
+            if conversation_peers is None:
+                conversation_peers = set()
+                setattr(u, "conversation_message_peers", conversation_peers)
+            conversation_peers.update(
+                peer
+                for peer in _message_peer_ids(payload)
+                if peer != str(app.session.uid or "")
+            )
+            return self.ok(payload)
         if path == "/api/im/messages":
             peer = q("peer") or q("uid") or q("yourid")
             if not peer:
@@ -1909,6 +1992,37 @@ class Handler(BaseHTTPRequestHandler):
                 )
             if path == "/api/social/unfollow":
                 return self.ok(R(app.social.unfollow(str(data.get("uid") or data.get("you") or ""))))
+            if path == "/api/social/add-friend":
+                current_uid = str(app.session.uid or "").strip()
+                target_uid = str(data.get("uid") or data.get("target_uid") or "").strip()
+                leave_word = str(
+                    data.get("leave_word")
+                    or data.get("yourwords")
+                    or data.get("message")
+                    or ""
+                ).strip()
+                if not target_uid or len(target_uid) > 128:
+                    return self.ok({"ok": False, "error": "缺少有效的目标用户 UID"}, 400)
+                if target_uid == current_uid:
+                    return self.ok({"ok": False, "error": "不能申请添加自己为好友"}, 400)
+                if len(leave_word) > 100:
+                    return self.ok({"ok": False, "error": "好友申请留言不能超过 100 个字符"}, 400)
+                if not self._allow_sensitive_action(
+                    "friend-request",
+                    current_uid or self.sid() or "-",
+                    limit=10,
+                    window_sec=60.0,
+                ):
+                    return
+                return self.ok(
+                    R(
+                        app.social.add_friend(
+                            target_uid,
+                            leave_word or "你好，想和你成为好友",
+                        ),
+                        empty_ok=True,
+                    )
+                )
             if path == "/api/social/agree-friend":
                 current_uid = str(app.session.uid or "")
                 applicant_uid = str(data.get("uid") or "").strip()
@@ -1976,6 +2090,9 @@ class Handler(BaseHTTPRequestHandler):
                 from_uid = str(app.session.uid or "").strip()
                 if not from_uid:
                     return self.ok({"ok": False, "error": "当前会话无 uid"}, 400)
+                capabilities = Handler.web_user_capabilities(self, u)
+                if not Handler.can_message_peer(self, u, to_uid):
+                    return Handler.deny_private_message(self, capabilities)
                 r = u.native.tim_rest.send_text(from_uid, to_uid, text)
                 # Best-effort: also mirror into banghua history if action exists.
                 hist = None
@@ -2008,6 +2125,11 @@ class Handler(BaseHTTPRequestHandler):
                     out["history_mirror"] = hist
                 if r.ok:
                     out["message"] = "已通过文本备用通道发送"
+                    conversation_peers = getattr(u, "conversation_message_peers", None)
+                    if conversation_peers is None:
+                        conversation_peers = set()
+                        setattr(u, "conversation_message_peers", conversation_peers)
+                    conversation_peers.add(to_uid)
                 return self.ok(out, 200 if r.ok else 400)
 
             if path == "/api/im/rest/revoke":
@@ -2058,6 +2180,9 @@ class Handler(BaseHTTPRequestHandler):
                         or data.get("target_id")
                         or data.get("to")
                     )
+                    capabilities = Handler.web_user_capabilities(self, u)
+                    if not Handler.can_message_peer(self, u, target_id):
+                        return Handler.deny_private_message(self, capabilities)
                     uploaded = F.upload_image(app.im, flash_upload.data)
                     try:
                         result = app.im.flash_photo_send(
@@ -2075,6 +2200,11 @@ class Handler(BaseHTTPRequestHandler):
                     if unique_id:
                         payload["uniqueid"] = unique_id
                     if payload.get("ok"):
+                        conversation_peers = getattr(u, "conversation_message_peers", None)
+                        if conversation_peers is None:
+                            conversation_peers = set()
+                            setattr(u, "conversation_message_peers", conversation_peers)
+                        conversation_peers.add(target_id)
                         payload.update(
                             {
                                 "path": uploaded["path"],
@@ -2344,6 +2474,16 @@ class Handler(BaseHTTPRequestHandler):
                 payload["active_property"] = active_property
                 if len(properties) > 1:
                     payload["filter_strategy"] = "round_robin"
+                if payload.get("ok"):
+                    match_peers = getattr(u, "match_message_peers", None)
+                    if match_peers is None:
+                        match_peers = set()
+                        setattr(u, "match_message_peers", match_peers)
+                    match_peers.update(
+                        peer
+                        for peer in _message_peer_ids(payload)
+                        if peer != str(app.session.uid or "")
+                    )
                 return self.ok(payload)
             if path == "/api/match/remove":
                 return self.ok(
@@ -2694,6 +2834,34 @@ def _saved_match_properties(raw_user: Dict[str, Any], fallback: str) -> List[str
     return [fallback] if fallback in N.MATCH_PROPERTIES else ["双"]
 
 
+def _message_peer_ids(payload: Any) -> Set[str]:
+    if not isinstance(payload, Mapping):
+        return set()
+    rows = payload.get("items") or payload.get("list") or []
+    if not isinstance(rows, list):
+        return set()
+    peers: Set[str] = set()
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        value = (
+            row.get("peer_id")
+            or row.get("conversation_user")
+            or row.get("user_id")
+            or row.get("uid")
+            or row.get("id")
+        )
+        peer = str(value or "").strip()
+        if (
+            peer
+            and peer.lower() not in {"0", "none", "null"}
+            and len(peer) <= 128
+            and not any(ord(char) < 33 for char in peer)
+        ):
+            peers.add(peer)
+    return peers
+
+
 def _as_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -2739,7 +2907,8 @@ def _web_user_capabilities(
         else bool(match_pool_online_list_enabled)
     )
     return {
-        "match_pool_online_list": enabled,
+        "match_pool_online_list": True,
+        "proactive_private_message": enabled,
     }
 
 
@@ -2748,7 +2917,7 @@ def _features() -> List[Dict[str, str]]:
 
 
 FEATURES: List[Dict[str, str]] = [
-    {"id": "nearby", "name": "身边", "desc": "在线用户、资料与聊天入口"},
+    {"id": "nearby", "name": "身边", "desc": "在线用户、资料与好友申请"},
     {"id": "msg", "name": "消息", "desc": "历史会话、未读数与受控实时聊天"},
     {"id": "match", "name": "匹配", "desc": "在线同城、漂流瓶与约会"},
     {"id": "moments", "name": "动态", "desc": "多分类动态流、点赞与评论"},

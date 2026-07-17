@@ -104,6 +104,8 @@ class WebUser:
     label: str = ""  # optional display label
     persist_sessions: bool = False
     match_pool_online_list_enabled: bool = False
+    match_message_peers: set[str] = field(default_factory=set, repr=False)
+    conversation_message_peers: set[str] = field(default_factory=set, repr=False)
     pending_until: Optional[float] = field(default=None, repr=False)
     profile_cache: Dict[str, tuple[float, Optional[Dict[str, Any]]]] = field(
         default_factory=dict,
@@ -206,8 +208,10 @@ class WebUser:
         }
 
     def capabilities(self) -> Dict[str, bool]:
+        enabled = bool(self.match_pool_online_list_enabled)
         return {
-            "match_pool_online_list": bool(self.match_pool_online_list_enabled),
+            "match_pool_online_list": True,
+            "proactive_private_message": enabled,
         }
 
 

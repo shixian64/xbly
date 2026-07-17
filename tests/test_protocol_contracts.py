@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bbw_protocol.adapters.pay import PayAdapter  # noqa: E402
+from bbw_protocol.app import BeibeiwuApp  # noqa: E402
 from bbw_protocol.cli import build_parser  # noqa: E402
 from bbw_protocol.client import ApiResult, _parse_result  # noqa: E402
 from bbw_protocol.modules.im import ImAPI  # noqa: E402
@@ -80,6 +81,32 @@ class ParseResultContractTests(unittest.TestCase):
         result = _parse_result(500, "[]", {})
         self.assertFalse(result.ok)
         self.assertEqual(result.data, [])
+
+
+class BootstrapContractTests(unittest.TestCase):
+    def test_product_bootstrap_can_skip_tencent_usersig_request(self) -> None:
+        calls = []
+        ok = ApiResult(True, 200, "true", data=True)
+        app = BeibeiwuApp.__new__(BeibeiwuApp)
+        app.content = SimpleNamespace(
+            is_show_ad=lambda: ok,
+            gift_list=lambda: ok,
+            recommend=lambda: ok,
+            chat_censorship=lambda: ok,
+        )
+        app.misc = SimpleNamespace(update_online=lambda **_kwargs: ok)
+        app.session = SimpleNamespace(logged_in=True)
+        app.profile = SimpleNamespace(get_me=lambda: ok, etiquette=lambda: ok)
+        app.im = SimpleNamespace(
+            tencent_sign=lambda: calls.append("txim") or ApiResult(
+                True, 200, "secret-usersig", data="secret-usersig"
+            )
+        )
+
+        result = app.bootstrap(include_im=False)
+
+        self.assertEqual(calls, [])
+        self.assertNotIn("txim", result)
 
 
 class NormalizerContractTests(unittest.TestCase):

@@ -85,7 +85,7 @@ const ADMIN_FIELD_LABELS = Object.freeze({
   media_quota_bytes: "媒体额度",
   media_used_bytes: "媒体已用空间",
   chat_retention_days: "聊天保存天数",
-  match_pool_online_list_enabled: "匹配池在线列表权限",
+  match_pool_online_list_enabled: "非匹配主动私信权限",
   invite_code_id: "邀请码记录编号",
   profile: "用户资料",
   device: "设备资料",
@@ -1004,7 +1004,7 @@ async function loadUsers(page = ADMIN_STATE.userPage) {
         { label: "显示名称", render: userDisplayName },
         { label: "上游用户编号", render: (row) => userUpstreamUid(row) || "未提供" },
         { label: "状态", render: (row) => statusBadge(row.status || (row.disabled_at ? "disabled" : "active")) },
-        { label: "匹配池在线列表", render: (row) => (row.match_pool_online_list_enabled ? "已授权" : "未授权") },
+        { label: "非匹配主动私信", render: (row) => (row.match_pool_online_list_enabled ? "已授权" : "未授权") },
         { label: "媒体使用", render: (row) => `${formatBytes(row.media_used_bytes || 0)} / ${formatBytes(row.media_quota_bytes || 0)}` },
         { label: "最近登录", render: (row) => formatDate(row.last_login_at) },
         { label: "创建时间", render: (row) => formatDate(row.created_at) },
@@ -1113,12 +1113,12 @@ function renderUserProfile() {
   const onlineListEnabled = Boolean(user.match_pool_online_list_enabled);
   const featurePanel = element("section", "admin-feature-panel");
   const featureCopy = element("div", "admin-feature-panel-copy");
-  featureCopy.appendChild(element("h4", "", "匹配池在线列表"));
+  featureCopy.appendChild(element("h4", "", "非匹配主动私信"));
   featureCopy.appendChild(
     element(
       "p",
       "",
-      "开启后，该用户可以在身边页和匹配页查看多人在线列表；关闭后，下一次请求会立即被拒绝。"
+      "在线用户列表、资料、动态和好友申请始终可用。开启后，该用户还可以从身边、资料、好友、访客和动态等非匹配入口主动发起私信；关闭后仅保留匹配私信和已有会话。"
     )
   );
   const featureToggle = element("label", "admin-feature-switch");
@@ -1127,7 +1127,7 @@ function renderUserProfile() {
   featureInput.checked = onlineListEnabled;
   featureInput.disabled = !ADMIN_STATE.selectedUserId;
   featureInput.setAttribute("role", "switch");
-  featureInput.setAttribute("aria-label", "允许该用户查看匹配池在线列表");
+  featureInput.setAttribute("aria-label", "允许该用户从非匹配入口主动发起私信");
   const featureTrack = element("span", "admin-feature-switch-track");
   featureTrack.setAttribute("aria-hidden", "true");
   const featureLabel = element(
@@ -1197,11 +1197,11 @@ function openMatchPoolOnlineListDialog(enabled) {
   };
   clearInputValues($("admin-match-pool-online-list-form"));
   $("admin-match-pool-online-list-title").textContent = enabled
-    ? "授权匹配池在线列表"
-    : "撤销匹配池在线列表授权";
+    ? "授权非匹配主动私信"
+    : "撤销非匹配主动私信授权";
   $("admin-match-pool-online-list-description").textContent = enabled
-    ? "授权后，该用户可以查看当前在线用户。请确认业务需要并填写操作理由。"
-    : "撤销后，该用户的下一次在线列表请求会立即被拒绝，无需等待重新登录。";
+    ? "授权后，该用户可以从身边、资料、好友、访客和动态等非匹配入口主动发起私信。在线列表、资料和好友申请不受此开关影响。"
+    : "撤销后，非匹配主动私信会在下一次权限检查时关闭；在线列表、资料、好友申请、匹配私信与已有会话仍可使用。";
   $("admin-match-pool-online-list-submit").textContent = enabled ? "确认授权" : "确认撤销授权";
   const dialog = $("admin-match-pool-online-list-dialog");
   if (!dialog.open) dialog.showModal();
@@ -2098,7 +2098,7 @@ $("admin-match-pool-online-list-form").addEventListener("submit", (event) => {
     const requestState = captureUserDetailRequest("profile");
     const reason = $("admin-match-pool-online-list-reason").value.trim();
     if (!pending?.userId || typeof pending.enabled !== "boolean") {
-      throw new AdminApiError("匹配池在线列表授权操作已经失效，请重新打开用户详情");
+      throw new AdminApiError("非匹配主动私信授权操作已经失效，请重新打开用户详情");
     }
     if (reason.length < 3) throw new AdminApiError("请填写至少三个字符的操作理由");
     const data = await adminApi(ADMIN_ENDPOINTS.userMatchPoolOnlineList(pending.userId), {
@@ -2112,7 +2112,7 @@ $("admin-match-pool-online-list-form").addEventListener("submit", (event) => {
       renderUserProfile();
     }
     ADMIN_STATE.needsRefresh = true;
-    toast(pending.enabled ? "已授权匹配池在线列表" : "已撤销匹配池在线列表授权", "success", 4200);
+    toast(pending.enabled ? "已授权非匹配主动私信" : "已撤销非匹配主动私信授权", "success", 4200);
   });
 });
 

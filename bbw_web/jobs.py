@@ -989,6 +989,7 @@ def record_product_event(owner_user_id: str, event_payload: Mapping[str, Any]) -
     relationship_map = {
         "/api/social/follow": ("follow", "active"),
         "/api/social/unfollow": ("follow", "inactive"),
+        "/api/social/add-friend": ("friend_request", "active"),
         "/api/social/agree-friend": ("friend", "active"),
         "/api/social/delete-friend": ("friend", "inactive"),
         "/api/social/visit": ("profile_view", "active"),

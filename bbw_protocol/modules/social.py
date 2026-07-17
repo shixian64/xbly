@@ -80,6 +80,27 @@ class SocialAPI:
     def agree_friend(self, id_: str) -> ApiResult:
         return self.c.call("agreefriend0", id=id_)
 
+    def add_friend(self, target_uid: str, leave_word: str = "") -> ApiResult:
+        """Send the standard v154 profile-page friend request.
+
+        The APK names the target ``myid`` and the current account ``yourid``;
+        keep that counter-intuitive wire format server-side so browsers only
+        submit the target UID and optional application message.
+        """
+
+        return self.c.call(
+            "addfriend0",
+            type="好友",
+            room_master_id="0",
+            find_friend_id="0",
+            audio_friend="",
+            audio_during_friend="0",
+            myid=target_uid,
+            yourid=self.c.session.uid,
+            yourwords=leave_word,
+            gift_string="[]",
+        )
+
     def delete_friend(self, **params: Any) -> ApiResult:
         return self.c.call("Deletefriend0", params)
 

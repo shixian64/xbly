@@ -14,13 +14,17 @@ from typing import Any, Mapping, Optional
 from redis import Redis
 from rq import Queue
 from rq.exceptions import InvalidJobOperation
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from bbw_prod.config import Settings
 from bbw_prod.crypto import CredentialCipher, normalize_phone
 from bbw_prod.db import session_scope
-from bbw_prod.models import ExternalAccount
-from bbw_prod.repositories import ExternalAccountRepository, UserRepository
+from bbw_prod.models import ExternalAccount, Relationship, utcnow
+from bbw_prod.repositories import (
+    ExternalAccountRepository,
+    RelationshipRepository,
+    UserRepository,
+)
 from bbw_prod.security import SessionTokenManager, keyed_identifier_hash
 from bbw_prod.services import (
     ConflictError,
@@ -66,6 +70,54 @@ class PendingLoginRejected(PermissionError):
 
 class PendingLoginConflict(RuntimeError):
     pass
+
+
+MESSAGE_POLICY_PROVIDER = "web-policy"
+MESSAGE_POLICY_MATCH_KIND = "match"
+MESSAGE_POLICY_CONVERSATION_KIND = "message_peer"
+
+
+def _message_peer_uid(value: Any) -> str:
+    peer = str(value or "").strip()
+    if (
+        not peer
+        or peer.lower() in {"0", "none", "null"}
+        or len(peer) > 128
+        or any(ord(char) < 33 for char in peer)
+    ):
+        return ""
+    return peer
+
+
+def _response_items(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [dict(item) for item in payload if isinstance(item, Mapping)]
+    if not isinstance(payload, Mapping):
+        return []
+    for key in ("items", "list", "users"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [dict(item) for item in value if isinstance(item, Mapping)]
+    nested = payload.get("data")
+    if nested is not payload:
+        return _response_items(nested)
+    return []
+
+
+def _item_peer_uid(item: Mapping[str, Any]) -> str:
+    for key in (
+        "peer_id",
+        "conversation_user",
+        "user_id",
+        "uid",
+        "id",
+        "yourid",
+    ):
+        peer = _message_peer_uid(item.get(key))
+        if peer:
+            return peer
+    nested = item.get("user")
+    return _item_peer_uid(nested) if isinstance(nested, Mapping) else ""
 
 
 def _aware_timestamp(value: Any) -> float:
@@ -835,6 +887,175 @@ class RuntimePersistence:
                     user.match_pool_online_list_enabled
                 ),
             )
+
+    def grant_message_peers(
+        self,
+        *,
+        identity: UserIdentity,
+        peers: list[str] | tuple[str, ...] | set[str],
+        kind: str,
+        evidence: Mapping[str, Any] | None = None,
+    ) -> list[str]:
+        """Persist server-owned message grants used by the send guard.
+
+        ``kind=match`` is written only from a successful server-side match
+        response. ``kind=message_peer`` records a conversation observed from a
+        trusted upstream response or a send already authorized by this server.
+        Browser-provided origin/source fields are never sufficient on their own.
+        """
+
+        if kind not in {
+            MESSAGE_POLICY_MATCH_KIND,
+            MESSAGE_POLICY_CONVERSATION_KIND,
+        }:
+            raise ValueError("unsupported message policy grant kind")
+        normalized = list(
+            dict.fromkeys(
+                peer
+                for peer in (_message_peer_uid(value) for value in peers)
+                if peer and peer != _message_peer_uid(identity.upstream_uid)
+            )
+        )
+        if not normalized:
+            return []
+        safe_evidence = {
+            str(key)[:80]: value
+            for key, value in dict(evidence or {}).items()
+            if isinstance(value, (str, int, float, bool)) or value is None
+        }
+        with session_scope() as db:
+            repo = RelationshipRepository(db)
+            for peer in normalized:
+                existing = db.scalar(
+                    select(Relationship).where(
+                        Relationship.owner_user_id == identity.user_id,
+                        Relationship.provider == MESSAGE_POLICY_PROVIDER,
+                        Relationship.subject_upstream_uid == peer,
+                        Relationship.kind == kind,
+                    )
+                )
+                metadata = dict(existing.extra_data or {}) if existing else {}
+                metadata.update(safe_evidence)
+                metadata["server_owned"] = True
+                repo.upsert(
+                    owner_user_id=identity.user_id,
+                    provider=MESSAGE_POLICY_PROVIDER,
+                    subject_upstream_uid=peer,
+                    kind=kind,
+                    status="active",
+                    started_at=existing.started_at if existing else utcnow(),
+                    ended_at=None,
+                    extra_data=metadata,
+                )
+        return normalized
+
+    def can_message_peer(self, identity: UserIdentity, peer: Any) -> bool:
+        """Authorize one private-message target from live durable state."""
+
+        target = _message_peer_uid(peer)
+        if not target or target == _message_peer_uid(identity.upstream_uid):
+            return False
+        if identity.match_pool_online_list_enabled:
+            return True
+        with session_scope() as db:
+            grant = db.scalar(
+                select(Relationship.id).where(
+                    Relationship.owner_user_id == identity.user_id,
+                    Relationship.provider == MESSAGE_POLICY_PROVIDER,
+                    Relationship.subject_upstream_uid == target,
+                    Relationship.kind.in_(
+                        [
+                            MESSAGE_POLICY_MATCH_KIND,
+                            MESSAGE_POLICY_CONVERSATION_KIND,
+                        ]
+                    ),
+                    Relationship.status == "active",
+                    Relationship.ended_at.is_(None),
+                )
+            )
+        return grant is not None
+
+    def message_policy_match_peers(
+        self, identity: UserIdentity, *, limit: int = 2000
+    ) -> list[str]:
+        """Return durable match grants for restoring the browser allowlist."""
+
+        with session_scope() as db:
+            values = db.scalars(
+                select(Relationship.subject_upstream_uid)
+                .where(
+                    Relationship.owner_user_id == identity.user_id,
+                    Relationship.provider == MESSAGE_POLICY_PROVIDER,
+                    Relationship.kind == MESSAGE_POLICY_MATCH_KIND,
+                    Relationship.status == "active",
+                    Relationship.ended_at.is_(None),
+                )
+                .order_by(Relationship.updated_at.desc())
+                .limit(max(1, min(int(limit), 5000)))
+            )
+            return [
+                peer
+                for peer in (_message_peer_uid(value) for value in values)
+                if peer and peer != _message_peer_uid(identity.upstream_uid)
+            ]
+
+    def remember_message_policy_response(
+        self,
+        *,
+        identity: UserIdentity,
+        method: str,
+        path: str,
+        request_data: Mapping[str, Any],
+        response_data: Mapping[str, Any],
+        status: int,
+    ) -> list[str]:
+        """Derive trusted grants before the product response reaches the browser."""
+
+        if int(status) >= 400 or response_data.get("ok") is not True:
+            return []
+        method_upper = str(method or "").upper()
+        if method_upper == "POST" and path in {
+            "/api/match/online",
+            "/api/match/local",
+        }:
+            peers = [_item_peer_uid(item) for item in _response_items(response_data)]
+            return self.grant_message_peers(
+                identity=identity,
+                peers=peers,
+                kind=MESSAGE_POLICY_MATCH_KIND,
+                evidence={"source_path": path, "grant_reason": "match_result"},
+            )
+        if method_upper == "GET" and path == "/api/im/conversations":
+            peers = [_item_peer_uid(item) for item in _response_items(response_data)]
+            return self.grant_message_peers(
+                identity=identity,
+                peers=peers,
+                kind=MESSAGE_POLICY_CONVERSATION_KIND,
+                evidence={
+                    "source_path": path,
+                    "grant_reason": "upstream_conversation",
+                },
+            )
+        if method_upper == "POST" and path in {
+            "/api/im/rest/send",
+            "/api/im/flash/send",
+        }:
+            peer = _message_peer_uid(
+                request_data.get("to")
+                or request_data.get("peer")
+                or request_data.get("uid")
+                or request_data.get("targetId")
+                or request_data.get("target_id")
+                or response_data.get("target_id")
+                or response_data.get("to")
+            )
+            return self.grant_message_peers(
+                identity=identity,
+                peers=[peer],
+                kind=MESSAGE_POLICY_CONVERSATION_KIND,
+                evidence={"source_path": path, "grant_reason": "authorized_send"},
+            )
+        return []
 
     def enqueue_message_archive(
         self,
