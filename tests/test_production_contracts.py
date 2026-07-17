@@ -306,6 +306,17 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn("fk_media_objects_message_owner", migration)
         self.assertIn("audit log retention period has not elapsed", migration)
 
+    def test_new_login_flushes_user_before_external_account(self) -> None:
+        services = self.read("bbw_prod/services.py")
+        complete_login = services.split("def complete_login", 1)[1].split(
+            "@dataclass(frozen=True, slots=True)\nclass AdminSessionState", 1
+        )[0]
+        add_user = complete_login.index("self.db.add(user)")
+        flush_user = complete_login.index("self.db.flush()", add_user)
+        add_account = complete_login.index("self.db.add(account)", flush_user)
+        self.assertLess(add_user, flush_user)
+        self.assertLess(flush_user, add_account)
+
     def test_raw_payload_redaction_handles_camel_case_nested_json_and_urls(self) -> None:
         try:
             import cryptography  # noqa: F401

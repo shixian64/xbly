@@ -1073,8 +1073,8 @@ class Handler(BaseHTTPRequestHandler):
                 tim = {
                     "ok": True,
                     **u.native.im.tim_login_payload(
-                        prefer=_tim_preference(q("prefer", "local")),
-                        allow_local_fallback=True,
+                        prefer="server",
+                        allow_local_fallback=False,
                     ),
                 }
             except Exception as e:
@@ -1345,12 +1345,12 @@ class Handler(BaseHTTPRequestHandler):
         # ---- im ----
         if path == "/api/im/tim":
             # Prefer server UserSig (tximsign.php puts sig in message=).
-            # Fall back to a BFF-local mint using the server-side configured secret.
+            # Product routes must never mint a local UserSig implicitly.  Deployments
+            # without control of the upstream TIM application degrade to HTTP history.
             try:
-                prefer = _tim_preference(q("prefer", "server"))
                 payload = u.native.im.tim_login_payload(
-                    prefer=prefer,
-                    allow_local_fallback=True,
+                    prefer="server",
+                    allow_local_fallback=False,
                 )
                 if not payload.get("userSig") or not payload.get("userID"):
                     return self.ok(
@@ -1417,8 +1417,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 return self.ok(
                     u.native.im.bootstrap(
-                        prefer_tim=_tim_preference(q("prefer", "local")),
-                        allow_local_fallback=True,
+                        prefer_tim="server",
+                        allow_local_fallback=False,
                     )
                 )
             except Exception as e:

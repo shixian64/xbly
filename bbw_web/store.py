@@ -175,7 +175,7 @@ class SessionStore:
         self.pending_expire_callback = pending_expire_callback
         if self.persist_sessions:
             SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        WEB_META_DIR.mkdir(parents=True, exist_ok=True)
+            WEB_META_DIR.mkdir(parents=True, exist_ok=True)
 
     def _new_sid(self) -> str:
         return secrets.token_urlsafe(24)

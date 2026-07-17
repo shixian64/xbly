@@ -28,7 +28,7 @@ def _tick(queue: Queue) -> None:
     _enqueue_once(
         queue,
         "bbw_web.jobs.schedule_due_syncs",
-        job_id=f"schedule-syncs:{slot}",
+        job_id=f"schedule-syncs-{slot}",
         job_timeout=120,
         result_ttl=300,
         failure_ttl=86400,
@@ -37,7 +37,7 @@ def _tick(queue: Queue) -> None:
         _enqueue_once(
             queue,
             "bbw_web.jobs.cleanup_expired_data",
-            job_id=f"cleanup-expired:{slot // 15}",
+            job_id=f"cleanup-expired-{slot // 15}",
             job_timeout=900,
             result_ttl=300,
             failure_ttl=86400,

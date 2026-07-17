@@ -664,7 +664,12 @@ class LoginAccountService:
             token=token,
             token_expires_at=token_expires_at,
         )
-        self.db.add_all((user, account))
+        # There is intentionally no ORM relationship between these security
+        # boundary models.  Flush the parent explicitly so PostgreSQL never
+        # sees the external account before its referenced user row.
+        self.db.add(user)
+        self.db.flush()
+        self.db.add(account)
         if invite is not None:
             self.invites.consume_locked(invite)
         self.db.flush()

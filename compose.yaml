@@ -142,12 +142,11 @@ services:
       - statement_timeout=60000
       - -c
       - log_min_duration_statement=2000
-      - -c
-      - unix_socket_directories=/tmp
     volumes:
       - postgres_data:/var/lib/postgresql/data
     tmpfs:
       - /tmp:size=16m,mode=1777
+      - /var/run/postgresql:size=1m,uid=70,gid=70,mode=3775
     networks:
       - database
     healthcheck:
@@ -361,6 +360,8 @@ services:
     read_only: true
     cap_drop:
       - ALL
+    cap_add:
+      - NET_BIND_SERVICE
     security_opt:
       - no-new-privileges:true
     environment:
