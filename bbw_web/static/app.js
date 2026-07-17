@@ -7437,10 +7437,16 @@ async function switchMomentsTab(tab, { force = false } = {}) {
 }
 
 function relationshipToolsHtml() {
-  return `<section class="section"><div class="form-grid relationship-tools">
-    <div class="surface-card"><div class="section-head"><div><h2>查找用户</h2><p>通过 UID 查看资料、关注或取关</p></div></div><form class="inline-form" data-form="social-user"><div class="field"><label for="social-uid">对方 UID</label><input id="social-uid" name="uid" placeholder="输入用户 UID" required /></div><button type="submit" class="btn primary" name="intent" value="view">查看资料</button><button type="submit" class="btn secondary" name="intent" value="follow">关注</button><button type="submit" class="btn secondary" name="intent" value="unfollow">取关</button></form><div id="social-user-result" class="result-panel"></div></div>
-    <div class="surface-card"><div class="section-head"><div><h2>举报不友善行为</h2><p>举报会提交给服务端处理，请如实填写</p></div></div><form data-form="social-report"><div class="field"><label for="report-id">用户或内容编号</label><input id="report-id" name="itemid" required /></div><div class="field"><label for="report-reason">原因</label><input id="report-reason" name="reason" maxlength="120" placeholder="简要说明原因" required /></div><button type="submit" class="btn danger full mt-sm">提交举报</button></form></div>
-  </div></section>`;
+  return `<section class="relationship-tools" aria-label="关系工具">
+    <details class="relationship-tool" name="relationship-tool">
+      <summary><span class="relationship-tool-copy"><strong>查找用户</strong><span>通过 UID 快速查看资料或管理关注</span></span><span class="relationship-tool-state" aria-hidden="true"><span class="expand-label">展开</span><span class="collapse-label">收起</span></span></summary>
+      <div class="relationship-tool-panel"><form class="relationship-tool-form" data-form="social-user"><div class="field"><label for="social-uid">对方 UID</label><input id="social-uid" name="uid" placeholder="输入用户 UID" required /></div><div class="relationship-tool-actions"><button type="submit" class="btn primary" name="intent" value="view">查看资料</button><button type="submit" class="btn secondary" name="intent" value="follow">关注</button><button type="submit" class="btn secondary" name="intent" value="unfollow">取关</button></div></form><div id="social-user-result" class="result-panel"></div></div>
+    </details>
+    <details class="relationship-tool relationship-tool--report" name="relationship-tool">
+      <summary><span class="relationship-tool-copy"><strong>举报不友善行为</strong><span>按需填写用户或内容信息并提交</span></span><span class="relationship-tool-state" aria-hidden="true"><span class="expand-label">展开</span><span class="collapse-label">收起</span></span></summary>
+      <div class="relationship-tool-panel"><form class="relationship-tool-form" data-form="social-report"><div class="field"><label for="report-id">用户或内容编号</label><input id="report-id" name="itemid" required /></div><div class="field"><label for="report-reason">原因</label><input id="report-reason" name="reason" maxlength="120" placeholder="简要说明原因" required /></div><div class="relationship-tool-actions relationship-tool-actions--single"><button type="submit" class="btn danger">提交举报</button></div></form></div>
+    </details>
+  </section>`;
 }
 
 async function loadSocialTab(tab, signal) {
@@ -7534,12 +7540,11 @@ function socialTabsHtml(tab, applyCount = 0, applyHasMore = false) {
 async function pageSocial(signal) {
   S.socialTab = normalizeSocialTab(S.socialTab);
   const view = await loadSocialTab(S.socialTab, signal);
-  return `<section class="relationship-toolbar"><div><h2>关系中心</h2><p>统一管理通讯录、好友申请、关注、粉丝、访客和黑名单</p></div></section>
-    <nav class="tab-row relationship-tabs ui-scrollbar ui-scrollbar--compact" role="tablist" aria-label="关系中心分类">${socialTabsHtml(
+  return `<nav class="tab-row relationship-tabs ui-scrollbar ui-scrollbar--compact" role="tablist" aria-label="关系中心分类">${socialTabsHtml(
       view.tab,
       view.applyCount,
       view.applyHasMore
-    )}</nav><div id="social-tab-panel" class="social-tab-panel" role="tabpanel">${view.body}</div>${relationshipToolsHtml()}`;
+    )}</nav>${relationshipToolsHtml()}<div id="social-tab-panel" class="social-tab-panel" role="tabpanel">${view.body}</div>`;
 }
 
 function syncSocialTabUI(tab) {

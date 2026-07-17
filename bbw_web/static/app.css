@@ -3700,8 +3700,136 @@ html.flash-viewing body {
   background: var(--brand);
 }
 
-.relationship-tools > .surface-card {
+.relationship-tools {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.65rem;
+  margin: 0.65rem 0 0.25rem;
+}
+
+.relationship-tool {
   min-width: 0;
+  overflow: hidden;
+  border: 1px solid rgba(115, 87, 217, 0.14);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.72);
+  box-shadow: 0 3px 12px rgba(59, 41, 82, 0.04);
+  transition: border-color 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
+}
+
+.relationship-tool[open] {
+  border-color: rgba(115, 87, 217, 0.24);
+  background: var(--surface-solid);
+  box-shadow: var(--shadow-sm);
+}
+
+.relationship-tool > summary {
+  display: flex;
+  min-height: 62px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  list-style: none;
+  padding: 0.65rem 0.75rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+.relationship-tool > summary::-webkit-details-marker {
+  display: none;
+}
+
+.relationship-tool > summary::marker {
+  content: "";
+}
+
+.relationship-tool-copy {
+  min-width: 0;
+}
+
+.relationship-tool-copy strong,
+.relationship-tool-copy > span {
+  display: block;
+}
+
+.relationship-tool-copy strong {
+  font-size: 0.84rem;
+}
+
+.relationship-tool-copy > span {
+  margin-top: 0.08rem;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.7rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.relationship-tool-state {
+  flex: none;
+  border-radius: 999px;
+  background: var(--brand-soft);
+  color: var(--brand-dark);
+  padding: 0.25rem 0.55rem;
+  font-size: 0.68rem;
+  font-weight: 750;
+}
+
+.relationship-tool-state .collapse-label,
+.relationship-tool[open] .relationship-tool-state .expand-label {
+  display: none;
+}
+
+.relationship-tool[open] .relationship-tool-state .collapse-label {
+  display: inline;
+}
+
+.relationship-tool-panel {
+  border-top: 1px solid var(--line);
+  padding: 0.8rem;
+}
+
+.relationship-tool-form {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.relationship-tool-form .field {
+  margin: 0;
+}
+
+.relationship-tool-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.45rem;
+}
+
+.relationship-tool-actions .btn {
+  min-width: 0;
+  min-height: 40px;
+  padding-right: 0.55rem;
+  padding-left: 0.55rem;
+}
+
+.relationship-tool-actions--single {
+  grid-template-columns: 1fr;
+}
+
+.relationship-tool--report {
+  border-color: rgba(216, 76, 100, 0.13);
+}
+
+.relationship-tool--report[open] {
+  border-color: rgba(216, 76, 100, 0.22);
+}
+
+.relationship-tool--report .relationship-tool-state {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.relationship-tools + .social-tab-panel > .section {
+  margin-top: 0.85rem;
 }
 
 .visitor-tabs {
@@ -4763,6 +4891,10 @@ html.flash-viewing body {
   .moment-comment-form {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .relationship-tools {
+    grid-template-columns: 1fr;
   }
 
   .stats-grid {
