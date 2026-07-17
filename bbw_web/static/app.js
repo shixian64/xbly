@@ -114,6 +114,11 @@ const S = {
   imMessageLoadingPeers: new Set(),
   imMessageLoadedPeers: new Set(),
   imComposerPanel: "",
+  imComposerDraft: "",
+  imComposerDraftRevision: 0,
+  imComposerDrafts: new Map(),
+  imComposerDraftRevisions: new Map(),
+  imVoiceMode: false,
   imStickers: [],
   imStickerGroups: [],
   imStickerActiveGroup: "",
@@ -174,17 +179,79 @@ function voiceRecordingAvailability() {
   return { available: true, reason: "按住“按住说话”录音，最长 60 秒" };
 }
 
+let visualViewportSyncFrame = 0;
+let stableVisualViewportHeight = Math.max(
+  0,
+  Number(window.visualViewport?.height || window.innerHeight || 0)
+);
+let stableVisualViewportWidth = Math.max(
+  0,
+  Number(window.visualViewport?.width || window.innerWidth || 0)
+);
+
 function syncVisualViewport() {
+  if (visualViewportSyncFrame) cancelAnimationFrame(visualViewportSyncFrame);
+  visualViewportSyncFrame = requestAnimationFrame(() => {
+    visualViewportSyncFrame = 0;
+    const viewport = window.visualViewport;
+    const viewportHeight = Math.max(0, Number(viewport?.height || window.innerHeight || 0));
+    const viewportWidth = Math.max(0, Number(viewport?.width || window.innerWidth || 0));
+    const viewportOffsetTop = Math.max(0, Number(viewport?.offsetTop || 0));
+    const composerFocused = document.activeElement?.matches?.("#im-text") === true;
+    const viewportWidthChanged = Math.abs(viewportWidth - stableVisualViewportWidth) > 40;
+
+    if (viewportWidthChanged || !composerFocused) {
+      stableVisualViewportHeight = viewportHeight;
+      stableVisualViewportWidth = viewportWidth;
+    } else {
+      stableVisualViewportHeight = Math.max(stableVisualViewportHeight, viewportHeight);
+    }
+
+    if (viewportHeight) {
+      document.documentElement.style.setProperty("--app-viewport-height", `${viewportHeight}px`);
+      document.documentElement.style.setProperty("--app-viewport-offset-top", `${viewportOffsetTop}px`);
+    }
+
+    const layoutViewportInset = Math.max(
+      0,
+      Number(window.innerHeight || 0) - viewportHeight - viewportOffsetTop
+    );
+    const stableViewportInset = Math.max(0, stableVisualViewportHeight - viewportHeight);
+    const keyboardVisible =
+      usesCoarsePointer() && composerFocused && Math.max(layoutViewportInset, stableViewportInset) > 120;
+    document.documentElement.classList.toggle("keyboard-visible", keyboardVisible);
+
+    if (composerFocused && S.route === "msg" && S.activePeer) {
+      requestAnimationFrame(() => scrollChatLogToBottom());
+    }
+  });
+}
+
+function waitForVisualViewportRecovery(targetHeight, timeout = 650) {
   const viewport = window.visualViewport;
-  const viewportHeight = Math.max(0, Number(viewport?.height || window.innerHeight || 0));
-  if (viewportHeight) {
-    document.documentElement.style.setProperty("--app-viewport-height", `${viewportHeight}px`);
+  const expectedHeight = Math.max(0, Number(targetHeight || 0));
+  const currentHeight = () => Number(viewport?.height || window.innerHeight || 0);
+  if (!expectedHeight || currentHeight() >= expectedHeight - 80) {
+    return Promise.resolve();
   }
-  const keyboardInset = Math.max(
-    0,
-    Number(window.innerHeight || 0) - viewportHeight - Math.max(0, Number(viewport?.offsetTop || 0))
-  );
-  document.documentElement.classList.toggle("keyboard-visible", usesCoarsePointer() && keyboardInset > 120);
+  return new Promise((resolve) => {
+    let timer = null;
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      viewport?.removeEventListener("resize", check);
+      window.removeEventListener("resize", check);
+      if (timer) clearTimeout(timer);
+      resolve();
+    };
+    const check = () => {
+      if (currentHeight() >= expectedHeight - 80) finish();
+    };
+    viewport?.addEventListener("resize", check, { passive: true });
+    window.addEventListener("resize", check, { passive: true });
+    timer = setTimeout(finish, timeout);
+  });
 }
 
 const esc = (value) =>
@@ -400,6 +467,8 @@ function setImConnectingUi(active, detail = "") {
   S.imLastError = active ? "" : S.imLastError;
   if (detail) S.imLastError = detail;
   updateImConnectionStatus();
+  const sendButton = document.querySelector(".chat-send-button");
+  if (sendButton && sendButton.dataset.pending !== "true") sendButton.disabled = S.imConnecting;
 }
 
 function toast(message, type = "info", ms = 2600) {
@@ -1026,6 +1095,7 @@ function showLogin(show, clearSecrets = false) {
   }
   $("screen-login").classList.toggle("hide", !show);
   $("screen-app").classList.toggle("hide", show);
+  if (show) document.body.classList.remove("chat-conversation-open");
   if (show) closeDrawer();
   if (clearSecrets) resetLoginInputs();
   if (show) {
@@ -1632,6 +1702,7 @@ async function activateRoute(id, { force = false } = {}) {
   S.route = target;
   root().classList.toggle("message-route", target === "msg");
   document.body.classList.toggle("message-route-active", target === "msg");
+  document.body.classList.toggle("chat-conversation-open", target === "msg" && Boolean(S.activePeer));
   syncNav();
   closeDrawer();
   const cacheKey = routeCacheKey(target);
@@ -1665,12 +1736,19 @@ async function activateRoute(id, { force = false } = {}) {
     root().focus({ preventScroll: true });
     centerActiveRelationshipTab();
     hydrateRenderedRoute(target, controller.signal, seq);
-    if (target === "msg") scrollChatLogToBottom();
+    if (target === "msg") {
+      syncChatComposerInput();
+      scrollChatLogToBottom();
+    }
     void refreshVisiblePeerPresence();
     if (target === "msg" && !S.imConnected) {
       // Load vendor SDK if needed, then login with BFF UserSig.
       void ensureTimConnected().then((ok) => {
-        if (ok && S.route === "msg" && seq === S.routeSeq) refreshMessageConversationRegion();
+        if (ok && S.route === "msg" && seq === S.routeSeq) {
+          refreshMessageConversationRegion({
+            refreshPane: document.activeElement?.matches?.("#im-text") !== true,
+          });
+        }
       });
     }
   } catch (error) {
@@ -4226,8 +4304,10 @@ function chatStickerItemHtml(sticker) {
 
 function chatComposerPanelHtml() {
   if (S.imComposerPanel === "emoji") {
-    return `<section class="chat-composer-panel ui-scrollbar" aria-label="文字表情"><div class="chat-panel-head"><strong>文字表情</strong><span>选择后插入输入框，按文本消息发送</span></div><div class="chat-emoticon-grid">${CHAT_TEXT_EMOTICONS.map(
-      (value) => `<button type="button" data-action="insert-chat-emoticon" data-value="${esc(value)}">${esc(value)}</button>`
+    return `<section class="chat-composer-panel ui-scrollbar" aria-label="常用表情"><div class="chat-panel-head"><strong>常用表情</strong><span>选择后插入消息</span></div><div class="chat-emoticon-grid">${CHAT_TEXT_EMOTICONS.map(
+      (value) => `<button type="button" data-action="insert-chat-emoticon" data-value="${esc(value)}">${esc(
+        value.replace(/^\[|\]$/g, "")
+      )}</button>`
     ).join("")}</div></section>`;
   }
   if (S.imComposerPanel === "sticker") {
@@ -4252,36 +4332,64 @@ function chatComposerPanelHtml() {
         : `<div class="chat-panel-empty">${S.imStickersLoaded ? "暂无可用表情包" : "打开后将加载表情包"}</div>`;
     return `<section class="chat-composer-panel chat-sticker-panel ui-scrollbar" aria-label="表情包"><div class="chat-panel-head"><strong>表情包</strong><button type="button" data-action="reload-chat-stickers">重新加载</button></div>${body}</section>`;
   }
+  if (S.imComposerPanel === "more") {
+    return `<section class="chat-composer-panel chat-more-panel ui-scrollbar" aria-label="更多消息功能"><div class="chat-panel-head"><strong>更多功能</strong><span>选择要发送的内容</span></div><div class="chat-more-grid">
+      <button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="image"><strong>图片与动图</strong><span>从相册或文件中选择</span></button>
+      <button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="video"><strong>视频</strong><span>发送短视频文件</span></button>
+      <button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="file"><strong>文件</strong><span>发送其他类型文件</span></button>
+      <button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="flash"><strong>闪图</strong><span>阅后失效的图片</span></button>
+      <button type="button" class="chat-more-action" data-action="toggle-chat-panel" data-panel="sticker"><strong>表情包</strong><span>发送收藏表情</span></button>
+    </div></section>`;
+  }
   return "";
 }
 
 function chatComposerHtml() {
   const recording = S.imRecordingState;
   const recordingAvailability = voiceRecordingAvailability();
-  return `<form class="chat-composer ui-scrollbar" data-form="im-send"><input type="hidden" name="peer" value="${esc(
+  const voiceMode = S.imVoiceMode && recordingAvailability.available;
+  const panelIsExpression = S.imComposerPanel === "emoji" || S.imComposerPanel === "sticker";
+  return `<form class="chat-composer${voiceMode ? " voice-mode" : ""}${recording?.active ? " is-recording" : ""}${
+    S.imComposerPanel ? " panel-open" : ""
+  }" data-form="im-send"><input type="hidden" name="peer" value="${esc(
     S.activePeer
-  )}" /><div class="chat-compose-tools ui-scrollbar ui-scrollbar--compact" aria-label="消息类型">
-      <button type="button" class="chat-tool-button${recording?.active ? " is-recording" : ""}" data-action="record-voice" ${
+  )}" /><div class="chat-compose-main">
+      <button type="button" class="chat-tool-button chat-voice-toggle${voiceMode ? " on" : ""}" data-action="toggle-chat-voice" ${
         recordingAvailability.available ? "" : "disabled"
-      } title="${esc(recordingAvailability.reason)}">${recordingAvailability.available ? "按住说话" : "录音不可用"}</button>
-      <button type="button" class="chat-tool-button" data-action="pick-chat-file" data-kind="image">图片/动图</button>
-      <button type="button" class="chat-tool-button" data-action="pick-chat-file" data-kind="video">视频</button>
-      <button type="button" class="chat-tool-button" data-action="pick-chat-file" data-kind="file">文件</button>
-      <button type="button" class="chat-tool-button" data-action="pick-chat-file" data-kind="flash">闪图</button>
-      <button type="button" class="chat-tool-button${S.imComposerPanel === "emoji" ? " on" : ""}" data-action="toggle-chat-panel" data-panel="emoji">文字表情</button>
-      <button type="button" class="chat-tool-button${S.imComposerPanel === "sticker" ? " on" : ""}" data-action="toggle-chat-panel" data-panel="sticker">表情包</button>
+      } title="${esc(recordingAvailability.reason)}" aria-pressed="${voiceMode ? "true" : "false"}">${
+        voiceMode ? "键盘" : "语音"
+      }</button>
+      <div class="chat-compose-field">
+        <label class="sr-only" for="im-text">消息</label>
+        <textarea class="ui-scrollbar" id="im-text" name="text" rows="1" autocomplete="off" enterkeyhint="enter" placeholder="输入消息" aria-keyshortcuts="Control+Enter" required>${esc(
+          S.imComposerDraft
+        )}</textarea>
+        <button type="button" class="chat-record-button${recording?.active ? " is-recording" : ""}${
+          recording?.cancel ? " is-canceling" : ""
+        }" data-action="record-voice" ${recordingAvailability.available ? "" : "disabled"} title="${esc(
+          recordingAvailability.reason
+        )}">${recording?.active ? (recording.cancel ? "松手取消" : "松手发送") : "按住说话"}</button>
+      </div>
+      <button type="button" class="chat-tool-button chat-expression-toggle${panelIsExpression ? " on" : ""}" data-action="toggle-chat-panel" data-panel="emoji" aria-expanded="${
+        panelIsExpression ? "true" : "false"
+      }">表情</button>
+      <button type="button" class="chat-tool-button chat-more-toggle${S.imComposerPanel === "more" ? " on" : ""}" data-action="toggle-chat-panel" data-panel="more" aria-expanded="${
+        S.imComposerPanel === "more" ? "true" : "false"
+      }">更多</button>
+      <button type="submit" class="btn primary chat-send-button" title="按 Ctrl+回车发送" ${
+        S.imConnecting ? "disabled" : ""
+      }>发送</button>
     </div>
-    <div class="chat-record-status${recording?.active ? " is-active" : ""}" id="im-record-status" aria-live="polite">${
+    <div class="chat-record-status${recording?.active ? " is-active" : ""}" id="im-record-status" aria-live="polite" ${
+      recording?.active ? "" : "hidden"
+    }>${
       recording?.active
         ? recording.cancel
           ? "松手取消"
           : `正在录音 ${Math.floor(recording.elapsed || 0)} 秒，上滑取消`
-        : recordingAvailability.reason
+        : ""
     }</div>
     ${chatComposerPanelHtml()}
-    <div class="chat-compose-main"><label class="sr-only" for="im-text">消息</label><textarea class="ui-scrollbar" id="im-text" name="text" rows="1" autocomplete="off" placeholder="输入消息，按 Ctrl+回车发送" aria-keyshortcuts="Control+Enter" required></textarea><button type="submit" class="btn primary" title="按 Ctrl+回车发送" ${
-      S.imConnecting ? "disabled" : ""
-    }>发送</button></div>
     <input class="sr-only" type="file" id="im-file-image" data-chat-upload="image" accept=".jpg,.jpeg,.png,.gif,.bmp,.webp,image/jpeg,image/png,image/gif,image/bmp,image/webp" multiple />
     <input class="sr-only" type="file" id="im-file-video" data-chat-upload="video" accept=".mp4,.mov,video/mp4,video/quicktime,video/mov" />
     <input class="sr-only" type="file" id="im-file-file" data-chat-upload="file" />
@@ -4325,9 +4433,21 @@ function refreshMessageConversationRegion({
   const list = document.querySelector(".conversation-list");
   const pane = document.querySelector(".chat-pane");
   if (!page || !layout || !list || !pane) return false;
+  const previousInput = refreshPane ? pane.querySelector("#im-text") : null;
+  const previousPeer = String(previousInput?.closest('form[data-form="im-send"]')?.elements?.peer?.value || "");
+  const preserveComposer = Boolean(previousInput && previousPeer === String(S.activePeer || ""));
+  const previousSelectionStart = preserveComposer && Number.isInteger(previousInput.selectionStart)
+    ? previousInput.selectionStart
+    : null;
+  const previousSelectionEnd = preserveComposer && Number.isInteger(previousInput.selectionEnd)
+    ? previousInput.selectionEnd
+    : previousSelectionStart;
+  const restoreComposerFocus = preserveComposer && document.activeElement === previousInput;
+  if (preserveComposer) setChatComposerDraft(previousInput.value);
   page.classList.toggle("conversation-open", Boolean(S.activePeer));
   layout.classList.toggle("has-active", Boolean(S.activePeer));
   layout.classList.toggle("is-list-collapsed", S.conversationListCollapsed);
+  document.body.classList.toggle("chat-conversation-open", Boolean(S.activePeer));
   if (refreshList) {
     list.innerHTML = conversationListHtml();
   } else {
@@ -4339,6 +4459,15 @@ function refreshMessageConversationRegion({
   }
   if (refreshPane) {
     pane.innerHTML = chatPaneHtml();
+    const nextInput = $("im-text");
+    syncChatComposerInput(nextInput);
+    if (nextInput && preserveComposer && previousSelectionStart !== null) {
+      nextInput.setSelectionRange(
+        Math.min(previousSelectionStart, nextInput.value.length),
+        Math.min(previousSelectionEnd ?? previousSelectionStart, nextInput.value.length)
+      );
+      if (restoreComposerFocus && !S.imVoiceMode) nextInput.focus({ preventScroll: true });
+    }
     scrollChatLogToBottom(pane.querySelector("#im-log"));
   }
   const count = document.querySelector("[data-conversation-count]");
@@ -4354,6 +4483,49 @@ function refreshMessageConversationRegion({
   if (focusComposer) $("im-text")?.focus({ preventScroll: true });
   void refreshVisiblePeerPresence();
   return true;
+}
+
+function syncChatComposerInput(input = $("im-text")) {
+  if (!input) return false;
+  const composer = input.closest(".chat-composer");
+  const hasText = Boolean(String(input.value || "").trim());
+  composer?.classList.toggle("has-text", hasText);
+  const previousHeight = input.getBoundingClientRect().height;
+  input.style.height = "auto";
+  const computedMaxHeight = Number.parseFloat(window.getComputedStyle(input).maxHeight);
+  const maxHeight = Number.isFinite(computedMaxHeight) ? computedMaxHeight : 120;
+  const nextHeight = Math.min(Math.max(input.scrollHeight, 40), maxHeight);
+  input.style.height = `${nextHeight}px`;
+  input.style.overflowY = input.scrollHeight > maxHeight ? "auto" : "hidden";
+  return Math.abs(previousHeight - nextHeight) > 1;
+}
+
+function setChatComposerDraft(value) {
+  const next = String(value ?? "");
+  if (next !== S.imComposerDraft) {
+    S.imComposerDraft = next;
+    S.imComposerDraftRevision += 1;
+  }
+  const peer = String(S.activePeer || "");
+  if (peer) {
+    const previousPeerDraft = String(S.imComposerDrafts.get(peer) || "");
+    if (next) S.imComposerDrafts.set(peer, next);
+    else S.imComposerDrafts.delete(peer);
+    if (next !== previousPeerDraft) {
+      S.imComposerDraftRevisions.set(peer, Number(S.imComposerDraftRevisions.get(peer) || 0) + 1);
+    }
+  }
+  return next;
+}
+
+function restoreChatComposerDraft(peer) {
+  const target = String(peer || "");
+  const next = target ? String(S.imComposerDrafts.get(target) || "") : "";
+  if (next !== S.imComposerDraft) {
+    S.imComposerDraft = next;
+    S.imComposerDraftRevision += 1;
+  }
+  return next;
 }
 
 function markConversationRead(peer) {
@@ -4373,7 +4545,8 @@ function markConversationRead(peer) {
 
 function refreshChatComposerKeepingText({ focus = false } = {}) {
   const previousInput = $("im-text");
-  const value = previousInput?.value || "";
+  const value = previousInput?.value ?? S.imComposerDraft;
+  setChatComposerDraft(value);
   const selectionStart = Number.isInteger(previousInput?.selectionStart) ? previousInput.selectionStart : value.length;
   const selectionEnd = Number.isInteger(previousInput?.selectionEnd) ? previousInput.selectionEnd : selectionStart;
   refreshMessageConversationRegion({ refreshList: false, refreshPane: true });
@@ -4381,6 +4554,7 @@ function refreshChatComposerKeepingText({ focus = false } = {}) {
   if (input) {
     input.value = value;
     input.setSelectionRange(Math.min(selectionStart, value.length), Math.min(selectionEnd, value.length));
+    syncChatComposerInput(input);
     if (focus) input.focus({ preventScroll: true });
   }
 }
@@ -4389,7 +4563,10 @@ function closeChatComposerPanelForKeyboard() {
   if (!S.imComposerPanel) return false;
   S.imComposerPanel = "";
   document.querySelector(".chat-composer-panel")?.remove();
-  document.querySelectorAll('[data-action="toggle-chat-panel"]').forEach((button) => button.classList.remove("on"));
+  document.querySelectorAll('[data-action="toggle-chat-panel"]').forEach((button) => {
+    button.classList.remove("on");
+    button.setAttribute("aria-expanded", "false");
+  });
   return true;
 }
 
@@ -4624,13 +4801,16 @@ function editRevokedMessage(id) {
   if (draft.trim() && draft !== text && !window.confirm("输入框已有未发送内容，确认替换为撤回的消息？")) {
     return false;
   }
-  if (S.imComposerPanel) {
+  if (S.imComposerPanel || S.imVoiceMode) {
     S.imComposerPanel = "";
+    S.imVoiceMode = false;
     refreshMessageConversationRegion({ refreshList: false, refreshPane: true });
   }
   const input = $("im-text");
   if (!input) throw new Error("消息输入框当前不可用");
+  setChatComposerDraft(text);
   input.value = text;
+  syncChatComposerInput(input);
   input.focus({ preventScroll: true });
   input.setSelectionRange(input.value.length, input.value.length);
   input.scrollIntoView({ block: "nearest", behavior: "smooth" });
@@ -4809,7 +4989,7 @@ async function sendTimMediaFile(kind, file, meta = {}) {
   if (previous) updateLocalMessage(pendingID, pending);
   else appendLocalMessage(pending);
   updateConversationActivity(peer, {
-    name: S.activePeerName || `用户 ${peer}`,
+    name: submittedPeerName,
     lastMessage: pending.preview,
     unreadCount: 0,
   });
@@ -5189,6 +5369,8 @@ function updateVoiceRecordingUi() {
   const availability = voiceRecordingAvailability();
   const button = document.querySelector('[data-action="record-voice"]');
   const status = $("im-record-status");
+  const composer = button?.closest(".chat-composer");
+  composer?.classList.toggle("is-recording", Boolean(state?.active));
   if (button) {
     button.classList.toggle("is-recording", Boolean(state?.active));
     button.classList.toggle("is-canceling", Boolean(state?.cancel));
@@ -5203,13 +5385,14 @@ function updateVoiceRecordingUi() {
         : "录音不可用";
   }
   if (status) {
+    status.hidden = !state?.active;
     status.classList.toggle("is-active", Boolean(state?.active));
     status.classList.toggle("is-canceling", Boolean(state?.cancel));
     status.textContent = state?.active
       ? state.cancel
         ? "已进入取消区域，松手取消"
         : `正在录音 ${Math.floor(state.elapsed || 0)} 秒，上滑取消`
-      : availability.reason;
+      : "";
   }
 }
 
@@ -7415,6 +7598,10 @@ async function logout() {
     S.imMessageLoadingPeers.clear();
     S.imMessageLoadedPeers.clear();
     S.imComposerPanel = "";
+    setChatComposerDraft("");
+    S.imComposerDrafts.clear();
+    S.imComposerDraftRevisions.clear();
+    S.imVoiceMode = false;
     S.imStickers = [];
     S.imStickerGroups = [];
     S.imStickerActiveGroup = "";
@@ -7670,11 +7857,40 @@ async function handleAction(action, button) {
     input.click();
     return;
   }
+  if (action === "toggle-chat-voice") {
+    if (!voiceRecordingAvailability().available) throw new Error(voiceRecordingAvailability().reason);
+    S.imVoiceMode = !S.imVoiceMode;
+    S.imComposerPanel = "";
+    if (S.imVoiceMode) $("im-text")?.blur();
+    refreshChatComposerKeepingText({ focus: !S.imVoiceMode });
+    return;
+  }
   if (action === "toggle-chat-panel") {
     const panel = String(button.dataset.panel || "");
-    S.imComposerPanel = S.imComposerPanel === panel ? "" : panel;
-    const openingOnTouch = Boolean(S.imComposerPanel) && usesCoarsePointer();
-    if (openingOnTouch) $("im-text")?.blur();
+    const nextPanel = S.imComposerPanel === panel ? "" : panel;
+    const openingOnTouch = Boolean(nextPanel) && usesCoarsePointer();
+    const viewportHeight = Number(window.visualViewport?.height || window.innerHeight || 0);
+    const viewportLooksCompressed = stableVisualViewportHeight - viewportHeight > 120;
+    const pointerKeyboardWasOpen = button.dataset.keyboardWasOpen === "1";
+    const pointerTargetHeight = Number(button.dataset.keyboardTargetHeight || 0);
+    delete button.dataset.keyboardWasOpen;
+    delete button.dataset.keyboardTargetHeight;
+    const keyboardWasOpen =
+      openingOnTouch &&
+      (pointerKeyboardWasOpen ||
+        document.activeElement?.matches?.("#im-text") === true ||
+        document.documentElement.classList.contains("keyboard-visible") ||
+        viewportLooksCompressed);
+    const peer = String(S.activePeer || "");
+    if (keyboardWasOpen) {
+      const targetHeight = Math.max(stableVisualViewportHeight, viewportHeight, pointerTargetHeight);
+      $("im-text")?.blur();
+      await waitForVisualViewportRecovery(targetHeight);
+      if (S.route !== "msg" || String(S.activePeer || "") !== peer) return;
+    }
+    S.imComposerPanel = nextPanel;
+    if (S.imComposerPanel === "emoji" || S.imComposerPanel === "sticker") S.imVoiceMode = false;
+    if (openingOnTouch && !keyboardWasOpen) $("im-text")?.blur();
     refreshChatComposerKeepingText({ focus: S.imComposerPanel === "emoji" && !openingOnTouch });
     if (S.imComposerPanel === "sticker" && !S.imStickersLoaded) void loadChatStickers();
     return;
@@ -7686,6 +7902,8 @@ async function handleAction(action, button) {
     const start = Number.isInteger(input.selectionStart) ? input.selectionStart : input.value.length;
     const end = Number.isInteger(input.selectionEnd) ? input.selectionEnd : start;
     input.setRangeText(value, start, end, "end");
+    setChatComposerDraft(input.value);
+    syncChatComposerInput(input);
     if (!usesCoarsePointer()) input.focus({ preventScroll: true });
     return;
   }
@@ -7740,10 +7958,13 @@ async function handleAction(action, button) {
     if (!uid) throw new Error("缺少对方 UID");
     if (uid !== S.activePeer) {
       S.imComposerPanel = "";
+      setChatComposerDraft($("im-text")?.value ?? S.imComposerDraft);
+      S.imVoiceMode = false;
       finishVoiceRecording(null, true);
       closeFlashViewer();
     }
     S.activePeer = uid;
+    restoreChatComposerDraft(uid);
     S.activePeerName = button.dataset.name || `用户 ${uid}`;
     ensureConversationForPeer(uid, {
       name: S.activePeerName,
@@ -7755,7 +7976,7 @@ async function handleAction(action, button) {
       go("msg", { force: true });
     } else {
       refreshMessageConversationRegion({
-        focusComposer: action === "select-conversation",
+        focusComposer: action === "select-conversation" && !usesCoarsePointer(),
         // Selecting an existing card only changes its active/read state. Keep
         // the list nodes (and loaded avatars/scroll position) to avoid a full
         // list reflow on every click; open-chat may still add a new card.
@@ -7769,7 +7990,10 @@ async function handleAction(action, button) {
     finishVoiceRecording(null, true);
     closeFlashViewer();
     S.imComposerPanel = "";
+    setChatComposerDraft($("im-text")?.value ?? S.imComposerDraft);
+    S.imVoiceMode = false;
     S.activePeer = "";
+    restoreChatComposerDraft("");
     S.activePeerName = "";
     refreshMessageConversationRegion({ refreshList: false });
     return;
@@ -8199,9 +8423,20 @@ async function handleProductForm(form, submitter) {
   }
   if (kind === "im-send") {
     const peer = String(values.peer || S.activePeer || "").trim();
-    const text = String(values.text || "").trim();
+    const submittedDraft = String(values.text || "");
+    setChatComposerDraft(submittedDraft);
+    const submittedDraftRevision = S.imComposerDraftRevision;
+    const submittedPeerDraftRevision = Number(S.imComposerDraftRevisions.get(peer) || 0);
+    const text = submittedDraft.trim();
     if (!peer || !text) throw new Error("请输入对方 UID 和消息内容");
     if (isSystemCustomerServicePeer(peer)) throw new Error("系统客服消息无需回复");
+    const submittedConversation = S.conversations.find((item) => conversationPeer(item) === peer) || {};
+    const submittedPeerName =
+      (peer === String(S.activePeer || "") ? S.activePeerName : "") ||
+      submittedConversation.nickname ||
+      submittedConversation.peer_name ||
+      submittedConversation.user?.nickname ||
+      `用户 ${peer}`;
 
     let sentEntry = null;
     if (S.imConnected && S.imMode === "sdk" && S.chat && resolveTimApi()) {
@@ -8276,7 +8511,28 @@ async function handleProductForm(form, submitter) {
       unreadCount: 0,
     });
     const input = $("im-text");
-    if (input) input.value = "";
+    const draftUnchanged =
+      String(S.activePeer || "") === peer &&
+      S.imComposerDraftRevision === submittedDraftRevision &&
+      String(input?.value ?? S.imComposerDraft) === submittedDraft;
+    const storedPeerDraftUnchanged =
+      Number(S.imComposerDraftRevisions.get(peer) || 0) === submittedPeerDraftRevision &&
+      String(S.imComposerDrafts.get(peer) || "") === submittedDraft;
+    const visiblePeerDraftUnchanged =
+      storedPeerDraftUnchanged &&
+      String(S.activePeer || "") === peer &&
+      String(input?.value ?? S.imComposerDraft) === submittedDraft;
+    const clearVisibleDraft = draftUnchanged || visiblePeerDraftUnchanged;
+    if (clearVisibleDraft) {
+      setChatComposerDraft("");
+    } else if (storedPeerDraftUnchanged) {
+      S.imComposerDrafts.delete(peer);
+      S.imComposerDraftRevisions.set(peer, submittedPeerDraftRevision + 1);
+    }
+    if (input && clearVisibleDraft) {
+      input.value = "";
+      syncChatComposerInput(input);
+    }
     if (S.route === "msg") {
       const log = $("im-log");
       if (log) {
@@ -8508,6 +8764,13 @@ $("login-back").addEventListener("click", (event) => {
 });
 
 document.addEventListener("input", (event) => {
+  const composerInput = event.target.closest && event.target.closest("#im-text");
+  if (composerInput) {
+    setChatComposerDraft(composerInput.value);
+    const resized = syncChatComposerInput(composerInput);
+    if (resized && S.route === "msg" && S.activePeer) requestAnimationFrame(() => scrollChatLogToBottom());
+    return;
+  }
   const input = event.target.closest && event.target.closest("#friend-filter");
   if (!input) return;
   const query = input.value.trim().toLowerCase();
@@ -8526,8 +8789,16 @@ document.addEventListener("input", (event) => {
 
 document.addEventListener("focusin", (event) => {
   if (usesCoarsePointer() && event.target?.matches?.("#im-text")) {
+    S.imVoiceMode = false;
     closeChatComposerPanelForKeyboard();
+    syncChatComposerInput(event.target);
+    syncVisualViewport();
+    requestAnimationFrame(() => scrollChatLogToBottom());
   }
+});
+
+document.addEventListener("focusout", (event) => {
+  if (event.target?.matches?.("#im-text")) setTimeout(syncVisualViewport, 0);
 });
 
 document.addEventListener("change", (event) => {
@@ -8570,6 +8841,16 @@ document.addEventListener(
 );
 
 document.addEventListener("pointerdown", (event) => {
+  const panelToggle = event.target.closest && event.target.closest('[data-action="toggle-chat-panel"]');
+  if (panelToggle && usesCoarsePointer()) {
+    const viewportHeight = Number(window.visualViewport?.height || window.innerHeight || 0);
+    const keyboardVisible =
+      document.activeElement?.matches?.("#im-text") === true ||
+      document.documentElement.classList.contains("keyboard-visible") ||
+      stableVisualViewportHeight - viewportHeight > 120;
+    panelToggle.dataset.keyboardWasOpen = keyboardVisible ? "1" : "0";
+    panelToggle.dataset.keyboardTargetHeight = String(Math.max(stableVisualViewportHeight, viewportHeight));
+  }
   const voice = event.target.closest && event.target.closest('[data-action="record-voice"]');
   if (voice && !voice.disabled) {
     event.preventDefault();

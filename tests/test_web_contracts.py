@@ -1822,6 +1822,13 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("event.shiftKey", app_js)
         self.assertIn('event.target.closest("#im-text")', app_js)
         self.assertIn("form.requestSubmit(submitter)", app_js)
+        self.assertIn("submittedDraftRevision", app_js)
+        self.assertIn("S.imComposerDraftRevision === submittedDraftRevision", app_js)
+        self.assertIn("submittedPeerDraftRevision", app_js)
+        self.assertIn("visiblePeerDraftUnchanged", app_js)
+        self.assertIn('String(S.activePeer || "") === peer', app_js)
+        self.assertIn("imComposerDrafts: new Map()", app_js)
+        self.assertIn("restoreChatComposerDraft(uid)", app_js)
 
     def test_conversation_list_defaults_expanded_and_supports_horizontal_collapse(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -2091,9 +2098,15 @@ class RichMessageFrontendContractTests(unittest.TestCase):
 
         self.assertIn("window.visualViewport", app_js)
         self.assertIn('setProperty("--app-viewport-height"', app_js)
+        self.assertIn('setProperty("--app-viewport-offset-top"', app_js)
+        self.assertIn("stableVisualViewportHeight", app_js)
         self.assertIn('window.visualViewport?.addEventListener("resize"', app_js)
         self.assertIn('window.visualViewport?.addEventListener("scroll"', app_js)
         self.assertIn("closeChatComposerPanelForKeyboard()", app_js)
+        self.assertIn("waitForVisualViewportRecovery", app_js)
+        self.assertIn("await waitForVisualViewportRecovery(targetHeight)", app_js)
+        self.assertIn("viewportLooksCompressed", app_js)
+        self.assertIn("keyboardTargetHeight", app_js)
         self.assertIn("selectionStart", app_js)
         self.assertIn("selectionEnd", app_js)
         self.assertNotIn('refreshChatComposerKeepingText({ focus: panel === "emoji" })', app_js)
@@ -2104,7 +2117,9 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("grid-template-columns: 1fr", mobile_media)
         self.assertIn(".conversation-layout.has-active .conversation-list-pane", mobile_media)
         self.assertIn(".conversation-layout.has-active .chat-pane", mobile_media)
-        self.assertIn("max-height: calc(100% - 84px)", short_media)
+        self.assertIn("body.chat-conversation-open .page-root.message-route", app_css)
+        self.assertIn("height: var(--app-viewport-height, 100dvh)", app_css)
+        self.assertIn("max-height: none", short_media)
         self.assertIn("--safe-left: env(safe-area-inset-left", app_css)
         self.assertIn("--safe-right: env(safe-area-inset-right", app_css)
         tablet_layout = app_css.split("@media (max-width: 960px)", 1)[1].split("@media (min-width: 961px)", 1)[0]
