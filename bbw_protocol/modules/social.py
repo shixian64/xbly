@@ -15,6 +15,8 @@ DYNAMIC_TAB_PLATENAMES = {
     "关注": "关注",
 }
 
+MAIN4_FEED_TABS = {"附近", "最新"}
+
 
 class SocialAPI:
     def __init__(self, client: ProtocolClient):
@@ -142,27 +144,33 @@ class SocialAPI:
         filter_property: str = "不限",
         filter_region: str = "不限",
     ) -> ApiResult:
-        """Read the v154 Dynamic feed used by the active APK navigation graph.
+        """Read the v154 Dynamic feed using the APK route for each Web tab.
 
-        ``Main4Branch.LuntanFragment`` sends ``精华`` for 推荐, ``同城`` for
-        附近 and ``首页`` for 最新 to ``luntannewnewnew``. Pagination starts
-        at ``1`` and subsequent requests use the last post id as ``pageindex``.
+        The normally reachable ``Main4Activity`` sends 附近/最新 through
+        ``Luntan0`` with ``start=1`` on the first request. The APK also retains
+        an unreferenced ``dongtai_graph`` whose other categories use
+        ``luntannewnewnew``. Keep those categories on their existing route so
+        fixing 附近/最新 does not regress the feeds that already return data.
         """
-        platename = DYNAMIC_TAB_PLATENAMES.get(str(tab or "推荐"), str(tab or "推荐"))
+        tab_name = str(tab or "推荐")
+        pageindex = str(cursor or "1")
+        platename = DYNAMIC_TAB_PLATENAMES.get(tab_name, tab_name)
+        body = {
+            "type": "getPostlist",
+            "myid": self.c.session.uid,
+            "platename": platename,
+            "pageindex": pageindex,
+            "filter_gender": filter_gender,
+            "filter_search": filter_search,
+            "filter_property": filter_property,
+            "filter_region": filter_region,
+        }
+        if tab_name in MAIN4_FEED_TABS:
+            body = {"start": "1" if pageindex == "1" else "0", **body}
+            return self.c.request(self.c.url("Luntan0", i="99999"), body)
         return self.c.request(
-            # dongtai_graph starts at LuntanFragment. Luntan0 belongs to the
-            # retained Main4Activity/LuntanNewFragment flow and is not this UI.
             self.c.url("luntannewnewnew", i="999999"),
-            {
-                "type": "getPostlist",
-                "myid": self.c.session.uid,
-                "platename": platename,
-                "pageindex": cursor,
-                "filter_gender": filter_gender,
-                "filter_search": filter_search,
-                "filter_property": filter_property,
-                "filter_region": filter_region,
-            },
+            body,
         )
 
     def user_posts(self, authid: Optional[str] = None, page: str = "1") -> ApiResult:

@@ -563,30 +563,39 @@ class ProtocolRoutingTests(unittest.TestCase):
                 calls.append((url, body))
                 return SimpleNamespace(ok=True)
 
-        SocialAPI(FakeClient()).posts("附近", "99", filter_region="上海")
-        self.assertEqual(calls[0][0], "999999:luntannewnewnew")
+        SocialAPI(FakeClient()).posts("附近", "1", filter_region="上海")
+        self.assertEqual(calls[0][0], "99999:Luntan0")
+        self.assertEqual(calls[0][1]["start"], "1")
         self.assertEqual(calls[0][1]["platename"], "同城")
-        self.assertEqual(calls[0][1]["pageindex"], "99")
+        self.assertEqual(calls[0][1]["pageindex"], "1")
         self.assertEqual(calls[0][1]["filter_region"], "上海")
-        self.assertNotIn("start", calls[0][1])
 
         SocialAPI(FakeClient()).posts("最新", "1")
+        self.assertEqual(calls[1][0], "99999:Luntan0")
+        self.assertEqual(calls[1][1]["start"], "1")
         self.assertEqual(calls[1][1]["platename"], "首页")
 
+        SocialAPI(FakeClient()).posts("附近", "99", filter_region="上海")
+        self.assertEqual(calls[2][0], "99999:Luntan0")
+        self.assertEqual(calls[2][1]["start"], "0")
+        self.assertEqual(calls[2][1]["pageindex"], "99")
+
         SocialAPI(FakeClient()).posts("推荐", "1")
-        self.assertEqual(calls[2][1]["platename"], "精华")
+        self.assertEqual(calls[3][0], "999999:luntannewnewnew")
+        self.assertNotIn("start", calls[3][1])
+        self.assertEqual(calls[3][1]["platename"], "精华")
 
         SocialAPI(FakeClient()).user_posts("42", "2")
-        self.assertEqual(calls[3][0], "99999:someonesluntannew")
+        self.assertEqual(calls[4][0], "99999:someonesluntannew")
         self.assertEqual(
-            calls[3][1],
+            calls[4][1],
             {"myid": "42", "authid": "42", "pageindex": "2"},
         )
 
         SocialAPI(FakeClient()).profile_posts("9", "3")
-        self.assertEqual(calls[4][0], "999999:someonesluntannew")
+        self.assertEqual(calls[5][0], "999999:someonesluntannew")
         self.assertEqual(
-            calls[4][1],
+            calls[5][1],
             {"myid": "42", "authid": "9", "pageindex": "3"},
         )
 
