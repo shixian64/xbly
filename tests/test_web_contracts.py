@@ -2548,7 +2548,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn(".page-root.message-route", tablet_layout)
         self.assertIn("padding-bottom: calc(var(--bottom-h) + var(--safe-bottom) + 1.2rem)", tablet_layout)
         desktop_layout = app_css.split("@media (min-width: 961px)", 1)[1].split("@media (max-width: 640px)", 1)[0]
-        self.assertIn("--side-w: clamp(196px, 18vw, 254px)", desktop_layout)
+        self.assertIn("--side-w: clamp(130.667px, 12vw, 169.333px)", desktop_layout)
         self.assertIn("@media (min-width: 961px) and (max-width: 1180px)", app_css)
         self.assertIn("min-height: 44px", app_css)
         self.assertIn("font-size: 16px", app_css)
