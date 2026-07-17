@@ -1002,8 +1002,12 @@ class SocialBffRoutingTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertEqual(calls, ["1", "2"])
-        self.assertEqual([item["id"] for item in items], ["9", "10"])
-        self.assertEqual(metadata["count"], 2)
+        self.assertEqual(len(items), bff_server.FRIEND_APPLICATION_PAGE_SIZE + 2)
+        self.assertEqual(items[0]["status"], "accepted")
+        self.assertEqual([item["id"] for item in items[-2:]], ["9", "10"])
+        self.assertEqual(metadata["count"], bff_server.FRIEND_APPLICATION_PAGE_SIZE + 2)
+        self.assertEqual(metadata["accepted_count"], bff_server.FRIEND_APPLICATION_PAGE_SIZE)
+        self.assertEqual(metadata["pending_incoming_count"], 2)
         self.assertFalse(metadata["has_more"])
         self.assertEqual(metadata["next_page"], "")
 
@@ -1082,7 +1086,7 @@ class SocialBffRoutingTests(unittest.TestCase):
         self.assertEqual(calls, [("friend_apply", "1")])
         self.assertEqual(response[1]["count"], 0)
 
-    def test_friend_application_directions_and_pending_counts_are_preserved(self) -> None:
+    def test_friend_application_directions_and_statuses_are_preserved(self) -> None:
         applications = ApiResult(
             True,
             200,
@@ -1106,7 +1110,6 @@ class SocialBffRoutingTests(unittest.TestCase):
                     "id": "incoming-accepted",
                     "myid": "42",
                     "yourid": "11",
-                    "agree": "1",
                     "userInfoList": {"id": "11", "nickname": "已添加用户"},
                 },
             ],
@@ -1130,12 +1133,17 @@ class SocialBffRoutingTests(unittest.TestCase):
         self.assertTrue(by_id["9"]["can_accept"])
         self.assertEqual(by_id["10"]["direction"], "outgoing")
         self.assertEqual(by_id["10"]["status_label"], "等待对方同意")
-        self.assertNotIn("11", by_id)
+        self.assertEqual(by_id["11"]["status"], "accepted")
+        self.assertFalse(by_id["11"]["can_accept"])
         counts = bff_server._friend_application_counts(items)
-        self.assertEqual(counts["incoming_count"], 1)
+        self.assertEqual(counts["incoming_count"], 2)
         self.assertEqual(counts["outgoing_count"], 1)
         self.assertEqual(counts["pending_incoming_count"], 1)
-        self.assertEqual(metadata["count"], 1)
+        self.assertEqual(counts["accepted_count"], 1)
+        self.assertEqual(metadata["count"], 3)
+        summary = bff_server._friend_application_summary(metadata)
+        self.assertEqual(summary["count"], 1)
+        self.assertEqual(summary["total_count"], 3)
 
     def test_nearby_moments_use_profile_region_and_report_missing_location(self) -> None:
         def run(raw_user, profile_data=None):
@@ -2439,7 +2447,7 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("function friendApplicationsHtml(envelope)", app_js)
         self.assertIn("function friendApplicationDirection(item)", app_js)
         self.assertIn('direction === "incoming" && status === "pending"', app_js)
-        self.assertIn('await switchSocialTab("apply", { force: true })', app_js)
+        self.assertIn("function markFriendApplicationAccepted(button)", app_js)
         self.assertIn(".friend-application-groups", app_css)
         self.assertIn(".friend-application-status--accepted", app_css)
         self.assertNotIn("更多服务", index_html)
@@ -2462,10 +2470,11 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('readConversationPeers: new Map()', app_js)
         self.assertIn('refreshList: false', app_js)
         self.assertIn('data-action="agree-friend" data-id=', app_js)
-        self.assertIn("function friendApplicationHtml(data)", app_js)
+        self.assertIn("function appendFriendApplicationItems(container, items)", app_js)
+        self.assertNotIn("function friendApplicationHtml(data)", app_js)
         self.assertIn('data-action="friend-apply-load-more"', app_js)
         self.assertIn("function syncFriendApplicationCount", app_js)
-        self.assertIn('await switchSocialTab("apply", { force: true })', app_js)
+        self.assertIn("markFriendApplicationAccepted(button)", app_js)
         self.assertIn("applyResult.value.data?.has_more === true", app_js)
         self.assertIn("clearRelationshipCache", app_js)
         self.assertIn('data-action="social-tab"', app_js)

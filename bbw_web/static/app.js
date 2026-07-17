@@ -2888,7 +2888,10 @@ function friendApplicationCard(item) {
     directionLabel
   )}</span><span class="friend-application-status friend-application-status--${status}">${esc(statusLabel)}</span>`;
   const canAccept = direction === "incoming" && status === "pending" && item?.can_accept !== false;
-  return `<div class="friend-application-card friend-application-card--${direction}">${userCard(
+  const applicationKey = String(item?.apply_id || `${direction}:${item?.id || item?.uid || ""}`);
+  return `<div class="friend-application-card friend-application-card--${direction}" data-friend-application-key="${esc(
+    applicationKey
+  )}">${userCard(
     { ...item, subtitle },
     { profile: true, accept: canAccept, titleMetaHtml }
   )}</div>`;
@@ -2902,20 +2905,14 @@ function friendApplicationGroupHtml(direction, items) {
     : direction === "outgoing"
       ? "当前账号主动申请添加的用户"
       : "服务端没有提供明确的申请方向";
-  return `<section class="friend-application-group friend-application-group--${direction}"><div class="friend-application-group-head"><div><h3>${title}</h3><p>${detail}</p></div><span>${items.length} 条</span></div>${
-    items.length
-      ? `<div class="stack">${items.map(friendApplicationCard).join("")}</div>`
-      : `<div class="friend-application-empty">${incoming ? "暂无收到的申请" : "暂无发出的申请"}</div>`
-  }</section>`;
+  return `<section class="friend-application-group friend-application-group--${direction}" data-friend-application-group="${direction}"><div class="friend-application-group-head"><div><h3>${title}</h3><p>${detail}</p></div><span data-friend-application-count>${items.length} 条</span></div><div class="stack" data-friend-application-stack>${items
+    .map(friendApplicationCard)
+    .join("")}</div><div class="friend-application-empty" data-friend-application-empty${
+    items.length ? " hidden" : ""
+  }>${incoming ? "暂无收到的申请" : direction === "outgoing" ? "暂无发出的申请" : "暂无其他申请记录"}</div></section>`;
 }
 
-function friendApplicationsHtml(envelope) {
-  if (envelope && envelope.ok === false) {
-    const info = errorInfo(envelope);
-    return emptyState(info.title, info.detail || "好友申请暂时无法加载", actionRoute(info.action));
-  }
-  const items = itemsOf(envelope);
-  if (!items.length) return emptyState("暂无好友申请", "收到或发出的申请会显示在这里");
+function friendApplicationGroupsHtml(items) {
   const incoming = items.filter((item) => friendApplicationDirection(item) === "incoming");
   const outgoing = items.filter((item) => friendApplicationDirection(item) === "outgoing");
   const unknown = items.filter((item) => friendApplicationDirection(item) === "unknown");
@@ -2925,6 +2922,69 @@ function friendApplicationsHtml(envelope) {
   )}${friendApplicationGroupHtml("outgoing", outgoing)}${
     unknown.length ? friendApplicationGroupHtml("unknown", unknown) : ""
   }</div>`;
+}
+
+function friendApplicationsHtml(envelope) {
+  if (envelope && envelope.ok === false) {
+    const info = errorInfo(envelope);
+    return emptyState(info.title, info.detail || "好友申请暂时无法加载", actionRoute(info.action));
+  }
+  const items = itemsOf(envelope);
+  const nextPage = String(envelope?.next_page || "").trim();
+  const content = items.length
+    ? friendApplicationGroupsHtml(items)
+    : emptyState("暂无好友申请", "收到或发出的申请会显示在这里");
+  return `<div data-friend-application-items>${content}</div>${
+    nextPage
+      ? `<div class="moment-load-more" data-friend-application-more><button type="button" class="btn secondary" data-action="friend-apply-load-more" data-page="${esc(
+          nextPage
+        )}">加载更多申请</button></div>`
+      : ""
+  }`;
+}
+
+function appendFriendApplicationItems(container, items) {
+  if (!container || !items.length) return;
+  if (!container.querySelector(".friend-application-groups")) {
+    container.innerHTML = friendApplicationGroupsHtml([]);
+  }
+  const groups = container.querySelector(".friend-application-groups");
+  const existing = new Set(
+    [...container.querySelectorAll("[data-friend-application-key]")].map((item) => item.dataset.friendApplicationKey)
+  );
+  items.forEach((item) => {
+    const direction = friendApplicationDirection(item);
+    const key = String(item?.apply_id || `${direction}:${item?.id || item?.uid || ""}`);
+    if (existing.has(key)) return;
+    existing.add(key);
+    let group = groups?.querySelector(`[data-friend-application-group="${direction}"]`);
+    if (!group && groups) {
+      groups.insertAdjacentHTML("beforeend", friendApplicationGroupHtml(direction, []));
+      group = groups.querySelector(`[data-friend-application-group="${direction}"]`);
+    }
+    group?.querySelector("[data-friend-application-stack]")?.insertAdjacentHTML(
+      "beforeend",
+      friendApplicationCard(item)
+    );
+    const count = group?.querySelectorAll("[data-friend-application-key]").length || 0;
+    const countLabel = group?.querySelector("[data-friend-application-count]");
+    if (countLabel) countLabel.textContent = `${count} 条`;
+    const empty = group?.querySelector("[data-friend-application-empty]");
+    if (empty) empty.hidden = count > 0;
+  });
+}
+
+function markFriendApplicationAccepted(button) {
+  const card = button?.closest?.("[data-friend-application-key]");
+  const status = card?.querySelector(".friend-application-status");
+  if (status) {
+    [...status.classList]
+      .filter((name) => name.startsWith("friend-application-status--"))
+      .forEach((name) => status.classList.remove(name));
+    status.classList.add("friend-application-status--accepted");
+    status.textContent = "已成为好友";
+  }
+  button?.remove();
 }
 
 function socialCardForTab(item, tab) {
@@ -2946,23 +3006,6 @@ function syncFriendApplicationCount(count, hasMore = false) {
   if (!tab) return;
   const suffix = friendApplicationCountText(count, hasMore);
   tab.textContent = suffix ? `好友申请 ${suffix}` : "好友申请";
-}
-
-function friendApplicationHtml(data) {
-  const content = envelopeHtml(
-    data,
-    (item) => socialCardForTab(item, "apply"),
-    "暂无好友申请",
-    "新的好友申请会显示在这里"
-  );
-  const nextPage = String(data?.next_page || "").trim();
-  return `<div data-friend-application-items>${content}</div>${
-    nextPage
-      ? `<div class="moment-load-more" data-friend-application-more><button type="button" class="btn secondary" data-action="friend-apply-load-more" data-page="${esc(
-          nextPage
-        )}">加载更多申请</button></div>`
-      : ""
-  }`;
 }
 
 function giftCard(item) {
@@ -7773,6 +7816,7 @@ async function loadSocialTab(tab, signal) {
   } else if (activeTab === "apply") {
     const { data } = await api("/api/social/friend-apply", { signal });
     applyCount = Number(data?.pending_incoming_count || 0);
+    applyHasMore = data?.has_more === true;
     body = `<section class="section friend-application-section"><div class="section-head"><div><h2>好友申请</h2><p>分别查看收到和发出的申请，状态会随服务端结果更新</p></div><button type="button" class="btn secondary small" data-action="refresh-route">刷新</button></div>${friendApplicationsHtml(
       data
     )}</section>`;
@@ -7810,15 +7854,12 @@ async function loadSocialTab(tab, signal) {
     };
     const { data } = await api(paths[activeTab], { signal });
     const [title, detail] = copy[activeTab];
-    if (activeTab === "apply") {
-      applyCount = Number(data?.count || itemsOf(data).length || 0);
-      applyHasMore = data?.has_more === true;
-    }
-    body = `<section class="section"><div class="section-head"><div><h2>${title}</h2><p>${detail}</p></div><button type="button" class="btn secondary small" data-action="refresh-route">刷新</button></div>${
-      activeTab === "apply"
-        ? friendApplicationHtml(data)
-        : envelopeHtml(data, (item) => socialCardForTab(item, activeTab), "列表还是空的", detail)
-    }</section>`;
+    body = `<section class="section"><div class="section-head"><div><h2>${title}</h2><p>${detail}</p></div><button type="button" class="btn secondary small" data-action="refresh-route">刷新</button></div>${envelopeHtml(
+      data,
+      (item) => socialCardForTab(item, activeTab),
+      "列表还是空的",
+      detail
+    )}</section>`;
   }
 
   return { tab: activeTab, body, applyCount, applyHasMore };
@@ -10255,17 +10296,7 @@ async function handleAction(action, button) {
     const { data } = await api(`/api/social/friend-apply?page=${encodeURIComponent(page)}`);
     if (data?.ok === false) throw new Error(errorInfo(data, "好友申请加载失败").title);
     const items = itemsOf(data);
-    if (container && items.length) {
-      let stack = container.querySelector(".stack");
-      if (!stack) {
-        container.innerHTML = '<div class="stack"></div>';
-        stack = container.querySelector(".stack");
-      }
-      stack?.insertAdjacentHTML(
-        "beforeend",
-        items.map((item) => socialCardForTab(item, "apply")).join("")
-      );
-    }
+    appendFriendApplicationItems(container, items);
     const nextPage = String(data?.next_page || "").trim();
     if (nextPage) {
       button.dataset.page = nextPage;
@@ -10274,8 +10305,11 @@ async function handleAction(action, button) {
     } else {
       more?.remove();
     }
-    const loadedCount = container?.querySelectorAll(".user-card").length || 0;
-    syncFriendApplicationCount(loadedCount, Boolean(nextPage));
+    const pendingIncoming =
+      container?.querySelectorAll(
+        ".friend-application-card--incoming .friend-application-status--pending"
+      ).length || 0;
+    syncFriendApplicationCount(pendingIncoming, Boolean(nextPage));
     return;
   }
   if (action === "agree-friend") {
@@ -10289,7 +10323,17 @@ async function handleAction(action, button) {
     });
     if (toastEnv(data, "已同意好友申请")) {
       clearRelationshipCache(["friends", "apply"]);
-      await switchSocialTab("apply", { force: true });
+      const section = button.closest(".friend-application-section");
+      const container = section?.querySelector("[data-friend-application-items]");
+      markFriendApplicationAccepted(button);
+      const pendingIncoming =
+        container?.querySelectorAll(
+          ".friend-application-card--incoming .friend-application-status--pending"
+        ).length || 0;
+      syncFriendApplicationCount(
+        pendingIncoming,
+        Boolean(section?.querySelector("[data-friend-application-more]"))
+      );
     }
     return;
   }

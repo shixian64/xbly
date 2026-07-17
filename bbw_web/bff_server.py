@@ -335,7 +335,7 @@ def _friend_applications(
     start_page: int = 1,
     scan_pages: int = FRIEND_APPLICATION_SCAN_PAGES,
 ) -> Tuple[Any, List[Dict[str, Any]], Dict[str, Any]]:
-    """Return a bounded window of pending applications across upstream pages."""
+    """Return a bounded window of friend-application history across upstream pages."""
     first_page = max(1, int(start_page))
     page_limit = max(1, min(int(scan_pages), FRIEND_APPLICATION_SCAN_PAGES))
     primary = result or app.social.friend_apply_list(str(first_page))
@@ -371,8 +371,7 @@ def _friend_applications(
             seen.add(key)
             if not item.get("request_status_known"):
                 status_unknown = True
-            if item.get("request_status") == "pending":
-                normalized.append(item)
+            normalized.append(item)
         if len(raw_items) < FRIEND_APPLICATION_PAGE_SIZE:
             next_page = ""
             break
@@ -381,19 +380,27 @@ def _friend_applications(
     if status_unknown and normalized:
         accepted = _accepted_friend_ids(app, current_uid)
         if accepted:
-            normalized = [
-                item
-                for item in normalized
-                if str(item.get("id") or "") not in accepted
-            ]
+            for item in normalized:
+                if str(item.get("id") or "") not in accepted:
+                    continue
+                item.update(
+                    request_status="accepted",
+                    request_status_known=True,
+                    is_pending=False,
+                    is_accepted=True,
+                    status="accepted",
+                    status_label="已成为好友",
+                    can_accept=False,
+                    is_friend=True,
+                )
     metadata = {
         "page": str(first_page),
         "next_page": next_page,
         "has_more": bool(next_page),
         "scanned_pages": scanned_pages,
+        "count": len(normalized),
         **_friend_application_counts(normalized),
     }
-    metadata["count"] = metadata["pending_incoming_count"]
     return primary, normalized, metadata
 
 
@@ -410,6 +417,13 @@ def _friend_application_counts(items: List[Dict[str, Any]]) -> Dict[str, int]:
         "pending_incoming_count": len(pending_incoming),
         "accepted_count": len(accepted),
     }
+
+
+def _friend_application_summary(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    summary = dict(metadata)
+    summary["total_count"] = int(metadata.get("count") or 0)
+    summary["count"] = int(metadata.get("pending_incoming_count") or 0)
+    return summary
 
 
 def _presence_uids(values: Any, limit: int = 100) -> List[str]:
@@ -1825,12 +1839,14 @@ class Handler(BaseHTTPRequestHandler):
                 payload["status"] = result.status
                 payload.update(metadata)
                 return self.ok(
-                    {"ok": True, **metadata}
+                    {"ok": True, **_friend_application_summary(metadata)}
                     if q("summary", "0") == "1"
                     else payload
                 )
             if q("summary", "0") == "1":
-                return self.ok({"ok": bool(result.ok), **metadata})
+                return self.ok(
+                    {"ok": bool(result.ok), **_friend_application_summary(metadata)}
+                )
             payload = N.envelope(result, items=items)
             payload["list"] = items
             payload["status"] = result.status
