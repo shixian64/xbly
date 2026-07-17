@@ -237,6 +237,7 @@ class RuntimePersistence:
     PENDING_LOGIN_SECONDS = 5 * 60
     WEB_PRESENCE_TTL_SECONDS = 120
     PRESENCE_REST_FAILURE_TTL_SECONDS = 10 * 60
+    MOMENT_VIDEO_GRANT_SECONDS = 2 * 60 * 60
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -371,6 +372,76 @@ class RuntimePersistence:
 
             self._r2_storage = R2Storage(self.settings)
         return self._r2_storage
+
+    def _moment_video_feed_grant_key(
+        self, identity: UserIdentity, post_id: str, asset_id: str
+    ) -> str:
+        post_digest = hashlib.sha256(str(post_id).encode("utf-8")).hexdigest()
+        return (
+            f"{self.settings.redis_prefix}:moment-video-feed-grant:"
+            f"{identity.user_id}:{post_digest}:{asset_id}"
+        )
+
+    def _moment_video_access_key(self, identity: UserIdentity, asset_id: str) -> str:
+        return (
+            f"{self.settings.redis_prefix}:moment-video-access:"
+            f"{identity.user_id}:{asset_id}"
+        )
+
+    def remember_moment_video_grants(
+        self, identity: UserIdentity, response_data: dict[str, Any]
+    ) -> int:
+        """Remember only videos that appeared in this user's successful feed response."""
+        from bbw_web.moment_video import (
+            MomentVideoError,
+            asset_id_for_url,
+            canonical_source_identity,
+        )
+
+        raw_items = response_data.get("items") or response_data.get("list") or []
+        if not isinstance(raw_items, list):
+            return 0
+        grants: list[tuple[str, str]] = []
+        for item in raw_items[:200]:
+            if not isinstance(item, dict):
+                continue
+            post_id = str(item.get("id") or item.get("post_id") or "").strip()
+            source = item.get("video") or item.get("postvideo")
+            if not post_id or not source:
+                continue
+            try:
+                canonical = canonical_source_identity(source)
+            except MomentVideoError:
+                continue
+            grants.append((post_id, asset_id_for_url(canonical)))
+        if not grants:
+            return 0
+        pipe = self.redis.pipeline()
+        for post_id, asset_id in grants:
+            pipe.set(
+                self._moment_video_feed_grant_key(identity, post_id, asset_id),
+                b"1",
+                ex=self.MOMENT_VIDEO_GRANT_SECONDS,
+            )
+        pipe.execute()
+        return len(grants)
+
+    def authorize_moment_video(
+        self, identity: UserIdentity, *, post_id: str, asset_id: str
+    ) -> bool:
+        feed_key = self._moment_video_feed_grant_key(identity, post_id, asset_id)
+        if not self.redis.exists(feed_key):
+            return False
+        self.redis.set(
+            self._moment_video_access_key(identity, asset_id),
+            b"1",
+            ex=self.MOMENT_VIDEO_GRANT_SECONDS,
+        )
+        return True
+
+    def can_access_moment_video(self, identity: UserIdentity, asset_id: str) -> bool:
+        key = self._moment_video_access_key(identity, asset_id)
+        return bool(self.redis.exists(key))
 
     def _failure_key(self, phone: str, client_ip: str) -> str:
         digest = hashlib.sha256(f"{phone.strip()}\n{client_ip}".encode("utf-8")).hexdigest()
@@ -1146,6 +1217,13 @@ class RuntimePersistence:
                 "/api/auth/sms-login",
             }:
                 self.set_web_presence(identity.upstream_uid, active=True)
+        if (
+            method.upper() == "GET"
+            and path == "/api/moments/posts"
+            and response_ok
+            and response_data.get("ok") is True
+        ):
+            self.remember_moment_video_grants(identity, response_data)
         if (
             response_ok
             and path in {"/api/im/messages", "/api/im/conversations"}

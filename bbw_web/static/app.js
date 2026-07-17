@@ -53,6 +53,9 @@ const ME_STATS_TTL_MS = 60 * 1000;
 const MESSAGE_REVOKE_DEFAULT_WINDOW_MS = 2 * 60 * 1000;
 const MEDIA_RECONCILE_DELAYS_MS = [1200, 3500, 8000];
 const CHAT_MEDIA_RETRY_DELAYS_MS = [700, 1800, 4000];
+const MOMENT_VIDEO_FRAME_CHECK_MS = 2500;
+const MOMENT_VIDEO_INITIAL_FRAME_WAIT_MS = 15000;
+const MOMENT_VIDEO_COMPAT_TIMEOUT_MS = 32 * 60 * 1000;
 const MATCH_GENDERS = ["不限", "男", "女"];
 const MATCH_PROPERTIES = ["双", "Z", "B"];
 
@@ -311,6 +314,10 @@ function localizedSystemText(value, fallback = "操作未成功") {
 
 /** Official OSS host used by APK for /images/... relative paths. */
 const MEDIA_BASE = "https://oss.banghua.xin";
+// The APK rewrites these retired OSS origins before loading media. Older
+// dynamic posts can still contain them, while the old buckets now return
+// 403/404 in browsers.
+const APK_MEDIA_ORIGIN_RE = /^(?:https?:)?\/\/(?:oss\.banghua\.xin|moyuanoss\.oss-cn-shanghai\.aliyuncs\.com|appletattachment\.oss-cn-beijing\.aliyuncs\.com)(?=[/?#]|$)/i;
 const INVALID_AVATAR_VALUES = new Set([
   "0",
   "false",
@@ -327,6 +334,8 @@ function mediaUrl(value) {
   const raw = String(value || "").trim();
   if (!raw || raw === "null" || raw === "undefined") return "";
   if (/^(?:blob:|data:(?:image|audio|video)\/)/i.test(raw)) return raw;
+  const canonical = raw.replace(APK_MEDIA_ORIGIN_RE, MEDIA_BASE);
+  if (canonical !== raw) return canonical;
   if (raw.startsWith("//")) return `https:${raw}`;
   if (/^https?:\/\//i.test(raw)) return raw;
   // API often returns site-relative paths like /images/999999/...
@@ -2621,9 +2630,13 @@ function momentMediaHtml(post) {
   const video = mediaUrl(post.video);
   const cover = mediaUrl(post.cover);
   const videoHtml = video
-    ? `<video class="moment-video" controls preload="metadata" playsinline ${cover ? `poster="${esc(cover)}"` : ""}><source src="${esc(
+    ? `<div class="moment-video-wrap" data-playback-wrap><video class="moment-video" controls controlslist="nodownload noremoteplayback" disablepictureinpicture disableremoteplayback draggable="false" preload="metadata" playsinline referrerpolicy="no-referrer" data-media-playback data-moment-video="true" data-post-id="${esc(
+        post.id || ""
+      )}" data-media-mode="original" data-original-source="${esc(video)}" data-media-source="${esc(
         video
-      )}" /></video>`
+      )}" data-video-frame-required="true" ${cover ? `poster="${esc(cover)}"` : ""} src="${esc(
+         video
+      )}"></video><div class="chat-playback-fallback moment-playback-fallback" data-playback-fallback hidden><span>视频加载失败</span><button type="button" data-action="retry-chat-playback">重试</button></div></div>`
     : "";
   return pictureHtml || videoHtml ? `<div class="moment-media">${pictureHtml}${videoHtml}</div>` : "";
 }
@@ -5113,7 +5126,7 @@ async function sendTimMediaFile(kind, file, meta = {}) {
   if (previous) updateLocalMessage(pendingID, pending);
   else appendLocalMessage(pending);
   updateConversationActivity(peer, {
-    name: submittedPeerName,
+    name: S.activePeerName || `用户 ${peer}`,
     lastMessage: pending.preview,
     unreadCount: 0,
   });
@@ -5816,6 +5829,10 @@ function reloadChatPlayback(media, { manual = false } = {}) {
   media.dataset.mediaRetryPending = "1";
   media.hidden = true;
   setChatPlaybackFallback(media, manual ? "正在重新加载媒体…" : "媒体加载中，正在重试…", true);
+  if (isMomentVideo(media)) {
+    const retryButton = media.closest("[data-playback-wrap]")?.querySelector('[data-action="retry-chat-playback"]');
+    if (retryButton) retryButton.hidden = true;
+  }
   media.removeAttribute("src");
   try {
     media.load();
@@ -5836,6 +5853,7 @@ function reloadChatPlayback(media, { manual = false } = {}) {
 }
 
 function handleChatPlaybackLoaded(media) {
+  if (isMomentVideo(media) && media.dataset.compatPending === "1") return;
   clearChatMediaRetryState(media.dataset.mediaSource);
   media.dataset.mediaRetryCount = "0";
   media.dataset.mediaRetryPending = "0";
@@ -5844,15 +5862,315 @@ function handleChatPlaybackLoaded(media) {
   setChatPlaybackFallback(media, "", false);
 }
 
+function isMomentVideo(media) {
+  return Boolean(media?.matches?.('video[data-moment-video="true"]'));
+}
+
+function momentVideoCompatUrl(value, action) {
+  const path = String(value || "").trim();
+  const suffix = action === "play" ? "play" : "status";
+  return new RegExp(`^/api/media/compat-video/[0-9a-f]{64}/${suffix}$`).test(path) ? path : "";
+}
+
+function setMomentVideoFallback(video, text, { retry = false } = {}) {
+  setChatPlaybackFallback(video, text, true);
+  const retryButton = video?.closest?.("[data-playback-wrap]")?.querySelector('[data-action="retry-chat-playback"]');
+  if (retryButton) {
+    retryButton.hidden = !retry;
+    retryButton.disabled = !retry;
+  }
+}
+
+function cancelPendingVideoFrameCallback(video) {
+  const callbackId = Number(video?.dataset?.videoFrameCallbackId || NaN);
+  if (Number.isFinite(callbackId) && typeof video.cancelVideoFrameCallback === "function") {
+    try {
+      video.cancelVideoFrameCallback(callbackId);
+    } catch {
+      /* The callback may already have fired or been canceled by a source reset. */
+    }
+  }
+  if (video?.dataset) {
+    video.dataset.videoFrameCallbackId = "";
+    video.dataset.videoFrameCallbackPending = "0";
+  }
+}
+
+function failMomentVideoCompatibility(video, text = "视频暂时无法播放") {
+  if (!video?.isConnected) return;
+  cancelPendingVideoFrameCallback(video);
+  video.pause();
+  video.hidden = true;
+  video.dataset.compatPending = "0";
+  video.dataset.compatUnavailable = "1";
+  video.dataset.mediaRetryPending = "0";
+  video.dataset.mediaFailed = "1";
+  video.dataset.videoFrameUnsupported = "1";
+  setMomentVideoFallback(video, text, { retry: true });
+}
+
+function applyMomentVideoCompatibility(video, data, { resumePlayback = false } = {}) {
+  if (!video?.isConnected) return false;
+  const playbackUrl = momentVideoCompatUrl(data?.playback_url, "play");
+  if (!playbackUrl) return false;
+  clearChatMediaRetryState(video.dataset.mediaSource);
+  video.dataset.mediaMode = "compat";
+  video.dataset.mediaSource = playbackUrl;
+  video.dataset.compatPending = "0";
+  video.dataset.compatUnavailable = "0";
+  video.dataset.mediaFailed = "0";
+  video.dataset.mediaRetryCount = "0";
+  video.dataset.mediaRetryPending = "1";
+  video.dataset.videoFramePresented = "0";
+  video.dataset.videoFrameCheckStartedAt = "0";
+  video.dataset.videoFrameUnsupported = "0";
+  video.hidden = false;
+  setMomentVideoFallback(video, "兼容版本已就绪，正在加载…");
+  cancelPendingVideoFrameCallback(video);
+  video.removeAttribute("src");
+  try {
+    video.load();
+  } catch {
+    /* Resetting before the compatibility source is best effort. */
+  }
+  requestAnimationFrame(() => {
+    if (!video.isConnected || video.dataset.mediaMode !== "compat") return;
+    video.dataset.mediaRetryPending = "0";
+    video.src = playbackUrl;
+    try {
+      video.load();
+    } catch {
+      failMomentVideoCompatibility(video);
+      return;
+    }
+    if (resumePlayback) {
+      const resume = () => {
+        if (!video.isConnected || video.dataset.mediaMode !== "compat") return;
+        video.play().catch(() => {
+          // Mobile browsers may require another user gesture after async source replacement.
+        });
+      };
+      video.addEventListener("canplay", resume, { once: true });
+    }
+  });
+  return true;
+}
+
+async function prepareMomentVideoCompatibility(video, { retry = false } = {}) {
+  if (!isMomentVideo(video) || !video.isConnected || video.dataset.mediaMode === "compat") return;
+  if (video.dataset.compatPending === "1") return;
+  const sourceUrl = String(video.dataset.originalSource || "").trim();
+  const postId = String(video.dataset.postId || "").trim();
+  if (!sourceUrl || !postId) {
+    failMomentVideoCompatibility(video);
+    return;
+  }
+  const sequence = String((Number(video.dataset.compatSequence || 0) + 1) % 1000000);
+  const resumePlayback = !video.paused && !video.ended;
+  const startedAt = Date.now();
+  video.dataset.compatSequence = sequence;
+  video.dataset.compatPending = "1";
+  video.dataset.compatUnavailable = "0";
+  video.dataset.mediaRetryPending = "1";
+  video.pause();
+  video.hidden = true;
+  setMomentVideoFallback(video, "正在准备兼容版本…");
+  cancelPendingVideoFrameCallback(video);
+  video.removeAttribute("src");
+  try {
+    video.load();
+  } catch {
+    /* Stop the incompatible source while the worker prepares the derivative. */
+  }
+
+  try {
+    const prepared = await api("/api/media/compat-video/prepare", {
+      method: "POST",
+      body: JSON.stringify({ source_url: sourceUrl, post_id: postId, retry: Boolean(retry) }),
+      timeout: 15000,
+    });
+    if (!video.isConnected || video.dataset.compatSequence !== sequence) return;
+    let data = prepared.data || {};
+    if (!prepared.ok || data.status === "failed") {
+      failMomentVideoCompatibility(video);
+      return;
+    }
+    if (data.status === "ready") {
+      if (!applyMomentVideoCompatibility(video, data, { resumePlayback })) {
+        failMomentVideoCompatibility(video);
+      }
+      return;
+    }
+    let statusUrl = momentVideoCompatUrl(data.status_url, "status");
+    if (data.status !== "processing" || !statusUrl) {
+      failMomentVideoCompatibility(video);
+      return;
+    }
+
+    while (
+      video.isConnected &&
+      video.dataset.compatSequence === sequence &&
+      Date.now() - startedAt < MOMENT_VIDEO_COMPAT_TIMEOUT_MS
+    ) {
+      const retryAfter = Math.max(1, Math.min(5, Number(data.retry_after || 2))) * 1000;
+      await new Promise((resolve) => setTimeout(resolve, retryAfter));
+      if (!video.isConnected || video.dataset.compatSequence !== sequence) return;
+      const status = await api(statusUrl, { timeout: 12000 });
+      if (!video.isConnected || video.dataset.compatSequence !== sequence) return;
+      data = status.data || {};
+      if (!status.ok || data.status === "failed") {
+        failMomentVideoCompatibility(video);
+        return;
+      }
+      if (data.status === "ready") {
+        if (!applyMomentVideoCompatibility(video, data, { resumePlayback })) {
+          failMomentVideoCompatibility(video);
+        }
+        return;
+      }
+      statusUrl = momentVideoCompatUrl(data.status_url || statusUrl, "status");
+      if (data.status !== "processing" || !statusUrl) {
+        failMomentVideoCompatibility(video);
+        return;
+      }
+      setMomentVideoFallback(video, "正在准备兼容版本…");
+    }
+    if (video.isConnected && video.dataset.compatSequence === sequence) {
+      failMomentVideoCompatibility(video, "兼容版本准备超时，请稍后重试");
+    }
+  } catch (error) {
+    if (!video.isConnected || video.dataset.compatSequence !== sequence) return;
+    if (error instanceof AuthExpiredError) return;
+    failMomentVideoCompatibility(video);
+  }
+}
+
+function scheduleVideoFrameCompatibilityCheck(video) {
+  if (!video?.isConnected || video.dataset.videoFrameCheckPending === "1") return;
+  if (
+    isMomentVideo(video) &&
+    video.dataset.mediaMode !== "compat" &&
+    video.dataset.playbackRequested !== "1" &&
+    video.paused
+  ) {
+    return;
+  }
+  const source = String(video.dataset.mediaSource || video.currentSrc || "");
+  const startedAt = Number(video.dataset.videoFrameCheckStartedAt || 0) || Date.now();
+  video.dataset.videoFrameCheckStartedAt = String(startedAt);
+  const canObserveFrame = !video.paused && typeof video.requestVideoFrameCallback === "function";
+  if (canObserveFrame && video.dataset.videoFrameCallbackPending !== "1") {
+    video.dataset.videoFrameCallbackPending = "1";
+    const callbackId = video.requestVideoFrameCallback(() => {
+      if (video.dataset.videoFrameCallbackId !== String(callbackId)) return;
+      video.dataset.videoFrameCallbackId = "";
+      video.dataset.videoFrameCallbackPending = "0";
+      if (!video.isConnected || String(video.dataset.mediaSource || video.currentSrc || "") !== source) return;
+      video.dataset.videoFramePresented = "1";
+      video.dataset.videoFrameUnsupported = "0";
+      video.dataset.videoFrameCheckStartedAt = "0";
+    });
+    video.dataset.videoFrameCallbackId = String(callbackId);
+  }
+  if (
+    video.videoWidth > 0 &&
+    video.videoHeight > 0 &&
+    (!canObserveFrame || video.dataset.videoFramePresented === "1")
+  ) {
+    video.dataset.videoFrameUnsupported = "0";
+    video.dataset.videoFrameCheckStartedAt = "0";
+    return;
+  }
+  video.dataset.videoFrameCheckPending = "1";
+  setTimeout(() => {
+    if (!video.isConnected) return;
+    video.dataset.videoFrameCheckPending = "0";
+    if (String(video.dataset.mediaSource || video.currentSrc || "") !== source) return;
+    if (
+      video.videoWidth > 0 &&
+      video.videoHeight > 0 &&
+      (!canObserveFrame || video.dataset.videoFramePresented === "1")
+    ) {
+      video.dataset.videoFrameUnsupported = "0";
+      video.dataset.videoFrameCheckStartedAt = "0";
+      return;
+    }
+    if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+      if (!video.paused && Date.now() - startedAt < MOMENT_VIDEO_INITIAL_FRAME_WAIT_MS) {
+        scheduleVideoFrameCompatibilityCheck(video);
+        return;
+      }
+      if (video.paused) return;
+      if (isMomentVideo(video)) {
+        if (video.dataset.mediaMode !== "compat") {
+          void prepareMomentVideoCompatibility(video);
+        } else {
+          failMomentVideoCompatibility(video);
+        }
+      }
+      return;
+    }
+    video.dataset.videoFrameUnsupported = "1";
+    if (isMomentVideo(video) && video.dataset.mediaMode !== "compat") {
+      void prepareMomentVideoCompatibility(video);
+      return;
+    }
+    video.pause();
+    video.hidden = true;
+    video.dataset.mediaFailed = "1";
+    if (isMomentVideo(video)) {
+      failMomentVideoCompatibility(video, "当前浏览器暂时无法播放此视频");
+    } else {
+      setChatPlaybackFallback(video, "当前浏览器暂时无法播放此视频", true);
+    }
+  }, MOMENT_VIDEO_FRAME_CHECK_MS);
+}
+
 function handleChatPlaybackError(media) {
-  if (!media?.isConnected || media.dataset.mediaRetryPending === "1") return;
+  if (
+    !media?.isConnected ||
+    media.dataset.mediaRetryPending === "1" ||
+    (isMomentVideo(media) && media.dataset.compatPending === "1")
+  ) {
+    return;
+  }
   const source = String(media.dataset.mediaSource || "").trim();
   if (!source) return;
+  if (
+    isMomentVideo(media) &&
+    media.dataset.mediaMode !== "compat" &&
+    media.dataset.playbackRequested !== "1"
+  ) {
+    media.hidden = true;
+    media.dataset.mediaFailed = "1";
+    media.dataset.videoFrameUnsupported = "1";
+    setMomentVideoFallback(media, "视频加载失败", { retry: true });
+    return;
+  }
+  const mediaErrorCode = Number(media.error?.code || 0);
+  if (
+    isMomentVideo(media) &&
+    media.dataset.mediaMode !== "compat" &&
+    media.dataset.playbackRequested === "1" &&
+    (mediaErrorCode === 3 || mediaErrorCode === 4)
+  ) {
+    media.dataset.videoFrameUnsupported = "1";
+    void prepareMomentVideoCompatibility(media);
+    return;
+  }
   const retryState = chatMediaRetryState(source);
   const attempt = Math.max(0, Number(retryState.attempt || 0));
   media.hidden = true;
   if (attempt >= CHAT_MEDIA_RETRY_DELAYS_MS.length) {
     retryState.failed = true;
+    if (isMomentVideo(media) && media.dataset.mediaMode !== "compat") {
+      void prepareMomentVideoCompatibility(media);
+      return;
+    }
+    if (isMomentVideo(media)) {
+      failMomentVideoCompatibility(media, "视频加载失败");
+      return;
+    }
     media.dataset.mediaFailed = "1";
     setChatPlaybackFallback(media, `${media.matches("audio") ? "语音" : "视频"}加载失败`, true);
     return;
@@ -5862,6 +6180,10 @@ function handleChatPlaybackError(media) {
   retryState.failed = false;
   media.dataset.mediaRetryCount = String(attempt + 1);
   setChatPlaybackFallback(media, `媒体加载中，正在重试（${attempt + 1}/${CHAT_MEDIA_RETRY_DELAYS_MS.length}）`, true);
+  if (isMomentVideo(media)) {
+    const retryButton = media.closest("[data-playback-wrap]")?.querySelector('[data-action="retry-chat-playback"]');
+    if (retryButton) retryButton.hidden = true;
+  }
   if (attempt === 0 && S.activePeer) schedulePeerMediaReconcile(S.activePeer);
   setTimeout(() => {
     if (!media.isConnected) return;
@@ -8125,6 +8447,30 @@ async function handleAction(action, button) {
   if (action === "retry-chat-playback") {
     const media = button.closest("[data-playback-wrap]")?.querySelector("[data-media-playback]");
     if (!media) throw new Error("媒体重试控件不可用");
+    if (
+      isMomentVideo(media) &&
+      media.dataset.mediaMode === "compat" &&
+      media.dataset.compatUnavailable === "1"
+    ) {
+      media.dataset.mediaMode = "original";
+      media.dataset.mediaSource = String(media.dataset.originalSource || "");
+      media.dataset.playbackRequested = "1";
+      await prepareMomentVideoCompatibility(media, { retry: true });
+      return;
+    }
+    if (
+      isMomentVideo(media) &&
+      media.dataset.mediaMode !== "compat" &&
+      (media.dataset.videoFrameUnsupported === "1" ||
+        media.dataset.compatUnavailable === "1" ||
+        media.dataset.mediaFailed === "1")
+    ) {
+      media.dataset.playbackRequested = "1";
+      await prepareMomentVideoCompatibility(media, {
+        retry: media.dataset.compatUnavailable === "1",
+      });
+      return;
+    }
     reloadChatPlayback(media, { manual: true });
     return;
   }
@@ -8710,7 +9056,7 @@ async function handleProductForm(form, submitter) {
     const archived = addImMessage(text, "mine", peer, sentEntry || { peerRead: false, delivery: "sent" });
     archiveMessageBestEffort(archived, "outgoing");
     updateConversationActivity(peer, {
-      name: S.activePeerName || `用户 ${peer}`,
+      name: submittedPeerName,
       lastMessage: text,
       unreadCount: 0,
     });
@@ -9191,10 +9537,52 @@ document.addEventListener(
 );
 
 document.addEventListener(
+  "contextmenu",
+  (event) => {
+    if (event.target?.closest?.('video[data-moment-video="true"]')) event.preventDefault();
+  },
+  true
+);
+
+document.addEventListener(
   "loadedmetadata",
   (event) => {
     if (event.target && event.target.matches && event.target.matches("audio[data-media-playback],video[data-media-playback]")) {
       handleChatPlaybackLoaded(event.target);
+    }
+  },
+  true
+);
+
+document.addEventListener(
+  "loadeddata",
+  (event) => {
+    if (event.target && event.target.matches && event.target.matches('video[data-video-frame-required="true"]')) {
+      scheduleVideoFrameCompatibilityCheck(event.target);
+    }
+  },
+  true
+);
+
+document.addEventListener(
+  "play",
+  (event) => {
+    if (event.target && event.target.matches && event.target.matches('video[data-video-frame-required="true"]')) {
+      event.target.dataset.playbackRequested = "1";
+      cancelPendingVideoFrameCallback(event.target);
+      event.target.dataset.videoFramePresented = "0";
+      event.target.dataset.videoFrameCheckStartedAt = String(Date.now());
+      scheduleVideoFrameCompatibilityCheck(event.target);
+    }
+  },
+  true
+);
+
+document.addEventListener(
+  "pointerdown",
+  (event) => {
+    if (event.target && event.target.matches && event.target.matches('video[data-moment-video="true"]')) {
+      event.target.dataset.playbackRequested = "1";
     }
   },
   true

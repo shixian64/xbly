@@ -263,7 +263,9 @@ class Settings:
             r2_region=os.getenv("BBW_R2_REGION", "auto"),
             rq_queues=tuple(
                 item.strip()
-                for item in os.getenv("BBW_RQ_QUEUES", "critical,default,media,sync").split(",")
+                for item in os.getenv(
+                    "BBW_RQ_QUEUES", "critical,default,media,sync,transcode"
+                ).split(",")
                 if item.strip()
             ),
             turnstile_site_key=os.getenv("BBW_TURNSTILE_SITE_KEY"),

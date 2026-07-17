@@ -92,6 +92,30 @@ class BffEnvelopeTests(unittest.TestCase):
             "data:image/png;base64,AA==",
         )
 
+    def test_apk_legacy_oss_urls_are_rewritten_to_the_canonical_media_host(self) -> None:
+        suffix = "/video/202607/sample.mp4?quality=source#preview"
+        for origin in (
+            "https://moyuanoss.oss-cn-shanghai.aliyuncs.com",
+            "http://appletattachment.oss-cn-beijing.aliyuncs.com",
+            "//moyuanoss.oss-cn-shanghai.aliyuncs.com",
+            "http://oss.banghua.xin",
+        ):
+            with self.subTest(origin=origin):
+                self.assertEqual(
+                    resolve_media_url(origin + suffix),
+                    "https://oss.banghua.xin" + suffix,
+                )
+        self.assertEqual(
+            resolve_media_url("https://example.invalid/video.mp4"),
+            "https://example.invalid/video.mp4",
+        )
+        self.assertEqual(
+            resolve_media_url(
+                "https://moyuanoss.oss-cn-shanghai.aliyuncs.com.evil/video.mp4"
+            ),
+            "https://moyuanoss.oss-cn-shanghai.aliyuncs.com.evil/video.mp4",
+        )
+
     def test_logged_in_user_avatar_is_exposed_to_the_web_client(self) -> None:
         session = Session(
             uid="42",
@@ -495,6 +519,8 @@ class BffEnvelopeTests(unittest.TestCase):
                     "authportrait": "/images/me.jpg",
                     "posttext": "第一行\\n第二行",
                     "postpicture": "images/a.jpg,images/b.jpg",
+                    "postvideo": "https://moyuanoss.oss-cn-shanghai.aliyuncs.com/video/p1.mp4",
+                    "cover": "https://appletattachment.oss-cn-beijing.aliyuncs.com/images/p1.jpg",
                     "like": "3",
                     "comment_sum": "2",
                     "topic": '[{"topic":"旅行"}]',
@@ -504,6 +530,8 @@ class BffEnvelopeTests(unittest.TestCase):
         )
         self.assertEqual(posts[0]["content"], "第一行\n第二行")
         self.assertEqual(posts[0]["pictures"][0], "https://oss.banghua.xin/images/a.jpg")
+        self.assertEqual(posts[0]["video"], "https://oss.banghua.xin/video/p1.mp4")
+        self.assertEqual(posts[0]["cover"], "https://oss.banghua.xin/images/p1.jpg")
         self.assertEqual(posts[0]["topics"], ["旅行"])
         self.assertTrue(posts[0]["is_pinned"])
 
@@ -2224,9 +2252,70 @@ class RichMessageFrontendContractTests(unittest.TestCase):
     def test_rich_media_csp_allows_blob_images_and_playback(self) -> None:
         root = Path(__file__).resolve().parents[1]
         server_py = (root / "bbw_web" / "bff_server.py").read_text(encoding="utf-8")
+        api_py = (root / "bbw_web" / "api.py").read_text(encoding="utf-8")
 
         self.assertIn("img-src 'self' data: blob: https:", server_py)
         self.assertIn("media-src 'self' data: blob: https:", server_py)
+        self.assertIn("media-src 'self' data: blob: https:", api_py)
+
+    def test_moment_videos_use_apk_url_rewrite_and_playback_fallback(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
+        compose = (root / "compose.yaml").read_text(encoding="utf-8")
+        media_url = app_js.split("function mediaUrl(value)", 1)[1].split("function validAvatarValue", 1)[0]
+        moment_media = app_js.split("function momentMediaHtml(post)", 1)[1].split("function momentOwnershipMenu", 1)[0]
+        transcode_service = compose.split("  transcode-worker:", 1)[1].split("  scheduler:", 1)[0]
+
+        self.assertIn("moyuanoss\\.oss-cn-shanghai\\.aliyuncs\\.com", app_js)
+        self.assertIn("appletattachment\\.oss-cn-beijing\\.aliyuncs\\.com", app_js)
+        self.assertLess(media_url.index("APK_MEDIA_ORIGIN_RE"), media_url.index('raw.startsWith("//")'))
+        self.assertIn('data-media-playback data-moment-video="true"', moment_media)
+        self.assertIn('data-media-mode="original"', moment_media)
+        self.assertIn('data-post-id="${esc(', moment_media)
+        self.assertIn('data-original-source="${esc(video)}"', moment_media)
+        self.assertIn('data-media-source="${esc(', moment_media)
+        self.assertIn('data-video-frame-required="true"', moment_media)
+        self.assertIn('controlslist="nodownload noremoteplayback"', moment_media)
+        self.assertIn("disablepictureinpicture", moment_media)
+        self.assertIn("disableremoteplayback", moment_media)
+        self.assertIn('draggable="false"', moment_media)
+        self.assertIn('data-action="retry-chat-playback"', moment_media)
+        self.assertNotIn("<a ", moment_media)
+        self.assertNotIn("href=", moment_media)
+        self.assertNotIn("打开原视频", moment_media)
+        self.assertNotIn("复制链接", moment_media)
+        self.assertNotIn("<source", moment_media)
+        self.assertIn("function scheduleVideoFrameCompatibilityCheck(video)", app_js)
+        self.assertIn("function prepareMomentVideoCompatibility(video", app_js)
+        self.assertIn('api("/api/media/compat-video/prepare"', app_js)
+        self.assertIn("post_id: postId", app_js)
+        self.assertIn("data.status === \"ready\"", app_js)
+        self.assertIn("applyMomentVideoCompatibility(video", app_js)
+        self.assertIn("video.dataset.mediaMode !== \"compat\"", app_js)
+        self.assertIn("video.dataset.playbackRequested !== \"1\"", app_js)
+        self.assertIn("HTMLMediaElement.HAVE_CURRENT_DATA", app_js)
+        self.assertIn("MOMENT_VIDEO_INITIAL_FRAME_WAIT_MS", app_js)
+        self.assertIn("mediaErrorCode === 3 || mediaErrorCode === 4", app_js)
+        self.assertIn("function cancelPendingVideoFrameCallback(video)", app_js)
+        self.assertIn("video.cancelVideoFrameCallback(callbackId)", app_js)
+        self.assertIn('media.dataset.mediaMode === "compat"', app_js)
+        self.assertIn('media.dataset.mediaMode = "original"', app_js)
+        self.assertIn("正在准备兼容版本…", app_js)
+        self.assertIn("视频暂时无法播放", app_js)
+        self.assertIn("当前浏览器暂时无法播放此视频", app_js)
+        self.assertNotIn("可打开原视频或下载后播放", app_js)
+        self.assertIn(".moment-video-wrap", app_css)
+        self.assertNotIn(".moment-playback-actions", app_css)
+        context_menu_guard = app_js.split(
+            'document.addEventListener(\n  "contextmenu",', 1
+        )[1].split('document.addEventListener(\n  "loadedmetadata",', 1)[0]
+        self.assertIn('video[data-moment-video="true"]', context_menu_guard)
+        self.assertIn("event.preventDefault()", context_menu_guard)
+        moment_video_css = app_css.split(".moment-video {", 1)[1].split("}", 1)[0]
+        self.assertIn("-webkit-touch-callout: none", moment_video_css)
+        self.assertIn("user-select: none", moment_video_css)
+        self.assertIn("stop_grace_period: 32m", transcode_service)
 
     def test_incoming_media_retries_and_reconciles_without_page_reload(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -2386,6 +2475,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("(max-height: 560px)", app_css)
         self.assertIn("(max-width: 960px)", app_css)
         self.assertIn("(any-pointer: coarse)", app_css)
+        self.assertIn("(min-aspect-ratio: 4 / 3)", app_css)
         self.assertIn(".conversation-layout", mobile_media)
         self.assertIn("grid-template-columns: 1fr", mobile_media)
         self.assertIn(".conversation-layout.has-active .conversation-list-pane", mobile_media)
@@ -2486,7 +2576,6 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         js_version = index_html.split('/static/app.js?v=', 1)[1].split('"', 1)[0]
         self.assertEqual(css_version, js_version)
         self.assertIn("mobile-media-retry-secure-viewport", css_version)
-        self.assertIn("responsive-nav-exclusive-mine-subnav", css_version)
 
 
 class FlashPhotoBffContractTests(unittest.TestCase):

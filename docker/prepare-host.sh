@@ -14,5 +14,6 @@ install -d -o root -g root -m 0750 "$DATA_ROOT"
 install -d -o root -g root -m 0750 "$DATA_ROOT/caddy"
 install -d -o 1000 -g 1000 -m 0700 "$DATA_ROOT/caddy/data"
 install -d -o 1000 -g 1000 -m 0700 "$DATA_ROOT/caddy/config"
+install -d -o 10001 -g 10001 -m 0700 "$DATA_ROOT/transcode"
 
-echo "已准备 Caddy 持久目录：$DATA_ROOT/caddy"
+echo "已准备持久目录：$DATA_ROOT/caddy、$DATA_ROOT/transcode"

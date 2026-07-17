@@ -11,6 +11,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # APK serves relative paths like /images/999999/... from this host.
 MEDIA_BASE = "https://oss.banghua.xin"
+# ``CommonUtil.getOssResourceUrl`` in the APK migrates these retired buckets
+# to the canonical CDN before any image or video is loaded.  Some older posts
+# still return the retired absolute origins, which now answer with 403/404.
+APK_MEDIA_ORIGIN_RE = re.compile(
+    r"^(?:https?:)?//(?:"
+    r"oss\.banghua\.xin|"
+    r"moyuanoss\.oss-cn-shanghai\.aliyuncs\.com|"
+    r"appletattachment\.oss-cn-beijing\.aliyuncs\.com"
+    r")(?=[/?#]|$)",
+    re.I,
+)
 EMPTY_MEDIA_VALUES = {
     "0",
     "false",
@@ -31,6 +42,9 @@ def resolve_media_url(value: Any) -> str:
         return ""
     if raw.lower().startswith("data:"):
         return raw if raw.lower().startswith("data:image/") else ""
+    canonical = APK_MEDIA_ORIGIN_RE.sub(MEDIA_BASE, raw, count=1)
+    if canonical != raw:
+        return canonical
     if raw.startswith("//"):
         return "https:" + raw
     if re.match(r"^https?://", raw, re.I):

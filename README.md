@@ -312,10 +312,10 @@ docker compose up -d
 docker compose ps
 ```
 
-首次启动顺序为 PostgreSQL、Redis、数据库迁移、App/Worker/Scheduler、Caddy。查看日志：
+首次启动顺序为 PostgreSQL、Redis、数据库迁移、App/Worker/Transcode Worker/Scheduler、Caddy。查看日志：
 
 ```bash
-docker compose logs --tail 100 postgres redis migrate app worker scheduler caddy
+docker compose logs --tail 100 postgres redis migrate app worker transcode-worker scheduler caddy
 ```
 
 验证服务：
@@ -345,7 +345,7 @@ cat docker/secrets/admin_initial_password
 ### 4. 上线前必须确认
 
 - 云安全组和防火墙不开放 `8000`、`5432`、`6379`，公网只开放 `80/443` 和受限 SSH。
-- R2 Bucket 没有公共开发 URL，浏览器只能获得最长 5 分钟的签名读取地址。
+- R2 Bucket 没有公共开发 URL；用户归档媒体签名最长 5 分钟，动态兼容视频签名最长 15 分钟。
 - `/admin` 已完成修改密码、TOTP、邀请码、用户启停和敏感查看审计测试。
 - 已生成至少一份 PostgreSQL 手工备份，并离线保存全部 Docker Secret。
 - 已在上游控制台轮换历史上曾进入源码的协议密钥。

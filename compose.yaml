@@ -47,7 +47,7 @@ x-app-environment: &app-environment
   BBW_R2_SECRET_KEY_FILE: /run/secrets/r2_secret_access_key
   BBW_R2_BUCKET: ${R2_BUCKET:?set R2_BUCKET}
   BBW_R2_REGION: auto
-  BBW_RQ_QUEUES: critical,default,media,sync
+  BBW_RQ_QUEUES: critical,default,media,sync,transcode
   BBW_TURNSTILE_SITE_KEY: ${TURNSTILE_SITE_KEY:-}
   BBW_TURNSTILE_SECRET_KEY_FILE: /run/secrets/turnstile_secret_key
   BBW_INVITE_REQUIRED: "true"
@@ -60,6 +60,9 @@ x-app-environment: &app-environment
   BBW_MEDIA_MAX_ATTACHMENT_BYTES: "20971520"
   BBW_MEDIA_ALLOWED_HOSTS: "${MEDIA_ALLOWED_HOSTS:-oss.banghua.xin,*.myqcloud.com,*.qcloud.com}"
   BBW_R2_PRESIGN_TTL_SECONDS: "300"
+  BBW_MOMENT_VIDEO_CACHE_RETENTION_DAYS: "30"
+  BBW_MOMENT_VIDEO_CACHE_MAX_BYTES: "2147483648"
+  BBW_MOMENT_VIDEO_CACHE_MAX_OBJECTS: "2000"
   NO_PROXY: postgres,redis,app,localhost,127.0.0.1
 
 x-worker-secrets: &worker-secrets
@@ -67,6 +70,10 @@ x-worker-secrets: &worker-secrets
   - app_master_key
   - credential_keyring
   - txim_secret_key
+  - r2_access_key_id
+  - r2_secret_access_key
+
+x-transcode-secrets: &transcode-secrets
   - r2_access_key_id
   - r2_secret_access_key
 
@@ -304,6 +311,7 @@ services:
     <<: *app-security
     environment:
       <<: *app-environment
+      BBW_RQ_QUEUES: critical,default,media,sync
       BBW_PHONE_HMAC_KEY_FILE: ""
       BBW_SESSION_HMAC_KEY_FILE: ""
       BBW_ROOMKIT_BUSINESS_TOKEN_FILE: ""
@@ -326,6 +334,57 @@ services:
     mem_reservation: 128m
     cpus: 0.60
     stop_grace_period: 60s
+    logging: *default-logging
+
+  transcode-worker:
+    image: ${APP_IMAGE:-bbw-app:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    <<: *app-security
+    environment:
+      <<: *app-environment
+      BBW_RQ_QUEUES: transcode
+      BBW_RQ_WITH_SCHEDULER: "true"
+      BBW_SKIP_DATABASE_CONFIG: "true"
+      BBW_DATABASE_URL: postgresql+psycopg://disabled:disabled@127.0.0.1:1/disabled
+      POSTGRES_PASSWORD_FILE: ""
+      BBW_CREDENTIAL_MASTER_KEY_FILE: ""
+      BBW_CREDENTIAL_KEYS_FILE: ""
+      BBW_PHONE_HMAC_KEY_FILE: ""
+      BBW_SESSION_HMAC_KEY_FILE: ""
+      BBW_TXIM_SECRET_KEY_FILE: ""
+      BBW_ROOMKIT_BUSINESS_TOKEN_FILE: ""
+      BBW_TURNSTILE_SITE_KEY: ""
+      BBW_TURNSTILE_SECRET_KEY_FILE: ""
+      BBW_MOMENT_VIDEO_JOB_TIMEOUT_SECONDS: "1500"
+      BBW_MOMENT_VIDEO_MAX_DURATION_SECONDS: "600"
+      BBW_MOMENT_VIDEO_MAX_SOURCE_DIMENSION: "4096"
+      BBW_MOMENT_VIDEO_MAX_SOURCE_PIXELS: "9000000"
+      BBW_MOMENT_VIDEO_MAX_SOURCE_FPS: "120"
+      BBW_MOMENT_VIDEO_MAX_OUTPUT_BYTES: "104857600"
+      BBW_MOMENT_VIDEO_THREADS: "1"
+      TMPDIR: /var/tmp/bbw-transcode
+    secrets: *transcode-secrets
+    command: ["python", "-m", "bbw_web.worker"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - queue
+      - egress
+    volumes:
+      - ${BBW_DATA_ROOT:-/var/lib/bbw}/transcode:/var/tmp/bbw-transcode
+    mem_limit: 512m
+    mem_reservation: 192m
+    cpus: 0.80
+    pids_limit: 128
+    # RQ may run one transcode for up to 1800 seconds. Allow the worker to
+    # finish that job and release scratch files before Docker sends SIGKILL.
+    stop_grace_period: 32m
     logging: *default-logging
 
   scheduler:

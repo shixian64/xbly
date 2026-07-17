@@ -13,6 +13,7 @@ import json
 import os
 import re
 import socket
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, Iterable, Mapping, Sequence
@@ -1611,7 +1612,7 @@ def _permanent_media_error(exc: Exception) -> bool:
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         status = int(exc.response.status_code)
-        return 400 <= status < 500 and status != 429
+        return 400 <= status < 500 and status not in {408, 425, 429}
     return False
 
 
@@ -1798,6 +1799,48 @@ def archive_media_job(outbox_id: str) -> dict[str, Any]:
             prepared.cleanup()
 
 
+def transcode_moment_video_job(
+    asset_id: str, source_url: str
+) -> dict[str, Any]:
+    """Create one cached H.264 derivative for browser-incompatible moment video."""
+    # Import lazily so normal synchronization/media jobs do not import ffmpeg
+    # orchestration or FastAPI-facing helpers on worker startup.
+    from bbw_web.moment_video import MomentVideoError, transcode_job
+
+    try:
+        return transcode_job(asset_id, source_url)
+    except MomentVideoError as exc:
+        # Invalid, oversized or undecodable inputs will not improve on an
+        # automatic retry. Finish deterministically; the API exposes only a
+        # generic failure and still allows a tightly rate-limited manual retry.
+        if "timed out" in str(exc).lower():
+            raise
+        return {
+            "ok": False,
+            "permanent": True,
+            "error_type": type(exc).__name__,
+        }
+    except MediaArchiveError as exc:
+        if "cannot be resolved" in str(exc).lower():
+            raise
+        return {
+            "ok": False,
+            "permanent": True,
+            "error_type": type(exc).__name__,
+        }
+    except httpx.HTTPStatusError as exc:
+        status = int(exc.response.status_code)
+        # Request Timeout, Too Early and Too Many Requests are explicitly
+        # transient; re-raise so the queue's delayed Retry policy handles them.
+        if 400 <= status < 500 and status not in {408, 425, 429}:
+            return {
+                "ok": False,
+                "permanent": True,
+                "error_type": "UpstreamMediaUnavailable",
+            }
+        raise
+
+
 def cleanup_expired_data() -> dict[str, Any]:
     """Delete expired private R2 objects first, then release quota and purge rows."""
 
@@ -1805,6 +1848,8 @@ def cleanup_expired_data() -> dict[str, Any]:
     now = utcnow()
     media_deleted = 0
     media_errors = 0
+    compat_media_deleted = 0
+    compat_media_errors = 0
     storage: R2Storage | None
     try:
         storage = R2Storage(settings)
@@ -1840,6 +1885,34 @@ def cleanup_expired_data() -> dict[str, Any]:
                             media.extra_data,
                             {"delete_error": str(exc)[:1000], "delete_attempted_at": now.isoformat()},
                         )
+        try:
+            from bbw_web.moment_video import (
+                _cache_index_keys,
+                cached_assets_for_cleanup,
+                forget_cached_asset,
+                object_key_for_asset,
+            )
+
+            connection = Redis.from_url(settings.redis_url)
+            try:
+                compat_assets = cached_assets_for_cleanup(
+                    connection, settings, limit=50
+                )
+                age_key, _size_key, _total_key = _cache_index_keys(settings)
+                for asset_id in compat_assets:
+                    try:
+                        last_access = connection.zscore(age_key, asset_id)
+                        if last_access is not None and time.time() - float(last_access) < 60:
+                            continue
+                        storage.delete(object_key_for_asset(asset_id))
+                        forget_cached_asset(connection, settings, asset_id)
+                        compat_media_deleted += 1
+                    except Exception:
+                        compat_media_errors += 1
+            finally:
+                connection.close()
+        except Exception:
+            compat_media_errors += 1
 
     with session_scope() as db:
         retention = RetentionService(db, settings)
@@ -1867,6 +1940,8 @@ def cleanup_expired_data() -> dict[str, Any]:
         "ok": True,
         "media_deleted": media_deleted,
         "media_errors": media_errors,
+        "compat_media_deleted": compat_media_deleted,
+        "compat_media_errors": compat_media_errors,
         "media_rows_purged": media_rows_purged,
         "raw_responses_deleted": raw_deleted,
         "audit_logs_deleted": audit_deleted,

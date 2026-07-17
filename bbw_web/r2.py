@@ -11,6 +11,7 @@ from typing import Any, BinaryIO, Optional
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,25 @@ class R2Storage:
                 ExpiresIn=max(30, min(900, int(expires_seconds))),
             )
         )
+
+    def head_object(self, key: str) -> dict[str, Any] | None:
+        """Return bounded object metadata, or ``None`` when the key is absent."""
+        try:
+            response = self.client.head_object(Bucket=self.bucket, Key=key)
+        except ClientError as exc:
+            error = exc.response.get("Error") or {}
+            code = str(error.get("Code") or "")
+            status = int((exc.response.get("ResponseMetadata") or {}).get("HTTPStatusCode") or 0)
+            if status == 404 or code in {"404", "NoSuchKey", "NotFound"}:
+                return None
+            raise
+        metadata = response.get("Metadata") or {}
+        return {
+            "size": max(0, int(response.get("ContentLength") or 0)),
+            "content_type": str(response.get("ContentType") or "application/octet-stream")[:160],
+            "etag": str(response.get("ETag") or "").strip('"')[:160],
+            "metadata": {str(key)[:128]: str(value)[:1024] for key, value in metadata.items()},
+        }
 
     def delete(self, key: str) -> None:
         self.client.delete_object(Bucket=self.bucket, Key=key)

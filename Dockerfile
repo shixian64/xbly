@@ -17,7 +17,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN set -eux; \
     export DEBIAN_FRONTEND=noninteractive; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates tzdata; \
+    apt-get install -y --no-install-recommends ca-certificates ffmpeg tzdata; \
     rm -rf /var/lib/apt/lists/*; \
     groupadd --gid "${APP_GID}" app; \
     useradd --uid "${APP_UID}" --gid "${APP_GID}" --no-create-home \

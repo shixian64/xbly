@@ -37,15 +37,16 @@ FastAPI + Uvicorn（1 worker，端口仅容器内 8000）
   +--> Redis：Session 辅助状态、限流、幂等、RQ 队列、调度锁
 
 RQ Worker --> 上游媒体下载、文件验证、EXIF 清理、R2 归档、同步补漏
+Transcode Worker --> 动态视频 H.264/AAC 兼容转换（独立单并发队列）
 Scheduler --> 每分钟派发同步/清理任务
 ```
 
 Docker 网络划分：
 
 - `public`：只有 Caddy 和 App，用于反向代理以及 App 出站访问。
-- `database`：内部数据库网络，仅 PostgreSQL、App、Worker 和一次性迁移容器接入。
+- `database`：内部数据库网络，仅 PostgreSQL、App、普通 Worker 和一次性迁移容器接入；转码 Worker 不接入。
 - `queue`：内部队列网络，仅 Redis、App、Worker 和 Scheduler 接入；Scheduler 在网络层也无法访问 PostgreSQL。
-- `egress`：仅 Worker 使用的出站网络，不包含数据库公网入口；Scheduler 不挂载数据库、协议、R2、HMAC 或 Turnstile Secret。
+- `egress`：仅普通 Worker 与转码 Worker 使用的出站网络，不包含数据库公网入口；转码 Worker 只挂载 R2 凭据，不挂载数据库、应用主密钥或腾讯 IM Secret。
 
 ## 3. 仓库中的部署文件
 
@@ -91,9 +92,10 @@ Caddy 会覆盖传给应用的 `CF-Connecting-IP`、`X-Real-IP` 和 `X-Forwarded
 - 禁止开启 R2 Public Development URL。
 - 不给 Token 账户管理、其他 Bucket 或 Cloudflare 全局权限。
 - Access Key ID 和 Secret Access Key 只写入 Docker secret。
-- 数据库保存随机对象键、类型、大小、哈希和归属，不能使用可预测文件名。
-- 下载只签发短期 URL，当前约定 300 秒。
-- 预签名 URL 的路径会被已授权浏览器看到，这是直接访问私有 R2 的必要例外；对象键保持随机且该 URL 不得进入访问日志、审计详情或 Referrer。
+- 用户归档媒体由数据库保存随机对象键、类型、大小、哈希和归属；动态兼容视频使用不可逆 URL 摘要生成的确定性私有缓存键。
+- 用户归档下载签名当前为 300 秒；最长 10 分钟的动态兼容视频签名为 900 秒。
+- 预签名 URL 的路径会被已授权浏览器看到，这是直接访问私有 R2 的必要例外；用户归档键保持随机、兼容缓存键只含摘要，且签名 URL 不得进入访问日志、审计详情或 Referrer。
+- 应用会按最近访问时间清理 `compat/moments/h264-main-1280-v1/`，默认保留 30 天、最多 2 GiB/2000 个对象；仍建议在 R2 为该前缀配置 30 天生命周期规则，作为 Redis 索引丢失时的兜底。
 
 如果前端需要通过 `fetch` 跨域读取签名 URL，再为 Bucket 配置只允许正式域名的 `GET`、`HEAD` CORS；不能使用 `*` 同时开放写入。
 
@@ -169,7 +171,7 @@ docker compose ps
 查看启动日志：
 
 ```bash
-docker compose logs --tail 100 postgres redis migrate app worker scheduler caddy
+docker compose logs --tail 100 postgres redis migrate app worker transcode-worker scheduler caddy
 ```
 
 健康验证：
@@ -206,7 +208,7 @@ sudo sh -c 'umask 077; openssl rand -base64 32 | tr -d "\n" > docker/secrets/adm
 - 邀请码创建、筛选和禁用；原码只在创建成功时显示一次。
 - 用户启用/停用；停用会撤销该用户全部 Web Session 并暂停后台同步。
 - 用户资料、会话、聊天、媒体、关系和活动查看；7 天内原始响应内容与明文凭据共用密码加 TOTP 的敏感解锁保护。
-- 私有 R2 媒体最长 5 分钟临时访问地址。
+- 私有 R2 用户归档媒体最长 5 分钟临时访问地址；动态兼容视频最长 15 分钟。
 - 系统概览和不可由管理端删除的审计日志。
 
 管理员 Session 绑定登录时的可信客户端 IP；网络出口变化后需要重新登录。管理端页面不使用 `localStorage`、`sessionStorage`、IndexedDB 或 Cache Storage 保存管理数据，退出、401、页面隐藏和敏感解锁到期时会清空相关 DOM。手动锁定或页面隐藏还会尽力调用服务端锁定接口，立即撤销数据库与 Redis 中的敏感解锁；如果浏览器在卸载阶段无法送达请求，本地仍会先清空，服务端授权最迟按 15 分钟上限失效。
@@ -301,7 +303,7 @@ docker compose config --quiet
 docker compose build --pull
 docker compose up -d
 docker compose ps
-docker compose logs --tail 100 migrate app worker scheduler
+docker compose logs --tail 100 migrate app worker transcode-worker scheduler
 ```
 
 数据库迁移必须向前兼容正在运行的旧代码。涉及删除列、重写大量数据或密钥轮换时，应拆为多次发布，不能在单次启动迁移中长时间锁表。
@@ -309,7 +311,7 @@ docker compose logs --tail 100 migrate app worker scheduler
 ### 8.2 进程和队列
 
 ```bash
-docker compose logs --since 30m app worker scheduler
+docker compose logs --since 30m app worker transcode-worker scheduler
 docker compose exec redis redis-cli INFO memory
 docker compose exec redis redis-cli INFO persistence
 docker compose exec redis redis-cli --scan --pattern 'rq:*' | head
@@ -342,6 +344,7 @@ chmod 600 backups/*.dump
 - [ ] Cloudflare DNS 已代理，SSL/TLS 为 Full (strict)。
 - [ ] 云安全组只向 Cloudflare 开放 80/443，SSH 只向管理员 IP 开放。
 - [ ] R2 Bucket 为私有，Token 权限只限目标 Bucket。
+- [ ] R2 已为 `compat/moments/h264-main-1280-v1/` 配置 30 天生命周期兜底规则。
 - [ ] `.env` 不含任何密码或 Secret。
 - [ ] `docker/secrets` 目录权限为 0700、实际 Secret 文件为只读 0444，并已有独立离线副本。
 - [ ] `docker compose config --quiet` 通过。
@@ -355,6 +358,7 @@ chmod 600 backups/*.dump
 - [ ] 普通用户无法读取其他用户聊天、媒体和关系数据。
 - [ ] 登录限流、异常 Turnstile、Session 超时和退出清理已验证。
 - [ ] 图片 EXIF 清理、文件类型拒绝、大小限制和 R2 私有下载已验证。
+- [ ] HEVC 动态触发异步兼容转换，PC/手机能播放 H.264/AAC 版本，失败态只有“重试”且没有原视频打开/下载入口。
 - [ ] 浏览器实时上报和后台消息补漏都能幂等入库。
 - [ ] 日志中没有密码、Token、Cookie、聊天正文和 R2 Secret。
 - [ ] `bbw_protocol/sign.py` 和 RoomKit 适配器中的内置业务密钥已迁移到 Secret、在上游轮换，并关闭生产环境本地 UserSig/管理员级回退。
@@ -386,7 +390,7 @@ chmod 600 backups/*.dump
 
 ## 12. R2 浏览器访问策略
 
-Bucket 必须保持私有，应用只签发最长 5 分钟的 GET 地址。若管理端或后续用户端需要通过 `fetch`、音视频 Range 请求访问签名地址，应在 R2 配置最小 CORS：
+Bucket 必须保持私有。用户归档对象只签发最长 5 分钟的 GET 地址；动态兼容视频因最长可播放 10 分钟，签名最长 15 分钟。若管理端或用户端需要通过 `fetch`、音视频 Range 请求访问签名地址，应在 R2 配置最小 CORS：
 
 - Allowed Origins：只填写正式站点 `https://你的域名`。
 - Allowed Methods：`GET`、`HEAD`。
