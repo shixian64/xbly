@@ -42,6 +42,9 @@ const CONVERSATION_REFRESH_ERROR_MS = 30 * 1000;
 const ARCHIVED_CONVERSATION_TTL_MS = 30 * 1000;
 const CONVERSATION_PROFILE_TTL_MS = 15 * 60 * 1000;
 const CONVERSATION_PROFILE_ERROR_TTL_MS = 60 * 1000;
+const CONVERSATION_SWIPE_THRESHOLD_PX = 42;
+const CONVERSATION_SWIPE_LOCK_PX = 8;
+const CONVERSATION_DELETE_CONFIRM_DELAY_MS = 500;
 const MESSAGE_ARCHIVE_RETRY_DELAYS_MS = [1500, 5000];
 const MESSAGE_ARCHIVE_MAX_IN_FLIGHT = 2;
 const PAGE_CACHE_TTL_MS = 2 * 60 * 1000;
@@ -104,6 +107,10 @@ const S = {
   conversationProfilesByUid: new Map(),
   conversationProfileFetchedAt: new Map(),
   conversationProfileLoadingUids: new Set(),
+  dismissedConversationPeers: new Map(),
+  dismissedConversationAccount: "",
+  conversationDeleteTimers: new Map(),
+  conversationSwipeGesture: null,
   readConversationPeers: new Map(),
   unreadTotal: 0,
   profileSeq: 0,
@@ -1131,6 +1138,7 @@ function showLogin(show, clearSecrets = false) {
 
 function applyUser(user) {
   S.user = user || null;
+  syncDismissedConversationAccount();
   const avatar = $("side-avatar");
   avatar.replaceChildren();
   avatar.hidden = true;
@@ -1331,6 +1339,65 @@ function refreshMessagePolicy() {
 
 function messageSyncAccountId() {
   return String(S.user?.uid || S.user?.id || "").trim();
+}
+
+function dismissedConversationStorageKey(account = messageSyncAccountId()) {
+  const normalized = String(account || "").trim();
+  return normalized ? `bbw:im:dismissed-conversations:${normalized}` : "";
+}
+
+function persistDismissedConversationPeers() {
+  const key = dismissedConversationStorageKey(S.dismissedConversationAccount);
+  if (!key) return;
+  try {
+    localStorage.setItem(
+      key,
+      JSON.stringify([...S.dismissedConversationPeers.entries()].slice(-300))
+    );
+  } catch {
+    // Private browsing can disable localStorage; the in-memory dismissal still works.
+  }
+}
+
+function syncDismissedConversationAccount() {
+  const account = messageSyncAccountId();
+  if (account === S.dismissedConversationAccount) return;
+  S.conversationDeleteTimers.forEach((timer) => clearTimeout(timer));
+  S.conversationDeleteTimers.clear();
+  S.conversationSwipeGesture = null;
+  S.dismissedConversationPeers.clear();
+  S.dismissedConversationAccount = account;
+  const key = dismissedConversationStorageKey(account);
+  if (!key) return;
+  try {
+    const stored = JSON.parse(localStorage.getItem(key) || "[]");
+    if (!Array.isArray(stored)) return;
+    stored.slice(-300).forEach((entry) => {
+      if (!Array.isArray(entry) || entry.length < 2) return;
+      const peer = String(entry[0] || "").trim();
+      const hiddenThrough = Number(entry[1]);
+      if (peer && Number.isFinite(hiddenThrough) && hiddenThrough >= 0) {
+        S.dismissedConversationPeers.set(peer, hiddenThrough);
+      }
+    });
+  } catch {
+    // Ignore malformed or unavailable browser storage.
+  }
+}
+
+function dismissConversationPeer(peer, item) {
+  const target = String(peer || "").trim();
+  if (!target) return;
+  const latest = conversationTimestamp(item);
+  S.dismissedConversationPeers.set(target, latest > 0 ? latest : Date.now());
+  persistDismissedConversationPeers();
+}
+
+function restoreDismissedConversationPeer(peer) {
+  const target = String(peer || "").trim();
+  if (!target || !S.dismissedConversationPeers.delete(target)) return false;
+  persistDismissedConversationPeers();
+  return true;
 }
 
 function ensureMessageSyncChannel() {
@@ -2390,6 +2457,21 @@ function conversationTimestamp(item) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function filterDismissedConversations(items) {
+  let storageChanged = false;
+  const visible = items.filter((item) => {
+    const peer = conversationPeer(item);
+    if (!peer || !S.dismissedConversationPeers.has(peer)) return true;
+    const hiddenThrough = Number(S.dismissedConversationPeers.get(peer) || 0);
+    if (conversationTimestamp(item) <= hiddenThrough) return false;
+    S.dismissedConversationPeers.delete(peer);
+    storageChanged = true;
+    return true;
+  });
+  if (storageChanged) persistDismissedConversationPeers();
+  return visible;
+}
+
 function applyConversationReadOverride(peer, item) {
   if (!S.readConversationPeers.has(peer)) return item;
   const readThrough = Number(S.readConversationPeers.get(peer) || 0);
@@ -2422,9 +2504,11 @@ function mergeConversationSources(history, cached) {
       byPeer.set(peer, preserveConversationAvatar(current, normalized));
     }
   });
-  return [...byPeer.values()]
-    .sort((a, b) => conversationTimestamp(b) - conversationTimestamp(a))
-    .map(applyCachedConversationProfile);
+  return filterDismissedConversations(
+    [...byPeer.values()]
+      .sort((a, b) => conversationTimestamp(b) - conversationTimestamp(a))
+      .map(applyCachedConversationProfile)
+  );
 }
 
 function applyCachedConversationProfile(item) {
@@ -2600,17 +2684,24 @@ function conversationCard(item) {
   const unread = Number(conversation.unread_count || conversation.unread || 0);
   const active = peer && peer === S.activePeer;
   const presence = peer ? presenceBadgeHtml(peer, { ...nestedUser, ...conversation }, "presence-compact") : "";
-  return `<button type="button" class="conversation-card${active ? " on" : ""}" data-action="select-conversation" data-uid="${esc(
-    peer
-  )}" data-name="${esc(name)}" data-avatar="${esc(avatar || "")}" aria-label="打开与 ${esc(name)} 的聊天" title="${esc(name)}">
-    ${avatarHtml(avatar)}
-    <span class="conversation-copy"><span class="conversation-title-line"><strong>${esc(name)}</strong>${presence}</span><span class="conversation-preview">${esc(
-      preview
-    )}</span></span>
-    <span class="conversation-meta">${time ? `<time>${esc(time)}</time>` : ""}${
-    unread > 0 ? `<span class="unread-badge" aria-label="${esc(unread)} 条未读">${esc(unread > 99 ? "99+" : unread)}</span>` : ""
-  }</span>
-  </button>`;
+  return `<div class="conversation-item" data-conversation-item data-uid="${esc(peer)}">
+    <button type="button" class="conversation-card${active ? " on" : ""}" data-action="select-conversation" data-uid="${esc(
+      peer
+    )}" data-name="${esc(name)}" data-avatar="${esc(avatar || "")}" aria-label="打开与 ${esc(name)} 的聊天" title="${esc(name)}">
+      ${avatarHtml(avatar)}
+      <span class="conversation-copy"><span class="conversation-title-line"><strong>${esc(name)}</strong>${presence}</span><span class="conversation-preview">${esc(
+        preview
+      )}</span></span>
+      <span class="conversation-meta">${time ? `<time>${esc(time)}</time>` : ""}${
+      unread > 0 ? `<span class="unread-badge" aria-label="${esc(unread)} 条未读">${esc(unread > 99 ? "99+" : unread)}</span>` : ""
+    }</span>
+    </button>
+    <button type="button" class="btn danger small conversation-delete-action" data-action="delete-conversation" data-uid="${esc(
+      peer
+    )}" data-name="${esc(name)}" aria-label="从聊天列表删除与 ${esc(
+      name
+    )} 的聊天" aria-hidden="true" tabindex="-1">删除</button>
+  </div>`;
 }
 
 function visitorCard(item) {
@@ -4457,6 +4548,7 @@ function activeConversation() {
 function ensureConversationForPeer(peer, { name = "", avatar = "" } = {}) {
   const target = String(peer || "").trim();
   if (!target) return null;
+  restoreDismissedConversationPeer(target);
   const index = S.conversations.findIndex((item) => conversationPeer(item) === target);
   if (index >= 0) {
     const current = S.conversations[index];
@@ -4512,6 +4604,141 @@ function conversationListHtml() {
   return S.conversations.length
     ? S.conversations.map(conversationCard).join("")
     : `<div class="empty-state"><div><strong>还没有聊天记录</strong><span>可以从通讯录或身边的人开始一段对话</span><button type="button" class="btn soft small" data-action="social-open-tab" data-tab="friends">打开通讯录</button></div></div>`;
+}
+
+function clearConversationDeleteTimer(peer) {
+  const target = String(peer || "").trim();
+  const timer = S.conversationDeleteTimers.get(target);
+  if (timer) clearTimeout(timer);
+  S.conversationDeleteTimers.delete(target);
+}
+
+function resetConversationDeleteConfirmation(item) {
+  if (!item) return;
+  const peer = String(item.dataset.uid || "").trim();
+  clearConversationDeleteTimer(peer);
+  item.classList.remove("is-delete-confirming");
+  const button = item.querySelector('[data-action="delete-conversation"]');
+  if (!button) return;
+  button.dataset.deleteStage = "idle";
+  button.dataset.locked = "false";
+  button.disabled = false;
+  button.textContent = "删除";
+}
+
+function setConversationDeleteRevealed(item, revealed) {
+  if (!item) return;
+  if (revealed) {
+    document.querySelectorAll("[data-conversation-item].is-delete-revealed").forEach((other) => {
+      if (other !== item) setConversationDeleteRevealed(other, false);
+    });
+  } else {
+    resetConversationDeleteConfirmation(item);
+  }
+  item.classList.toggle("is-delete-revealed", revealed);
+  const button = item.querySelector('[data-action="delete-conversation"]');
+  if (button) {
+    button.setAttribute("aria-hidden", String(!revealed));
+    button.tabIndex = revealed ? 0 : -1;
+  }
+}
+
+function beginConversationSwipe(event) {
+  const item = event.target.closest && event.target.closest("[data-conversation-item]");
+  if (
+    !item ||
+    event.target.closest('[data-action="delete-conversation"]') ||
+    (event.pointerType === "mouse" && event.button !== 0)
+  ) {
+    return;
+  }
+  S.conversationSwipeGesture = {
+    pointerId: event.pointerId,
+    item,
+    startX: event.clientX,
+    startY: event.clientY,
+    dx: 0,
+    dy: 0,
+    axis: "",
+  };
+}
+
+function moveConversationSwipe(event) {
+  const gesture = S.conversationSwipeGesture;
+  if (!gesture || gesture.pointerId !== event.pointerId) return;
+  gesture.dx = event.clientX - gesture.startX;
+  gesture.dy = event.clientY - gesture.startY;
+  if (!gesture.axis) {
+    if (Math.max(Math.abs(gesture.dx), Math.abs(gesture.dy)) < CONVERSATION_SWIPE_LOCK_PX) return;
+    gesture.axis = Math.abs(gesture.dx) > Math.abs(gesture.dy) ? "horizontal" : "vertical";
+  }
+  if (gesture.axis === "horizontal") event.preventDefault();
+}
+
+function finishConversationSwipe(event, cancelled = false) {
+  const gesture = S.conversationSwipeGesture;
+  if (!gesture || gesture.pointerId !== event.pointerId) return;
+  S.conversationSwipeGesture = null;
+  if (cancelled || gesture.axis !== "horizontal") return;
+  const item = gesture.item;
+  if (!item.isConnected) return;
+  if (gesture.dx <= -CONVERSATION_SWIPE_THRESHOLD_PX) {
+    setConversationDeleteRevealed(item, true);
+  } else if (gesture.dx >= CONVERSATION_SWIPE_THRESHOLD_PX) {
+    setConversationDeleteRevealed(item, false);
+  } else {
+    return;
+  }
+  item.dataset.suppressConversationClick = "true";
+  setTimeout(() => {
+    if (item.isConnected) delete item.dataset.suppressConversationClick;
+  }, 350);
+}
+
+function startConversationDeleteConfirmation(button) {
+  const item = button.closest("[data-conversation-item]");
+  const peer = String(button.dataset.uid || item?.dataset.uid || "").trim();
+  if (!item?.classList.contains("is-delete-revealed") || !peer) return;
+  clearConversationDeleteTimer(peer);
+  item.classList.remove("is-delete-confirming");
+  button.dataset.deleteStage = "waiting";
+  button.dataset.locked = "true";
+  button.disabled = true;
+  button.textContent = "请稍候";
+  const timer = setTimeout(() => {
+    S.conversationDeleteTimers.delete(peer);
+    if (!button.isConnected || !item.classList.contains("is-delete-revealed")) return;
+    item.classList.add("is-delete-confirming");
+    button.dataset.deleteStage = "confirm";
+    button.dataset.locked = "false";
+    button.disabled = false;
+    button.textContent = "确认删除";
+  }, CONVERSATION_DELETE_CONFIRM_DELAY_MS);
+  S.conversationDeleteTimers.set(peer, timer);
+}
+
+function removeConversationListItem(peer) {
+  const target = String(peer || "").trim();
+  const conversation = S.conversations.find((item) => conversationPeer(item) === target);
+  if (!target || !conversation) return;
+  dismissConversationPeer(target, conversation);
+  clearConversationDeleteTimer(target);
+  const wasActive = target === String(S.activePeer || "");
+  if (wasActive) {
+    finishVoiceRecording(null, true);
+    closeFlashViewer();
+    closeChatMediaViewer();
+    S.imComposerPanel = "";
+    setChatComposerDraft($("im-text")?.value ?? S.imComposerDraft);
+    S.imVoiceMode = false;
+    S.activePeer = "";
+    restoreChatComposerDraft("");
+    S.activePeerName = "";
+  }
+  S.conversations = S.conversations.filter((item) => conversationPeer(item) !== target);
+  recalculateUnreadTotal();
+  refreshMessageConversationRegion({ refreshList: true, refreshPane: wasActive });
+  toast("聊天已从列表移除，消息仍然保留");
 }
 
 function stickerGroupsFromEnvelope(envelope) {
@@ -9036,6 +9263,14 @@ async function handleAction(action, button) {
     return;
   }
   if (action === "record-voice" || action === "flash-hold") return;
+  if (action === "delete-conversation") {
+    if (button.dataset.deleteStage === "confirm") {
+      removeConversationListItem(button.dataset.uid);
+    } else {
+      startConversationDeleteConfirmation(button);
+    }
+    return;
+  }
   if (action === "toggle-conversation-list") {
     S.conversationListCollapsed = !S.conversationListCollapsed;
     refreshChatComposerKeepingText();
@@ -9762,6 +9997,7 @@ document.addEventListener(
 );
 
 document.addEventListener("pointerdown", (event) => {
+  beginConversationSwipe(event);
   const panelToggle = event.target.closest && event.target.closest('[data-action="toggle-chat-panel"]');
   if (panelToggle && usesCoarsePointer()) {
     const viewportHeight = Number(window.visualViewport?.height || window.innerHeight || 0);
@@ -9792,12 +10028,21 @@ document.addEventListener("pointerdown", (event) => {
   }
 });
 
-document.addEventListener("pointermove", (event) => moveVoiceRecording(event));
+document.addEventListener(
+  "pointermove",
+  (event) => {
+    moveConversationSwipe(event);
+    moveVoiceRecording(event);
+  },
+  { passive: false }
+);
 document.addEventListener("pointerup", (event) => {
+  finishConversationSwipe(event);
   finishVoiceRecording(event);
   if (S.imFlashHold) closeFlashViewer();
 });
 document.addEventListener("pointercancel", (event) => {
+  finishConversationSwipe(event, true);
   finishVoiceRecording(event, true);
   if (S.imFlashHold) closeFlashViewer();
 });
@@ -9824,6 +10069,11 @@ document.addEventListener("keyup", (event) => {
 });
 
 document.addEventListener("click", (event) => {
+  const swipedCard = event.target.closest && event.target.closest(".conversation-card");
+  if (swipedCard?.closest("[data-conversation-item]")?.dataset.suppressConversationClick === "true") {
+    event.preventDefault();
+    return;
+  }
   const routeButton = event.target.closest("[data-route]");
   if (routeButton) {
     event.preventDefault();

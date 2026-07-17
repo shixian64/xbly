@@ -2341,7 +2341,17 @@ summary:focus-visible {
   background: transparent;
 }
 
+.conversation-item {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  border-radius: 14px;
+  touch-action: pan-y;
+}
+
 .conversation-card {
+  position: relative;
+  z-index: 1;
   display: flex;
   width: 100%;
   min-width: 0;
@@ -2351,6 +2361,8 @@ summary:focus-visible {
   background: transparent;
   padding: 0.65rem;
   text-align: left;
+  touch-action: pan-y;
+  transition: background 0.16s ease, padding-right 0.16s ease;
 }
 
 .conversation-card:hover,
@@ -2360,6 +2372,42 @@ summary:focus-visible {
 
 .conversation-card.on {
   box-shadow: inset 3px 0 var(--brand);
+}
+
+.conversation-delete-action {
+  position: absolute;
+  z-index: 2;
+  top: 50%;
+  right: 0.65rem;
+  min-width: 68px;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translate(0.35rem, -50%);
+  transition: opacity 0.16s ease, transform 0.16s ease, visibility 0.16s ease;
+}
+
+.conversation-item.is-delete-revealed .conversation-card {
+  background: #fff;
+  padding-right: 6.7rem;
+}
+
+.conversation-item.is-delete-revealed .conversation-title-line .presence-badge,
+.conversation-item.is-delete-revealed .conversation-meta {
+  display: none;
+}
+
+.conversation-item.is-delete-revealed .conversation-delete-action {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translate(0, -50%);
+}
+
+.conversation-item.is-delete-confirming .conversation-delete-action {
+  border-color: var(--danger);
+  background: var(--danger);
+  color: #fff;
 }
 
 .conversation-card .avatar {
