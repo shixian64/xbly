@@ -2605,6 +2605,49 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         ):
             self.assertNotIn(marker, app_js)
 
+    def test_profile_queries_render_readable_dedicated_results(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
+        page_me = app_js.split("async function pageMe(signal)", 1)[1].split(
+            "async function pageLab", 1
+        )[0]
+        actions = app_js.split('if (action === "face-status")', 1)[1].split(
+            'if (action === "im-rong")', 1
+        )[0]
+        result_views = app_js.split("function profileQueryCard", 1)[1].split(
+            "function setActiveProfileQuery", 1
+        )[0]
+
+        for marker in (
+            "function faceStatusView",
+            "function etiquetteStatusView",
+            "function referralStatusView",
+            "function referralSaveView",
+            "function loadProfileQuery",
+            'class="profile-query-result',
+        ):
+            self.assertIn(marker, app_js)
+        self.assertIn('class="button-row profile-query-actions"', page_me)
+        self.assertIn('aria-live="polite"', page_me)
+        self.assertLess(page_me.index('id="me-result"'), page_me.index('data-form="referral-set"'))
+        self.assertNotIn("operationView(data", actions)
+        self.assertNotIn("detailsView(data", actions)
+        for developer_detail in (
+            "最新结果",
+            "错误码",
+            "认证记录",
+            "当前账号",
+            "服务端返回",
+            "读取状态",
+            "profile-query-result-facts",
+            "profile-query-result-note",
+        ):
+            self.assertNotIn(developer_detail, result_views)
+        self.assertIn(".profile-query-result-highlight", app_css)
+        self.assertIn(".profile-query-actions .btn.is-active", app_css)
+        self.assertIn("user-select: all", app_css)
+
     def test_responsive_navigation_is_exclusive_and_keeps_mine_children_available(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")

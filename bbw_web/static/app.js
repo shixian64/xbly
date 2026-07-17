@@ -3185,6 +3185,147 @@ function operationView(data, successTitle = "操作已提交") {
   return `<div class="notice"><strong>${esc(localizedSystemText(successTitle, "操作已提交"))}</strong><div>${esc(notice)}</div></div>${detailsView(data, "订单/操作信息")}`;
 }
 
+function resultPayload(data) {
+  if (data && Object.prototype.hasOwnProperty.call(data, "value")) return data.value;
+  return data;
+}
+
+function findResultField(value, aliases) {
+  const expected = new Set(aliases.map((key) => String(key).replace(/[^a-z0-9]/gi, "").toLowerCase()));
+  const visited = new Set();
+  const visit = (item, depth) => {
+    if (!item || typeof item !== "object" || depth > 3 || visited.has(item)) return undefined;
+    visited.add(item);
+    for (const [key, fieldValue] of Object.entries(item)) {
+      const normalized = String(key).replace(/[^a-z0-9]/gi, "").toLowerCase();
+      if (expected.has(normalized) && fieldValue != null && fieldValue !== "") return fieldValue;
+    }
+    for (const fieldValue of Object.values(item)) {
+      const found = visit(fieldValue, depth + 1);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  };
+  return visit(value, 0);
+}
+
+function profileQueryCard({ title, value, unit = "", summary = "", tone = "neutral", code = false }) {
+  return `<section class="profile-query-result is-${esc(tone)}" aria-label="${esc(title)}查询结果">
+    <h3>${esc(title)}</h3>
+    <div class="profile-query-result-highlight${code ? " is-code" : ""}"><strong>${esc(value || "—")}</strong>${unit ? `<span>${esc(unit)}</span>` : ""}</div>
+    ${summary ? `<p class="profile-query-result-summary">${esc(summary)}</p>` : ""}
+  </section>`;
+}
+
+function profileQueryErrorView(data, title) {
+  const info = errorInfo(data, `${title}查询失败`);
+  return profileQueryCard({
+    title,
+    value: "暂时无法查询",
+    summary: info.detail && info.detail !== info.title ? `${info.title}，${info.detail}` : info.title,
+    tone: "error",
+  });
+}
+
+function faceStatusView(data) {
+  const session = data?.session && typeof data.session === "object" ? data.session : {};
+  const rawStatus = session.is_realname;
+  const verifyTime = data?.rp_verify_time ?? session.rp_verify_time;
+  const hasExplicitStatus = rawStatus !== undefined && rawStatus !== null && rawStatus !== "";
+  const hasVerifyRecord = verifyTime !== undefined && verifyTime !== null && !["", "0", "false", "null"].includes(String(verifyTime).trim().toLowerCase());
+  const known = hasExplicitStatus || verifyTime !== undefined;
+  const verified = hasExplicitStatus ? flagEnabled(rawStatus) : hasVerifyRecord;
+  return profileQueryCard({
+    title: "实名认证",
+    value: known ? (verified ? "已完成" : "未完成") : "暂时无法确认",
+    summary: verified ? "你已完成实名认证。" : known ? "请在官方客户端完成刷脸认证。" : "请稍后重新查询。",
+    tone: verified ? "success" : known ? "warning" : "neutral",
+  });
+}
+
+function etiquetteStatusView(data) {
+  if (!data || data.ok === false) return profileQueryErrorView(data, "礼仪分");
+  const payload = resultPayload(data);
+  const scalarPayload = payload == null || typeof payload !== "object" ? payload : undefined;
+  const rawScore =
+    findResultField(payload, ["etiquetteScore", "score", "totalScore", "fraction", "point", "points"]) ?? scalarPayload;
+  const scoreMatch = String(rawScore ?? "").match(/-?\d+(?:\.\d+)?/);
+  const score = scoreMatch ? Number(scoreMatch[0]) : null;
+  const descriptionValue = findResultField(payload, [
+    "description",
+    "desc",
+    "etiquetteDescription",
+    "etiquetteScoreDescription",
+    "scoreDescription",
+    "scoreDesc",
+    "remark",
+    "tips",
+    "label",
+  ]);
+  const description =
+    descriptionValue != null && typeof descriptionValue !== "object"
+      ? localizedSystemText(String(descriptionValue), String(descriptionValue))
+      : "";
+  const requirement = Number.isFinite(score)
+    ? score >= 80
+      ? "当前礼仪分可以正常使用聊天功能。"
+      : "礼仪分达到 80 分后可使用聊天功能。"
+    : "暂时没有查询到礼仪分，请稍后重试。";
+  return profileQueryCard({
+    title: "礼仪分",
+    value: Number.isFinite(score) ? String(score) : "暂无",
+    unit: Number.isFinite(score) ? "分" : "",
+    summary: description || requirement,
+    tone: Number.isFinite(score) ? (score >= 80 ? "success" : "warning") : "neutral",
+  });
+}
+
+function referralStatusView(data) {
+  if (!data || data.ok === false) return profileQueryErrorView(data, "推荐码");
+  const payload = resultPayload(data);
+  const scalarPayload = payload == null || typeof payload !== "object" ? payload : undefined;
+  const rawReferral =
+    findResultField(payload, ["referral", "referralCode", "inviteCode", "recommendCode", "code"]) ?? scalarPayload;
+  const referral = rawReferral != null && typeof rawReferral !== "object" ? String(rawReferral).trim() : "";
+  return profileQueryCard({
+    title: "推荐码",
+    value: referral || "暂无",
+    summary: referral ? "填写时请核对完整字符。" : "暂时没有可用的推荐码。",
+    tone: referral ? "success" : "neutral",
+    code: Boolean(referral),
+  });
+}
+
+function referralSaveView(data) {
+  if (!data || data.ok === false) return profileQueryErrorView(data, "推荐码保存");
+  return profileQueryCard({
+    title: "推荐码",
+    value: "保存成功",
+    summary: "可以点击查看推荐码确认。",
+    tone: "success",
+  });
+}
+
+function setActiveProfileQuery(action) {
+  root().querySelectorAll(".profile-query-actions [data-action]").forEach((button) => {
+    const active = button.dataset.action === action;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+}
+
+async function loadProfileQuery(action, title, path, renderer) {
+  setActiveProfileQuery(action);
+  setPanel("me-result", `<div class="profile-query-loading" role="status">正在查询${esc(title)}…</div>`);
+  try {
+    const { data } = await api(path);
+    setPanel("me-result", renderer(data));
+  } catch (error) {
+    setPanel("me-result", profileQueryErrorView({ ok: false, message: error?.message || "请求失败" }, title));
+    throw error;
+  }
+}
+
 function statCard(value, label) {
   return `<div class="stat-card"><div class="stat-value">${esc(value ?? "—")}</div><div class="stat-label">${esc(label)}</div></div>`;
 }
@@ -7027,7 +7168,7 @@ async function pageMe(signal) {
         user_role: user.user_role,
       })}</div>
     </div></section>
-    <section class="section"><div class="surface-card"><div class="section-head"><div><h2>资料与礼仪</h2><p>实名刷脸建议在官方客户端中完成</p></div></div><div class="button-row"><button type="button" class="btn secondary" data-action="face-status">实名状态</button><button type="button" class="btn secondary" data-action="etiquette">礼仪分</button><button type="button" class="btn secondary" data-action="referral-get">查看推荐码</button></div><form class="inline-form mt-sm" data-form="referral-set"><div class="field"><label for="referral-value">设置推荐码</label><input id="referral-value" name="referral" placeholder="输入推荐码" required /></div><button type="submit" class="btn secondary">保存</button></form><div id="me-result" class="result-panel"></div></div></section>`;
+    <section class="section"><div class="surface-card profile-service-card"><div class="section-head"><div><h2>资料与礼仪</h2><p>查看账号认证、礼仪分和推荐码</p></div></div><div class="button-row profile-query-actions"><button type="button" class="btn secondary" data-action="face-status" aria-controls="me-result" aria-pressed="false">查看实名状态</button><button type="button" class="btn secondary" data-action="etiquette" aria-controls="me-result" aria-pressed="false">查看礼仪分</button><button type="button" class="btn secondary" data-action="referral-get" aria-controls="me-result" aria-pressed="false">查看推荐码</button></div><div id="me-result" class="result-panel profile-query-result-panel" aria-live="polite"></div><form class="inline-form profile-referral-form" data-form="referral-set"><div class="field"><label for="referral-value">设置推荐码</label><input id="referral-value" name="referral" placeholder="输入推荐码" required /></div><button type="submit" class="btn secondary">保存</button></form></div></section>`;
 }
 
 async function pageLab() {
@@ -8812,19 +8953,13 @@ async function handleAction(action, button) {
     return;
   }
   if (action === "face-status") {
-    const { data } = await api("/api/face/status");
-    setPanel("me-result", `<div class="notice warn">网页版不执行刷脸流程，请在官方客户端中完成实名认证。</div>${detailsView(data, "实名状态")}`);
-    return;
+    return loadProfileQuery(action, "实名状态", "/api/face/status", faceStatusView);
   }
   if (action === "etiquette") {
-    const { data } = await api("/api/profile/etiquette");
-    setPanel("me-result", operationView(data, "礼仪信息已读取"));
-    return;
+    return loadProfileQuery(action, "礼仪分", "/api/profile/etiquette", etiquetteStatusView);
   }
   if (action === "referral-get") {
-    const { data } = await api("/api/referral");
-    setPanel("me-result", operationView(data, "推荐码信息已读取"));
-    return;
+    return loadProfileQuery(action, "推荐码", "/api/referral", referralStatusView);
   }
   if (action === "im-rong") {
     const { data } = await api("/api/im/rong");
@@ -9036,7 +9171,10 @@ async function handleProductForm(form, submitter) {
     const { data } = await api("/api/profile/nick", { method: "POST", body: JSON.stringify({ name }) });
     if (data.user) applyUser(data.user);
     if (toastEnv(data, "昵称已更新")) go("me", { force: true });
-    else setPanel("me-result", operationView(data, "昵称修改结果"));
+    else {
+      setActiveProfileQuery("");
+      setPanel("me-result", operationView(data, "昵称修改结果"));
+    }
     return;
   }
   if (kind === "referral-set") {
@@ -9044,8 +9182,9 @@ async function handleProductForm(form, submitter) {
       method: "POST",
       body: JSON.stringify({ referral: String(values.referral || "").trim() }),
     });
-    toastEnv(data, "推荐码设置请求已提交");
-    setPanel("me-result", operationView(data, "推荐码设置结果"));
+    toastEnv(data, "推荐码已保存");
+    setActiveProfileQuery("");
+    setPanel("me-result", referralSaveView(data));
     return;
   }
   if (kind === "im-send") {
