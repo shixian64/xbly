@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
 from redis import Redis
@@ -20,8 +21,11 @@ from bbw_prod.crypto import CredentialCipher, normalize_phone
 from bbw_prod.db import session_scope
 from bbw_prod.models import ExternalAccount
 from bbw_prod.repositories import ExternalAccountRepository, UserRepository
+from bbw_prod.security import SessionTokenManager, keyed_identifier_hash
 from bbw_prod.services import (
+    ConflictError,
     InviteInvalid,
+    InviteService,
     LoginAccountService,
     LoginPrecheck,
     PermissionDenied,
@@ -41,6 +45,26 @@ class UserIdentity:
     user_id: uuid.UUID
     external_account_id: uuid.UUID
     upstream_uid: str
+
+
+@dataclass(frozen=True, slots=True)
+class PendingLogin:
+    phone: str = field(repr=False)
+    mode: str
+    upstream_uid: str
+    password: str = field(repr=False)
+
+
+class PendingLoginExpired(PermissionError):
+    pass
+
+
+class PendingLoginRejected(PermissionError):
+    pass
+
+
+class PendingLoginConflict(RuntimeError):
+    pass
 
 
 def _aware_timestamp(value: Any) -> float:
@@ -157,6 +181,8 @@ def _sanitize_profile(value: Any) -> Any:
 
 
 class RuntimePersistence:
+    PENDING_LOGIN_SECONDS = 5 * 60
+
     def __init__(self, settings: Settings):
         self.settings = settings
         self.redis = Redis.from_url(settings.redis_url, decode_responses=False)
@@ -252,11 +278,22 @@ class RuntimePersistence:
         values = self.redis.mget(self._failure_keys(phone, client_ip))
         return max((int(value or 0) for value in values), default=0)
 
-    def precheck_login(
+    def precheck_account(self, *, phone: str) -> LoginPrecheck:
+        if not phone:
+            raise PermissionError("请输入手机号")
+        try:
+            with session_scope() as db:
+                service = LoginAccountService(
+                    db, self.settings, self.cipher, self.phone_hmac_key
+                )
+                return service.precheck_credentials(phone=phone)
+        except PermissionDenied as exc:
+            raise PermissionError("账号不可用") from exc
+
+    def precheck_login_credentials(
         self,
         *,
         phone: str,
-        invite_code: str,
         client_ip: str,
         turnstile_token: str = "",
     ) -> LoginPrecheck:
@@ -268,14 +305,7 @@ class RuntimePersistence:
         if failures >= 2 and self.turnstile.enabled:
             if not self.turnstile.verify(turnstile_token, remote_ip=client_ip):
                 raise PermissionError("需要完成人机验证后才能继续登录")
-        try:
-            with session_scope() as db:
-                service = LoginAccountService(
-                    db, self.settings, self.cipher, self.phone_hmac_key
-                )
-                return service.precheck(phone=phone, invite_code=invite_code or None)
-        except (InviteInvalid, PermissionDenied) as exc:
-            raise PermissionError(str(exc)) from exc
+        return self.precheck_account(phone=phone)
 
     def record_login_failure(self, *, phone: str, client_ip: str) -> None:
         if not phone:
@@ -301,6 +331,180 @@ class RuntimePersistence:
         except (InviteInvalid, PermissionDenied) as exc:
             raise PermissionError(str(exc)) from exc
 
+    def validate_invite_code(self, invite_code: str) -> None:
+        if not invite_code:
+            raise PermissionError("请输入有效邀请码")
+        try:
+            with session_scope() as db:
+                InviteService(db, self.settings).validate(invite_code)
+        except InviteInvalid as exc:
+            raise PermissionError("邀请码无效或已不可用") from exc
+
+    def _pending_login_key(self, raw_sid: str) -> str:
+        return SessionTokenManager.redis_key(
+            self.settings.redis_prefix, "pending-login", raw_sid
+        )
+
+    def _pending_login_context(self, raw_sid: str) -> str:
+        return f"pending-login:{SessionTokenManager.hash_sid(raw_sid)}"
+
+    def _pending_client_hash(self, *, client_ip: str, user_agent: str) -> str:
+        return keyed_identifier_hash(
+            f"{client_ip}\n{user_agent[:512]}",
+            self.session_hmac_key,
+            purpose="pending-login-client",
+        )
+
+    def begin_pending_login(
+        self,
+        *,
+        raw_sid: str,
+        phone: str,
+        password: str,
+        mode: str,
+        upstream_uid: str,
+        client_ip: str,
+        user_agent: str,
+    ) -> int:
+        if not raw_sid or not upstream_uid:
+            raise ValueError("pending login requires an authenticated upstream session")
+        payload = {
+            "phone": normalize_phone(phone),
+            "password": password,
+            "mode": "sms" if mode == "sms" else "password",
+            "upstream_uid": str(upstream_uid),
+            "client_hash": self._pending_client_hash(
+                client_ip=client_ip, user_agent=user_agent
+            ),
+            "created_at": time.time(),
+        }
+        encrypted = self.cipher.encrypt_json(
+            payload,
+            purpose="web-login.pending",
+            context=self._pending_login_context(raw_sid),
+        )
+        self.redis.set(
+            self._pending_login_key(raw_sid),
+            json.dumps(encrypted, ensure_ascii=True, separators=(",", ":")),
+            ex=self.PENDING_LOGIN_SECONDS,
+        )
+        self._clear_login_failures(phone=phone, client_ip=client_ip)
+        return self.PENDING_LOGIN_SECONDS
+
+    def _decode_pending_login(
+        self,
+        raw_sid: str,
+        raw_payload: Any,
+        *,
+        client_ip: str,
+        user_agent: str,
+    ) -> PendingLogin:
+        if raw_payload is None:
+            raise PendingLoginExpired("登录验证已失效，请重新登录")
+        try:
+            if isinstance(raw_payload, bytes):
+                raw_payload = raw_payload.decode("utf-8")
+            encrypted = json.loads(str(raw_payload))
+            payload = self.cipher.decrypt_json(
+                encrypted,
+                purpose="web-login.pending",
+                context=self._pending_login_context(raw_sid),
+            )
+            expected_client = self._pending_client_hash(
+                client_ip=client_ip, user_agent=user_agent
+            )
+            if not hmac.compare_digest(
+                str(payload.get("client_hash") or ""), expected_client
+            ):
+                raise PendingLoginExpired("登录环境已变化，请重新登录")
+            phone = normalize_phone(str(payload.get("phone") or ""))
+            upstream_uid = str(payload.get("upstream_uid") or "").strip()
+            if not upstream_uid:
+                raise ValueError("pending login has no upstream identity")
+            return PendingLogin(
+                phone=phone,
+                password=str(payload.get("password") or ""),
+                mode="sms" if payload.get("mode") == "sms" else "password",
+                upstream_uid=upstream_uid,
+            )
+        except PendingLoginExpired:
+            raise
+        except Exception as exc:
+            raise PendingLoginExpired("登录验证已失效，请重新登录") from exc
+
+    def peek_pending_login(
+        self,
+        raw_sid: str,
+        *,
+        client_ip: str,
+        user_agent: str,
+    ) -> PendingLogin:
+        return self._decode_pending_login(
+            raw_sid,
+            self.redis.get(self._pending_login_key(raw_sid)),
+            client_ip=client_ip,
+            user_agent=user_agent,
+        )
+
+    def claim_pending_login(
+        self,
+        raw_sid: str,
+        *,
+        client_ip: str,
+        user_agent: str,
+    ) -> PendingLogin:
+        return self._decode_pending_login(
+            raw_sid,
+            self.redis.getdel(self._pending_login_key(raw_sid)),
+            client_ip=client_ip,
+            user_agent=user_agent,
+        )
+
+    def cancel_pending_login(self, raw_sid: str) -> bool:
+        if not raw_sid:
+            return False
+        return bool(self.redis.delete(self._pending_login_key(raw_sid)))
+
+    def finish_pending_login(
+        self,
+        *,
+        raw_sid: str,
+        web_user: WebUser,
+        invite_code: str,
+        old_sid: str | None,
+        client_ip: str,
+        user_agent: str,
+    ) -> UserIdentity:
+        pending = self.peek_pending_login(
+            raw_sid, client_ip=client_ip, user_agent=user_agent
+        )
+        if str(web_user.app.session.uid or "") != pending.upstream_uid:
+            self.cancel_pending_login(raw_sid)
+            raise PendingLoginExpired("登录验证已失效，请重新登录")
+        self.validate_invite_code(invite_code)
+        pending = self.claim_pending_login(
+            raw_sid, client_ip=client_ip, user_agent=user_agent
+        )
+        if str(web_user.app.session.uid or "") != pending.upstream_uid:
+            raise PendingLoginExpired("登录验证已失效，请重新登录")
+        try:
+            return self.complete_login(
+                web_user=web_user,
+                phone=pending.phone,
+                invite_code=invite_code,
+                password=pending.password,
+                login_context=None,
+                old_sid=old_sid,
+                client_ip=client_ip,
+                user_agent=user_agent,
+            )
+        except InviteInvalid as exc:
+            raise PermissionError("邀请码无效或已不可用") from exc
+        except PermissionDenied as exc:
+            raise PendingLoginRejected("账号不可用，请重新登录") from exc
+        except ConflictError as exc:
+            raise PendingLoginConflict("账号绑定状态已变化，请重新登录") from exc
+
     @staticmethod
     def _device_data(web_user: WebUser) -> dict[str, Any]:
         session = web_user.app.session
@@ -318,7 +522,7 @@ class RuntimePersistence:
         *,
         web_user: WebUser,
         phone: str,
-        invite_code: str,
+        invite_code: str | None,
         password: str,
         login_context: LoginPrecheck | None,
         old_sid: str | None,
@@ -361,6 +565,7 @@ class RuntimePersistence:
             completion.external_account.id,
             str(completion.external_account.upstream_uid or upstream.uid),
         )
+        web_user.clear_pending()
         self._attach_runtime(web_user, identity)
         return identity
 
@@ -484,6 +689,7 @@ class RuntimePersistence:
                 display_name=str(app.session.nickname or "") or None,
                 profile=_sanitize_profile(dict(app.session.raw_user or {})),
                 device_data={**app.session.device_dict()},
+                require_invite=False,
             )
         return True
 

@@ -208,6 +208,93 @@ class ProductionContractTests(unittest.TestCase):
             self.assertIn("finally {", segment, start_marker)
             self.assertIn(clear_call, segment, start_marker)
 
+    def test_user_login_uses_a_real_two_stage_invitation_gate(self) -> None:
+        html = self.read("bbw_web/static/index.html")
+        js = self.read("bbw_web/static/app.js")
+        api = self.read("bbw_web/api.py")
+        persistence = self.read("bbw_web/persistence.py")
+        services = self.read("bbw_prod/services.py")
+        bff = self.read("bbw_web/bff_server.py")
+
+        self.assertIn('id="login-credentials-step"', html)
+        self.assertIn('id="login-invite-step" class="hide"', html)
+        self.assertLess(html.index('id="password"'), html.index('id="invite-code"'))
+        self.assertIn('id="login-back"', html)
+
+        credential_step = js.split("async function submitLoginCredentials", 1)[1].split(
+            "async function submitLoginInvite", 1
+        )[0]
+        invite_step = js.split("async function submitLoginInvite", 1)[1].split(
+            "async function cancelPendingLogin", 1
+        )[0]
+        completion = js.split("function completeBrowserLogin", 1)[1].split(
+            "async function submitLoginCredentials", 1
+        )[0]
+        self.assertNotIn('$("invite-code")', credential_step)
+        self.assertNotIn("invite_code", credential_step)
+        self.assertNotIn('$("password")', invite_step)
+        self.assertNotIn("password:", invite_step)
+        self.assertIn('body: JSON.stringify({ invite_code: inviteCode })', invite_step)
+        self.assertIn("S.authenticated = true", completion)
+        self.assertNotIn("S.authenticated = true", credential_step)
+        self.assertNotIn("S.authenticated = true", invite_step)
+
+        self.assertIn('@app.post("/api/auth/invite"', api)
+        self.assertIn('@app.post("/api/auth/invite/cancel"', api)
+        self.assertIn("_pending_cookie_name", api)
+        self.assertIn("begin_pending_login", api)
+        self.assertIn("finish_pending_login", api)
+        pending_branch = api.split("if login_context is not None and login_context.requires_invite", 1)[1].split(
+            "identity = persistence.complete_login", 1
+        )[0]
+        self.assertIn("return response", pending_branch)
+        self.assertNotIn("name=legacy.COOKIE_NAME", pending_branch)
+
+        self.assertIn("PENDING_LOGIN_SECONDS = 5 * 60", persistence)
+        self.assertIn("self.cipher.encrypt_json", persistence)
+        self.assertIn("self.redis.getdel", persistence)
+        self.assertIn('purpose="web-login.pending"', persistence)
+        self.assertIn("def precheck_credentials", services)
+        self.assertIn("bool(self.settings.invite_required)", services)
+        self.assertIn(
+            "if require_invite and self.settings.invite_required and not invite_code",
+            services,
+        )
+        credential_precheck = services.split("def precheck_credentials", 1)[1].split(
+            "def precheck", 1
+        )[0]
+        self.assertGreaterEqual(
+            credential_precheck.count("bool(self.settings.invite_required)"), 2
+        )
+        existing_completion = services.split("if by_phone is not None:", 1)[1].split(
+            "if by_uid is not None:", 1
+        )[0]
+        self.assertIn("self.invites.validate(invite_code, for_update=True)", existing_completion)
+        self.assertIn("self.invites.consume_locked(invite)", existing_completion)
+        self.assertIn("authenticated\": False", api)
+        self.assertIn("status_code=202", pending_branch)
+        self.assertIn("def _cancel_pending_runtime", api)
+        cancel_helper = api.split("def _cancel_pending_runtime", 1)[1].split(
+            "async def _legacy_dispatch", 1
+        )[0]
+        self.assertLess(
+            cancel_helper.index("persistence.require_identity(raw_sid)"),
+            cancel_helper.index("web_user.app.auth.logout()"),
+        )
+        self.assertIn("def _auth_json_request_error", api)
+        self.assertIn('content_type.startswith("application/json")', api)
+        login_dispatch = api.split(
+            'if request.method == "POST" and path in {"/api/auth/login", "/api/auth/sms-login"}:',
+            1,
+        )[1].split("# Never trust an authenticated object", 1)[0]
+        self.assertLess(
+            login_dispatch.index("_auth_json_request_error(request)"),
+            login_dispatch.index("_cancel_pending_runtime"),
+        )
+        self.assertIn("if web_user.pending_until is None:", api)
+        self.assertIn("normalized_phone = account_context.normalized_phone", api)
+        self.assertIn('"invite_login": INVITE_LOGIN_ENABLED', bff)
+
     def test_model_and_migration_owner_and_audit_constraints(self) -> None:
         models = self.read("bbw_prod/models.py")
         migration = self.read("migrations/versions/20260716_0001_initial_production.py")
@@ -286,6 +373,91 @@ class ProductionContractTests(unittest.TestCase):
             settings('{"1":"' + key_a + '","1":"' + key_a + '"}').load_credential_keyring()
         with self.assertRaises(ConfigurationError):
             settings('{"1":"' + key_a + '"}', master_key=key_b).load_credential_keyring()
+
+    def test_pending_login_credentials_are_encrypted_bound_and_one_time(self) -> None:
+        try:
+            from bbw_prod.crypto import CredentialCipher
+            from bbw_web.persistence import PendingLoginExpired, RuntimePersistence
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        class FakeRedis:
+            def __init__(self) -> None:
+                self.values: dict[str, str] = {}
+
+            def set(self, name: str, value: str, **_kwargs: object) -> bool:
+                self.values[name] = value
+                return True
+
+            def get(self, name: str) -> str | None:
+                return self.values.get(name)
+
+            def getdel(self, name: str) -> str | None:
+                return self.values.pop(name, None)
+
+            def delete(self, *names: str) -> int:
+                removed = 0
+                for name in names:
+                    removed += int(self.values.pop(name, None) is not None)
+                return removed
+
+        runtime = RuntimePersistence.__new__(RuntimePersistence)
+        runtime.settings = types.SimpleNamespace(redis_prefix="contract")
+        runtime.redis = FakeRedis()
+        runtime.cipher = CredentialCipher({1: b"k" * 32}, 1)
+        runtime.session_hmac_key = b"s" * 32
+        raw_sid = "pending_contract_sid_1234567890"
+        phone = "13800138000"
+        password = "upstream-secret-password"
+
+        runtime.begin_pending_login(
+            raw_sid=raw_sid,
+            phone=phone,
+            password=password,
+            mode="password",
+            upstream_uid="42",
+            client_ip="127.0.0.1",
+            user_agent="contract-agent",
+        )
+        redis_value = runtime.redis.values[runtime._pending_login_key(raw_sid)]
+        self.assertNotIn(phone, redis_value)
+        self.assertNotIn(password, redis_value)
+
+        pending = runtime.peek_pending_login(
+            raw_sid,
+            client_ip="127.0.0.1",
+            user_agent="contract-agent",
+        )
+        self.assertEqual(pending.phone, phone)
+        self.assertEqual(pending.password, password)
+        claimed = runtime.claim_pending_login(
+            raw_sid,
+            client_ip="127.0.0.1",
+            user_agent="contract-agent",
+        )
+        self.assertEqual(claimed.upstream_uid, "42")
+        with self.assertRaises(PendingLoginExpired):
+            runtime.claim_pending_login(
+                raw_sid,
+                client_ip="127.0.0.1",
+                user_agent="contract-agent",
+            )
+
+        runtime.begin_pending_login(
+            raw_sid=raw_sid,
+            phone=phone,
+            password=password,
+            mode="password",
+            upstream_uid="42",
+            client_ip="127.0.0.1",
+            user_agent="contract-agent",
+        )
+        with self.assertRaises(PendingLoginExpired):
+            runtime.peek_pending_login(
+                raw_sid,
+                client_ip="127.0.0.2",
+                user_agent="contract-agent",
+            )
 
 
 if __name__ == "__main__":

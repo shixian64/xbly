@@ -1201,7 +1201,8 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("room_top_envelope(app.room.top())", bff_server_py)
         self.assertIn("room_create_envelope(", bff_server_py)
         self.assertIn('if path == "/api/room/native-list"', bff_server_py)
-        self.assertIn('"capabilities": {"roomkit_list": True}', bff_server_py)
+        self.assertIn('"roomkit_list": True', bff_server_py)
+        self.assertIn('"invite_login": INVITE_LOGIN_ENABLED', bff_server_py)
         self.assertIn(".room-cover", app_css)
         self.assertIn(".room-owner-avatar", app_css)
 

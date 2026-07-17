@@ -9,9 +9,10 @@ Run with::
 
     uvicorn bbw_web.api:app --host 0.0.0.0 --port 8000 --workers 1
 
-Only one worker is used on the 2 GiB deployment profile.  Browser sessions are
-kept in Redis/PostgreSQL, so increasing the worker count later does not require
-changing the cookie format.
+Only one worker is used on the 2 GiB deployment profile. Authenticated browser
+sessions are kept in Redis/PostgreSQL; the short two-stage login window also
+holds an upstream runtime in that worker, so multi-worker deployments must add
+sticky routing or externalize that pending runtime before scaling out.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Iterable, Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -248,6 +249,132 @@ def _response_json(headers: Iterable[tuple[str, str]], body: bytes) -> dict[str,
     return _json_object(body)
 
 
+def _pending_cookie_name(user_cookie_name: str) -> str:
+    if user_cookie_name.startswith("__Host-"):
+        return f"__Host-{user_cookie_name[len('__Host-'):]}-pending-login"
+    return f"{user_cookie_name}_pending_login"
+
+
+def _valid_pending_sid(raw_sid: str | None) -> bool:
+    value = str(raw_sid or "")
+    return 20 <= len(value) <= 128 and all(
+        character.isascii() and (character.isalnum() or character in "_-")
+        for character in value
+    )
+
+
+def _auth_json_request_error(request: Request) -> JSONResponse | None:
+    content_type = str(request.headers.get("Content-Type") or "").lower()
+    if not content_type.startswith("application/json"):
+        return JSONResponse(
+            {"ok": False, "error": "请求格式必须为 JSON"}, status_code=415
+        )
+    raw_origin = str(request.headers.get("Origin") or "")
+    if raw_origin:
+        origin = legacy._normalize_origin(raw_origin)
+        host = str(request.headers.get("Host") or "").strip().lower()
+        if not origin:
+            return JSONResponse(
+                {"ok": False, "error": "cross-origin request rejected"},
+                status_code=403,
+            )
+        parsed_origin = urlparse(origin)
+        if not host or parsed_origin.netloc.lower() != host:
+            return JSONResponse(
+                {"ok": False, "error": "cross-origin request rejected"},
+                status_code=403,
+            )
+    elif str(request.headers.get("Sec-Fetch-Site") or "").lower() in {
+        "cross-site",
+        "same-site",
+    }:
+        return JSONResponse(
+            {"ok": False, "error": "cross-origin request rejected"},
+            status_code=403,
+        )
+    return None
+
+
+def _set_cookie(
+    response: Response,
+    *,
+    name: str,
+    value: str,
+    secure: bool,
+    max_age: int | None = None,
+) -> None:
+    response.set_cookie(
+        key=name,
+        value=value,
+        max_age=max_age,
+        path="/",
+        secure=secure,
+        httponly=True,
+        samesite="strict",
+    )
+
+
+def _clear_cookie(response: Response, *, name: str, secure: bool) -> None:
+    response.delete_cookie(
+        key=name,
+        path="/",
+        secure=secure,
+        httponly=True,
+        samesite="strict",
+    )
+
+
+def _logout_web_user(web_user: Any) -> None:
+    try:
+        with web_user.lock:
+            web_user.app.auth.logout()
+    except Exception:
+        pass
+
+
+def _logout_expired_pending_user(web_user: Any) -> None:
+    try:
+        with web_user.lock:
+            if web_user.pending_until is None:
+                return
+            web_user.app.auth.logout()
+    except Exception:
+        pass
+
+
+def _discard_pending_runtime(raw_sid: str) -> None:
+    if not raw_sid or legacy.STORE is None:
+        return
+    web_user = legacy.STORE.get(raw_sid)
+    if web_user is not None:
+        _logout_web_user(web_user)
+        web_user.clear_pending()
+    legacy.STORE.drop(raw_sid)
+
+
+def _cancel_pending_runtime(persistence: Any, raw_sid: str) -> bool:
+    """Cancel only a still-pending SID, never a concurrently promoted session."""
+    if not _valid_pending_sid(raw_sid):
+        return False
+    web_user = legacy.STORE.get(raw_sid) if legacy.STORE is not None else None
+    if web_user is None:
+        return bool(persistence.cancel_pending_login(raw_sid))
+    with web_user.lock:
+        if persistence.require_identity(raw_sid) is not None:
+            return False
+        deleted = bool(persistence.cancel_pending_login(raw_sid))
+        if not deleted and web_user.pending_until is None:
+            return False
+        try:
+            web_user.app.auth.logout()
+        except Exception:
+            pass
+        web_user.clear_pending()
+        if legacy.STORE is not None:
+            legacy.STORE.drop(raw_sid)
+        return True
+
+
 async def _legacy_dispatch(request: Request) -> Response:
     """Restore durable state, execute one product route, then persist effects."""
     max_body = int(
@@ -280,9 +407,30 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
     cookie_name = legacy.COOKIE_NAME
     sid = request.cookies.get(cookie_name)
     persistence = request.app.state.persistence
+    pending_cookie_name = _pending_cookie_name(cookie_name)
+    pending_sid = request.cookies.get(pending_cookie_name)
 
     path = request.url.path
     request_json = _json_object(raw_body)
+
+    if request.method == "POST" and path in {"/api/auth/login", "/api/auth/sms-login"}:
+        request_error = _auth_json_request_error(request)
+        if request_error is not None:
+            return request_error
+        if _valid_pending_sid(pending_sid):
+            cancelled = _cancel_pending_runtime(persistence, pending_sid)
+            if not cancelled and persistence.require_identity(pending_sid) is not None:
+                promoted_user = (
+                    legacy.STORE.get(pending_sid) if legacy.STORE is not None else None
+                )
+                if promoted_user is not None:
+                    return _pending_login_response(
+                        request,
+                        {"ok": True, **promoted_user.public()},
+                        status_code=200,
+                        clear_pending=True,
+                        set_session_sid=pending_sid,
+                    )
 
     # Never trust an authenticated object that only remains in process memory.
     # PostgreSQL/Redis are the authority for idle/absolute expiry and revocation.
@@ -321,24 +469,34 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
 
     if request.method == "POST" and path == "/api/auth/sms-send":
         phone = str(request_json.get("phone") or "").strip()
-        invite_code = str(request_json.get("invite_code") or "").strip()
         try:
-            persistence.precheck_invite(phone=phone, invite_code=invite_code)
+            account_context = persistence.precheck_login_credentials(
+                phone=phone,
+                client_ip=client_ip,
+                turnstile_token=str(request_json.get("turnstile_token") or ""),
+            )
+            normalized_phone = account_context.normalized_phone
         except ValueError:
             return JSONResponse(
                 {"ok": False, "error": "手机号格式无效"}, status_code=400
             )
         except PermissionError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=403)
+        except RuntimeError as exc:
+            return JSONResponse(
+                {"ok": False, "error": str(exc)},
+                status_code=429,
+                headers={"Retry-After": "900"},
+            )
         sms_limits = (
             persistence.rate_limit(
-                f"sms-send-phone:{phone}", limit=3, window_seconds=10 * 60
+                f"sms-send-phone:{normalized_phone}", limit=3, window_seconds=10 * 60
             ),
             persistence.rate_limit(
                 f"sms-send-ip:{client_ip}", limit=3, window_seconds=10 * 60
             ),
             persistence.rate_limit(
-                f"sms-send-combined:{phone}:{client_ip}",
+                f"sms-send-combined:{normalized_phone}:{client_ip}",
                 limit=3,
                 window_seconds=10 * 60,
             ),
@@ -353,9 +511,8 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
     login_context: Any = None
     if request.method == "POST" and path in {"/api/auth/login", "/api/auth/sms-login"}:
         try:
-            login_context = persistence.precheck_login(
+            login_context = persistence.precheck_login_credentials(
                 phone=str(request_json.get("phone") or "").strip(),
-                invite_code=str(request_json.get("invite_code") or "").strip(),
                 client_ip=client_ip,
                 turnstile_token=str(request_json.get("turnstile_token") or ""),
             )
@@ -415,10 +572,40 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
             web_user = legacy.STORE.get(new_sid) if legacy.STORE is not None else None
             if web_user is None:
                 raise RuntimeError("authenticated session was not registered")
+            if login_context is not None and login_context.requires_invite:
+                expires_in = persistence.begin_pending_login(
+                    raw_sid=new_sid,
+                    phone=str(request_json.get("phone") or "").strip(),
+                    password=str(request_json.get("password") or ""),
+                    mode="sms" if path == "/api/auth/sms-login" else "password",
+                    upstream_uid=str(web_user.app.session.uid or ""),
+                    client_ip=client_ip,
+                    user_agent=str(request.headers.get("User-Agent") or "")[:512],
+                )
+                web_user.mark_pending(expires_in)
+                response = JSONResponse(
+                    {
+                        "ok": True,
+                        "authenticated": False,
+                        "requires_invite": True,
+                        "next": "invite",
+                        "message": "账号验证成功，请输入邀请码",
+                        "expires_in": expires_in,
+                    },
+                    status_code=202,
+                )
+                _set_cookie(
+                    response,
+                    name=pending_cookie_name,
+                    value=new_sid,
+                    secure=bool(request.app.state.settings.cookie_secure),
+                    max_age=expires_in,
+                )
+                return response
             identity = persistence.complete_login(
                 web_user=web_user,
                 phone=str(request_json.get("phone") or "").strip(),
-                invite_code=str(request_json.get("invite_code") or "").strip(),
+                invite_code=None,
                 password=str(request_json.get("password") or ""),
                 login_context=login_context,
                 old_sid=sid,
@@ -427,8 +614,8 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
             )
         except Exception:
             LOGGER.exception("authenticated session persistence failed")
-            if legacy.STORE is not None:
-                legacy.STORE.drop(new_sid)
+            persistence.cancel_pending_login(new_sid)
+            _discard_pending_runtime(new_sid)
             persistence.revoke_session(new_sid)
             return JSONResponse(
                 {"ok": False, "error": "登录状态保存失败，请稍后重试"},
@@ -458,6 +645,12 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
         (name.encode("latin-1"), value.encode("latin-1"))
         for name, value in response_headers
     ]
+    if is_login_path and response_data.get("ok") and pending_sid:
+        _clear_cookie(
+            response,
+            name=pending_cookie_name,
+            secure=bool(request.app.state.settings.cookie_secure),
+        )
     return response
 
 
@@ -478,6 +671,7 @@ async def lifespan(application: FastAPI):
     application.state.persistence = persistence
 
     legacy.LAB_ENABLED = False
+    legacy.INVITE_LOGIN_ENABLED = True
     legacy.CORS_ALLOW_ORIGINS = set()
     legacy.COOKIE_SECURE = bool(settings.cookie_secure)
     legacy.COOKIE_NAME = str(settings.user_cookie_name)
@@ -487,6 +681,7 @@ async def lifespan(application: FastAPI):
         auto_heartbeat=False,
         persist_sessions=False,
         allow_weak_onekey=False,
+        pending_expire_callback=_logout_expired_pending_user,
     )
     try:
         persistence.startup()
@@ -498,6 +693,7 @@ async def lifespan(application: FastAPI):
         bootstrap_initial_admin(settings, persistence)
         yield
     finally:
+        legacy.INVITE_LOGIN_ENABLED = False
         if legacy.STORE is not None:
             legacy.STORE.close()
         persistence.close()
@@ -590,6 +786,221 @@ def auth_security(request: Request, phone: str = "") -> dict[str, Any]:
             client_ip=client_ip,
         ),
     }
+
+
+def _pending_login_response(
+    request: Request,
+    payload: dict[str, Any],
+    *,
+    status_code: int,
+    clear_pending: bool = False,
+    set_session_sid: str | None = None,
+) -> JSONResponse:
+    response = JSONResponse(payload, status_code=status_code)
+    secure = bool(request.app.state.settings.cookie_secure)
+    if set_session_sid:
+        _set_cookie(
+            response,
+            name=legacy.COOKIE_NAME,
+            value=set_session_sid,
+            secure=secure,
+        )
+    if clear_pending:
+        _clear_cookie(
+            response,
+            name=_pending_cookie_name(legacy.COOKIE_NAME),
+            secure=secure,
+        )
+    return response
+
+
+def _finish_pending_invite_sync(
+    request: Request, invite_code: str
+) -> JSONResponse:
+    from bbw_web.persistence import (
+        PendingLoginConflict,
+        PendingLoginExpired,
+        PendingLoginRejected,
+    )
+
+    persistence = request.app.state.persistence
+    client_ip = _client_ip(request)
+    user_agent = str(request.headers.get("User-Agent") or "")[:512]
+    pending_cookie = _pending_cookie_name(legacy.COOKIE_NAME)
+    pending_sid = str(request.cookies.get(pending_cookie) or "")
+    if not _valid_pending_sid(pending_sid):
+        return _pending_login_response(
+            request,
+            {"ok": False, "error": "登录验证已失效，请重新登录"},
+            status_code=401,
+            clear_pending=True,
+        )
+    if not persistence.rate_limit(
+        f"invite-verify:{pending_sid}:{client_ip}", limit=8, window_seconds=5 * 60
+    ):
+        return _pending_login_response(
+            request,
+            {"ok": False, "error": "邀请码验证过于频繁，请稍后重试"},
+            status_code=429,
+        )
+    web_user = legacy.STORE.get(pending_sid) if legacy.STORE is not None else None
+    if web_user is None:
+        try:
+            persistence.peek_pending_login(
+                pending_sid, client_ip=client_ip, user_agent=user_agent
+            )
+        except PendingLoginExpired:
+            return _pending_login_response(
+                request,
+                {"ok": False, "error": "登录验证已失效，请重新登录"},
+                status_code=401,
+                clear_pending=True,
+            )
+        return _pending_login_response(
+            request,
+            {
+                "ok": False,
+                "retryable": True,
+                "error": "登录验证正在同步，请稍后重试",
+            },
+            status_code=503,
+        )
+    if not web_user.app.session.logged_in:
+        _cancel_pending_runtime(persistence, pending_sid)
+        return _pending_login_response(
+            request,
+            {"ok": False, "error": "登录验证已失效，请重新登录"},
+            status_code=401,
+            clear_pending=True,
+        )
+    try:
+        with web_user.lock:
+            persistence.finish_pending_login(
+                raw_sid=pending_sid,
+                web_user=web_user,
+                invite_code=invite_code,
+                old_sid=request.cookies.get(legacy.COOKIE_NAME),
+                client_ip=client_ip,
+                user_agent=user_agent,
+            )
+    except PendingLoginExpired as exc:
+        # A simultaneous duplicate completion may observe the one-time marker
+        # after the first request has already promoted this same SID.
+        if persistence.require_identity(pending_sid) is not None:
+            return _pending_login_response(
+                request,
+                {"ok": True, **web_user.public()},
+                status_code=200,
+                clear_pending=True,
+                set_session_sid=pending_sid,
+            )
+        _cancel_pending_runtime(persistence, pending_sid)
+        return _pending_login_response(
+            request,
+            {"ok": False, "error": str(exc)},
+            status_code=401,
+            clear_pending=True,
+        )
+    except PendingLoginRejected as exc:
+        _cancel_pending_runtime(persistence, pending_sid)
+        return _pending_login_response(
+            request,
+            {"ok": False, "pending_cleared": True, "error": str(exc)},
+            status_code=403,
+            clear_pending=True,
+        )
+    except PendingLoginConflict as exc:
+        _cancel_pending_runtime(persistence, pending_sid)
+        return _pending_login_response(
+            request,
+            {"ok": False, "pending_cleared": True, "error": str(exc)},
+            status_code=409,
+            clear_pending=True,
+        )
+    except PermissionError as exc:
+        try:
+            persistence.peek_pending_login(
+                pending_sid, client_ip=client_ip, user_agent=user_agent
+            )
+        except PendingLoginExpired:
+            _cancel_pending_runtime(persistence, pending_sid)
+            return _pending_login_response(
+                request,
+                {"ok": False, "error": "邀请码状态已变化，请重新登录"},
+                status_code=409,
+                clear_pending=True,
+            )
+        return _pending_login_response(
+            request,
+            {"ok": False, "error": str(exc)},
+            status_code=403,
+        )
+    except Exception:
+        LOGGER.exception("pending invitation completion failed")
+        if persistence.require_identity(pending_sid) is not None:
+            return _pending_login_response(
+                request,
+                {"ok": True, **web_user.public()},
+                status_code=200,
+                clear_pending=True,
+                set_session_sid=pending_sid,
+            )
+        _cancel_pending_runtime(persistence, pending_sid)
+        return _pending_login_response(
+            request,
+            {
+                "ok": False,
+                "pending_cleared": True,
+                "error": "登录状态保存失败，请重新登录",
+            },
+            status_code=503,
+            clear_pending=True,
+        )
+    return _pending_login_response(
+        request,
+        {"ok": True, **web_user.public()},
+        status_code=200,
+        clear_pending=True,
+        set_session_sid=pending_sid,
+    )
+
+
+@app.post("/api/auth/invite", include_in_schema=False)
+async def complete_pending_invite(request: Request) -> JSONResponse:
+    request_error = _auth_json_request_error(request)
+    if request_error is not None:
+        return request_error
+    data = _json_object(await request.body())
+    invite_code = str(data.get("invite_code") or "").strip()
+    if not invite_code:
+        return _pending_login_response(
+            request,
+            {"ok": False, "error": "请输入有效邀请码"},
+            status_code=400,
+        )
+    return await run_in_threadpool(_finish_pending_invite_sync, request, invite_code)
+
+
+@app.post("/api/auth/invite/cancel", include_in_schema=False)
+async def cancel_pending_invite(request: Request) -> JSONResponse:
+    request_error = _auth_json_request_error(request)
+    if request_error is not None:
+        return request_error
+    pending_sid = str(
+        request.cookies.get(_pending_cookie_name(legacy.COOKIE_NAME)) or ""
+    )
+    if _valid_pending_sid(pending_sid):
+        await run_in_threadpool(
+            _cancel_pending_runtime,
+            request.app.state.persistence,
+            pending_sid,
+        )
+    return _pending_login_response(
+        request,
+        {"ok": True},
+        status_code=200,
+        clear_pending=True,
+    )
 
 
 @app.get("/admin", include_in_schema=False)

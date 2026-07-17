@@ -42,7 +42,10 @@ class ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
         if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         super().server_bind()
+
+
 LAB_ENABLED = False
+INVITE_LOGIN_ENABLED = False
 CORS_ALLOW_ORIGINS: Set[str] = set()
 MAX_JSON_BODY_BYTES = 256 * 1024
 COOKIE_SECURE = False
@@ -979,7 +982,10 @@ class Handler(BaseHTTPRequestHandler):
                     "version": 3,
                     **STORE.stats(),
                     "features": _features(),
-                    "capabilities": {"roomkit_list": True},
+                    "capabilities": {
+                        "roomkit_list": True,
+                        "invite_login": INVITE_LOGIN_ENABLED,
+                    },
                     "lab_enabled": LAB_ENABLED,
                 }
             )
@@ -989,7 +995,10 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "features": _features(),
-                    "capabilities": {"roomkit_list": True},
+                    "capabilities": {
+                        "roomkit_list": True,
+                        "invite_login": INVITE_LOGIN_ENABLED,
+                    },
                     "lab_enabled": LAB_ENABLED,
                     "auto_heartbeat": STORE.auto_heartbeat,
                 }
@@ -1023,7 +1032,10 @@ class Handler(BaseHTTPRequestHandler):
                     **pub,
                     "user": user_dto,
                     "features": _features(),
-                    "capabilities": {"roomkit_list": True},
+                    "capabilities": {
+                        "roomkit_list": True,
+                        "invite_login": INVITE_LOGIN_ENABLED,
+                    },
                     "lab_enabled": LAB_ENABLED,
                     "auto_heartbeat": STORE.auto_heartbeat,
                 }

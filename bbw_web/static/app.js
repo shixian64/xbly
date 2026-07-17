@@ -48,6 +48,8 @@ const S = {
   sessionGeneration: 0,
   route: "nearby",
   loginMode: "password",
+  loginStage: "credentials",
+  inviteLoginAvailable: null,
   labEnabled: false,
   roomkitAvailable: false,
   routeController: null,
@@ -737,6 +739,26 @@ async function withPending(button, task) {
   }
 }
 
+function withLoginPending(button, task) {
+  const form = $("login-form");
+  if (!form || form.dataset.pending === "true") return Promise.resolve();
+  form.dataset.pending = "true";
+  form.setAttribute("aria-busy", "true");
+  const buttons = [$("login-submit"), $("login-back")].filter(Boolean);
+  buttons.forEach((item) => {
+    if (item !== button) item.disabled = true;
+  });
+  return withPending(button, task).finally(() => {
+    form.dataset.pending = "false";
+    form.removeAttribute("aria-busy");
+    buttons.forEach((item) => {
+      if (item.dataset.pending !== "true") {
+        item.disabled = item.dataset.locked === "true";
+      }
+    });
+  });
+}
+
 function resetLoginInputs() {
   clearInterval(S.smsTimer);
   S.smsTimer = null;
@@ -756,6 +778,7 @@ function resetLoginInputs() {
     smsButton.textContent = "获取验证码";
   }
   resetTurnstileChallenge({ hide: true });
+  setLoginStage("credentials");
   setLoginMode("password");
 }
 
@@ -969,7 +992,12 @@ function showLogin(show, clearSecrets = false) {
   $("screen-app").classList.toggle("hide", show);
   if (show) closeDrawer();
   if (clearSecrets) resetLoginInputs();
-  if (show) setTimeout(() => $("phone").focus(), 0);
+  if (show) {
+    setTimeout(() => {
+      const target = S.loginStage === "invite" ? $("invite-code") : $("phone");
+      target?.focus();
+    }, 0);
+  }
 }
 
 function applyUser(user) {
@@ -1022,6 +1050,26 @@ function setLoginMode(mode) {
     button.classList.toggle("on", on);
     button.setAttribute("aria-selected", String(on));
   });
+}
+
+function setLoginStage(stage) {
+  const inviteStage = stage === "invite";
+  S.loginStage = inviteStage ? "invite" : "credentials";
+  $("login-credentials-step").classList.toggle("hide", inviteStage);
+  $("login-invite-step").classList.toggle("hide", !inviteStage);
+  $("login-form").classList.toggle("invite-step", inviteStage);
+  $("login-back").classList.toggle("hide", !inviteStage);
+  $("login-submit").textContent = inviteStage ? "验证并进入" : "登录";
+  $("login-eyebrow").textContent = inviteStage ? "最后一步" : "欢迎回来";
+  $("login-title").textContent = inviteStage ? "输入邀请码" : "回到XBLY";
+  $("login-subtitle").textContent = inviteStage
+    ? "账号验证已完成，通过邀请验证后即可进入。"
+    : "发现新朋友，分享此刻的快乐。";
+  if (inviteStage) {
+    $("invite-code").value = "";
+    resetTurnstileChallenge({ hide: true });
+    setTimeout(() => $("invite-code").focus(), 0);
+  }
 }
 
 function navItems() {
@@ -7916,6 +7964,7 @@ async function loadFeatures() {
     const features = data && data.features;
     S.serverHeartbeat = Boolean(data?.auto_heartbeat);
     S.roomkitAvailable = Boolean(data?.capabilities?.roomkit_list);
+    S.inviteLoginAvailable = Boolean(data?.capabilities?.invite_login);
     S.labEnabled = Boolean(
       data?.lab_enabled === true ||
         (!Array.isArray(features) && features && features.lab_enabled === true) ||
@@ -7923,6 +7972,7 @@ async function loadFeatures() {
     );
   } catch {
     S.labEnabled = false;
+    S.inviteLoginAvailable = null;
   }
   buildNav();
 }
@@ -7962,81 +8012,139 @@ $("phone").addEventListener("blur", () => {
 $("send-sms").addEventListener("click", (event) => {
   const button = event.currentTarget;
   void withPending(button, async () => {
+    if (S.inviteLoginAvailable === false) {
+      throw new Error("当前启动方式不支持邀请码验证，请启动完整 Web 服务");
+    }
     const phone = $("phone").value.trim();
-    const inviteCode = $("invite-code").value.trim();
     if (!/^\d{6,18}$/.test(phone)) throw new Error("请输入有效手机号");
-    if (!inviteCode) throw new Error("请输入有效邀请码");
+    const security = await refreshLoginSecurity(phone);
+    if (security.required && !security.token) throw new Error("请先完成人机验证");
     const { data } = await api("/api/auth/sms-send", {
       method: "POST",
-      body: JSON.stringify({ phone, invite_code: inviteCode }),
+      body: JSON.stringify({ phone, turnstile_token: security.token || "" }),
       authOptional: true,
     });
     if (toastEnv(data, "验证码已发送")) startSmsCountdown(button);
   });
 });
 
+function completeBrowserLogin(data) {
+  resetTurnstileChallenge({ hide: true });
+  S.sessionGeneration += 1;
+  S.authenticated = true;
+  applyUser(data.user);
+  showLogin(false, true);
+  updatePresence(!document.hidden);
+  buildNav();
+  void startMessageServices();
+  const desired = hashRoute();
+  go(isRouteAllowed(desired) ? desired : "nearby", { replace: !isRouteAllowed(desired), force: true });
+  toast("登录成功");
+}
+
+function clearPendingCredentialInputs() {
+  $("password").value = "";
+  $("sms-code").value = "";
+  $("invite-code").value = "";
+}
+
+async function submitLoginCredentials() {
+  if (S.inviteLoginAvailable === false) {
+    throw new Error("当前启动方式不支持邀请码验证，请启动完整 Web 服务");
+  }
+  const phone = $("phone").value.trim();
+  const password = $("password").value;
+  const code = $("sms-code").value.trim();
+  $("login-message").textContent = "";
+  if (!/^\d{6,18}$/.test(phone)) throw new Error("请输入有效手机号");
+  const security = await refreshLoginSecurity(phone);
+  if (security.required && !security.token) throw new Error("请先完成人机验证");
+  const turnstileToken = security.token || "";
+  let result;
+  if (S.loginMode === "sms") {
+    if (!code) throw new Error("请输入短信验证码");
+    result = await api("/api/auth/sms-login", {
+      method: "POST",
+      body: JSON.stringify({ phone, code, turnstile_token: turnstileToken }),
+      authOptional: true,
+    });
+  } else {
+    if (!password) throw new Error("请输入密码");
+    result = await api("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ phone, password, mode: "password", turnstile_token: turnstileToken }),
+      authOptional: true,
+    });
+  }
+  if (!result.data.ok) {
+    const info = errorInfo(result.data, "登录失败");
+    $("login-message").textContent = info.title;
+    resetTurnstileChallenge();
+    void refreshLoginSecurity(phone).catch(() => {});
+    return;
+  }
+  if (result.data.requires_invite) {
+    $("password").value = "";
+    $("sms-code").value = "";
+    $("login-message").textContent = "";
+    setLoginStage("invite");
+    return;
+  }
+  completeBrowserLogin(result.data);
+}
+
+async function submitLoginInvite() {
+  const inviteCode = $("invite-code").value.trim();
+  $("login-message").textContent = "";
+  if (!inviteCode) throw new Error("请输入有效邀请码");
+  const result = await api("/api/auth/invite", {
+    method: "POST",
+    body: JSON.stringify({ invite_code: inviteCode }),
+    authOptional: true,
+  });
+  if (!result.data.ok) {
+    const info = errorInfo(result.data, "邀请码验证失败");
+    $("login-message").textContent = info.title;
+    if (
+      result.data.pending_cleared ||
+      [401, 409].includes(result.status) ||
+      (result.status === 503 && !result.data.retryable)
+    ) {
+      clearPendingCredentialInputs();
+      setLoginStage("credentials");
+      setTimeout(() => $("phone").focus(), 0);
+    } else {
+      $("invite-code").focus();
+      $("invite-code").select();
+    }
+    return;
+  }
+  completeBrowserLogin(result.data);
+}
+
+async function cancelPendingLogin() {
+  await api("/api/auth/invite/cancel", {
+    method: "POST",
+    body: "{}",
+    authOptional: true,
+    timeout: 7000,
+  });
+  clearPendingCredentialInputs();
+  $("login-message").textContent = "";
+  setLoginStage("credentials");
+  setTimeout(() => $("phone").focus(), 0);
+}
+
 $("login-form").addEventListener("submit", (event) => {
   event.preventDefault();
   const button = $("login-submit");
-  void withPending(button, async () => {
-    const phone = $("phone").value.trim();
-    const password = $("password").value;
-    const code = $("sms-code").value.trim();
-    const inviteCode = $("invite-code").value.trim();
-    $("login-message").textContent = "";
-    if (!/^\d{6,18}$/.test(phone)) throw new Error("请输入有效手机号");
-    if (!inviteCode) throw new Error("请输入有效邀请码");
-    const security = await refreshLoginSecurity(phone);
-    if (security.required && !security.token) {
-      throw new Error("请先完成人机验证");
-    }
-    const turnstileToken = security.token || "";
-    let result;
-    if (S.loginMode === "sms") {
-      if (!code) throw new Error("请输入短信验证码");
-      result = await api("/api/auth/sms-login", {
-        method: "POST",
-        body: JSON.stringify({
-          phone,
-          code,
-          invite_code: inviteCode,
-          turnstile_token: turnstileToken,
-        }),
-        authOptional: true,
-      });
-    } else {
-      if (!password) throw new Error("请输入密码");
-      result = await api("/api/auth/login", {
-        method: "POST",
-        body: JSON.stringify({
-          phone,
-          password,
-          mode: "password",
-          invite_code: inviteCode,
-          turnstile_token: turnstileToken,
-        }),
-        authOptional: true,
-      });
-    }
-    if (!result.data.ok) {
-      const info = errorInfo(result.data, "登录失败");
-      $("login-message").textContent = info.title;
-      resetTurnstileChallenge();
-      void refreshLoginSecurity(phone).catch(() => {});
-      return;
-    }
-    resetTurnstileChallenge({ hide: true });
-    S.sessionGeneration += 1;
-    S.authenticated = true;
-    applyUser(result.data.user);
-    showLogin(false, true);
-    updatePresence(!document.hidden);
-    buildNav();
-    void startMessageServices();
-    const desired = hashRoute();
-    go(isRouteAllowed(desired) ? desired : "nearby", { replace: !isRouteAllowed(desired), force: true });
-    toast("登录成功");
-  });
+  void withLoginPending(button, () =>
+    S.loginStage === "invite" ? submitLoginInvite() : submitLoginCredentials()
+  );
+});
+
+$("login-back").addEventListener("click", (event) => {
+  void withLoginPending(event.currentTarget, cancelPendingLogin);
 });
 
 document.addEventListener("input", (event) => {
@@ -8315,6 +8423,15 @@ window.addEventListener("pagehide", (event) => {
   if (!event.persisted) {
     revokeAllChatObjectUrls();
     S.imMediaRetryState.clear();
+    if (S.loginStage === "invite") {
+      void fetch("/api/auth/invite/cancel", {
+        method: "POST",
+        credentials: "include",
+        keepalive: true,
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      }).catch(() => {});
+    }
   }
   if (S.authenticated) {
     const options = {

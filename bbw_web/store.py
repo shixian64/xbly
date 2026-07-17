@@ -13,7 +13,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from bbw_protocol.app import BeibeiwuApp
 from bbw_protocol.adapters import NativeBundle
@@ -52,6 +52,7 @@ class WebUser:
     heartbeat: Optional[Heartbeat] = None
     label: str = ""  # optional display label
     persist_sessions: bool = False
+    pending_until: Optional[float] = field(default=None, repr=False)
     profile_cache: Dict[str, tuple[float, Optional[Dict[str, Any]]]] = field(
         default_factory=dict,
         repr=False,
@@ -60,6 +61,17 @@ class WebUser:
 
     def touch(self) -> None:
         self.last_seen = time.time()
+
+    def mark_pending(self, ttl_seconds: float) -> None:
+        self.pending_until = time.time() + max(1.0, float(ttl_seconds))
+        if self.persist_sessions:
+            try:
+                self.delete_persisted()
+            except OSError:
+                pass
+
+    def clear_pending(self) -> None:
+        self.pending_until = None
 
     def start_heartbeat(self, interval_sec: float = 55.0) -> Dict[str, Any]:
         if self.heartbeat and self.heartbeat.running:
@@ -151,6 +163,7 @@ class SessionStore:
         heartbeat_interval: float = 55.0,
         persist_sessions: bool = False,
         allow_weak_onekey: bool = False,
+        pending_expire_callback: Optional[Callable[[WebUser], None]] = None,
     ):
         self._lock = threading.RLock()
         self.users: Dict[str, WebUser] = {}
@@ -159,6 +172,7 @@ class SessionStore:
         self.heartbeat_interval = heartbeat_interval
         self.persist_sessions = bool(persist_sessions)
         self.allow_weak_onekey = bool(allow_weak_onekey)
+        self.pending_expire_callback = pending_expire_callback
         if self.persist_sessions:
             SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
         WEB_META_DIR.mkdir(parents=True, exist_ok=True)
@@ -209,7 +223,11 @@ class SessionStore:
             u = self.users.get(web_sid)
             if not u:
                 return None
-            if time.time() - u.last_seen > self.ttl_sec:
+            now = time.time()
+            if (
+                now - u.last_seen > self.ttl_sec
+                or (u.pending_until is not None and now >= u.pending_until)
+            ):
                 self._drop(web_sid)
                 return None
             u.touch()
@@ -245,17 +263,30 @@ class SessionStore:
         u = self.users.pop(web_sid, None)
         if not u:
             return False
+        was_pending = u.pending_until is not None
         u.stop_heartbeat()
         if delete_persisted:
             try:
                 u.delete_persisted(persisted_uid)
             except OSError:
                 pass
+        if was_pending and self.pending_expire_callback is not None:
+            threading.Thread(
+                target=self.pending_expire_callback,
+                args=(u,),
+                name="bbw-pending-login-cleanup",
+                daemon=True,
+            ).start()
         return True
 
     def purge_expired(self) -> int:
         now = time.time()
-        dead = [k for k, v in self.users.items() if now - v.last_seen > self.ttl_sec]
+        dead = [
+            k
+            for k, v in self.users.items()
+            if now - v.last_seen > self.ttl_sec
+            or (v.pending_until is not None and now >= v.pending_until)
+        ]
         for k in dead:
             self._drop(k)
         return len(dead)

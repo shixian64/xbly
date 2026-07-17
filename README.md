@@ -83,7 +83,8 @@ python -m bbw_protocol.cli repl
 # —— 产品化 Web App（PC 侧栏 / 手机五项底栏）——
 python -m bbw_web --port 8765
 # http://127.0.0.1:8765/
-# 这是 memory-only 本地入口，不注册管理 API；只看管理页面可访问：
+# 这是 memory-only 本地入口，没有邀请码数据库，不能完成两阶段登录；
+# 不注册管理 API，只看管理页面可访问：
 # http://127.0.0.1:8765/static/admin.html
 # 身边·消息·匹配·动态·我的；侧栏按所属主模块展开二级入口
 # 手机录音需要受信任的 HTTPS 安全上下文，部署说明见 bbw_web/README.md
@@ -109,7 +110,7 @@ print(app.native.im.tim_login_payload())   # 给 TIM Web SDK
 
 ## Windows 本地测试管理端
 
-`py -3 -m bbw_web --port 8765` 启动的是旧的内存会话入口，只提供用户端和旧 BFF，不能登录管理端：
+`py -3 -m bbw_web --port 8765` 启动的是旧的内存会话入口，只提供静态用户界面和旧 BFF；它没有邀请码数据库，不能完成两阶段用户登录，也不能登录管理端：
 
 - 只查看管理界面：`http://127.0.0.1:8765/static/admin.html`
 - 完整测试管理端：必须启动 `bbw_web.api:app`，并准备 PostgreSQL、Redis 和本地 Secret。

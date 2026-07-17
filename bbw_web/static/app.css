@@ -375,8 +375,39 @@ summary:focus-visible {
   gap: 0.5rem;
 }
 
-.login-submit {
+.login-step-copy {
+  border: 1px solid rgba(121, 92, 224, 0.16);
+  border-radius: 16px;
+  background: rgba(121, 92, 224, 0.07);
+  padding: 0.9rem 1rem;
+}
+
+.login-step-copy strong {
+  display: block;
+  color: var(--brand-dark);
+  font-size: 0.94rem;
+}
+
+.login-step-copy p {
+  margin: 0.3rem 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.55;
+}
+
+.login-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.55rem;
   margin-top: 1rem;
+}
+
+.login-form.invite-step .login-actions {
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.35fr);
+}
+
+.login-submit {
+  margin-top: 0;
 }
 
 .form-message {
@@ -4656,6 +4687,10 @@ html.keyboard-visible .chat-composer-panel {
   }
 
   .input-action {
+    grid-template-columns: 1fr;
+  }
+
+  .login-form.invite-step .login-actions {
     grid-template-columns: 1fr;
   }
 

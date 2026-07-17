@@ -20,6 +20,10 @@ python -m bbw_web --port 8765
 # http://127.0.0.1:8765/
 ```
 
+该 memory-only 入口没有邀请码数据库，只能查看界面和使用旧 BFF，不能完成两阶段邀请码登录。需要登录用户端时，请按仓库根目录 README 的“Windows 本地测试管理端”章节启动 `bbw_web.api:app`，并准备 PostgreSQL、Redis 和本地 Secret。
+
+完整入口采用两阶段登录：先验证账号密码或短信验证码，再显示邀请码输入；每次交互式登录成功都会原子消耗邀请码的一次可用次数，后台 Token 重认证不会重复消耗。
+
 默认行为：
 
 - Cookie-only 会话，不把 SID 写入 `localStorage`、URL 或 JSON。

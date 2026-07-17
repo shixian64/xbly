@@ -479,9 +479,10 @@ class LoginAccountService:
         self.users = UserRepository(db)
         self.invites = InviteService(db, settings)
 
-    def precheck(
-        self, *, phone: str, invite_code: str | None, provider: str = "beibeiwu"
+    def precheck_credentials(
+        self, *, phone: str, provider: str = "beibeiwu"
     ) -> LoginPrecheck:
+        """检查账号是否允许登录，但不在上游认证前要求邀请码。"""
         normalized = normalize_phone(phone)
         digest = phone_lookup_hmac(normalized, self.phone_hmac_key)
         existing = self.accounts.get_by_phone_hmac(digest, provider=provider)
@@ -489,11 +490,40 @@ class LoginAccountService:
             user = self.users.get(existing.user_id)
             if user is None or user.status != "active":
                 raise PermissionDenied("user account is not active")
-            return LoginPrecheck(digest, normalized, user.id, existing.id, None, False)
+            return LoginPrecheck(
+                digest,
+                normalized,
+                user.id,
+                existing.id,
+                None,
+                bool(self.settings.invite_required),
+            )
+        return LoginPrecheck(
+            digest,
+            normalized,
+            None,
+            None,
+            None,
+            bool(self.settings.invite_required),
+        )
+
+    def precheck(
+        self, *, phone: str, invite_code: str | None, provider: str = "beibeiwu"
+    ) -> LoginPrecheck:
+        context = self.precheck_credentials(phone=phone, provider=provider)
+        if not context.requires_invite:
+            return context
         if not invite_code:
             raise InviteInvalid("an invitation code is required")
         invite = self.invites.validate(invite_code)
-        return LoginPrecheck(digest, normalized, None, None, invite.id, True)
+        return LoginPrecheck(
+            context.phone_hmac,
+            context.normalized_phone,
+            context.existing_user_id,
+            context.existing_external_account_id,
+            invite.id,
+            True,
+        )
 
     @staticmethod
     def _credential_context(account_id: uuid.UUID, field: str) -> str:
@@ -553,6 +583,7 @@ class LoginAccountService:
         display_name: str | None = None,
         profile: Mapping[str, Any] | None = None,
         device_data: Mapping[str, Any] | None = None,
+        require_invite: bool = True,
     ) -> LoginCompletion:
         normalized = normalize_phone(phone)
         digest = phone_lookup_hmac(normalized, self.phone_hmac_key)
@@ -582,20 +613,33 @@ class LoginAccountService:
                 user.display_name = display_name[:160]
             if profile is not None:
                 user.profile = dict(profile)
+            invite = None
+            if require_invite and self.settings.invite_required:
+                if not invite_code:
+                    raise InviteInvalid("an invitation code is required")
+                invite = self.invites.validate(invite_code, for_update=True)
+            elif invite_code:
+                invite = self.invites.validate(invite_code, for_update=True)
+            if invite is not None:
+                self.invites.consume_locked(invite)
             self.db.flush()
             return LoginCompletion(user, by_phone, False)
 
         if by_uid is not None:
             raise ConflictError("upstream account is already bound to another phone")
-        if not invite_code:
+        if require_invite and self.settings.invite_required and not invite_code:
             raise InviteInvalid("an invitation code is required")
-        invite = self.invites.validate(invite_code, for_update=True)
+        invite = (
+            self.invites.validate(invite_code, for_update=True)
+            if invite_code
+            else None
+        )
         user = User(
             id=uuid.uuid4(),
             status="active",
             display_name=(display_name or "")[:160] or None,
             profile=dict(profile or {}),
-            invite_code_id=invite.id,
+            invite_code_id=invite.id if invite is not None else None,
             media_quota_bytes=self.settings.per_user_media_quota_bytes,
             chat_retention_days=self.settings.message_retention_days,
             last_login_at=utcnow(),
@@ -621,7 +665,8 @@ class LoginAccountService:
             token_expires_at=token_expires_at,
         )
         self.db.add_all((user, account))
-        self.invites.consume_locked(invite)
+        if invite is not None:
+            self.invites.consume_locked(invite)
         self.db.flush()
         return LoginCompletion(user, account, True)
 
