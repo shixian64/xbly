@@ -34,7 +34,15 @@ from bbw_web.r2 import R2Storage
 COMPAT_PROFILE = "h264-main-1280-v1"
 CACHE_INDEX_VERSION = "atomic-v1"
 ASSET_ID_RE = re.compile(r"^[0-9a-f]{64}$")
-SOURCE_PATH_RE = re.compile(r"^/video/\d{6}/\d{10,20}\.(?:mp4|mov)$", re.I)
+# Older APK feeds stored MP4 video objects below ``audios/99999``. Keep both
+# known layouts explicit instead of allowing arbitrary public CDN paths.
+SOURCE_PATH_RE = re.compile(
+    r"^(?:"
+    r"/video/\d{6}/\d{10,20}\.(?:mp4|mov)|"
+    r"/audios/99999/\d{4}/(?:0[1-9]|1[0-2])/[A-Z0-9_-]{8,128}\.mp4"
+    r")$",
+    re.I,
+)
 ALLOWED_SOURCE_HOSTS = ("oss.banghua.xin",)
 
 

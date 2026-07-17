@@ -17,7 +17,8 @@ class MomentVideoCompatibilityContracts(unittest.TestCase):
         for marker in (
             'COMPAT_PROFILE = "h264-main-1280-v1"',
             'ALLOWED_SOURCE_HOSTS = ("oss.banghua.xin",)',
-            'SOURCE_PATH_RE = re.compile(r"^/video/\\d{6}/\\d{10,20}\\.(?:mp4|mov)$", re.I)',
+            'r"/video/\\d{6}/\\d{10,20}\\.(?:mp4|mov)|"',
+            'r"/audios/99999/\\d{4}/(?:0[1-9]|1[0-2])/[A-Z0-9_-]{8,128}\\.mp4"',
             '"-c:v",\n        "libx264"',
             '"-profile:v",\n        "main"',
             '"-c:a",\n        "aac"',
@@ -49,6 +50,34 @@ class MomentVideoCompatibilityContracts(unittest.TestCase):
         self.assertNotIn('"-i",\n        source_url', source)
         self.assertNotIn("redis.lock(", source)
         self.assertNotIn("CredentialCipher", source)
+
+    def test_real_apk_moment_video_paths_are_allowed_without_broadening_hosts(
+        self,
+    ) -> None:
+        from bbw_web.moment_video import MomentVideoError, canonical_source_identity
+
+        allowed = {
+            "video/202607/1784275489034.MOV": (
+                "https://oss.banghua.xin/video/202607/1784275489034.MOV"
+            ),
+            "audios/99999/2022/08/IJ6J6OOCV2ah2HDAHAdqJsS2.mp4": (
+                "https://oss.banghua.xin/audios/99999/2022/08/"
+                "IJ6J6OOCV2ah2HDAHAdqJsS2.mp4"
+            ),
+        }
+        for value, expected in allowed.items():
+            with self.subTest(value=value):
+                self.assertEqual(canonical_source_identity(value), expected)
+
+        rejected = (
+            "https://example.invalid/video/202607/1784275489034.MOV",
+            "audios/99999/2022/13/IJ6J6OOCV2ah2HDAHAdqJsS2.mp4",
+            "audios/99999/2022/08/../../secret.mp4",
+            "audios/10000/2022/08/IJ6J6OOCV2ah2HDAHAdqJsS2.mp4",
+        )
+        for value in rejected:
+            with self.subTest(value=value), self.assertRaises(MomentVideoError):
+                canonical_source_identity(value)
 
     def test_cache_accounting_is_atomic_and_quota_is_trimmed_on_writes(self) -> None:
         source = (ROOT / "bbw_web" / "moment_video.py").read_text(encoding="utf-8")

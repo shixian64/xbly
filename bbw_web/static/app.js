@@ -6154,22 +6154,10 @@ function handleChatPlaybackError(media) {
   }
   const source = String(media.dataset.mediaSource || "").trim();
   if (!source) return;
-  if (
-    isMomentVideo(media) &&
-    media.dataset.mediaMode !== "compat" &&
-    media.dataset.playbackRequested !== "1"
-  ) {
-    media.hidden = true;
-    media.dataset.mediaFailed = "1";
-    media.dataset.videoFrameUnsupported = "1";
-    setMomentVideoFallback(media, "视频加载失败", { retry: true });
-    return;
-  }
   const mediaErrorCode = Number(media.error?.code || 0);
   if (
     isMomentVideo(media) &&
     media.dataset.mediaMode !== "compat" &&
-    media.dataset.playbackRequested === "1" &&
     (mediaErrorCode === 3 || mediaErrorCode === 4)
   ) {
     media.dataset.videoFrameUnsupported = "1";

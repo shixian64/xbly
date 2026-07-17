@@ -2356,6 +2356,15 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("HTMLMediaElement.HAVE_CURRENT_DATA", app_js)
         self.assertIn("MOMENT_VIDEO_INITIAL_FRAME_WAIT_MS", app_js)
         self.assertIn("mediaErrorCode === 3 || mediaErrorCode === 4", app_js)
+        playback_error = app_js.split("function handleChatPlaybackError(media)", 1)[
+            1
+        ].split("function openChatMediaViewer", 1)[0]
+        decode_fallback = playback_error.split("const mediaErrorCode", 1)[1].split(
+            "const retryState", 1
+        )[0]
+        self.assertIn("prepareMomentVideoCompatibility(media)", decode_fallback)
+        self.assertNotIn("playbackRequested", decode_fallback)
+        self.assertNotIn('setMomentVideoFallback(media, "视频加载失败"', decode_fallback)
         self.assertIn("function cancelPendingVideoFrameCallback(video)", app_js)
         self.assertIn("video.cancelVideoFrameCallback(callbackId)", app_js)
         self.assertIn('media.dataset.mediaMode === "compat"', app_js)
