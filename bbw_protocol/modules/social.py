@@ -42,12 +42,12 @@ class SocialAPI:
 
     def follow_users(self, id_: Optional[str] = None, page: str = "1") -> ApiResult:
         return self.c.call(
-            "getFollowUser", id=id_ or self.c.session.uid, pageIndex=page
+            "getFollowUser", id=id_ or self.c.session.uid, pageindex=page
         )
 
     def fans_users(self, id_: Optional[str] = None, page: str = "1") -> ApiResult:
         return self.c.call(
-            "getFansUser", id=id_ or self.c.session.uid, pageIndex=page
+            "getFansUser", id=id_ or self.c.session.uid, pageindex=page
         )
 
     # ---- friends ----

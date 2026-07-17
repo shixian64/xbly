@@ -493,6 +493,21 @@ class SocialAndImRoutingContractTests(unittest.TestCase):
             ),
         )
 
+    def test_follow_and_fans_lists_use_case_sensitive_pageindex(self) -> None:
+        client = self.FakeClient()
+        api = SocialAPI(client)
+
+        api.follow_users(page="2")
+        api.fans_users("9", page="3")
+
+        self.assertEqual(
+            client.calls,
+            [
+                ("getFollowUser", {"id": "42", "pageindex": "2"}),
+                ("getFansUser", {"id": "9", "pageindex": "3"}),
+            ],
+        )
+
     def test_history_conversation_uses_page_parameter(self) -> None:
         client = self.FakeClient()
         ImAPI(client).history_conversations("3")

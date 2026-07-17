@@ -134,7 +134,7 @@ def run_suite(tier: str, uid: str, token: str, sample_other_uid: str = "1") -> L
         ("用户资料(他人)", "getUserAttributes0", {"userId": sample_other_uid, "latitude": "0", "longitude": "0"}),
         ("自己资料Me", "getUserAttributesMe1", {"userId": uid or "0", "phonebrand": "Android", "pushregid": "p", "version_code": "154"}),
         ("关注列表", "getFollowList", {"id": uid or "0"}),
-        ("粉丝列表", "getFansUser", {"id": uid or "0", "pageIndex": "1"}),
+        ("粉丝列表", "getFansUser", {"id": uid or "0", "pageindex": "1"}),
         ("发帖相关-filter", "getFilterWords", {}),
         ("敏感词", "getIllegalWord", {}),
         ("聊天审查配置", "getChatCensorship", {}),
