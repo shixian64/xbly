@@ -4047,6 +4047,12 @@ html.flash-viewing body {
   padding: 0.85rem;
 }
 
+.profile-moment-time {
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.4;
+}
+
 .lab-code {
   min-height: 180px;
   max-height: 460px;

@@ -1285,11 +1285,16 @@ class SocialFrontendContractTests(unittest.TestCase):
             'data?.feed_type !== "user"',
             'String(data?.target_uid || "") !== String(uid || "")',
             'button.dataset.page = String(data?.next_page || Number(page) + 1)',
+            "function renderMomentCard(item, { showAuthor = true } = {})",
+            "function profileMomentCard(item)",
+            "return renderMomentCard(item, { showAuthor: false });",
+            "posts.map(profileMomentCard).join(\"\")",
         ):
             self.assertIn(marker, app_js)
         self.assertIn(".profile-moment-feed", app_css)
+        self.assertIn(".profile-moment-time", app_css)
         self.assertIn(".profile-moments-button", app_css)
-        self.assertIn("-profile-moments", index_html)
+        self.assertIn("-profile-moments-compact-cards", index_html)
 
     def test_bottle_card_uses_apk_content_and_readable_visual_hierarchy(self) -> None:
         root = Path(__file__).resolve().parents[1]

@@ -2105,7 +2105,7 @@ function momentOwnershipMenu(post) {
     </div></details>`;
 }
 
-function momentCard(item) {
+function renderMomentCard(item, { showAuthor = true } = {}) {
   const post = item && typeof item === "object" ? item : {};
   const id = String(post.id || "");
   const authorId = String(post.author_id || "");
@@ -2126,10 +2126,14 @@ function momentCard(item) {
     post.hide_comment ? "1" : "0"
   }" data-comment-forbid="${post.comment_forbid ? "1" : "0"}">
     <header class="moment-card-head">
-      <button type="button" class="moment-author" data-action="open-profile" data-uid="${esc(authorId)}">
+      ${
+        showAuthor
+          ? `<button type="button" class="moment-author" data-action="open-profile" data-uid="${esc(authorId)}">
         ${avatarHtml(post.avatar)}
         <span><strong>${esc(name)}</strong><small>${esc([post.time, meta].filter(Boolean).join(" · ") || "刚刚")}</small></span>
-      </button>
+      </button>`
+          : `<time class="profile-moment-time">${esc(post.time || "刚刚")}</time>`
+      }
       ${momentOwnershipMenu(post)}
     </header>
     ${flags ? `<div class="moment-flags">${flags}</div>` : ""}
@@ -2149,6 +2153,14 @@ function momentCard(item) {
     </footer>
     <section class="moment-comments hide" data-comment-panel aria-label="评论区"></section>
   </article>`;
+}
+
+function momentCard(item) {
+  return renderMomentCard(item);
+}
+
+function profileMomentCard(item) {
+  return renderMomentCard(item, { showAuthor: false });
 }
 
 function momentCommentCard(item, postOwnerId) {
@@ -5971,7 +5983,7 @@ function profileMomentsHtml(data, uid, displayName) {
   )}的公开动态</p></div></div>
     <div id="profile-moment-feed" class="moment-feed profile-moment-feed" aria-live="polite">${envelopeHtml(
       data,
-      momentCard,
+      profileMomentCard,
       "还没有可见动态",
       "对方暂未发布动态，或当前没有你可以查看的内容"
     )}</div>
@@ -6041,7 +6053,7 @@ async function loadMoreProfileMoments(button) {
     button.dataset.locked = "true";
     return;
   }
-  feed.insertAdjacentHTML("beforeend", posts.map(momentCard).join(""));
+  feed.insertAdjacentHTML("beforeend", posts.map(profileMomentCard).join(""));
   button.dataset.page = String(data?.next_page || Number(page) + 1);
 }
 
