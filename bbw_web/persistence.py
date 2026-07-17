@@ -746,7 +746,7 @@ class RuntimePersistence:
     ) -> bool:
         idempotency_key = str(payload.get("idempotency_key") or "")
         digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
-        job_id = f"archive-message:{identity.user_id}:{digest}"
+        job_id = f"archive-message-{identity.user_id}-{digest}"
         try:
             self.default_queue.enqueue(
                 "bbw_web.jobs.archive_message_job",
@@ -817,7 +817,7 @@ class RuntimePersistence:
                     path,
                     query,
                     response_data,
-                    job_id=f"history-response:{identity.user_id}:{digest}",
+                    job_id=f"history-response-{identity.user_id}-{digest}",
                     result_ttl=600,
                     failure_ttl=86400,
                 )
@@ -849,7 +849,7 @@ class RuntimePersistence:
                     path,
                     query,
                     response_data,
-                    job_id=f"social-snapshot:{identity.user_id}:{snapshot_digest}",
+                    job_id=f"social-snapshot-{identity.user_id}-{snapshot_digest}",
                     result_ttl=600,
                     failure_ttl=86400,
                 )
@@ -913,7 +913,7 @@ class RuntimePersistence:
                     "bbw_web.jobs.record_product_event",
                     str(identity.user_id),
                     event_payload,
-                    job_id=f"product-event:{identity.user_id}:{digest}",
+                    job_id=f"product-event-{identity.user_id}-{digest}",
                     result_ttl=600,
                     failure_ttl=86400,
                 )

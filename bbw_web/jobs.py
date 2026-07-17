@@ -571,7 +571,7 @@ def _dispatch_media_outboxes(
             queue.enqueue(
                 "bbw_web.jobs.archive_media_job",
                 str(outbox_id),
-                job_id=f"archive-media:{outbox_id}:{attempt}",
+                job_id=f"archive-media-{outbox_id}-{attempt}",
                 job_timeout=360,
                 result_ttl=600,
                 failure_ttl=7 * 86400,
@@ -1137,7 +1137,7 @@ def schedule_due_syncs() -> dict[str, Any]:
                 "bbw_web.jobs.sync_account_history",
                 str(owner_id),
                 str(account_id),
-                job_id=f"sync-history:{account_id}:{slot}",
+                job_id=f"sync-history-{account_id}-{slot}",
                 job_timeout=900,
                 result_ttl=600,
                 failure_ttl=7 * 86400,

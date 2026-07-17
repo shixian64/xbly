@@ -41,6 +41,25 @@ class ProductionContractTests(unittest.TestCase):
                 parsed += 1
         self.assertGreaterEqual(parsed, 15)
 
+    def test_rq_job_ids_use_only_supported_characters(self) -> None:
+        persistence = self.read("bbw_web/persistence.py")
+        jobs = self.read("bbw_web/jobs.py")
+        scheduler = self.read("bbw_web/scheduler.py")
+        source = "\n".join((persistence, jobs, scheduler))
+
+        for forbidden in (
+            'job_id=f"archive-message:',
+            'job_id=f"archive-media:',
+            'job_id=f"sync-history:',
+            'job_id=f"history-response:',
+            'job_id=f"social-snapshot:',
+            'job_id=f"product-event:',
+        ):
+            self.assertNotIn(forbidden, source)
+        self.assertIn('job_id = f"archive-message-', persistence)
+        self.assertIn('job_id=f"archive-media-', jobs)
+        self.assertIn('job_id=f"sync-history-', jobs)
+
     def test_admin_bootstrap_runs_inside_lifespan_cleanup_scope(self) -> None:
         source = self.read("bbw_web/api.py")
         lifespan = source.split("async def lifespan", 1)[1].split("app = FastAPI", 1)[0]
