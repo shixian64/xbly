@@ -41,6 +41,7 @@ from bbw_protocol.adapters import NativeBundle
 from bbw_protocol.app import BeibeiwuApp
 from bbw_protocol.client import ApiResult
 from bbw_protocol.session import Session
+from bbw_web.match_history import load_match_history, record_match_history_response
 from bbw_web.store import WebUser
 from bbw_web.turnstile import TurnstileVerifier
 
@@ -1142,6 +1143,39 @@ class RuntimePersistence:
                 evidence={"source_path": path, "grant_reason": "authorized_send"},
             )
         return []
+
+    def remember_match_history_response(
+        self,
+        *,
+        identity: UserIdentity,
+        method: str,
+        path: str,
+        response_data: Mapping[str, Any],
+        status: int,
+        request_id: str,
+    ) -> list[str]:
+        return record_match_history_response(
+            owner_user_id=identity.user_id,
+            upstream_uid=identity.upstream_uid,
+            method=method,
+            path=path,
+            response_data=response_data,
+            status=status,
+            request_id=request_id,
+        )
+
+    def match_history(
+        self,
+        identity: UserIdentity,
+        *,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> dict[str, Any]:
+        return load_match_history(
+            owner_user_id=identity.user_id,
+            page=page,
+            page_size=page_size,
+        )
 
     def enqueue_message_archive(
         self,

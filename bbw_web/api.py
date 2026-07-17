@@ -22,6 +22,7 @@ import io
 import json
 import logging
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
@@ -168,6 +169,8 @@ class CapturingHandler(legacy.Handler):
         nearby_custom_city_enabled: Optional[bool] = None,
         message_peer_authorizer: Optional[Callable[[str], bool]] = None,
         message_policy_match_peers: Iterable[str] = (),
+        match_history_loader: Optional[Callable[[int], dict[str, Any]]] = None,
+        match_history_recorder: Optional[Callable[[str, dict[str, Any]], None]] = None,
     ) -> None:
         # BaseHTTPRequestHandler.__init__ immediately starts reading a socket;
         # intentionally do not call it here.
@@ -181,6 +184,8 @@ class CapturingHandler(legacy.Handler):
         self._request_nearby_custom_city_enabled = nearby_custom_city_enabled
         self._request_message_peer_authorizer = message_peer_authorizer
         self._request_message_policy_match_peers = tuple(message_policy_match_peers)
+        self._request_match_history_loader = match_history_loader
+        self._request_match_history_recorder = match_history_recorder
         self.request_version = "HTTP/1.1"
         self.close_connection = True
         self._held_user_lock = None
@@ -551,6 +556,45 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
         except Exception:
             LOGGER.exception("message policy match grant lookup failed")
 
+    match_history_loader: Optional[Callable[[int], dict[str, Any]]] = None
+    if identity is not None and path == "/api/match/history":
+        match_history_loader = (
+            lambda page, request_identity=identity: persistence.match_history(
+                request_identity,
+                page=page,
+            )
+        )
+
+    match_history_recorder: Optional[Callable[[str, dict[str, Any]], None]] = None
+    if (
+        identity is not None
+        and request.method == "POST"
+        and path in {"/api/match/online", "/api/match/local"}
+    ):
+        match_history_request_id = uuid.uuid4().hex
+
+        def persist_match_history(
+            match_path: str,
+            response_payload: dict[str, Any],
+            *,
+            request_identity: Any = identity,
+            request_id: str = match_history_request_id,
+        ) -> None:
+            try:
+                persistence.remember_match_history_response(
+                    identity=request_identity,
+                    method="POST",
+                    path=match_path,
+                    response_data=response_payload,
+                    status=200,
+                    request_id=request_id,
+                )
+            except Exception:
+                LOGGER.exception("match history persistence failed")
+                raise
+
+        match_history_recorder = persist_match_history
+
     handler = CapturingHandler(
         method=request.method,
         path=_request_path(request),
@@ -573,6 +617,8 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
             else None
         ),
         message_policy_match_peers=message_policy_match_peers,
+        match_history_loader=match_history_loader,
+        match_history_recorder=match_history_recorder,
     )
     try:
         if request.method == "GET":
@@ -641,6 +687,23 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
                     },
                     status_code=503,
                 )
+
+    if (
+        identity is not None
+        and request.method == "POST"
+        and path == "/api/match/voice/start"
+    ):
+        try:
+            persistence.remember_match_history_response(
+                identity=identity,
+                method=request.method,
+                path=path,
+                response_data=response_data,
+                status=status,
+                request_id=uuid.uuid4().hex,
+            )
+        except Exception:
+            LOGGER.exception("match history persistence failed")
 
     is_login_path = path in {"/api/auth/login", "/api/auth/sms-login"}
     if is_login_path and not response_data.get("ok"):

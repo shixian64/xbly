@@ -1891,6 +1891,41 @@ class Handler(BaseHTTPRequestHandler):
             return self.ok(empty_list_envelope(result, RL(result), "黑名单为空"))
 
         # ---- match ----
+        if path == "/api/match/history":
+            raw_page = str(q("page", "1") or "1").strip()
+            if not raw_page.isdigit() or not 1 <= int(raw_page) <= 100_000:
+                return self.ok({"ok": False, "error": "匹配历史页码无效"}, 400)
+            loader = getattr(self, "_request_match_history_loader", None)
+            if not callable(loader):
+                lock = getattr(u, "lock", None)
+                if lock is None:
+                    history = list(getattr(u, "match_history", []) or [])
+                else:
+                    with lock:
+                        history = list(getattr(u, "match_history", []) or [])
+                page = int(raw_page)
+                page_size = 10
+                start = (page - 1) * page_size
+                items = history[start : start + page_size]
+                has_more = start + len(items) < len(history)
+                return self.ok(
+                    {
+                        "ok": True,
+                        "items": items,
+                        "list": items,
+                        "count": len(history),
+                        "page": page,
+                        "next_page": page + 1 if has_more else None,
+                        "has_more": has_more,
+                    }
+                )
+            try:
+                return self.ok(loader(int(raw_page)))
+            except Exception:
+                return self.ok(
+                    {"ok": False, "error": "匹配历史暂时无法加载，请稍后重试"},
+                    503,
+                )
         if path == "/api/match/status":
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="bbw-match") as pool:
                 cards_future = pool.submit(app.call, "getMyCard", uid=app.session.uid)
@@ -3157,6 +3192,18 @@ class Handler(BaseHTTPRequestHandler):
                         for peer in _message_peer_ids(payload)
                         if peer != str(app.session.uid or "")
                     )
+                    recorded_peers = _remember_web_match_history(u, path, payload)
+                    if recorded_peers:
+                        payload["history_saved"] = True
+                        recorder = getattr(self, "_request_match_history_recorder", None)
+                        if callable(recorder):
+                            try:
+                                recorder(path, payload)
+                            except Exception:
+                                payload["history_saved"] = False
+                                payload["history_warning"] = (
+                                    "匹配成功，但历史记录暂时没有保存，请保留当前匹配结果"
+                                )
                 return self.ok(payload)
             if path == "/api/match/remove":
                 return self.ok(
@@ -3459,6 +3506,54 @@ def _message_peer_ids(payload: Any) -> Set[str]:
             and not any(ord(char) < 33 for char in peer)
         ):
             peers.add(peer)
+    return peers
+
+
+def _remember_web_match_history(user: Any, path: str, payload: Mapping[str, Any]) -> List[str]:
+    """Keep a bounded session history for the documented memory-only BFF."""
+
+    if path not in {"/api/match/online", "/api/match/local"}:
+        return []
+    current_uid = str(getattr(getattr(user.app, "session", None), "uid", "") or "").strip()
+    mode = "local" if path == "/api/match/local" else "online"
+    matched_at = int(time.time() * 1000)
+    profiles = N.normalize_users(payload.get("items") or payload.get("list") or [])
+    entries: List[Dict[str, Any]] = []
+    peers: List[str] = []
+    for index, profile in enumerate(profiles):
+        peer = str(profile.get("id") or "").strip()
+        if not peer or peer == current_uid:
+            continue
+        peers.append(peer)
+        entries.append(
+            {
+                **profile,
+                "id": peer,
+                "uid": peer,
+                "history_id": f"memory-{time.time_ns()}-{index}",
+                "match_mode": mode,
+                "matched_at": matched_at,
+                "source_path": path,
+                "filters": dict(payload.get("filters") or {}),
+            }
+        )
+    if not entries:
+        return []
+
+    def update_history() -> None:
+        history = getattr(user, "match_history", None)
+        if not isinstance(history, list):
+            history = []
+            setattr(user, "match_history", history)
+        history[0:0] = entries
+        del history[500:]
+
+    lock = getattr(user, "lock", None)
+    if lock is None:
+        update_history()
+    else:
+        with lock:
+            update_history()
     return peers
 
 

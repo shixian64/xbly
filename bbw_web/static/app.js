@@ -2408,7 +2408,8 @@ function userCard(item, options = {}) {
   }
   const titleMetaHtml = String(options.titleMetaHtml || "");
   const presence = options.presence && id ? presenceBadgeHtml(id, user) : "";
-  return `<article class="user-card">
+  const cardClass = ["user-card", String(options.className || "").trim()].filter(Boolean).join(" ");
+  return `<article class="${esc(cardClass)}">
     ${avatarHtml(user.avatar || user.portrait)}
     <div class="card-copy"><div class="card-title-line"><strong>${esc(name)}</strong>${titleMetaHtml}</div><span>${esc(subtitle)}</span></div>
     ${actions.length || presence ? `<div class="card-actions">${presence}${actions.join("")}</div>` : ""}
@@ -7545,8 +7546,87 @@ async function pageMessages(signal) {
     </section><div id="im-info" class="result-panel"></div></div>`;
 }
 
+function matchHistoryModeLabel(mode) {
+  if (mode === "local") return "同城匹配";
+  if (mode === "voice") return "语音匹配";
+  return "在线匹配";
+}
+
+function matchHistoryCard(item) {
+  const profile = item && typeof item === "object" ? { ...item } : {};
+  const uid = String(profile.user_id || profile.uid || profile.id || "").trim();
+  const matchedAt = formatBottleTime(profile.matched_at || profile.occurred_at || "");
+  const originalSubtitle = String(profile.subtitle || "").trim();
+  const basicSubtitle =
+    originalSubtitle || [uid && `UID ${uid}`, profile.city || profile.region, profile.signature].filter(Boolean).join(" · ");
+  profile.subtitle = [basicSubtitle, matchedAt && `匹配于 ${matchedAt}`].filter(Boolean).join(" · ");
+  return userCard(profile, {
+    chat: true,
+    profile: true,
+    chatOrigin: "match",
+    className: "match-history-card",
+    titleMetaHtml: `<span class="match-history-mode">${esc(matchHistoryModeLabel(profile.match_mode))}</span>`,
+  });
+}
+
+function matchHistoryMoreHtml(data) {
+  const nextPage = String(data?.next_page || "").trim();
+  if (!nextPage || data?.has_more !== true) return "";
+  return `<div class="match-history-more" data-match-history-more><button type="button" class="btn secondary" data-action="match-history-load-more" data-page="${esc(
+    nextPage
+  )}">加载更多记录</button></div>`;
+}
+
+function matchHistoryHtml(data) {
+  if (data?.ok === false) {
+    const info = errorInfo(data, "匹配历史加载失败");
+    return errorState(info.title || "匹配历史加载失败", "match");
+  }
+  const items = itemsOf(data);
+  if (!items.length) return emptyState("还没有匹配记录", "成功匹配到用户后会保存在这里");
+  return `<div class="match-history-list"><div class="stack" data-match-history-items>${items
+    .map(matchHistoryCard)
+    .join("")}</div>${matchHistoryMoreHtml(data)}</div>`;
+}
+
+async function loadMatchHistory(page = 1, { append = false } = {}) {
+  const panel = $("match-history");
+  if (!panel) return;
+  const normalizedPage = Number(page);
+  if (!Number.isInteger(normalizedPage) || normalizedPage < 1) throw new Error("匹配历史页码无效");
+  if (!append) panel.innerHTML = loadingState("正在读取匹配历史…");
+  try {
+    const { data } = await api(`/api/match/history?page=${encodeURIComponent(String(normalizedPage))}`);
+    if (data?.ok === false) throw new Error(errorInfo(data, "匹配历史加载失败").title);
+    if (!append) {
+      panel.innerHTML = matchHistoryHtml(data);
+      void refreshVisiblePeerPresence();
+      return;
+    }
+
+    const items = itemsOf(data);
+    const list = panel.querySelector("[data-match-history-items]");
+    const more = panel.querySelector("[data-match-history-more]");
+    if (list && items.length) list.insertAdjacentHTML("beforeend", items.map(matchHistoryCard).join(""));
+    if (more) more.outerHTML = matchHistoryMoreHtml(data);
+    void refreshVisiblePeerPresence();
+  } catch (error) {
+    if (!append && panel.isConnected) panel.innerHTML = errorState(error?.message || "匹配历史加载失败", "match");
+    throw error;
+  }
+}
+
 async function pageMatching(signal) {
-  const { data } = await api("/api/match/status", { signal });
+  const [statusResult, historyResult] = await Promise.allSettled([
+    api("/api/match/status", { signal }),
+    api("/api/match/history?page=1", { signal }),
+  ]);
+  if (statusResult.status !== "fulfilled") throw statusResult.reason;
+  const { data } = statusResult.value;
+  const historyData =
+    historyResult.status === "fulfilled"
+      ? historyResult.value.data
+      : { ok: false, error: historyResult.reason?.message || "匹配历史加载失败" };
   applyCapabilities(data.capabilities);
   if (data.user) applyUser(data.user);
   const display = data.display || (data.status && data.status.display) || {};
@@ -7577,6 +7657,10 @@ async function pageMatching(signal) {
     <section class="section match-result-section"><div class="section-head match-section-head"><div><h2>匹配结果</h2><p>新的相遇会集中显示在这里</p></div></div><div id="match-result" class="match-result-surface">${emptyState(
       "准备好后开始匹配",
       "设置条件并选择匹配方式，结果会显示在这里"
+    )}</div></section>
+
+    <section class="section match-history-section"><div class="section-head match-section-head"><div><h2>匹配历史</h2><p>记录在线、同城和语音匹配成功的用户</p></div><button type="button" class="btn secondary small" data-action="match-history-refresh">刷新</button></div><div id="match-history" class="match-history-surface">${matchHistoryHtml(
+      historyData
     )}</div></section>
   </div>`;
 }
@@ -8304,20 +8388,28 @@ async function runMatch(path, body = {}) {
   const success = data.active_property && Array.isArray(data.filters?.properties) && data.filters.properties.length > 1
     ? `本次按属性 ${data.active_property} 匹配`
     : "请求已完成";
-  toastEnv(data, success);
+  const historyWarning = data.history_saved === false
+    ? String(data.history_warning || "匹配成功，但历史记录暂时没有保存")
+    : "";
+  if (historyWarning) toast(historyWarning, "error", 5200);
+  else toastEnv(data, success);
   const renderer = isBottle
     ? bottleCard
     : (item) => userCard(item, { chat: true, profile: true, chatOrigin: "match" });
   setPanel(
     "match-result",
-    envelopeHtml(
+    `${historyWarning ? `<div class="notice warn match-history-warning"><strong>匹配结果已保留在当前页面</strong><div>${esc(
+      historyWarning
+    )}</div></div>` : ""}${envelopeHtml(
       data,
       renderer,
       isBottle ? "暂时没有捡到漂流瓶" : "暂时没有匹配结果",
       isBottle ? "稍后再来捡一个" : "稍后再试，或检查匹配次数"
-    )
+    )}`
   );
-  if (!isBottle) await refreshMatchStats();
+  if (!isBottle) {
+    await Promise.allSettled([refreshMatchStats(), loadMatchHistory(1)]);
+  }
 }
 
 function voiceMatchPeerId(peer = S.voiceMatchPeer) {
@@ -10371,6 +10463,10 @@ async function handleAction(action, button) {
   if (action === "match-online") return runMatch("/api/match/online");
   if (action === "match-local") return runMatch("/api/match/local");
   if (action === "match-pick") return runMatch("/api/match/bottle-pick");
+  if (action === "match-history-refresh") return loadMatchHistory(1);
+  if (action === "match-history-load-more") {
+    return loadMatchHistory(button.dataset.page, { append: true });
+  }
   if (action === "voice-match-start") return startVoiceMatch();
   if (action === "voice-match-cancel") return cancelVoiceMatch();
   if (action === "voice-match-call-target") {

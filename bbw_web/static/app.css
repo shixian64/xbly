@@ -1735,6 +1735,42 @@ summary:focus-visible {
     linear-gradient(135deg, rgba(238, 233, 255, 0.45), rgba(255, 255, 255, 0.82));
 }
 
+.match-history-surface .empty-state,
+.match-history-surface .error-state {
+  min-height: 132px;
+}
+
+.match-history-card {
+  border-color: rgba(115, 87, 217, 0.14);
+  background: rgba(255, 255, 255, 0.86);
+}
+
+.match-history-mode {
+  display: inline-flex;
+  width: fit-content;
+  flex: 0 0 auto;
+  align-items: center;
+  border: 1px solid rgba(115, 87, 217, 0.16);
+  border-radius: 999px;
+  background: var(--brand-soft);
+  color: var(--brand-dark);
+  padding: 0.1rem 0.42rem;
+  font-size: 0.62rem;
+  font-weight: 750;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.match-history-more {
+  display: flex;
+  justify-content: center;
+  margin-top: 0.85rem;
+}
+
+.match-history-warning {
+  margin-bottom: 0.65rem;
+}
+
 .service-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));

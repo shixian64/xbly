@@ -106,6 +106,7 @@ class WebUser:
     match_pool_online_list_enabled: bool = False
     nearby_custom_city_enabled: bool = False
     match_message_peers: set[str] = field(default_factory=set, repr=False)
+    match_history: list[Dict[str, Any]] = field(default_factory=list, repr=False)
     conversation_message_peers: set[str] = field(default_factory=set, repr=False)
     # Voice matching and Rong credentials are intentionally session-memory
     # only.  They must never be written into persisted browser sessions.
