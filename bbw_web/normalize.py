@@ -655,8 +655,54 @@ def normalize_social_users(data: Any, current_uid: str = "") -> List[Dict[str, A
     return out
 
 
+def _friend_application_status(agree: Any, state: Any = "") -> str:
+    raw_agree = str(agree or "").strip().lower()
+    raw_state = str(state or "").strip().lower()
+    if raw_agree in {
+        "1",
+        "true",
+        "accepted",
+        "agreed",
+        "已同意",
+        "已添加",
+        "已加",
+        "已成为好友",
+    }:
+        return "accepted"
+    combined = f"{raw_agree} {raw_state}"
+    if any(value in combined for value in ("rejected", "refused", "已拒绝", "拒绝申请")):
+        return "rejected"
+    if any(value in combined for value in ("cancelled", "canceled", "已取消", "撤回")):
+        return "cancelled"
+    if any(value in combined for value in ("expired", "invalid", "已失效", "已过期")):
+        return "expired"
+    return "pending"
+
+
+def _friend_application_status_label(status: str, direction: str) -> str:
+    if status == "accepted":
+        return "已成为好友"
+    if status == "rejected":
+        return "对方已拒绝" if direction == "outgoing" else "已拒绝"
+    if status == "cancelled":
+        return "申请已取消"
+    if status == "expired":
+        return "申请已失效"
+    if direction == "incoming":
+        return "等待你处理"
+    if direction == "outgoing":
+        return "等待对方同意"
+    return "等待确认"
+
+
 def normalize_friend_application(item: Any, current_uid: str = "") -> Optional[Dict[str, Any]]:
-    """Normalize Friendsapply0 without mistaking the recipient for the applicant."""
+    """Normalize both received and sent ``Friendsapply0`` relationship rows.
+
+    The APK stores the request recipient in ``myid`` and the applicant in
+    ``yourid``.  Its list UI treats ``myid == current user`` as a received
+    request (showing an agree action), while the inverse direction is rendered
+    as a sent request.  ``agree == 1`` means the relationship was accepted.
+    """
     d = _as_dict(item) if isinstance(item, str) else item
     if not isinstance(d, dict):
         return None
@@ -668,29 +714,50 @@ def normalize_friend_application(item: Any, current_uid: str = "") -> Optional[D
             "",
         )
     )
-    applicant_id = ""
-    for key in (
-        "friendid",
-        "friendId",
-        "friendsid",
-        "yourid",
-        "your_id",
-        "youid",
-        "fromUserId",
-        "from_user_id",
-        "fromid",
-        "from_id",
-        "applicant_id",
-        "apply_uid",
-        "sender_id",
-        "userId",
-        "userid",
-        "uid",
-    ):
-        value = str(d.get(key) or "").strip()
-        if value and value != current:
-            applicant_id = value
-            break
+    recipient_id = str(
+        _first(
+            d,
+            ["myid", "myId", "recipient_id", "recipientId", "target_id", "toUserId", "to_user_id"],
+            "",
+        )
+    ).strip()
+    applicant_id = str(
+        _first(
+            d,
+            ["yourid", "yourId", "your_id", "applicant_id", "apply_uid", "sender_id", "fromUserId", "from_user_id"],
+            "",
+        )
+    ).strip()
+    legacy_uid = str(_first(d, ["uid", "userId", "userid"], "")).strip()
+    legacy_friend_id = str(
+        _first(d, ["friendid", "friendId", "friendsid", "youid", "fromid", "from_id"], "")
+    ).strip()
+
+    direction = "unknown"
+    peer_id = ""
+    from_uid = applicant_id
+    to_uid = recipient_id
+    if current and recipient_id == current and applicant_id and applicant_id != current:
+        direction = "incoming"
+        peer_id = applicant_id
+    elif current and applicant_id == current and recipient_id and recipient_id != current:
+        direction = "outgoing"
+        peer_id = recipient_id
+    elif current and legacy_uid == current and legacy_friend_id and legacy_friend_id != current:
+        direction = "incoming"
+        peer_id = legacy_friend_id
+        from_uid = legacy_friend_id
+        to_uid = current
+    elif current and legacy_friend_id == current and legacy_uid and legacy_uid != current:
+        direction = "outgoing"
+        peer_id = legacy_uid
+        from_uid = current
+        to_uid = legacy_uid
+    else:
+        for value in (applicant_id, recipient_id, legacy_friend_id, legacy_uid):
+            if value and value != current and value != apply_id:
+                peer_id = value
+                break
 
     nested = _first(
         d,
@@ -699,13 +766,20 @@ def normalize_friend_application(item: Any, current_uid: str = "") -> Optional[D
     )
     nested_user = normalize_user(nested)
     nested_id = str((nested_user or {}).get("id") or "")
-    if not applicant_id and nested_id and nested_id != current:
-        applicant_id = nested_id
+    if not peer_id and nested_id and nested_id != current:
+        peer_id = nested_id
 
     generic = normalize_user(d) or {}
     generic_id = str(generic.get("id") or "")
-    if not applicant_id and generic_id and generic_id != current and generic_id != apply_id:
-        applicant_id = generic_id
+    if not peer_id and generic_id and generic_id != current and generic_id != apply_id:
+        peer_id = generic_id
+
+    if direction == "unknown" and peer_id:
+        raw_direction = str(_first(d, ["direction", "apply_direction", "request_direction"], "")).lower()
+        if raw_direction in {"incoming", "received", "receive", "in", "收到"}:
+            direction = "incoming"
+        elif raw_direction in {"outgoing", "sent", "send", "out", "发出"}:
+            direction = "outgoing"
 
     nickname = str(
         _first(
@@ -737,26 +811,26 @@ def normalize_friend_application(item: Any, current_uid: str = "") -> Optional[D
             "",
         )
     )
-    if nested_user and nested_id == applicant_id:
+    if nested_user and (not nested_id or nested_id == peer_id):
         nickname = nickname or str(nested_user.get("nickname") or "")
         avatar = avatar or str(nested_user.get("avatar") or "")
-    if generic_id == applicant_id:
+    if generic_id == peer_id:
         nickname = nickname or str(generic.get("nickname") or "")
         avatar = avatar or str(generic.get("avatar") or "")
 
-    if not applicant_id:
+    if not peer_id:
         return None
-    raw_agree = str(_first(d, ["agree", "agreed", "accepted"], "")).strip().lower()
-    request_status_known = raw_agree not in {"", "none", "null", "undefined"}
-    request_status = (
-        "accepted"
-        if raw_agree in {"1", "true", "yes", "accepted", "agreed"}
-        else "pending"
+    profile = (
+        dict(nested_user or {})
+        if nested_user and (not nested_id or nested_id == peer_id)
+        else dict(generic or {})
+        if generic_id == peer_id
+        else {}
     )
     profile_online = ""
-    if nested_id == applicant_id:
+    if nested_id == peer_id:
         profile_online = str((nested_user or {}).get("online") or "")
-    elif generic_id == applicant_id:
+    elif generic_id == peer_id:
         profile_online = str((generic or {}).get("online") or "")
     peer_online = str(
         _first(
@@ -777,33 +851,65 @@ def normalize_friend_application(item: Any, current_uid: str = "") -> Optional[D
             d,
             ["friend_hide_online", "friendHideOnline", "your_hide_online"],
             (nested_user or {}).get("hide_online")
-            if nested_id == applicant_id
+            if nested_id == peer_id
             else (generic or {}).get("hide_online")
-            if generic_id == applicant_id
+            if generic_id == peer_id
             else "0",
         )
     )
+    agree = str(_first(d, ["agree", "accepted", "is_agree", "apply_status"], ""))
+    state = str(_first(d, ["state", "status", "request_state"], ""))
+    status = _friend_application_status(agree, state)
+    request_status_known = any(
+        str(value or "").strip().lower() not in {"", "none", "null", "undefined"}
+        for value in (agree, state)
+    )
+    leave_words = str(
+        _first(
+            d,
+            ["yourleavewords", "yourwords", "leave_words", "leave_word", "message"],
+            profile.get("leave_words") or "",
+        )
+    )
+    request_time = str(_first(d, ["time", "created_at", "apply_time", "request_time"], ""))
     return {
-        **generic,
-        "id": applicant_id,
-        "nickname": nickname or f"用户 {applicant_id}",
+        **profile,
+        "id": peer_id,
+        "nickname": nickname or str(profile.get("nickname") or f"用户 {peer_id}"),
         "avatar": avatar,
         "online": peer_online,
         "hide_online": peer_hide_online,
         "subtitle": " · ".join(
             part
             for part in (
-                f"uid {applicant_id}",
+                f"UID {peer_id}",
                 str(_first(d, ["region", "city", "area"], "")),
                 str(_first(d, ["signature", "sign", "description"], ""))[:24],
             )
             if part
         ),
-        "apply_id": apply_id or applicant_id,
-        "request_status": request_status,
+        "apply_id": apply_id or peer_id,
+        "request_status": status,
         "request_status_known": request_status_known,
-        "is_pending": request_status == "pending",
-        "is_accepted": request_status == "accepted",
+        "is_pending": status == "pending",
+        "is_accepted": status == "accepted",
+        "direction": direction,
+        "direction_label": {
+            "incoming": "对方向我申请",
+            "outgoing": "我向对方申请",
+        }.get(direction, "申请方向待确认"),
+        "status": status,
+        "status_label": _friend_application_status_label(status, direction),
+        "can_accept": direction == "incoming" and status == "pending",
+        "is_friend": status == "accepted",
+        "from_uid": from_uid,
+        "to_uid": to_uid,
+        "myid": recipient_id,
+        "yourid": applicant_id,
+        "agree": agree,
+        "state": state,
+        "leave_words": leave_words,
+        "request_time": request_time,
     }
 
 
@@ -835,6 +941,10 @@ def normalize_friends(data: Any, current_uid: str = "") -> List[Dict[str, Any]]:
             normalized.pop("request_status_known", None)
             normalized.pop("is_pending", None)
             normalized.pop("is_accepted", None)
+            normalized["status"] = "accepted"
+            normalized["status_label"] = "已成为好友"
+            normalized["can_accept"] = False
+            normalized["is_friend"] = True
             out.append(normalized)
             continue
         user = normalize_user(item)
@@ -2165,12 +2275,14 @@ def normalize_match_status(cards_data: Any, nums_data: Any, user: Optional[Dict]
         "display": {
             "online": str(online if online is not None else "—"),
             "local": str(local if local is not None else "—"),
+            "voice": str(voice if voice is not None else "—"),
             "card": str(match_card if match_card is not None else "—"),
             "money": money,
         },
         "parsed": {
             "online_ok": online is not None,
             "local_ok": local is not None,
+            "voice_ok": voice is not None,
             "card_ok": match_card is not None,
         },
     }

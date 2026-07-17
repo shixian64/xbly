@@ -1,0 +1,22 @@
+RongCloud Web SDK files vendored from the official CDN.
+
+rong-imlib-5.9.5.js
+  package: @rongcloud/imlib-next@5.9.5
+  source: https://cdn.ronghub.com/RongIMLib-5.9.5.prod.js
+  sha256: F815EF570CCF1D296E3C67371AB852FE7CA339E90E1E4A9B57B8BD31B26BBAC9
+  license: LICENSE-imlib.txt
+
+rong-rtc-5.7.2.js
+  package: @rongcloud/plugin-rtc@5.7.2
+  source: https://cdn.ronghub.com/RCRTC-5.7.2.prod.js
+  sha256: 4F66412265941426AB1AEFD4587DD326613F381FD45309DF358A2C1086688FD6
+  license: LICENSE-rtc.txt
+
+rong-call-5.2.10.js
+  package: @rongcloud/plugin-call@5.2.10
+  source: https://cdn.ronghub.com/RCCall-5.2.10.prod.js
+  sha256: D746542837673C1986590F6389F9B39F85CC27EC8675C5FE5018C2B9B703BA2E
+  license: LICENSE-call.txt
+
+Integration reference: https://doc.rongcloud.cn/call/Web/5.X/install
+Do not edit the minified SDK files by hand.

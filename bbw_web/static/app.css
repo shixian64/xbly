@@ -1182,8 +1182,8 @@ summary:focus-visible {
   position: relative;
   z-index: 1;
   display: grid;
-  min-width: min(310px, 42%);
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-width: min(430px, 50%);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0.35rem;
   border: 1px solid rgba(115, 87, 217, 0.16);
   border-radius: 17px;
@@ -1506,6 +1506,182 @@ summary:focus-visible {
   border-color: rgba(115, 87, 217, 0.2);
   background: var(--brand-soft);
   color: var(--brand-dark);
+}
+
+.voice-match-overview {
+  grid-template-columns: minmax(280px, 1fr) minmax(460px, 1.15fr);
+}
+
+.voice-match-stats {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-self: stretch;
+  margin-top: 0;
+}
+
+.voice-match-stats .stat-card {
+  display: grid;
+  min-height: 96px;
+  align-content: center;
+  border-color: rgba(255, 255, 255, 0.82);
+  background: rgba(255, 255, 255, 0.78);
+  box-shadow: 0 10px 24px rgba(71, 52, 115, 0.07);
+}
+
+.voice-match-control-card {
+  display: grid;
+  gap: 1rem;
+  border-color: rgba(115, 87, 217, 0.16);
+  background:
+    radial-gradient(circle at 92% 8%, rgba(232, 117, 162, 0.12), transparent 28%),
+    var(--surface);
+}
+
+.voice-match-state {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.voice-match-state-copy {
+  display: grid;
+  min-width: 0;
+  gap: 0.22rem;
+}
+
+.voice-match-state-copy strong {
+  font-size: 1rem;
+}
+
+.voice-match-state-copy span,
+.voice-match-start-row > span,
+.voice-match-notes span {
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.55;
+}
+
+.voice-match-state-actions,
+.voice-match-start-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.voice-match-state-actions {
+  justify-content: flex-end;
+}
+
+.voice-match-start-row {
+  border-top: 1px solid var(--line);
+  padding-top: 0.85rem;
+}
+
+.voice-match-start {
+  min-width: 180px;
+}
+
+.voice-match-notes {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.7rem;
+}
+
+.voice-match-notes > div {
+  display: grid;
+  gap: 0.2rem;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.7);
+  padding: 0.8rem;
+}
+
+.voice-match-notes strong {
+  font-size: 0.78rem;
+}
+
+.voice-call-dialog {
+  width: min(420px, calc(100vw - 28px));
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.86);
+  border-radius: 26px;
+  background:
+    radial-gradient(circle at 50% 0, rgba(232, 117, 162, 0.18), transparent 38%),
+    linear-gradient(155deg, #f5f1ff, #fff 62%);
+  box-shadow: 0 30px 90px rgba(34, 24, 49, 0.3);
+  padding: 0;
+}
+
+.voice-call-dialog::backdrop {
+  background: rgba(31, 24, 43, 0.56);
+  backdrop-filter: blur(5px);
+}
+
+.voice-call-dialog.is-open {
+  position: fixed;
+  z-index: 130;
+  inset: 50% auto auto 50%;
+  display: block;
+  transform: translate(-50%, -50%);
+}
+
+.voice-call-dialog-body {
+  display: grid;
+  justify-items: center;
+  gap: 0.45rem;
+  padding: 2rem 1.3rem 1.35rem;
+  text-align: center;
+}
+
+.voice-call-kicker {
+  border-radius: 999px;
+  background: rgba(115, 87, 217, 0.1);
+  color: var(--brand-dark);
+  padding: 0.28rem 0.6rem;
+  font-size: 0.68rem;
+  font-weight: 800;
+}
+
+.voice-call-dialog h2,
+.voice-call-dialog p {
+  margin: 0;
+}
+
+.voice-call-dialog h2 {
+  margin-top: 0.45rem;
+  font-size: 1.35rem;
+}
+
+.voice-call-dialog-body > strong {
+  color: var(--brand-dark);
+  font-size: 1rem;
+}
+
+.voice-call-dialog p {
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.voice-call-dialog time {
+  margin: 0.65rem 0;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  font-size: 1.65rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+
+.voice-call-actions {
+  display: flex;
+  width: 100%;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.55rem;
+}
+
+.voice-call-actions .btn {
+  min-width: 104px;
 }
 
 .match-submit:hover {
@@ -3700,6 +3876,128 @@ html.flash-viewing body {
   background: var(--brand);
 }
 
+.friend-application-section {
+  min-width: 0;
+}
+
+.friend-application-groups {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.friend-application-group {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.72);
+  box-shadow: var(--shadow-sm);
+  padding: 0.8rem;
+}
+
+.friend-application-group--incoming {
+  border-color: rgba(115, 87, 217, 0.18);
+}
+
+.friend-application-group--outgoing {
+  border-color: rgba(71, 133, 219, 0.18);
+}
+
+.friend-application-group-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.65rem;
+}
+
+.friend-application-group-head h3,
+.friend-application-group-head p {
+  margin: 0;
+}
+
+.friend-application-group-head h3 {
+  font-size: 0.88rem;
+}
+
+.friend-application-group-head p {
+  margin-top: 0.08rem;
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.friend-application-group-head > span {
+  flex: none;
+  border-radius: 999px;
+  background: var(--bg-strong);
+  color: var(--muted);
+  padding: 0.2rem 0.5rem;
+  font-size: 0.66rem;
+  font-weight: 750;
+}
+
+.friend-application-card .user-card {
+  border-color: rgba(73, 55, 96, 0.09);
+  box-shadow: none;
+}
+
+.friend-application-card .card-title-line {
+  flex-wrap: wrap;
+}
+
+.friend-application-direction,
+.friend-application-status {
+  display: inline-flex !important;
+  width: max-content;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.12rem 0.42rem;
+  font-size: 0.62rem !important;
+  font-weight: 750;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.friend-application-direction {
+  background: var(--brand-soft);
+  color: var(--brand-dark) !important;
+}
+
+.friend-application-direction--outgoing {
+  background: var(--blue-soft);
+  color: #386aab !important;
+}
+
+.friend-application-direction--unknown {
+  background: var(--bg-strong);
+  color: var(--muted) !important;
+}
+
+.friend-application-status {
+  background: var(--orange-soft);
+  color: #9c5b24 !important;
+}
+
+.friend-application-status--accepted {
+  background: var(--green-soft);
+  color: var(--green) !important;
+}
+
+.friend-application-status--rejected,
+.friend-application-status--cancelled,
+.friend-application-status--expired {
+  background: var(--danger-soft);
+  color: var(--danger) !important;
+}
+
+.friend-application-empty {
+  border: 1px dashed var(--line-strong);
+  border-radius: 13px;
+  color: var(--muted);
+  padding: 0.8rem;
+  font-size: 0.74rem;
+  text-align: center;
+}
+
 .relationship-tools {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -4926,6 +5224,35 @@ html.flash-viewing body {
   .match-hub-tabs {
     width: 100%;
     min-width: 0;
+  }
+
+  .voice-match-overview {
+    grid-template-columns: 1fr;
+  }
+
+  .voice-match-stats,
+  .voice-match-notes {
+    grid-template-columns: 1fr;
+  }
+
+  .voice-match-state,
+  .voice-match-start-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .voice-match-state-actions {
+    justify-content: stretch;
+  }
+
+  .voice-match-state-actions .btn,
+  .voice-match-start {
+    width: 100%;
+  }
+
+  .voice-call-dialog {
+    width: calc(100% - 20px);
+    border-radius: 22px;
   }
 
   .match-filter-form {

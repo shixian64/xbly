@@ -29,7 +29,11 @@ const MINE_NAV = [
 const LAB_NAV = { id: "lab", name: "协议台", desc: "仅限已启用的调试环境" };
 const LEGACY_RELATION_ROUTES = { friends: "friends", visitors: "visitors" };
 const SOCIAL_TABS = ["friends", "apply", "follows", "fans", "visitors", "black"];
-const MATCH_HUB_TABS = ["match", "bottle"];
+const MATCH_HUB_TABS = ["match", "voice", "bottle"];
+const RONG_IM_SDK_SRC = "/static/vendor/rong/rong-imlib-5.9.5.js";
+const RONG_RTC_SDK_SRC = "/static/vendor/rong/rong-rtc-5.7.2.js";
+const RONG_CALL_SDK_SRC = "/static/vendor/rong/rong-call-5.2.10.js";
+const RONG_CALL_SUCCESS = 10000;
 const SYSTEM_CUSTOMER_SERVICE_UID = "1";
 const MESSAGE_SYNC_TICK_MS = 3000;
 const MESSAGE_SUMMARY_CHAT_MS = 25 * 1000;
@@ -82,6 +86,22 @@ const S = {
   meStats: null,
   meStatsAt: 0,
   matchTab: "match",
+  voiceMatchServerState: { state: "idle", active: false, target: null },
+  voiceMatchQuota: { free: null, cards: null },
+  voiceMatchSdkLoading: null,
+  voiceMatchConnecting: null,
+  voiceMatchConnected: false,
+  voiceMatchInitialized: false,
+  voiceMatchUserId: "",
+  voiceMatchRtcClient: null,
+  voiceMatchCaller: null,
+  voiceMatchSession: null,
+  voiceMatchPeer: null,
+  voiceMatchPhase: "idle",
+  voiceMatchMuted: false,
+  voiceMatchCallStartedAt: 0,
+  voiceMatchTimer: null,
+  voiceMatchFinalizing: false,
   nearbyTab: "online",
   nearbyFilters: {
     online: { gender: "不限", property: "不限", age: "不限", city: "" },
@@ -200,6 +220,19 @@ function voiceRecordingAvailability() {
     return { available: false, reason: "当前浏览器不支持录音编码" };
   }
   return { available: true, reason: "按住“按住说话”录音，最长 60 秒" };
+}
+
+function voiceCallAvailability() {
+  if (!window.isSecureContext) {
+    return { available: false, reason: "语音通话需要 HTTPS 安全环境或本机访问" };
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    return { available: false, reason: "当前浏览器无法访问麦克风" };
+  }
+  if (typeof window.RTCPeerConnection === "undefined") {
+    return { available: false, reason: "当前浏览器不支持实时语音通话" };
+  }
+  return { available: true, reason: "首次使用时浏览器会请求麦克风权限" };
 }
 
 let visualViewportSyncFrame = 0;
@@ -388,6 +421,57 @@ const TIM_SDK_SRC = "/static/vendor/tim-js.js";
 const TIM_UPLOAD_PLUGIN_SRC = "/static/vendor/tim-upload-plugin.js";
 let _timSdkLoading = null;
 let _timUploadPluginLoading = null;
+
+function loadVoiceVendorScript(src, globalName) {
+  if (window[globalName]) return Promise.resolve(window[globalName]);
+  return new Promise((resolve, reject) => {
+    const selector = `script[data-rong-sdk="${globalName}"]`;
+    let script = document.querySelector(selector);
+    const finish = () => {
+      if (window[globalName]) resolve(window[globalName]);
+      else reject(new Error(`语音组件 ${globalName} 加载失败`));
+    };
+    if (script) {
+      if (script.dataset.loaded === "1") return finish();
+      script.addEventListener("load", finish, { once: true });
+      script.addEventListener("error", () => reject(new Error(`语音组件 ${globalName} 加载失败`)), { once: true });
+      return;
+    }
+    script = document.createElement("script");
+    script.src = src;
+    script.async = true;
+    script.dataset.rongSdk = globalName;
+    script.addEventListener(
+      "load",
+      () => {
+        script.dataset.loaded = "1";
+        finish();
+      },
+      { once: true }
+    );
+    script.addEventListener("error", () => reject(new Error(`语音组件 ${globalName} 加载失败`)), { once: true });
+    document.head.appendChild(script);
+  });
+}
+
+function ensureVoiceMatchSdk() {
+  if (window.RongIMLib && window.RCRTC && window.RCCall) {
+    return Promise.resolve({ RongIMLib: window.RongIMLib, RCRTC: window.RCRTC, RCCall: window.RCCall });
+  }
+  if (S.voiceMatchSdkLoading) return S.voiceMatchSdkLoading;
+  S.voiceMatchSdkLoading = (async () => {
+    await loadVoiceVendorScript(RONG_IM_SDK_SRC, "RongIMLib");
+    await loadVoiceVendorScript(RONG_RTC_SDK_SRC, "RCRTC");
+    await loadVoiceVendorScript(RONG_CALL_SDK_SRC, "RCCall");
+    if (!window.RongIMLib || !window.RCRTC || !window.RCCall) {
+      throw new Error("语音通话组件没有正确初始化");
+    }
+    return { RongIMLib: window.RongIMLib, RCRTC: window.RCRTC, RCCall: window.RCCall };
+  })().finally(() => {
+    S.voiceMatchSdkLoading = null;
+  });
+  return S.voiceMatchSdkLoading;
+}
 
 function withTimeout(promise, ms, label = "操作") {
   let timer = null;
@@ -612,6 +696,7 @@ async function api(path, options = {}) {
       S.imConnectingGeneration = -1;
       scrubAuthenticatedDom();
       applyUser(null);
+      void cleanupVoiceMatch({ disconnect: true });
       void cleanupIM().finally(() => clearSensitiveBrowserStorage());
       showLogin(true, true);
       toast("登录已失效，请重新登录", "error");
@@ -1857,6 +1942,13 @@ function hydrateRenderedRoute(route, signal, seq) {
       }
     });
   }
+  if (route === "match" && S.matchTab === "voice") {
+    void hydrateVoiceMatchPanel().catch((error) => {
+      if (error?.name !== "AbortError" && seq === S.routeSeq && S.route === "match" && S.matchTab === "voice") {
+        console.info("[voice-match]", error?.message || error);
+      }
+    });
+  }
   if (S.authenticatedServicesPending) scheduleAuthenticatedServices(1000);
 }
 
@@ -2314,10 +2406,11 @@ function userCard(item, options = {}) {
       chatOrigin ? ` data-chat-origin="${esc(chatOrigin)}"` : ""
     }>资料</button>`);
   }
+  const titleMetaHtml = String(options.titleMetaHtml || "");
   const presence = options.presence && id ? presenceBadgeHtml(id, user) : "";
   return `<article class="user-card">
     ${avatarHtml(user.avatar || user.portrait)}
-    <div class="card-copy"><div class="card-title-line"><strong>${esc(name)}</strong></div><span>${esc(subtitle)}</span></div>
+    <div class="card-copy"><div class="card-title-line"><strong>${esc(name)}</strong>${titleMetaHtml}</div><span>${esc(subtitle)}</span></div>
     ${actions.length || presence ? `<div class="card-actions">${presence}${actions.join("")}</div>` : ""}
   </article>`;
 }
@@ -2743,10 +2836,101 @@ function friendListHtml(items) {
     .join("")}</div><div id="friend-search-empty" class="empty-state compact-empty hide"><div><strong>没有找到好友</strong><span>换一个昵称或 UID 试试</span></div></div>`;
 }
 
+function friendApplicationDirection(item) {
+  const direction = String(item?.direction || "").toLowerCase();
+  return ["incoming", "outgoing"].includes(direction) ? direction : "unknown";
+}
+
+function friendApplicationStatus(item) {
+  const status = String(item?.status || "").toLowerCase();
+  return ["pending", "accepted", "rejected", "cancelled", "expired"].includes(status)
+    ? status
+    : item?.is_friend === true || String(item?.agree || "") === "1"
+      ? "accepted"
+      : "pending";
+}
+
+function friendApplicationCard(item) {
+  const direction = friendApplicationDirection(item);
+  const status = friendApplicationStatus(item);
+  const directionLabel =
+    item?.direction_label ||
+    (direction === "incoming" ? "对方向我申请" : direction === "outgoing" ? "我向对方申请" : "申请方向待确认");
+  const statusLabel =
+    item?.status_label ||
+    (status === "accepted"
+      ? "已成为好友"
+      : status === "rejected"
+        ? direction === "outgoing"
+          ? "对方已拒绝"
+          : "已拒绝"
+        : status === "cancelled"
+          ? "申请已取消"
+          : status === "expired"
+            ? "申请已失效"
+            : direction === "incoming"
+              ? "等待你处理"
+              : direction === "outgoing"
+                ? "等待对方同意"
+                : "等待确认");
+  const leaveWords = String(item?.leave_words || item?.yourleavewords || "").trim();
+  const requestTime = formatSocialTime(item?.request_time || item?.time || item?.created_at);
+  const relationshipCopy =
+    direction === "incoming"
+      ? "对方向你发起好友申请"
+      : direction === "outgoing"
+        ? "你向对方发起好友申请"
+        : "好友申请记录";
+  const subtitle = [relationshipCopy, leaveWords && `留言：${leaveWords}`, requestTime && `申请时间 ${requestTime}`]
+    .filter(Boolean)
+    .join(" · ");
+  const titleMetaHtml = `<span class="friend-application-direction friend-application-direction--${direction}">${esc(
+    directionLabel
+  )}</span><span class="friend-application-status friend-application-status--${status}">${esc(statusLabel)}</span>`;
+  const canAccept = direction === "incoming" && status === "pending" && item?.can_accept !== false;
+  return `<div class="friend-application-card friend-application-card--${direction}">${userCard(
+    { ...item, subtitle },
+    { profile: true, accept: canAccept, titleMetaHtml }
+  )}</div>`;
+}
+
+function friendApplicationGroupHtml(direction, items) {
+  const incoming = direction === "incoming";
+  const title = incoming ? "收到的申请" : direction === "outgoing" ? "发出的申请" : "其他申请记录";
+  const detail = incoming
+    ? "其他用户申请添加当前账号为好友"
+    : direction === "outgoing"
+      ? "当前账号主动申请添加的用户"
+      : "服务端没有提供明确的申请方向";
+  return `<section class="friend-application-group friend-application-group--${direction}"><div class="friend-application-group-head"><div><h3>${title}</h3><p>${detail}</p></div><span>${items.length} 条</span></div>${
+    items.length
+      ? `<div class="stack">${items.map(friendApplicationCard).join("")}</div>`
+      : `<div class="friend-application-empty">${incoming ? "暂无收到的申请" : "暂无发出的申请"}</div>`
+  }</section>`;
+}
+
+function friendApplicationsHtml(envelope) {
+  if (envelope && envelope.ok === false) {
+    const info = errorInfo(envelope);
+    return emptyState(info.title, info.detail || "好友申请暂时无法加载", actionRoute(info.action));
+  }
+  const items = itemsOf(envelope);
+  if (!items.length) return emptyState("暂无好友申请", "收到或发出的申请会显示在这里");
+  const incoming = items.filter((item) => friendApplicationDirection(item) === "incoming");
+  const outgoing = items.filter((item) => friendApplicationDirection(item) === "outgoing");
+  const unknown = items.filter((item) => friendApplicationDirection(item) === "unknown");
+  return `<div class="friend-application-groups">${friendApplicationGroupHtml(
+    "incoming",
+    incoming
+  )}${friendApplicationGroupHtml("outgoing", outgoing)}${
+    unknown.length ? friendApplicationGroupHtml("unknown", unknown) : ""
+  }</div>`;
+}
+
 function socialCardForTab(item, tab) {
   if (tab === "follows") return userCard(item, { profile: true, unfollow: true });
   if (tab === "fans") return userCard(item, { profile: true, follow: !item?.is_follower });
-  if (tab === "apply") return userCard(item, { profile: true, accept: true });
+  if (tab === "apply") return friendApplicationCard(item);
   if (tab === "black") return userCard(item, { profile: true, unblock: true });
   return userCard(item, { profile: true });
 }
@@ -3449,6 +3633,82 @@ function matchStatsHtml(display = {}, user = {}) {
     display.card ?? "—",
     "匹配卡"
   )}${statCard(display.money ?? user?.money ?? "0", "乐园币")}`;
+}
+
+function voiceMatchStatsHtml(status = {}, display = {}) {
+  const free = Number(status.voice_free);
+  const cards = Number(status.match_card);
+  S.voiceMatchQuota = {
+    free: Number.isFinite(free) ? free : null,
+    cards: Number.isFinite(cards) ? cards : null,
+  };
+  const freeLabel = Number.isFinite(free) ? String(Math.max(0, free)) : String(display.voice ?? "—");
+  const cardLabel = Number.isFinite(cards) ? String(Math.max(0, cards)) : String(display.card ?? "—");
+  const cost = Number.isFinite(free) && free > 0 ? "使用免费次数" : "消耗 3 张匹配卡";
+  return `${matchQuotaCard(freeLabel, "语音免费")}${statCard(cardLabel, "匹配卡")}${statCard(cost, "本次消耗")}`;
+}
+
+function voiceMatchServerState(value = S.voiceMatchServerState) {
+  const state = value && typeof value === "object" ? value : {};
+  return {
+    state: String(state.state || "idle"),
+    active: state.active === true,
+    stale: state.stale === true,
+    target: state.target && typeof state.target === "object" ? state.target : null,
+    started_at: Number(state.started_at || 0),
+  };
+}
+
+function voiceMatchStateHtml() {
+  const server = voiceMatchServerState();
+  const peer = S.voiceMatchPeer || server.target;
+  const peerName = String(peer?.nickname || peer?.name || (peer?.id ? `用户 ${peer.id}` : ""));
+  let title = "准备开始语音匹配";
+  let detail = "连接语音服务后即可开始，匹配成功会直接发起一对一语音通话。";
+  if (S.voiceMatchPhase === "connecting") {
+    title = "正在连接语音服务";
+    detail = "连接完成前不会消耗语音匹配次数或匹配卡。";
+  } else if (S.voiceMatchPhase === "matching") {
+    title = "正在提交语音匹配";
+    detail = "请不要重复点击，正在等待服务端返回匹配结果。";
+  } else if (S.voiceMatchPhase === "error") {
+    title = "语音服务暂时不可用";
+    detail = "请检查网络、麦克风权限后重试。";
+  } else if (S.voiceMatchPhase === "incoming") {
+    title = peerName ? `${peerName}正在呼叫你` : "收到语音来电";
+    detail = "请在通话窗口中选择接听或拒绝。";
+  } else if (S.voiceMatchPhase === "calling" || S.voiceMatchPhase === "ringing") {
+    title = peerName ? `正在呼叫${peerName}` : "正在发起语音通话";
+    detail = S.voiceMatchPhase === "ringing" ? "对方已收到呼叫，正在等待接听。" : "正在等待对方接听。";
+  } else if (S.voiceMatchPhase === "connected") {
+    title = peerName ? `正在与${peerName}通话` : "语音通话中";
+    detail = "可以在通话窗口中静音或挂断。";
+  } else if (server.state === "waiting") {
+    title = "正在等待另一位用户";
+    detail = "请保持页面在线。匹配成功后会显示语音来电。";
+  } else if (server.state === "matched") {
+    title = peerName ? `已匹配到${peerName}` : "已匹配到用户";
+    detail = "可以继续呼叫该用户，不需要再次发起匹配。";
+  } else if (server.state === "calling") {
+    title = peerName ? `正在呼叫${peerName}` : "正在发起语音通话";
+    detail = "等待对方接听。";
+  } else if (server.state === "stale") {
+    title = "上次等待已超时";
+    detail = "请先取消旧的等待状态，再重新开始语音匹配。";
+  } else if (S.voiceMatchConnected) {
+    title = "语音服务已连接";
+    detail = "开始匹配后请避免重复点击，服务端接受请求时即可能消耗一次机会。";
+  }
+  const callBusy = Boolean(S.voiceMatchSession) || ["incoming", "calling", "ringing", "connected", "ending"].includes(S.voiceMatchPhase);
+  const retryCall = !callBusy && server.state === "matched" && peer?.id
+    ? `<button type="button" class="btn secondary" data-action="voice-match-call-target" data-uid="${esc(peer.id)}">呼叫已匹配用户</button>`
+    : "";
+  const cancel = !callBusy && (server.state === "waiting" || server.state === "matched" || server.state === "calling" || server.state === "stale")
+    ? '<button type="button" class="btn soft" data-action="voice-match-cancel">取消当前匹配</button>'
+    : "";
+  return `<div class="voice-match-state-copy"><strong>${esc(title)}</strong><span>${esc(detail)}</span></div>${
+    retryCall || cancel ? `<div class="voice-match-state-actions">${retryCall}${cancel}</div>` : ""
+  }`;
 }
 
 function normalizedMatchProperties(value) {
@@ -7280,6 +7540,48 @@ async function pageMatching(signal) {
   </div>`;
 }
 
+async function pageVoiceMatch(signal) {
+  const [{ data: matchData }, { data: voiceData }] = await Promise.all([
+    api("/api/match/status", { signal }),
+    api("/api/match/voice/status", { signal }),
+  ]);
+  applyCapabilities(matchData.capabilities || voiceData.capabilities);
+  if (matchData.user) applyUser(matchData.user);
+  S.voiceMatchServerState = voiceMatchServerState(voiceData);
+  if (S.voiceMatchServerState.target) S.voiceMatchPeer = S.voiceMatchServerState.target;
+  const status = matchData.status || {};
+  const display = matchData.display || status.display || {};
+  const availability = voiceCallAvailability();
+  const free = Number(status.voice_free);
+  const cards = Number(status.match_card);
+  const quotaKnown = Number.isFinite(free) && Number.isFinite(cards);
+  const hasQuota = !quotaKnown || free > 0 || cards >= 3;
+  const server = voiceMatchServerState();
+  const canStart = availability.available && hasQuota && !server.active && !server.stale && server.state !== "matched";
+  const startHint = !availability.available
+    ? availability.reason
+    : !hasQuota
+      ? "当前没有免费次数，且匹配卡不足 3 张"
+      : server.active || server.stale || server.state === "matched"
+        ? "请先处理当前语音匹配状态"
+        : availability.reason;
+  return `<div class="match-page voice-match-page">
+    <section class="match-overview voice-match-overview">
+      <div class="match-overview-copy"><span class="match-kicker">语音匹配</span><h2>和新朋友实时聊一会儿</h2><p>网页会使用融云通话服务与官方客户端互通。开始匹配前先建立连接，服务端返回等待或用户后才进入通话流程。</p><div class="match-current-filter"><span>使用要求</span><strong>安全网页环境与麦克风权限</strong></div></div>
+      <div id="voice-match-stats" class="stats-grid voice-match-stats">${voiceMatchStatsHtml(status, display)}</div>
+    </section>
+    <section class="section voice-match-workbench">
+      <div class="surface-card voice-match-control-card">
+        <div id="voice-match-state" class="voice-match-state" aria-live="polite">${voiceMatchStateHtml()}</div>
+        <div class="voice-match-start-row"><button type="button" class="btn primary voice-match-start" data-action="voice-match-start" ${
+          canStart ? "" : "disabled"
+        }>开始语音匹配</button><span id="voice-match-start-hint">${esc(startHint)}</span></div>
+      </div>
+    </section>
+    <section class="section"><div class="surface-card voice-match-notes"><div><strong>匹配消耗</strong><span>有免费次数时扣除一次；没有免费次数时消耗 3 张匹配卡。</span></div><div><strong>等待方式</strong><span>进入等待后请保持网页在线。离开当前标签不会自动取消，取消时请点击页面中的取消按钮。</span></div><div><strong>通话控制</strong><span>来电后可以接听或拒绝；通话中可以静音或挂断。</span></div></div></section>
+  </div>`;
+}
+
 async function pageBottle(signal) {
   void signal;
   return `<div class="match-page bottle-page">
@@ -7296,9 +7598,10 @@ function matchHubHeader(tab) {
   const activeTab = normalizeMatchTab(tab);
   const tabs = [
     ["match", "匹配"],
+    ["voice", "语音匹配"],
     ["bottle", "漂流瓶"],
   ];
-  return `<section class="match-hub-header"><div class="match-hub-copy"><span>相遇方式</span><strong>选择匹配或漂流瓶</strong><p>切换标签，只更新下方内容。</p></div><nav class="match-hub-tabs" role="tablist" aria-label="相遇方式">${tabs
+  return `<section class="match-hub-header"><div class="match-hub-copy"><span>相遇方式</span><strong>选择匹配、语音匹配或漂流瓶</strong><p>切换标签，只更新下方内容。</p></div><nav class="match-hub-tabs" role="tablist" aria-label="相遇方式">${tabs
     .map(
       ([id, label]) => `<button type="button" id="match-hub-tab-${id}" role="tab" class="match-hub-tab${activeTab === id ? " on" : ""}" aria-selected="${
         activeTab === id
@@ -7467,6 +7770,12 @@ async function loadSocialTab(tab, signal) {
     body = `<section class="section contact-surface"><div class="contact-search"><label class="sr-only" for="friend-filter">搜索好友</label><input id="friend-filter" type="search" placeholder="搜索昵称或 UID" autocomplete="off" /></div>${friendListHtml(
       friends
     )}</section>`;
+  } else if (activeTab === "apply") {
+    const { data } = await api("/api/social/friend-apply", { signal });
+    applyCount = Number(data?.pending_incoming_count || 0);
+    body = `<section class="section friend-application-section"><div class="section-head"><div><h2>好友申请</h2><p>分别查看收到和发出的申请，状态会随服务端结果更新</p></div><button type="button" class="btn secondary small" data-action="refresh-route">刷新</button></div>${friendApplicationsHtml(
+      data
+    )}</section>`;
   } else if (activeTab === "visitors") {
     const type = S.visitorTab === "seen_by_me" ? "seen_by_me" : "seen_me";
     const { data } = await api(`/api/social/visitors?type=${encodeURIComponent(type)}&page=0`, { signal });
@@ -7492,13 +7801,11 @@ async function loadSocialTab(tab, signal) {
     const paths = {
       follows: "/api/social/follows",
       fans: "/api/social/fans",
-      apply: "/api/social/friend-apply",
       black: "/api/social/blacklist",
     };
     const copy = {
       follows: ["我的关注", "你主动关注的人会显示在这里"],
       fans: ["我的粉丝", "关注你的人会显示在这里"],
-      apply: ["好友申请", "处理想要添加你为好友的新朋友"],
       black: ["黑名单", "可以在这里解除屏蔽"],
     };
     const { data } = await api(paths[activeTab], { signal });
@@ -7600,10 +7907,23 @@ async function switchSocialTab(tab, { visitorTab = S.visitorTab, force = false }
   }
 }
 
+async function loadMatchHubTab(tab, signal) {
+  const activeTab = normalizeMatchTab(tab);
+  if (activeTab === "voice") return pageVoiceMatch(signal);
+  if (activeTab === "bottle") return pageBottle(signal);
+  return pageMatching(signal);
+}
+
+function matchTabLoadingLabel(tab) {
+  if (tab === "voice") return "语音匹配";
+  if (tab === "bottle") return "漂流瓶";
+  return "匹配";
+}
+
 async function pageMatch(signal) {
   const tab = normalizeMatchTab(S.matchTab);
   S.matchTab = tab;
-  const content = tab === "bottle" ? await pageBottle(signal) : await pageMatching(signal);
+  const content = await loadMatchHubTab(tab, signal);
   return `<div class="match-hub">${matchHubHeader(tab)}<div id="match-hub-panel" class="match-hub-panel" role="tabpanel" aria-labelledby="match-hub-tab-${tab}">${content}</div></div>`;
 }
 
@@ -7637,12 +7957,13 @@ async function switchMatchHubTab(tab) {
   history.pushState(null, "", matchRouteHash(activeTab));
   S.pageCache.delete(routeCacheKey("match"));
   panel.setAttribute("aria-busy", "true");
-  panel.innerHTML = `<div class="match-panel-loading"><span>正在切换到${activeTab === "bottle" ? "漂流瓶" : "匹配"}…</span></div>`;
+  panel.innerHTML = `<div class="match-panel-loading"><span>正在切换到${matchTabLoadingLabel(activeTab)}…</span></div>`;
 
   try {
-    const content = activeTab === "bottle" ? await pageBottle(controller.signal) : await pageMatching(controller.signal);
+    const content = await loadMatchHubTab(activeTab, controller.signal);
     if (controller.signal.aborted || seq !== S.routeSeq || S.route !== "match" || S.matchTab !== activeTab) return;
     panel.innerHTML = content;
+    if (activeTab === "voice") void hydrateVoiceMatchPanel();
   } catch (error) {
     if (error?.name === "AbortError" || seq !== S.routeSeq || S.route !== "match") return;
     if (error instanceof AuthExpiredError) return;
@@ -7958,6 +8279,540 @@ async function runMatch(path, body = {}) {
     )
   );
   if (!isBottle) await refreshMatchStats();
+}
+
+function voiceMatchPeerId(peer = S.voiceMatchPeer) {
+  return String(peer?.id || peer?.uid || peer?.userId || "").trim();
+}
+
+function voiceMatchPeerName(peer = S.voiceMatchPeer) {
+  const id = voiceMatchPeerId(peer);
+  return String(peer?.nickname || peer?.name || (id ? `用户 ${id}` : "对方"));
+}
+
+function rongCallSucceeded(resultOrCode) {
+  const code = typeof resultOrCode === "object" ? resultOrCode?.code : resultOrCode;
+  const expected = Number(window.RCCall?.RCCallErrorCode?.SUCCESS ?? RONG_CALL_SUCCESS);
+  return Number(code) === expected;
+}
+
+function updateVoiceMatchPanel() {
+  setPanel("voice-match-state", voiceMatchStateHtml());
+  const button = root().querySelector('[data-action="voice-match-start"]');
+  const hint = $("voice-match-start-hint");
+  if (!button) return;
+  const availability = voiceCallAvailability();
+  const server = voiceMatchServerState();
+  const free = Number(S.voiceMatchQuota.free);
+  const cards = Number(S.voiceMatchQuota.cards);
+  const quotaKnown = S.voiceMatchQuota.free != null && S.voiceMatchQuota.cards != null;
+  const hasQuota = !quotaKnown || free > 0 || cards >= 3;
+  const busy = server.active || server.stale || server.state === "matched" || Boolean(S.voiceMatchSession);
+  button.disabled = !availability.available || !hasQuota || busy || S.voiceMatchPhase === "connecting" || !S.voiceMatchConnected;
+  if (!hint) return;
+  hint.textContent = !availability.available
+    ? availability.reason
+    : !hasQuota
+      ? "当前没有免费次数，且匹配卡不足 3 张"
+      : busy
+        ? "请先处理当前语音匹配或通话"
+        : !S.voiceMatchConnected
+          ? S.voiceMatchPhase === "error" ? "语音服务连接失败，请稍后重试" : "正在连接语音服务"
+          : availability.reason;
+}
+
+function formatVoiceCallDuration(startedAt = S.voiceMatchCallStartedAt) {
+  if (!startedAt) return "00:00";
+  const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const remain = seconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(remain).padStart(2, "0")}`;
+}
+
+function stopVoiceCallTimer() {
+  clearInterval(S.voiceMatchTimer);
+  S.voiceMatchTimer = null;
+}
+
+function startVoiceCallTimer() {
+  if (!S.voiceMatchCallStartedAt) S.voiceMatchCallStartedAt = Date.now();
+  stopVoiceCallTimer();
+  const update = () => {
+    const element = $("voice-call-duration");
+    if (element) element.textContent = formatVoiceCallDuration();
+  };
+  update();
+  S.voiceMatchTimer = setInterval(update, 1000);
+}
+
+function voiceCallDialogCopy() {
+  const phase = S.voiceMatchPhase;
+  const name = voiceMatchPeerName();
+  if (phase === "incoming") return { title: "语音来电", status: `${name}正在呼叫你` };
+  if (phase === "ringing") return { title: "正在呼叫", status: `${name}已收到呼叫` };
+  if (phase === "calling") return { title: "正在呼叫", status: `正在等待${name}接听` };
+  if (phase === "connected") return { title: "语音通话中", status: `正在与${name}通话` };
+  if (phase === "ending") return { title: "正在结束通话", status: "请稍候" };
+  if (phase === "ended") return { title: "语音通话已结束", status: "通话连接已关闭" };
+  return { title: "语音通话", status: "等待通话状态" };
+}
+
+function syncVoiceCallDialog({ open = true } = {}) {
+  const dialog = $("voice-call-dialog");
+  if (!dialog) return;
+  const copy = voiceCallDialogCopy();
+  const title = $("voice-call-title");
+  const status = $("voice-call-status");
+  const peer = $("voice-call-peer");
+  const duration = $("voice-call-duration");
+  if (title) title.textContent = copy.title;
+  if (status) status.textContent = copy.status;
+  if (peer) peer.textContent = voiceMatchPeerName();
+  if (duration) duration.textContent = formatVoiceCallDuration();
+  const incoming = S.voiceMatchPhase === "incoming";
+  const connected = S.voiceMatchPhase === "connected";
+  const pending = ["calling", "ringing"].includes(S.voiceMatchPhase);
+  const ending = ["ending", "ended"].includes(S.voiceMatchPhase);
+  const accept = dialog.querySelector('[data-action="voice-call-accept"]');
+  const reject = dialog.querySelector('[data-action="voice-call-reject"]');
+  const mute = dialog.querySelector('[data-action="voice-call-mute"]');
+  const hangup = dialog.querySelector('[data-action="voice-call-hangup"]');
+  if (accept) accept.hidden = !incoming;
+  if (reject) reject.hidden = !incoming;
+  if (mute) {
+    mute.hidden = !connected;
+    mute.textContent = S.voiceMatchMuted ? "取消静音" : "静音";
+    mute.setAttribute("aria-pressed", String(S.voiceMatchMuted));
+  }
+  if (hangup) {
+    hangup.hidden = incoming || ending || (!connected && !pending);
+    hangup.disabled = ending;
+  }
+  if (open && !dialog.open) {
+    try {
+      dialog.showModal();
+    } catch {
+      dialog.classList.add("is-open");
+    }
+  }
+}
+
+function closeVoiceCallDialog() {
+  const dialog = $("voice-call-dialog");
+  if (!dialog) return;
+  try {
+    if (dialog.open) dialog.close();
+  } catch {
+    // Fallback display class is cleared below.
+  }
+  dialog.classList.remove("is-open");
+}
+
+function playVoiceRemoteTrack(track) {
+  try {
+    if (!track || typeof track.isAudioTrack !== "function" || !track.isAudioTrack()) return;
+    if (typeof track.isLocalTrack === "function" && track.isLocalTrack()) return;
+    const result = track.play?.();
+    if (result && typeof result.catch === "function") {
+      result.catch(() => toast("浏览器阻止了语音播放，请点击通话窗口后重试", "error", 4200));
+    }
+  } catch {
+    toast("远端语音暂时无法播放", "error", 4200);
+  }
+}
+
+function setVoiceMatchConnectedPhase(session = S.voiceMatchSession) {
+  if (session && S.voiceMatchSession && session !== S.voiceMatchSession) return;
+  S.voiceMatchPhase = "connected";
+  if (!S.voiceMatchCallStartedAt) S.voiceMatchCallStartedAt = Date.now();
+  startVoiceCallTimer();
+  syncVoiceCallDialog();
+  updateVoiceMatchPanel();
+}
+
+function voiceSessionListener() {
+  return {
+    onRinging(sender, session) {
+      if (session && S.voiceMatchSession && session !== S.voiceMatchSession) return;
+      const userId = String(sender?.userId || "").trim();
+      if (userId && !voiceMatchPeerId()) S.voiceMatchPeer = { id: userId };
+      S.voiceMatchPhase = "ringing";
+      syncVoiceCallDialog();
+      updateVoiceMatchPanel();
+    },
+    onAccept(sender, session) {
+      const userId = String(sender?.userId || "").trim();
+      if (userId && !voiceMatchPeerId()) S.voiceMatchPeer = { id: userId };
+      setVoiceMatchConnectedPhase(session);
+    },
+    onHungup(_sender, _reason, session) {
+      void finalizeVoiceMatchSession(session, "对方已结束语音通话");
+    },
+    onTrackReady(track) {
+      playVoiceRemoteTrack(track);
+    },
+    onMemberModify() {},
+    onMediaModify() {},
+    onAudioMuteChange() {},
+    onVideoMuteChange() {},
+    onTrackSubscribeFail() {
+      toast("远端语音订阅失败，请稍后重试", "error", 4200);
+    },
+    onTrackPublishFail() {
+      toast("本地语音发送失败，请检查麦克风权限", "error", 4200);
+    },
+    onConnected(session) {
+      setVoiceMatchConnectedPhase(session);
+    },
+  };
+}
+
+function handleIncomingVoiceSession(session) {
+  if (!session) return;
+  if (S.voiceMatchSession && S.voiceMatchSession !== session) {
+    try {
+      void Promise.resolve(session.hungup?.());
+    } catch {
+      // Reject a second simultaneous session best-effort.
+    }
+    return;
+  }
+  const mediaType = Number(session.getMediaType?.() ?? 1);
+  if (mediaType !== 1) {
+    try {
+      void Promise.resolve(session.hungup?.());
+    } catch {
+      // Only one-to-one audio is supported by this product surface.
+    }
+    return;
+  }
+  S.voiceMatchSession = session;
+  const callerId = String(session.getCallerId?.() || session.getInviterId?.() || session.getTargetId?.() || "").trim();
+  const remoteUsers = session.getRemoteUsers?.();
+  const remoteUser = Array.isArray(remoteUsers)
+    ? remoteUsers.find((item) => String(item?.userId || "") === callerId) || remoteUsers[0]
+    : null;
+  if (callerId) {
+    S.voiceMatchPeer = {
+      id: callerId,
+      nickname: String(remoteUser?.name || "").trim(),
+      avatar: String(remoteUser?.portraitUri || "").trim(),
+    };
+  }
+  S.voiceMatchPhase = "incoming";
+  S.voiceMatchMuted = false;
+  S.voiceMatchCallStartedAt = 0;
+  session.registerSessionListener?.(voiceSessionListener());
+  syncVoiceCallDialog();
+  updateVoiceMatchPanel();
+}
+
+async function ensureVoiceCallReady({ force = false } = {}) {
+  const availability = voiceCallAvailability();
+  if (!availability.available) throw new Error(availability.reason);
+  if (!force && S.voiceMatchConnected && S.voiceMatchCaller) return true;
+  if (S.voiceMatchConnecting) return S.voiceMatchConnecting;
+  S.voiceMatchPhase = "connecting";
+  updateVoiceMatchPanel();
+  const generation = S.sessionGeneration;
+  S.voiceMatchConnecting = (async () => {
+    const { RongIMLib, RCRTC, RCCall } = await ensureVoiceMatchSdk();
+    const { data } = await api("/api/match/voice/bootstrap", {
+      method: "POST",
+      body: "{}",
+      timeout: 20000,
+    });
+    if (!isCurrentAuthenticatedSession(generation)) return false;
+    if (!data?.ok) throw new Error(localizedSystemText(data?.error || data?.message, "语音服务身份获取失败"));
+    const credentials = data.credentials || {};
+    const appKey = String(credentials.appKey || "").trim();
+    const userId = String(credentials.userId || "").trim();
+    const token = String(credentials.token || "").trim();
+    const nickname = String(credentials.nickname || "").trim();
+    const portrait = mediaUrl(credentials.portrait || "");
+    if (!appKey || !userId || !token || token === "123") throw new Error("语音服务身份无效，请重新登录后重试");
+
+    if (force && S.voiceMatchInitialized) {
+      try {
+        await RongIMLib.disconnect?.();
+        await RongIMLib.destroy?.();
+      } catch {
+        // Re-initialization below is still allowed to report the real error.
+      }
+      S.voiceMatchInitialized = false;
+    }
+    if (!S.voiceMatchInitialized) {
+      RongIMLib.init({ appkey: appKey });
+      const rtcClient = RongIMLib.installPlugin(RCRTC.installer, {});
+      const caller = RongIMLib.installPlugin(RCCall.installer, {
+        rtcClient,
+        onSession: handleIncomingVoiceSession,
+        onSessionClose(session) {
+          void finalizeVoiceMatchSession(session, "语音通话已结束");
+        },
+        onOfflineRecord() {},
+      });
+      S.voiceMatchRtcClient = rtcClient;
+      S.voiceMatchCaller = caller;
+      S.voiceMatchInitialized = true;
+    }
+    S.voiceMatchCaller?.registerUserInfo?.({
+      ...(nickname ? { name: nickname } : {}),
+      ...(portrait ? { portraitUri: portrait } : {}),
+    });
+    const connected = await withTimeout(Promise.resolve(RongIMLib.connect(token)), 20000, "语音服务连接");
+    if (!isCurrentAuthenticatedSession(generation)) return false;
+    if (Number(connected?.code) !== 0) throw new Error(`语音服务连接失败（${connected?.code ?? "unknown"}）`);
+    const connectedUserId = String(connected?.data?.userId || userId);
+    if (connectedUserId !== userId) throw new Error("语音服务连接到了错误的用户身份");
+    S.voiceMatchConnected = true;
+    S.voiceMatchUserId = userId;
+    S.voiceMatchPhase = S.voiceMatchSession ? S.voiceMatchPhase : "idle";
+    updateVoiceMatchPanel();
+    return true;
+  })()
+    .catch((error) => {
+      S.voiceMatchConnected = false;
+      S.voiceMatchPhase = "error";
+      updateVoiceMatchPanel();
+      throw error;
+    })
+    .finally(() => {
+      S.voiceMatchConnecting = null;
+    });
+  return S.voiceMatchConnecting;
+}
+
+async function refreshVoiceMatchStats() {
+  try {
+    const { data } = await api("/api/match/status", { timeout: 8000 });
+    const status = data.status || {};
+    const display = data.display || status.display || {};
+    const free = Number(status.voice_free);
+    const cards = Number(status.match_card);
+    S.voiceMatchQuota = {
+      free: Number.isFinite(free) ? free : null,
+      cards: Number.isFinite(cards) ? cards : null,
+    };
+    setPanel("voice-match-stats", voiceMatchStatsHtml(status, display));
+    updateVoiceMatchPanel();
+  } catch {
+    // Voice state remains usable even when the soft quota refresh fails.
+  }
+}
+
+async function hydrateVoiceMatchPanel() {
+  if (S.route !== "match" || S.matchTab !== "voice") return;
+  updateVoiceMatchPanel();
+  try {
+    await ensureVoiceCallReady();
+  } catch (error) {
+    if (S.route === "match" && S.matchTab === "voice") {
+      toast(error?.message || "语音服务连接失败", "error", 4200);
+    }
+  }
+}
+
+async function startRongVoiceCall(targetId, target = null) {
+  const uid = String(targetId || "").trim();
+  if (!uid) throw new Error("匹配结果缺少用户编号");
+  await ensureVoiceCallReady();
+  if (!S.voiceMatchCaller) throw new Error("语音通话组件尚未就绪");
+  if (S.voiceMatchSession) throw new Error("当前已有进行中的语音通话");
+  S.voiceMatchPeer = target && typeof target === "object" ? target : { id: uid };
+  S.voiceMatchPhase = "calling";
+  syncVoiceCallDialog();
+  updateVoiceMatchPanel();
+  const result = await S.voiceMatchCaller.call({
+    targetId: uid,
+    mediaType: window.RCCall?.RCCallMediaType?.AUDIO ?? 1,
+    listener: voiceSessionListener(),
+    constraints: {
+      audio: {
+        sampleRate: 48000,
+      },
+    },
+  });
+  if (!rongCallSucceeded(result)) {
+    S.voiceMatchPhase = "error";
+    closeVoiceCallDialog();
+    updateVoiceMatchPanel();
+    throw new Error(`无法发起语音通话（${result?.code ?? "unknown"}）`);
+  }
+  S.voiceMatchSession = result.session;
+  if (S.voiceMatchPhase !== "connected") S.voiceMatchPhase = "calling";
+  syncVoiceCallDialog();
+  updateVoiceMatchPanel();
+  return true;
+}
+
+async function startVoiceMatch() {
+  await ensureVoiceCallReady();
+  const server = voiceMatchServerState();
+  if (server.active || server.stale || server.state === "matched") throw new Error("请先处理当前语音匹配状态");
+  S.voiceMatchPhase = "matching";
+  updateVoiceMatchPanel();
+  const { data } = await api("/api/match/voice/start", {
+    method: "POST",
+    body: "{}",
+    timeout: 30000,
+  });
+  if (!data?.ok) {
+    S.voiceMatchServerState = voiceMatchServerState(data);
+    S.voiceMatchPhase = "idle";
+    updateVoiceMatchPanel();
+    toastEnv(data, "语音匹配未开始");
+    await refreshVoiceMatchStats();
+    return;
+  }
+  S.voiceMatchServerState = voiceMatchServerState(data);
+  if (data.target) S.voiceMatchPeer = data.target;
+  updateVoiceMatchPanel();
+  await refreshVoiceMatchStats();
+  if (data.outcome === "waiting") {
+    toast("正在等待另一位用户加入");
+    return;
+  }
+  if (data.outcome === "matched") {
+    try {
+      await startRongVoiceCall(voiceMatchPeerId(data.target), data.target);
+    } catch (error) {
+      toast(`${error?.message || "语音呼叫失败"}，可以使用“呼叫已匹配用户”重试`, "error", 5200);
+      updateVoiceMatchPanel();
+    }
+  }
+}
+
+async function cancelVoiceMatch({ quiet = false, refresh = true } = {}) {
+  if (S.voiceMatchSession) {
+    try {
+      await Promise.resolve(S.voiceMatchSession.hungup?.());
+    } catch {
+      // Queue cancellation below remains useful even if hangup was not confirmed.
+    }
+  }
+  const { data } = await api("/api/match/voice/cancel", {
+    method: "POST",
+    body: "{}",
+    timeout: 12000,
+  });
+  S.voiceMatchServerState = voiceMatchServerState(data?.remote_ok ? { state: "idle", active: false } : data);
+  S.voiceMatchSession = null;
+  if (data?.remote_ok) S.voiceMatchPeer = null;
+  S.voiceMatchPhase = S.voiceMatchConnected ? "idle" : "error";
+  S.voiceMatchMuted = false;
+  S.voiceMatchCallStartedAt = 0;
+  stopVoiceCallTimer();
+  closeVoiceCallDialog();
+  updateVoiceMatchPanel();
+  if (!quiet) toastEnv(data, data?.remote_ok ? "已取消语音匹配" : "已结束当前等待");
+  if (refresh) await refreshVoiceMatchStats();
+}
+
+async function finishVoiceMatchServerState() {
+  try {
+    await api("/api/match/voice/finish", { method: "POST", body: "{}", timeout: 6000, authOptional: true });
+  } catch {
+    // Local media/session cleanup must not depend on this bookkeeping request.
+  }
+}
+
+async function finalizeVoiceMatchSession(session, message = "语音通话已结束") {
+  if (session && S.voiceMatchSession && session !== S.voiceMatchSession) return;
+  if (S.voiceMatchFinalizing) return;
+  S.voiceMatchFinalizing = true;
+  S.voiceMatchPhase = "ended";
+  stopVoiceCallTimer();
+  syncVoiceCallDialog();
+  await finishVoiceMatchServerState();
+  S.voiceMatchServerState = voiceMatchServerState({ state: "idle", active: false });
+  S.voiceMatchSession = null;
+  S.voiceMatchPeer = null;
+  S.voiceMatchMuted = false;
+  S.voiceMatchCallStartedAt = 0;
+  updateVoiceMatchPanel();
+  toast(message);
+  setTimeout(() => {
+    closeVoiceCallDialog();
+    S.voiceMatchPhase = S.voiceMatchConnected ? "idle" : "error";
+    S.voiceMatchFinalizing = false;
+    updateVoiceMatchPanel();
+  }, 900);
+}
+
+async function acceptVoiceCall() {
+  const session = S.voiceMatchSession;
+  if (!session) throw new Error("当前没有可接听的语音来电");
+  const result = await Promise.resolve(session.accept?.());
+  if (!rongCallSucceeded(result)) throw new Error(`无法接听语音来电（${result?.code ?? "unknown"}）`);
+  setVoiceMatchConnectedPhase(session);
+}
+
+async function hangupVoiceCall(message = "语音通话已结束") {
+  const session = S.voiceMatchSession;
+  if (!session) {
+    await finalizeVoiceMatchSession(null, message);
+    return;
+  }
+  S.voiceMatchPhase = "ending";
+  syncVoiceCallDialog();
+  const result = await Promise.resolve(session.hungup?.());
+  if (result && !rongCallSucceeded(result)) {
+    S.voiceMatchPhase = "connected";
+    syncVoiceCallDialog();
+    throw new Error(`暂时无法结束语音通话（${result?.code ?? "unknown"}）`);
+  }
+  await finalizeVoiceMatchSession(session, message);
+}
+
+async function toggleVoiceCallMute() {
+  const session = S.voiceMatchSession;
+  if (!session || S.voiceMatchPhase !== "connected") throw new Error("当前没有进行中的语音通话");
+  const result = S.voiceMatchMuted
+    ? await Promise.resolve(session.enableAudioTrack?.())
+    : await Promise.resolve(session.disableAudioTrack?.());
+  if (!rongCallSucceeded(result)) throw new Error(`静音设置失败（${result?.code ?? "unknown"}）`);
+  S.voiceMatchMuted = !S.voiceMatchMuted;
+  syncVoiceCallDialog();
+}
+
+async function cleanupVoiceMatch({ cancelQueue = false, disconnect = true } = {}) {
+  stopVoiceCallTimer();
+  if (cancelQueue && voiceMatchServerState().state !== "idle") {
+    try {
+      await cancelVoiceMatch({ quiet: true, refresh: false });
+    } catch {
+      // Continue with local logout cleanup.
+    }
+  } else if (S.voiceMatchSession) {
+    try {
+      await Promise.resolve(S.voiceMatchSession.hungup?.());
+    } catch {
+      // Best-effort local cleanup.
+    }
+  }
+  if (disconnect && window.RongIMLib) {
+    try {
+      await withTimeout(Promise.resolve(window.RongIMLib.disconnect?.()), 3000, "语音服务退出");
+      await withTimeout(Promise.resolve(window.RongIMLib.destroy?.()), 3000, "语音服务清理");
+    } catch {
+      // Logout must not be blocked by an SDK cleanup timeout.
+    }
+  }
+  S.voiceMatchConnected = false;
+  S.voiceMatchInitialized = false;
+  S.voiceMatchUserId = "";
+  S.voiceMatchRtcClient = null;
+  S.voiceMatchCaller = null;
+  S.voiceMatchSession = null;
+  S.voiceMatchPeer = null;
+  S.voiceMatchPhase = "idle";
+  S.voiceMatchMuted = false;
+  S.voiceMatchCallStartedAt = 0;
+  S.voiceMatchFinalizing = false;
+  S.voiceMatchServerState = voiceMatchServerState({ state: "idle", active: false });
+  closeVoiceCallDialog();
+  updateVoiceMatchPanel();
 }
 
 function formatTimLoginError(error, source = "") {
@@ -8831,6 +9686,7 @@ function updatePresence(active) {
 
 async function logout() {
   try {
+    await cleanupVoiceMatch({ cancelQueue: true, disconnect: true });
     await api("/api/auth/logout", { method: "POST", body: "{}", timeout: 7000, authOptional: true });
   } catch (error) {
     toast(`服务端退出未确认：${error.message || error}`, "error", 3600);
@@ -9473,6 +10329,16 @@ async function handleAction(action, button) {
   if (action === "match-online") return runMatch("/api/match/online");
   if (action === "match-local") return runMatch("/api/match/local");
   if (action === "match-pick") return runMatch("/api/match/bottle-pick");
+  if (action === "voice-match-start") return startVoiceMatch();
+  if (action === "voice-match-cancel") return cancelVoiceMatch();
+  if (action === "voice-match-call-target") {
+    const target = S.voiceMatchPeer || voiceMatchServerState().target;
+    return startRongVoiceCall(button.dataset.uid || voiceMatchPeerId(target), target);
+  }
+  if (action === "voice-call-accept") return acceptVoiceCall();
+  if (action === "voice-call-reject") return hangupVoiceCall("已拒绝语音来电");
+  if (action === "voice-call-hangup") return hangupVoiceCall();
+  if (action === "voice-call-mute") return toggleVoiceCallMute();
   if (action === "receive-task") {
     const id = button.dataset.id;
     if (!id) throw new Error("缺少任务编号");
@@ -10234,6 +11100,11 @@ $("profile-dialog").addEventListener("cancel", (event) => {
 $("profile-dialog").addEventListener("click", (event) => {
   if (event.target === event.currentTarget) closeProfileDialog();
 });
+$("voice-call-dialog").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  if (S.voiceMatchPhase === "incoming") void hangupVoiceCall("已拒绝语音来电");
+  else if (S.voiceMatchSession) void hangupVoiceCall();
+});
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && $("sidebar").classList.contains("open")) closeDrawer(true);
@@ -10318,6 +11189,26 @@ window.addEventListener("pagehide", (event) => {
     }).catch(() => {});
     if (S.serverHeartbeat) {
       void fetch("/api/heartbeat/stop", { ...options, body: "{}" }).catch(() => {});
+    }
+    const voiceState = voiceMatchServerState();
+    if (!event.persisted && !S.voiceMatchSession && voiceState.state !== "idle") {
+      void fetch("/api/match/voice/cancel", { ...options, body: "{}" }).catch(() => {});
+    } else if (!event.persisted && S.voiceMatchSession) {
+      void fetch("/api/match/voice/finish", { ...options, body: "{}" }).catch(() => {});
+    }
+  }
+  if (!event.persisted && S.voiceMatchSession) {
+    try {
+      void S.voiceMatchSession.hungup?.();
+    } catch {
+      // Page is leaving; the SDK will also close its media tracks.
+    }
+  }
+  if (!event.persisted && window.RongIMLib?.disconnect) {
+    try {
+      void window.RongIMLib.disconnect();
+    } catch {
+      // Page is leaving; no additional recovery is possible here.
     }
   }
   if (!event.persisted && S.chat && typeof S.chat.logout === "function") {

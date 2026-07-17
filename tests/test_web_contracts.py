@@ -10,6 +10,7 @@ from unittest.mock import patch
 from bbw_protocol.client import ApiResult
 from bbw_protocol.adapters.im import ImAdapter
 from bbw_protocol.modules.misc import MiscAPI
+from bbw_protocol.modules.match import MatchAPI
 from bbw_protocol.modules.social import SocialAPI
 from bbw_protocol.session import Session
 from bbw_web import bff_server
@@ -624,6 +625,25 @@ class SecurityHelperTests(unittest.TestCase):
                 allow_local_fallback=False,
             )
 
+    def test_rong_credentials_accept_apk_user_id_casing_in_response(self) -> None:
+        app = SimpleNamespace(
+            session=SimpleNamespace(uid="42", nickname="Me", portrait="me.jpg"),
+            im=SimpleNamespace(
+                rong_register=lambda **_kwargs: ApiResult(
+                    True,
+                    200,
+                    '{"data":{"token":"rong-token","userID":"42"}}',
+                    data={"data": {"token": "rong-token", "userID": "42"}},
+                )
+            ),
+        )
+
+        credentials = ImAdapter(app).rong_register()
+
+        self.assertTrue(credentials.ok)
+        self.assertEqual(credentials.user_id, "42")
+        self.assertEqual(credentials.token, "rong-token")
+
 
 class ProtocolRoutingTests(unittest.TestCase):
     def test_id2_meta_uses_i888_route(self) -> None:
@@ -1062,6 +1082,61 @@ class SocialBffRoutingTests(unittest.TestCase):
         self.assertEqual(calls, [("friend_apply", "1")])
         self.assertEqual(response[1]["count"], 0)
 
+    def test_friend_application_directions_and_pending_counts_are_preserved(self) -> None:
+        applications = ApiResult(
+            True,
+            200,
+            "[]",
+            data=[
+                {
+                    "id": "incoming-1",
+                    "myid": "42",
+                    "yourid": "9",
+                    "agree": "0",
+                    "userInfoList": {"id": "9", "nickname": "申请人"},
+                },
+                {
+                    "id": "outgoing-1",
+                    "myid": "10",
+                    "yourid": "42",
+                    "agree": "0",
+                    "userInfoList": {"id": "10", "nickname": "申请目标"},
+                },
+                {
+                    "id": "incoming-accepted",
+                    "myid": "42",
+                    "yourid": "11",
+                    "agree": "1",
+                    "userInfoList": {"id": "11", "nickname": "已添加用户"},
+                },
+            ],
+        )
+        friends = ApiResult(
+            True,
+            200,
+            "[]",
+            data=[{"id": "relation-11", "uid": "42", "friendid": "11", "friendnickname": "已添加用户"}],
+        )
+        app = SimpleNamespace(
+            social=SimpleNamespace(
+                friend_apply_list=lambda _page: applications,
+                friends=lambda: friends,
+            )
+        )
+
+        _, items, metadata = bff_server._friend_applications(app, "42", applications)
+        by_id = {item["id"]: item for item in items}
+        self.assertEqual(by_id["9"]["direction"], "incoming")
+        self.assertTrue(by_id["9"]["can_accept"])
+        self.assertEqual(by_id["10"]["direction"], "outgoing")
+        self.assertEqual(by_id["10"]["status_label"], "等待对方同意")
+        self.assertNotIn("11", by_id)
+        counts = bff_server._friend_application_counts(items)
+        self.assertEqual(counts["incoming_count"], 1)
+        self.assertEqual(counts["outgoing_count"], 1)
+        self.assertEqual(counts["pending_incoming_count"], 1)
+        self.assertEqual(metadata["count"], 1)
+
     def test_nearby_moments_use_profile_region_and_report_missing_location(self) -> None:
         def run(raw_user, profile_data=None):
             calls = []
@@ -1203,6 +1278,7 @@ class SocialBffRoutingTests(unittest.TestCase):
         self.assertEqual(calls[:2], [("agree", "9"), ("friends", None)])
         self.assertTrue(response[1]["ok"])
         self.assertTrue(response[1]["verified"])
+        self.assertEqual(response[1]["application_status"], "accepted")
 
 
 class MatchRoutingContractTests(unittest.TestCase):
@@ -1579,6 +1655,133 @@ class MatchRoutingContractTests(unittest.TestCase):
         self.assertEqual(response[1]["active_property"], "B")
 
 
+class VoiceMatchBffContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.old_store = bff_server.STORE
+        bff_server.STORE = SimpleNamespace()
+
+    def tearDown(self) -> None:
+        bff_server.STORE = self.old_store
+
+    @staticmethod
+    def _harness(path, web_user, body=None):
+        class Harness:
+            def __init__(self):
+                self.path = path
+                self.response = None
+
+            def _check_api_origin(self):
+                return True
+
+            def body(self):
+                return dict(body or {})
+
+            def sid(self):
+                return "sid"
+
+            def user(self, _sid):
+                return web_user
+
+            def ok(self, obj, status=200, **_kwargs):
+                self.response = (status, obj)
+                return self.response
+
+        return Harness()
+
+    def test_voice_bootstrap_returns_only_browser_required_credentials(self) -> None:
+        issued = SimpleNamespace(
+            ok=True,
+            app_key="app-key",
+            user_id="42",
+            token="rong-token",
+            nickname="Me",
+            portrait="me.jpg",
+            raw={"must": "not leak"},
+        )
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(session=SimpleNamespace(uid="42")),
+            native=SimpleNamespace(im=SimpleNamespace(rong_register=lambda: issued)),
+            lock=threading.RLock(),
+            match_pool_online_list_enabled=False,
+            nearby_custom_city_enabled=False,
+        )
+        harness = self._harness("/api/match/voice/bootstrap", web_user)
+        bff_server.Handler.do_POST(harness)
+
+        self.assertEqual(harness.response[0], 200)
+        self.assertTrue(harness.response[1]["ok"])
+        self.assertEqual(harness.response[1]["credentials"]["token"], "rong-token")
+        self.assertNotIn("raw", harness.response[1])
+        self.assertEqual(web_user.voice_rong_credentials["user_id"], "42")
+
+    def test_voice_start_waits_once_and_rejects_duplicate_charge(self) -> None:
+        calls = []
+        result = ApiResult(True, 200, "wait", data="wait", kind="text")
+        match = SimpleNamespace(
+            start_voice=lambda **kwargs: calls.append(kwargs) or result,
+            normalize_voice_result=MatchAPI.normalize_voice_result,
+        )
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(session=SimpleNamespace(uid="42"), match=match),
+            native=SimpleNamespace(),
+            lock=threading.RLock(),
+            match_pool_online_list_enabled=False,
+            nearby_custom_city_enabled=False,
+            voice_rong_credentials={
+                "app_key": "app-key",
+                "user_id": "42",
+                "token": "rong-token",
+                "nickname": "Me",
+                "portrait": "",
+            },
+            voice_rong_credentials_at=bff_server.time.time(),
+            voice_match_state={},
+            match_message_peers=set(),
+        )
+
+        first = self._harness("/api/match/voice/start", web_user)
+        bff_server.Handler.do_POST(first)
+        second = self._harness("/api/match/voice/start", web_user)
+        bff_server.Handler.do_POST(second)
+
+        self.assertEqual(first.response[0], 200)
+        self.assertEqual(first.response[1]["outcome"], "waiting")
+        self.assertTrue(first.response[1]["active"])
+        self.assertEqual(second.response[0], 409)
+        self.assertEqual(second.response[1]["code"], "VOICE_MATCH_ALREADY_ACTIVE")
+        self.assertEqual(calls, [{"id_": "42"}])
+
+    def test_voice_cancel_clears_matched_target_without_removing_wait_queue(self) -> None:
+        def unexpected_remove(**_kwargs):
+            self.fail("a completed match must not call removeXiaobeiMatch")
+
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(
+                session=SimpleNamespace(uid="42"),
+                match=SimpleNamespace(cancel_voice=unexpected_remove),
+            ),
+            native=SimpleNamespace(),
+            lock=threading.RLock(),
+            match_pool_online_list_enabled=False,
+            nearby_custom_city_enabled=False,
+            voice_match_state={
+                "state": "matched",
+                "target": {"id": "9", "nickname": "Peer"},
+                "started_at": bff_server.time.time(),
+                "updated_at": bff_server.time.time(),
+            },
+        )
+
+        harness = self._harness("/api/match/voice/cancel", web_user)
+        bff_server.Handler.do_POST(harness)
+
+        self.assertEqual(harness.response[0], 200)
+        self.assertTrue(harness.response[1]["ok"])
+        self.assertFalse(harness.response[1]["remote_required"])
+        self.assertEqual(harness.response[1]["state"], "idle")
+        self.assertIsNone(harness.response[1]["target"])
+
+
 class PrivateMessagePermissionBffContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.old_store = bff_server.STORE
@@ -1890,13 +2093,12 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('data-me-stat="friends"', page_me)
         self.assertIn("PAGE_CACHE_TTL_MS = 2 * 60 * 1000", app_js)
 
-    def test_voice_room_ui_is_removed_from_match_hub(self) -> None:
+    def test_voice_room_ui_is_removed_but_voice_matching_is_first_class(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
 
         for removed in (
             "语音房",
-            "语音匹配",
             "function pageRoom",
             "function roomCard",
             'data-action="room-auth"',
@@ -1907,11 +2109,26 @@ class SocialFrontendContractTests(unittest.TestCase):
             "LEGACY_MATCH_ROUTES",
         ):
             self.assertNotIn(removed, app_js)
+        for marker in (
+            'const MATCH_HUB_TABS = ["match", "voice", "bottle"]',
+            '["voice", "语音匹配"]',
+            "async function pageVoiceMatch(signal)",
+            'data-action="voice-match-start"',
+            "async function ensureVoiceCallReady",
+            "async function startRongVoiceCall",
+            'api("/api/match/voice/start"',
+            "sampleRate: 48000",
+            "registerUserInfo?.(",
+            "session.getRemoteUsers?.()",
+        ):
+            self.assertIn(marker, app_js)
 
     def test_match_page_uses_responsive_preference_workbench(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
         app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
+        index_html = (root / "bbw_web" / "static" / "index.html").read_text(encoding="utf-8")
+        bff_server_py = (root / "bbw_web" / "bff_server.py").read_text(encoding="utf-8")
         match_hub_background = root / "bbw_web" / "static" / "match-hub-bg.png"
 
         for marker in (
@@ -1921,7 +2138,9 @@ class SocialFrontendContractTests(unittest.TestCase):
             'history.pushState(null, "", matchRouteHash(activeTab))',
             'return switchMatchHubTab(tab);',
             '["match", "匹配"]',
+            '["voice", "语音匹配"]',
             '["bottle", "漂流瓶"]',
+            "async function pageVoiceMatch(signal)",
             "async function pageBottle(signal)",
             'class="match-overview"',
             'data-form="match-filter"',
@@ -1937,6 +2156,20 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn(".match-submit", app_css)
         self.assertIn(".match-hub-tabs", app_css)
         self.assertIn(".match-panel-loading", app_css)
+        self.assertIn(".voice-match-control-card", app_css)
+        self.assertIn(".voice-call-dialog", app_css)
+        self.assertIn('id="voice-call-dialog"', index_html)
+        self.assertIn('if path == "/api/match/voice/bootstrap"', bff_server_py)
+        self.assertIn('if path == "/api/match/voice/start"', bff_server_py)
+        self.assertIn('if path == "/api/match/voice/cancel"', bff_server_py)
+        self.assertIn('app.match.start_voice(id_=app.session.uid)', bff_server_py)
+        for vendor in (
+            "rong/rong-imlib-5.9.5.js",
+            "rong/rong-rtc-5.7.2.js",
+            "rong/rong-call-5.2.10.js",
+            "rong/VERSION.txt",
+        ):
+            self.assertTrue((root / "bbw_web" / "static" / "vendor" / vendor).is_file())
         self.assertIn('url("/static/match-hub-bg.png")', app_css)
         self.assertTrue(match_hub_background.is_file())
         self.assertNotIn('statCard(display.online ?? "—", "在线免费")', app_js)
@@ -2193,7 +2426,7 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('id: "social"', app_js)
         self.assertIn('const SOCIAL_TABS = ["friends", "apply", "follows", "fans", "visitors", "black"]', app_js)
         self.assertIn('name: "关系中心"', app_js)
-        self.assertIn('const MATCH_HUB_TABS = ["match", "bottle"]', app_js)
+        self.assertIn('const MATCH_HUB_TABS = ["match", "voice", "bottle"]', app_js)
         self.assertNotIn("LEGACY_MATCH_ROUTES", app_js)
         self.assertNotIn('["room", "语音房"]', app_js)
         self.assertNotIn("function pageRoom", app_js)
@@ -2203,6 +2436,12 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("function socialRouteHash", app_js)
         self.assertIn(".nav-children", app_css)
         self.assertIn(".relationship-tabs", app_css)
+        self.assertIn("function friendApplicationsHtml(envelope)", app_js)
+        self.assertIn("function friendApplicationDirection(item)", app_js)
+        self.assertIn('direction === "incoming" && status === "pending"', app_js)
+        self.assertIn('await switchSocialTab("apply", { force: true })', app_js)
+        self.assertIn(".friend-application-groups", app_css)
+        self.assertIn(".friend-application-status--accepted", app_css)
         self.assertNotIn("更多服务", index_html)
         self.assertIn('id="tools-nav-section"', index_html)
         self.assertNotIn('data-route="friends"', app_js)

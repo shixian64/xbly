@@ -79,7 +79,10 @@ python -m bbw_web --port 8765
 | API | 作用 |
 |---|---|
 | `GET /api/im/tim` | 产品模式下返回受控能力说明，不向浏览器暴露宽泛凭证 |
-| `GET /api/im/rong` | 产品模式下返回受控能力说明 |
+| `GET /api/im/rong` | 产品模式下继续禁止通用 IM 凭证下发 |
+| `POST /api/match/voice/bootstrap` | 仅为一对一语音匹配下发当前用户的融云连接凭证 |
+| `POST /api/match/voice/start` | 调用 APK 同款 `xiaobeiMatchNew(type=语音)` |
+| `POST /api/match/voice/cancel` | 尝试移出语音匹配等待队列 |
 | `POST /api/face/init` | 需 SDK `meta_info` |
 | `GET /api/wallet` | 返回余额、礼物背包和服务端会员状态；会员字段只读 |
 

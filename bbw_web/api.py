@@ -601,6 +601,7 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
     message_policy_paths = {
         "/api/match/online",
         "/api/match/local",
+        "/api/match/voice/start",
         "/api/im/conversations",
         "/api/im/rest/send",
         "/api/im/flash/send",
@@ -618,7 +619,7 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
         except Exception:
             LOGGER.exception("message policy response persistence failed")
             if (
-                path in {"/api/match/online", "/api/match/local"}
+                path in {"/api/match/online", "/api/match/local", "/api/match/voice/start"}
                 and status < 400
                 and response_data.get("ok") is True
             ):

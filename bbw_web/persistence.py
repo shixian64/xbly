@@ -1102,6 +1102,7 @@ class RuntimePersistence:
         if method_upper == "POST" and path in {
             "/api/match/online",
             "/api/match/local",
+            "/api/match/voice/start",
         }:
             peers = [_item_peer_uid(item) for item in _response_items(response_data)]
             return self.grant_message_peers(

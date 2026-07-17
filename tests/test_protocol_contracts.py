@@ -327,14 +327,40 @@ class NormalizerContractTests(unittest.TestCase):
         self.assertTrue(application["request_status_known"])
         self.assertTrue(application["is_pending"])
         self.assertFalse(application["is_accepted"])
+        self.assertEqual(application["direction"], "incoming")
+        self.assertEqual(application["status"], "pending")
+        self.assertEqual(application["status_label"], "等待你处理")
+        self.assertTrue(application["can_accept"])
+
+        outgoing_application = normalize_friend_applications(
+            [
+                {
+                    "id": "apply-2",
+                    "myid": "9",
+                    "yourid": "10001",
+                    "agree": "0",
+                    "yourleavewords": "你好",
+                    "time": "1710000000",
+                    "userInfoList": {"id": "9", "nickname": "申请目标"},
+                }
+            ],
+            current_uid="10001",
+        )[0]
+        self.assertEqual(outgoing_application["id"], "9")
+        self.assertEqual(outgoing_application["direction"], "outgoing")
+        self.assertEqual(outgoing_application["status"], "pending")
+        self.assertEqual(outgoing_application["status_label"], "等待对方同意")
+        self.assertFalse(outgoing_application["can_accept"])
+        self.assertEqual(outgoing_application["leave_words"], "你好")
 
         accepted_application = normalize_friend_applications(
             [
                 {
-                    "id": "apply-2",
-                    "uid": "10001",
-                    "friendid": "10",
+                    "id": "apply-3",
+                    "myid": "10001",
+                    "yourid": "9",
                     "agree": "1",
+                    "userInfoList": {"id": "9", "nickname": "已添加用户"},
                 }
             ],
             current_uid="10001",
@@ -342,6 +368,10 @@ class NormalizerContractTests(unittest.TestCase):
         self.assertEqual(accepted_application["request_status"], "accepted")
         self.assertFalse(accepted_application["is_pending"])
         self.assertTrue(accepted_application["is_accepted"])
+        self.assertEqual(accepted_application["direction"], "incoming")
+        self.assertEqual(accepted_application["status"], "accepted")
+        self.assertEqual(accepted_application["status_label"], "已成为好友")
+        self.assertFalse(accepted_application["can_accept"])
 
         friend = normalize_friends(
             [
@@ -480,6 +510,18 @@ class SocialAndImRoutingContractTests(unittest.TestCase):
             self.calls.append((url, body, kwargs))
             return SimpleNamespace(ok=True)
 
+        def call_url(self, url, params=None, **kwargs):
+            body = dict(params or {})
+            body.update(kwargs)
+            self.calls.append((url, body))
+            return SimpleNamespace(ok=True)
+
+        def call_redis(self, action, params=None, **kwargs):
+            body = dict(params or {})
+            body.update(kwargs)
+            self.calls.append((action, body))
+            return SimpleNamespace(ok=True)
+
     def test_friend_and_visit_actions_match_apk_v154(self) -> None:
         client = self.FakeClient()
         api = SocialAPI(client)
@@ -557,6 +599,36 @@ class SocialAndImRoutingContractTests(unittest.TestCase):
         client = self.FakeClient()
         MatchAPI(client).set_filter("女")
         self.assertEqual(client.calls, [("resetMatch", {"id": "42", "value": "女"})])
+
+    def test_rong_register_uses_apk_case_sensitive_user_id_field(self) -> None:
+        client = self.FakeClient()
+        ImAPI(client).rong_register()
+        _url, body = client.calls[0]
+        self.assertEqual(body["userID"], "42")
+        self.assertNotIn("userId", body)
+
+    def test_voice_match_uses_apk_redis_action_and_literal_type(self) -> None:
+        client = self.FakeClient()
+        api = MatchAPI(client)
+        api.start_voice()
+        api.cancel_voice()
+        self.assertEqual(
+            client.calls,
+            [
+                ("xiaobeiMatchNew", {"id": "42", "type": "语音"}),
+                ("removeXiaobeiMatch", {"id": "42", "type": "语音"}),
+            ],
+        )
+
+    def test_voice_match_response_normalizes_wait_false_and_user(self) -> None:
+        waiting = ApiResult(True, 200, "wait", data="wait", kind="text")
+        insufficient = ApiResult(False, 200, "false", data="false", kind="text")
+        matched = ApiResult(True, 200, '{"id":"9","nickname":"Peer"}', data={"id": "9", "nickname": "Peer"})
+        self.assertEqual(MatchAPI.normalize_voice_result(waiting)["outcome"], "waiting")
+        self.assertEqual(MatchAPI.normalize_voice_result(insufficient)["outcome"], "insufficient")
+        normalized = MatchAPI.normalize_voice_result(matched)
+        self.assertEqual(normalized["outcome"], "matched")
+        self.assertEqual(normalized["target"]["id"], "9")
 
     def test_bottle_creation_and_rethrow_keep_distinct_apk_actions(self) -> None:
         client = self.FakeClient()

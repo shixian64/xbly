@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#f8f5ff" />
   <meta name="color-scheme" content="light" />
   <title>XBLY</title>
-  <link rel="stylesheet" href="/static/app.css?v=20260716-mobile-media-retry-secure-viewport-no-text-icons-match-voice-tabs-adaptive-sidebar-message-list-avatar-clean-message-header-message-time-fix-scrollbar-component-csp-avatar-events-message-wide-partial-match-tabs-tim-profile-avatar-zh-ui-partial-social-moments-tabs-feed-fix2-invite-archive-secure-logout-turnstile-message-bootstrap-profile-moments-compact-cards-two-step-login-match-pool-permission-auth-bootstrap-wechat-composer-keyboard-responsive-nav-exclusive-mine-subnav-private-message-policy-moment-video-compat-message-header-compact-list-read-action-h264-fallback-no-original-entry-no-menu-intro-presence-action-mine-partial-tabs-stable-no-duplicate-moments-profile-user-results-optimistic-text-send-match-bottle-tabs-no-commerce-server-membership-nearby-discovery-comment-avatar-profile-hide-default-moment-badges" />
+  <link rel="stylesheet" href="/static/app.css?v=20260716-mobile-media-retry-secure-viewport-no-text-icons-match-voice-tabs-adaptive-sidebar-message-list-avatar-clean-message-header-message-time-fix-scrollbar-component-csp-avatar-events-message-wide-partial-match-tabs-tim-profile-avatar-zh-ui-partial-social-moments-tabs-feed-fix2-invite-archive-secure-logout-turnstile-message-bootstrap-profile-moments-compact-cards-two-step-login-match-pool-permission-auth-bootstrap-wechat-composer-keyboard-responsive-nav-exclusive-mine-subnav-private-message-policy-moment-video-compat-message-header-compact-list-read-action-h264-fallback-no-original-entry-no-menu-intro-presence-action-mine-partial-tabs-stable-no-duplicate-moments-profile-user-results-optimistic-text-send-match-bottle-tabs-no-commerce-server-membership-nearby-discovery-comment-avatar-profile-hide-default-moment-badges-voice-match-rong-call" />
 </head>
 <body>
   <div id="toast" class="toast hide" role="status" aria-live="polite" aria-atomic="true"></div>
@@ -133,7 +133,23 @@
     <div id="profile-dialog-body" class="profile-dialog-body ui-scrollbar"></div>
   </dialog>
 
+  <dialog id="voice-call-dialog" class="voice-call-dialog" aria-labelledby="voice-call-title" aria-describedby="voice-call-status">
+    <div class="voice-call-dialog-body">
+      <span class="voice-call-kicker">一对一语音</span>
+      <h2 id="voice-call-title">语音通话</h2>
+      <strong id="voice-call-peer">对方</strong>
+      <p id="voice-call-status">等待通话状态</p>
+      <time id="voice-call-duration" datetime="PT0S">00:00</time>
+      <div class="voice-call-actions">
+        <button type="button" class="btn primary" data-action="voice-call-accept" hidden>接听</button>
+        <button type="button" class="btn soft" data-action="voice-call-reject" hidden>拒绝</button>
+        <button type="button" class="btn secondary" data-action="voice-call-mute" aria-pressed="false" hidden>静音</button>
+        <button type="button" class="btn danger" data-action="voice-call-hangup" hidden>挂断</button>
+      </div>
+    </div>
+  </dialog>
+
   <!-- Message services initialize in the background after authentication so unread state is ready on every route. -->
-  <script src="/static/app.js?v=20260716-mobile-media-retry-secure-viewport-no-text-icons-match-voice-tabs-adaptive-sidebar-message-list-avatar-clean-message-header-message-time-fix-scrollbar-component-csp-avatar-events-message-wide-partial-match-tabs-tim-profile-avatar-zh-ui-partial-social-moments-tabs-feed-fix2-invite-archive-secure-logout-turnstile-message-bootstrap-profile-moments-compact-cards-two-step-login-match-pool-permission-auth-bootstrap-wechat-composer-keyboard-responsive-nav-exclusive-mine-subnav-private-message-policy-moment-video-compat-message-header-compact-list-read-action-h264-fallback-no-original-entry-no-menu-intro-presence-action-mine-partial-tabs-stable-no-duplicate-moments-profile-user-results-optimistic-text-send-match-bottle-tabs-no-commerce-server-membership-nearby-discovery-comment-avatar-profile-hide-default-moment-badges"></script>
+  <script src="/static/app.js?v=20260716-mobile-media-retry-secure-viewport-no-text-icons-match-voice-tabs-adaptive-sidebar-message-list-avatar-clean-message-header-message-time-fix-scrollbar-component-csp-avatar-events-message-wide-partial-match-tabs-tim-profile-avatar-zh-ui-partial-social-moments-tabs-feed-fix2-invite-archive-secure-logout-turnstile-message-bootstrap-profile-moments-compact-cards-two-step-login-match-pool-permission-auth-bootstrap-wechat-composer-keyboard-responsive-nav-exclusive-mine-subnav-private-message-policy-moment-video-compat-message-header-compact-list-read-action-h264-fallback-no-original-entry-no-menu-intro-presence-action-mine-partial-tabs-stable-no-duplicate-moments-profile-user-results-optimistic-text-send-match-bottle-tabs-no-commerce-server-membership-nearby-discovery-comment-avatar-profile-hide-default-moment-badges-voice-match-rong-call"></script>
 </body>
 </html>

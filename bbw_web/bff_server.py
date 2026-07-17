@@ -62,6 +62,13 @@ RECENT_MUTATIONS: Dict[str, float] = {}
 FINANCIAL_PATHS = {
     "/api/wallet/withdraw",
 }
+VOICE_MATCH_ACTIVE_TTL_SEC = 10 * 60.0
+VOICE_RONG_CREDENTIAL_TTL_SEC = 6 * 60 * 60.0
+VOICE_WEB_SDK = {
+    "imlib": "5.9.5",
+    "rtc": "5.7.2",
+    "call": "5.2.10",
+}
 
 
 class RequestBodyError(ValueError):
@@ -109,6 +116,70 @@ def _mutation_allowed(sid: str, path: str, data: Dict[str, Any], window_sec: flo
             return False
         RECENT_MUTATIONS[digest] = now
         return True
+
+
+def _voice_match_state(user: Any) -> Dict[str, Any]:
+    value = getattr(user, "voice_match_state", None)
+    if not isinstance(value, dict):
+        value = {}
+        setattr(user, "voice_match_state", value)
+    state = str(value.get("state") or "idle")
+    started_at = float(value.get("started_at") or 0.0)
+    active = state in {"waiting", "matched", "calling"}
+    stale = bool(active and started_at and time.time() - started_at >= VOICE_MATCH_ACTIVE_TTL_SEC)
+    return {
+        "state": "stale" if stale else state,
+        "active": active and not stale,
+        "stale": stale,
+        "target": value.get("target") if isinstance(value.get("target"), dict) else None,
+        "started_at": started_at,
+        "updated_at": float(value.get("updated_at") or started_at or 0.0),
+    }
+
+
+def _set_voice_match_state(
+    user: Any,
+    state: str,
+    *,
+    target: Optional[Dict[str, Any]] = None,
+    preserve_started: bool = False,
+) -> Dict[str, Any]:
+    previous = getattr(user, "voice_match_state", None)
+    previous = previous if isinstance(previous, dict) else {}
+    now = time.time()
+    started_at = float(previous.get("started_at") or 0.0) if preserve_started else now
+    if state == "idle":
+        started_at = 0.0
+    value = {
+        "state": state,
+        "target": dict(target) if isinstance(target, dict) else None,
+        "started_at": started_at,
+        "updated_at": now,
+    }
+    setattr(user, "voice_match_state", value)
+    return _voice_match_state(user)
+
+
+def _voice_rong_credentials(user: Any) -> Optional[Dict[str, str]]:
+    value = getattr(user, "voice_rong_credentials", None)
+    created_at = float(getattr(user, "voice_rong_credentials_at", 0.0) or 0.0)
+    session = getattr(getattr(user, "app", None), "session", None)
+    current_uid = str(getattr(session, "uid", "") or "").strip()
+    if (
+        not isinstance(value, dict)
+        or not value.get("token")
+        or str(value.get("user_id") or "") != current_uid
+        or not created_at
+        or time.time() - created_at >= VOICE_RONG_CREDENTIAL_TTL_SEC
+    ):
+        return None
+    return {
+        "app_key": str(value.get("app_key") or ""),
+        "user_id": current_uid,
+        "token": str(value.get("token") or ""),
+        "nickname": str(value.get("nickname") or ""),
+        "portrait": str(value.get("portrait") or ""),
+    }
 
 
 def _json_bytes(obj: Any, status: int = 200) -> Tuple[int, bytes, str]:
@@ -320,9 +391,25 @@ def _friend_applications(
         "next_page": next_page,
         "has_more": bool(next_page),
         "scanned_pages": scanned_pages,
-        "count": len(normalized),
+        **_friend_application_counts(normalized),
     }
+    metadata["count"] = metadata["pending_incoming_count"]
     return primary, normalized, metadata
+
+
+def _friend_application_counts(items: List[Dict[str, Any]]) -> Dict[str, int]:
+    incoming = [item for item in items if item.get("direction") == "incoming"]
+    outgoing = [item for item in items if item.get("direction") == "outgoing"]
+    pending = [item for item in items if item.get("status") == "pending"]
+    pending_incoming = [item for item in incoming if item.get("status") == "pending"]
+    accepted = [item for item in items if item.get("status") == "accepted"]
+    return {
+        "incoming_count": len(incoming),
+        "outgoing_count": len(outgoing),
+        "pending_count": len(pending),
+        "pending_incoming_count": len(pending_incoming),
+        "accepted_count": len(accepted),
+    }
 
 
 def _presence_uids(values: Any, limit: int = 100) -> List[str]:
@@ -1816,6 +1903,16 @@ class Handler(BaseHTTPRequestHandler):
                     "nums_ok": nums.ok,
                 }
             )
+        if path == "/api/match/voice/status":
+            return self.ok(
+                {
+                    "ok": True,
+                    **_voice_match_state(u),
+                    "credential_ready": _voice_rong_credentials(u) is not None,
+                    "sdk": dict(VOICE_WEB_SDK),
+                    "capabilities": Handler.web_user_capabilities(self, u),
+                }
+            )
         if path in {"/api/match/online-users", "/api/match/nearby-users"}:
             capabilities = Handler.web_user_capabilities(self, u)
             gender = _discovery_gender(q("gender", "不限"))
@@ -2375,8 +2472,12 @@ class Handler(BaseHTTPRequestHandler):
                         app, current_uid
                     )
                     pending = any(
-                        str(item.get("id") or "") == applicant_uid
-                        or str(item.get("apply_id") or "") == apply_id
+                        (
+                            str(item.get("id") or "") == applicant_uid
+                            or str(item.get("apply_id") or "") == apply_id
+                        )
+                        and item.get("direction") == "incoming"
+                        and item.get("status") == "pending"
                         for item in remaining
                     )
                     if not pending:
@@ -2384,6 +2485,7 @@ class Handler(BaseHTTPRequestHandler):
                         break
                 payload = R(result)
                 payload["verified"] = verified
+                payload["application_status"] = "accepted" if verified else "pending"
                 if verified:
                     payload.update(ok=True, message="已同意好友申请", error=None)
                 elif getattr(result, "ok", False):
@@ -2737,6 +2839,228 @@ class Handler(BaseHTTPRequestHandler):
                 return self.ok(R(app.profile.set_privacy(**_params(data))))
 
             # match
+            if path == "/api/match/voice/bootstrap":
+                credentials = _voice_rong_credentials(u)
+                if credentials is None:
+                    issued = u.native.im.rong_register()
+                    token = str(getattr(issued, "token", "") or "").strip()
+                    issued_uid = str(getattr(issued, "user_id", "") or app.session.uid or "").strip()
+                    if not bool(getattr(issued, "ok", False)) or token in {
+                        "",
+                        "123",
+                        "null",
+                        "None",
+                    }:
+                        return self.ok(
+                            {
+                                "ok": False,
+                                "code": "VOICE_RONG_TOKEN_UNAVAILABLE",
+                                "error": "语音服务身份暂时不可用，请稍后重试",
+                                "sdk": dict(VOICE_WEB_SDK),
+                            },
+                            503,
+                        )
+                    if issued_uid != str(app.session.uid or ""):
+                        return self.ok(
+                            {
+                                "ok": False,
+                                "code": "VOICE_RONG_USER_MISMATCH",
+                                "error": "语音服务身份与当前账号不一致，请重新登录",
+                            },
+                            409,
+                        )
+                    credentials = {
+                        "app_key": str(getattr(issued, "app_key", "") or ""),
+                        "user_id": issued_uid,
+                        "token": token,
+                        "nickname": str(getattr(issued, "nickname", "") or ""),
+                        "portrait": str(getattr(issued, "portrait", "") or ""),
+                    }
+                    setattr(u, "voice_rong_credentials", dict(credentials))
+                    setattr(u, "voice_rong_credentials_at", time.time())
+                return self.ok(
+                    {
+                        "ok": True,
+                        "credentials": {
+                            "appKey": credentials["app_key"],
+                            "userId": credentials["user_id"],
+                            "token": credentials["token"],
+                            "nickname": credentials["nickname"],
+                            "portrait": credentials["portrait"],
+                        },
+                        "sdk": dict(VOICE_WEB_SDK),
+                    }
+                )
+            if path == "/api/match/voice/start":
+                if _voice_rong_credentials(u) is None:
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "code": "VOICE_SERVICE_NOT_READY",
+                            "error": "请先连接语音服务，再开始匹配",
+                        },
+                        409,
+                    )
+                with u.lock:
+                    current = _voice_match_state(u)
+                    if current["stale"]:
+                        return self.ok(
+                            {
+                                "ok": False,
+                                "code": "VOICE_MATCH_STALE_REQUIRES_CANCEL",
+                                "error": "上次语音匹配状态已超时，请先取消后再重新开始",
+                                **current,
+                            },
+                            409,
+                        )
+                    if current["active"]:
+                        return self.ok(
+                            {
+                                "ok": False,
+                                "code": "VOICE_MATCH_ALREADY_ACTIVE",
+                                "error": "当前已有进行中的语音匹配",
+                                **current,
+                            },
+                            409,
+                        )
+                    _set_voice_match_state(u, "calling")
+                try:
+                    result = app.match.start_voice(id_=app.session.uid)
+                except Exception:
+                    with u.lock:
+                        _set_voice_match_state(u, "idle")
+                    raise
+                normalized = app.match.normalize_voice_result(result)
+                outcome = str(normalized.get("outcome") or "error")
+                if outcome == "insufficient":
+                    with u.lock:
+                        state = _set_voice_match_state(u, "idle")
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "code": "VOICE_MATCH_QUOTA_REQUIRED",
+                            "error": "语音匹配次数或匹配卡不足",
+                            "outcome": outcome,
+                            **state,
+                        },
+                        409,
+                    )
+                if outcome == "waiting":
+                    with u.lock:
+                        state = _set_voice_match_state(u, "waiting")
+                    return self.ok(
+                        {
+                            "ok": True,
+                            "outcome": outcome,
+                            "message": "正在等待另一位用户加入",
+                            **state,
+                        }
+                    )
+                if outcome == "matched":
+                    target_raw = normalized.get("target")
+                    target = N.normalize_user(target_raw) or {}
+                    target_id = str(
+                        target.get("id")
+                        or (target_raw or {}).get("id")
+                        or (target_raw or {}).get("uid")
+                        or (target_raw or {}).get("userId")
+                        or ""
+                    ).strip()
+                    if not target_id:
+                        with u.lock:
+                            _set_voice_match_state(u, "idle")
+                        return self.ok(
+                            {
+                                "ok": False,
+                                "code": "VOICE_MATCH_TARGET_INVALID",
+                                "error": "匹配结果缺少用户信息，请稍后重试",
+                            },
+                            502,
+                        )
+                    target["id"] = target_id
+                    target.setdefault("uid", target_id)
+                    with u.lock:
+                        state = _set_voice_match_state(u, "matched", target=target)
+                        match_peers = getattr(u, "match_message_peers", None)
+                        if match_peers is None:
+                            match_peers = set()
+                            setattr(u, "match_message_peers", match_peers)
+                        match_peers.add(target_id)
+                    return self.ok(
+                        {
+                            "ok": True,
+                            "outcome": outcome,
+                            "message": "已匹配到用户，正在发起语音通话",
+                            "target": target,
+                            "items": [target],
+                            "count": 1,
+                            **state,
+                        }
+                    )
+                with u.lock:
+                    _set_voice_match_state(u, "idle")
+                return self.ok(
+                    {
+                        "ok": False,
+                        "code": "VOICE_MATCH_RESPONSE_INVALID",
+                        "error": "语音匹配返回了无法识别的结果，请稍后重试",
+                    },
+                    502,
+                )
+            if path == "/api/match/voice/cancel":
+                # A returned match is no longer in the Redis waiting queue.
+                # Clearing that local target must therefore not depend on
+                # removeXiaobeiMatch returning success (the APK does not call
+                # remove after receiving a user either).  Keeping it blocked
+                # on a false remove response would prevent all later matches.
+                with u.lock:
+                    stored = getattr(u, "voice_match_state", None)
+                    stored_state = (
+                        str(stored.get("state") or "idle")
+                        if isinstance(stored, dict)
+                        else "idle"
+                    )
+                    if stored_state in {"idle", "matched"}:
+                        state = _set_voice_match_state(u, "idle")
+                        return self.ok(
+                            {
+                                "ok": True,
+                                "code": "",
+                                "message": (
+                                    "已放弃当前匹配用户"
+                                    if stored_state == "matched"
+                                    else "当前没有等待中的语音匹配"
+                                ),
+                                "error": None,
+                                "remote_ok": True,
+                                "remote_required": False,
+                                **state,
+                            }
+                        )
+                result = app.match.cancel_voice(id_=app.session.uid)
+                remote = R(result, empty_ok=True)
+                with u.lock:
+                    state = (
+                        _set_voice_match_state(u, "idle")
+                        if remote.get("ok")
+                        else _voice_match_state(u)
+                    )
+                return self.ok(
+                    {
+                        "ok": bool(remote.get("ok")),
+                        "code": str(remote.get("code") or ""),
+                        "message": "已取消语音匹配" if remote.get("ok") else "本地等待已结束，但服务端取消状态未确认",
+                        "error": None if remote.get("ok") else "服务端取消状态未确认，请留意后续来电",
+                        "remote_ok": bool(remote.get("ok")),
+                        "remote_required": True,
+                        **state,
+                    },
+                    200 if remote.get("ok") else 502,
+                )
+            if path == "/api/match/voice/finish":
+                with u.lock:
+                    state = _set_voice_match_state(u, "idle")
+                return self.ok({"ok": True, "message": "语音通话状态已结束", **state})
             if path in {"/api/match/online", "/api/match/local"}:
                 raw_user = getattr(app.session, "raw_user", {}) or {}
                 if not isinstance(raw_user, dict):
@@ -3169,6 +3493,7 @@ def _web_user_capabilities(
     )
     return {
         "match_pool_online_list": True,
+        "voice_match": True,
         "proactive_private_message": enabled,
         "direct_im_credentials": False,
         "nearby_custom_city": (
@@ -3187,11 +3512,10 @@ def _features() -> List[Dict[str, str]]:
 FEATURES: List[Dict[str, str]] = [
     {"id": "nearby", "name": "身边", "desc": "在线用户、资料与好友申请"},
     {"id": "msg", "name": "消息", "desc": "历史会话、未读数与受控实时聊天"},
-    {"id": "match", "name": "匹配", "desc": "在线同城、漂流瓶与约会"},
+    {"id": "match", "name": "匹配", "desc": "在线同城、语音匹配、漂流瓶与约会"},
     {"id": "moments", "name": "动态", "desc": "多分类动态流、点赞与评论"},
     {"id": "me", "name": "我的", "desc": "关系统计、资料、实名与设置"},
     {"id": "social", "name": "关系中心", "desc": "通讯录、申请、关注、粉丝、访客与黑名单"},
-    {"id": "room", "name": "语音房", "desc": "旧版榜单、客户端房间列表与接口状态"},
     {"id": "wallet", "name": "资产与权益", "desc": "余额、提现、礼物背包与服务端会员权益"},
     {"id": "tasks", "name": "任务与奖励", "desc": "任务列表与奖励领取"},
     {"id": "lab", "name": "协议台", "desc": "非商业 do= 调用"},

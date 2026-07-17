@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import json
+from typing import Any, Dict, Optional
 
 from ..client import ApiResult, ProtocolClient
 
@@ -17,6 +18,65 @@ class MatchAPI:
             id=id_ or self.c.session.uid,
             type=type_,
         )
+
+    def start_voice(self, id_: Optional[str] = None) -> ApiResult:
+        """Start the APK-compatible one-to-one audio match.
+
+        The native client posts the literal Chinese value ``语音`` to the
+        Redis-backed ``xiaobeiMatchNew`` action.  A successful response is
+        either ``wait`` or one matched user's JSON object.
+        """
+        return self.c.call_redis(
+            "xiaobeiMatchNew",
+            id=id_ or self.c.session.uid,
+            type="语音",
+        )
+
+    def cancel_voice(self, id_: Optional[str] = None) -> ApiResult:
+        """Best-effort removal from the native voice matching queue."""
+        return self.remove("语音", id_=id_)
+
+    @staticmethod
+    def normalize_voice_result(result: ApiResult) -> Dict[str, Any]:
+        """Classify the three APK response branches without leaking raw data."""
+        value: Any = getattr(result, "data", None)
+        if isinstance(value, str):
+            text = value.strip()
+            lowered = text.lower()
+            if lowered == "wait":
+                return {"outcome": "waiting", "target": None}
+            if lowered in {"false", "no", "null", "none", ""}:
+                return {"outcome": "insufficient", "target": None}
+            if text[:1] in "[{":
+                try:
+                    value = json.loads(text)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return {"outcome": "error", "target": None}
+
+        if isinstance(value, list):
+            value = next((item for item in value if isinstance(item, dict)), None)
+        if isinstance(value, dict):
+            nested = value.get("data")
+            if isinstance(nested, dict) and not any(
+                key in value for key in ("id", "uid", "userId", "userID")
+            ):
+                value = nested
+            target_id = str(
+                value.get("id")
+                or value.get("uid")
+                or value.get("userId")
+                or value.get("userID")
+                or ""
+            ).strip()
+            if target_id:
+                return {"outcome": "matched", "target": value}
+
+        raw = str(getattr(result, "raw", "") or "").strip().lower()
+        if raw == "wait":
+            return {"outcome": "waiting", "target": None}
+        if raw in {"false", "no", "null", "none", ""}:
+            return {"outcome": "insufficient", "target": None}
+        return {"outcome": "error", "target": None}
 
     def online_users(self, **params: Any) -> ApiResult:
         return self.c.call("getOnlineMatchUser", params)

@@ -107,6 +107,11 @@ class WebUser:
     nearby_custom_city_enabled: bool = False
     match_message_peers: set[str] = field(default_factory=set, repr=False)
     conversation_message_peers: set[str] = field(default_factory=set, repr=False)
+    # Voice matching and Rong credentials are intentionally session-memory
+    # only.  They must never be written into persisted browser sessions.
+    voice_match_state: Dict[str, Any] = field(default_factory=dict, repr=False)
+    voice_rong_credentials: Optional[Dict[str, str]] = field(default=None, repr=False)
+    voice_rong_credentials_at: float = field(default=0.0, repr=False)
     pending_until: Optional[float] = field(default=None, repr=False)
     profile_cache: Dict[str, tuple[float, Optional[Dict[str, Any]]]] = field(
         default_factory=dict,

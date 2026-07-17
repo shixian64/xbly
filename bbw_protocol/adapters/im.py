@@ -192,7 +192,14 @@ class ImAdapter:
                 token = nested.get("token") or nested.get("Token") or ""
             elif not token and isinstance(nested, str):
                 token = nested
-            uid = str(data.get("userId") or data.get("user_id") or uid)
+            uid = str(data.get("userID") or data.get("userId") or data.get("user_id") or uid)
+            if isinstance(nested, dict):
+                uid = str(
+                    nested.get("userID")
+                    or nested.get("userId")
+                    or nested.get("user_id")
+                    or uid
+                )
         if not token and r.raw:
             # sometimes plain token
             t = r.raw.strip()

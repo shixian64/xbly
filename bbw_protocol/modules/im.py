@@ -27,7 +27,10 @@ class ImAPI:
     ) -> ApiResult:
         return self.c.call_url(
             RONG_REGISTER,
-            userId=user_id or self.c.session.uid,
+            # The APK posts the case-sensitive PHP field ``userID``.  Using
+            # ``userId`` falls through to the upstream demo endpoint's stub
+            # response (observed as {"token":"123"}).
+            userID=user_id or self.c.session.uid,
             userNickName=nickname or self.c.session.nickname or "user",
             userPortrait=portrait or self.c.session.portrait or "",
         )
