@@ -1196,6 +1196,11 @@ h3 {
   padding: 0.65rem 0.8rem;
 }
 
+.admin-global-search .admin-button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .admin-global-search input:focus {
   border-color: var(--admin-primary);
   background: #ffffff;
@@ -1735,6 +1740,14 @@ h3 {
   background: #f5f7fc;
 }
 
+.admin-table .admin-button {
+  white-space: nowrap;
+}
+
+.admin-status {
+  justify-self: start;
+}
+
 .admin-table-primary {
   display: block;
   color: var(--admin-text);
@@ -1767,6 +1780,7 @@ h3 {
   background: #f2f5fb;
   box-shadow: var(--admin-shadow-soft);
   padding: clamp(0.85rem, 2vw, 1.2rem);
+  scroll-margin-top: 108px;
 }
 
 .admin-detail-header {
@@ -2076,6 +2090,10 @@ body.admin-navigation-open {
     min-height: calc(100vh - 154px);
     max-height: calc(100vh - 154px);
   }
+
+  .admin-user-detail {
+    scroll-margin-top: 170px;
+  }
 }
 
 @media (max-width: 1100px) {
@@ -2185,6 +2203,10 @@ body.admin-navigation-open {
 
   .admin-content {
     padding: 1rem;
+  }
+
+  .admin-user-detail {
+    scroll-margin-top: 190px;
   }
 
   .admin-context-bar {
@@ -2344,11 +2366,15 @@ body.admin-navigation-open {
     padding-top: calc(1.75rem + var(--admin-safe-top));
   }
 
-  .admin-login-capabilities,
+  .admin-login-capabilities {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-metric-grid,
   .admin-data-metric-grid,
   .admin-quick-actions,
   .admin-detail-metric-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .admin-topbar {
