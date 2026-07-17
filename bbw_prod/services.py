@@ -496,7 +496,7 @@ class LoginAccountService:
                 user.id,
                 existing.id,
                 None,
-                bool(self.settings.invite_required),
+                False,
             )
         return LoginPrecheck(
             digest,

@@ -546,6 +546,11 @@ class RuntimePersistence:
                 display_name=str(upstream.nickname or "") or None,
                 profile=_sanitize_profile(dict(upstream.raw_user or {})),
                 device_data=self._device_data(web_user),
+                require_invite=(
+                    login_context.requires_invite
+                    if login_context is not None
+                    else True
+                ),
             )
             sessions = UserSessionService(
                 db, self.redis, self.settings, self.session_hmac_key

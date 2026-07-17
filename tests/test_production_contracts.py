@@ -263,9 +263,11 @@ class ProductionContractTests(unittest.TestCase):
         credential_precheck = services.split("def precheck_credentials", 1)[1].split(
             "def precheck", 1
         )[0]
-        self.assertGreaterEqual(
-            credential_precheck.count("bool(self.settings.invite_required)"), 2
+        self.assertEqual(
+            credential_precheck.count("bool(self.settings.invite_required)"), 1
         )
+        self.assertIn("existing.id,\n                None,\n                False", credential_precheck)
+        self.assertIn("login_context.requires_invite", persistence)
         existing_completion = services.split("if by_phone is not None:", 1)[1].split(
             "if by_uid is not None:", 1
         )[0]
