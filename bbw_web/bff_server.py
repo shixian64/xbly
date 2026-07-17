@@ -1505,13 +1505,9 @@ class Handler(BaseHTTPRequestHandler):
                     )
             except Exception as e:
                 return self.ok({"ok": False, "error": _safe_error(e, "登录失败")}, 400)
-            profile_result = None
-            try:
-                bootstrap_result = user.app.bootstrap()
-                profile_result = bootstrap_result.get("me")
-            except Exception:
-                pass
-            _enrich_session_profile(user, profile_result)
+            # Login response latency must depend only on authentication and
+            # durable session persistence.  Home/profile/IM data is loaded by
+            # the product routes after the browser enters the application.
             return self.ok({"ok": True, **user.public()}, set_cookie=user.web_sid)
 
         if path == "/api/auth/logout":
@@ -1576,7 +1572,6 @@ class Handler(BaseHTTPRequestHandler):
                             400,
                         )
                     user.app.session.password = ""
-                    _enrich_session_profile(user)
                     STORE.rotate_sid(user)
                     user.persist()
                     if STORE.auto_heartbeat:

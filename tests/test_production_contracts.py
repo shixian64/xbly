@@ -317,6 +317,18 @@ class ProductionContractTests(unittest.TestCase):
         self.assertLess(add_user, flush_user)
         self.assertLess(flush_user, add_account)
 
+    def test_product_login_does_not_wait_for_bootstrap_requests(self) -> None:
+        source = self.read("bbw_web/bff_server.py")
+        password_login = source.split('if path == "/api/auth/login":', 1)[1].split(
+            'if path == "/api/auth/logout":', 1
+        )[0]
+        sms_login = source.split('if path == "/api/auth/sms-login":', 1)[1].split(
+            'if path == "/api/auth/password":', 1
+        )[0]
+        self.assertNotIn("app.bootstrap()", password_login)
+        self.assertNotIn("_enrich_session_profile", password_login)
+        self.assertNotIn("_enrich_session_profile", sms_login)
+
     def test_raw_payload_redaction_handles_camel_case_nested_json_and_urls(self) -> None:
         try:
             import cryptography  # noqa: F401
