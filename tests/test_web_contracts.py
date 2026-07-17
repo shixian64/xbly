@@ -311,6 +311,7 @@ class BffEnvelopeTests(unittest.TestCase):
                 {
                     "content": "你好",
                     "msgTimestamp": "1710000000",
+                    "unreadCount": "3",
                     "userInfoList": {"id": "9", "nickname": "N"},
                 }
             ],
@@ -319,8 +320,9 @@ class BffEnvelopeTests(unittest.TestCase):
         self.assertEqual(payload["entity"], "conversation")
         self.assertEqual(payload["items"][0]["peer_id"], "9")
         self.assertEqual(payload["items"][0]["last_message"], "你好")
+        self.assertEqual(payload["items"][0]["unread_count"], 3)
 
-    def test_conversation_list_enriches_and_caches_missing_peer_avatar(self) -> None:
+    def test_conversation_list_does_not_fetch_missing_peer_profiles(self) -> None:
         calls = []
 
         def get_user(uid: str) -> ApiResult:
@@ -351,37 +353,18 @@ class BffEnvelopeTests(unittest.TestCase):
                 }
             ],
         )
-        cache = {}
+        item = conversation_envelope(app, result, {})["items"][0]
+        self.assertEqual(item["peer_id"], "9")
+        self.assertEqual(item["avatar"], "")
+        self.assertEqual(item["nickname"], "9")
+        self.assertEqual(calls, [])
 
-        first = conversation_envelope(app, result, cache)
-        second = conversation_envelope(app, result, cache)
+    def test_conversation_list_uses_fresh_cached_peer_profile(self) -> None:
+        calls = []
 
-        self.assertEqual(
-            first["items"][0]["avatar"],
-            "https://oss.banghua.xin/images/users/avatar.jpg",
-        )
-        self.assertEqual(first["items"][0]["nickname"], "头像用户")
-        self.assertEqual(second["items"][0]["avatar"], first["items"][0]["avatar"])
-        self.assertEqual(calls, ["9"])
-
-    def test_conversation_list_rejects_a_mismatched_profile_avatar(self) -> None:
-        def get_user(_uid: str) -> ApiResult:
-            return ApiResult(
-                True,
-                200,
-                "",
-                data=[
-                    {
-                        "id": "42",
-                        "nickname": "当前用户",
-                        "portrait": "images/users/me.jpg",
-                    },
-                    {
-                        "nickname": "无编号资料",
-                        "portrait": "images/users/idless.jpg",
-                    },
-                ],
-            )
+        def get_user(uid: str) -> ApiResult:
+            calls.append(uid)
+            raise AssertionError("conversation summary must not fetch profiles")
 
         app = SimpleNamespace(profile=SimpleNamespace(get_user=get_user))
         result = ApiResult(
@@ -396,12 +379,22 @@ class BffEnvelopeTests(unittest.TestCase):
                 }
             ],
         )
+        cache = {
+            "9": (
+                bff_server.time.monotonic(),
+                {
+                    "id": "9",
+                    "nickname": "头像用户",
+                    "avatar": "https://oss.banghua.xin/images/users/avatar.jpg",
+                },
+            )
+        }
 
-        item = conversation_envelope(app, result, {})["items"][0]
+        item = conversation_envelope(app, result, cache)["items"][0]
 
-        self.assertEqual(item["peer_id"], "9")
-        self.assertEqual(item["avatar"], "")
-        self.assertEqual(item["nickname"], "9")
+        self.assertEqual(item["avatar"], "https://oss.banghua.xin/images/users/avatar.jpg")
+        self.assertEqual(item["nickname"], "头像用户")
+        self.assertEqual(calls, [])
 
     def test_message_normalization_keeps_revoke_identity_and_state(self) -> None:
         messages = normalize_messages(
@@ -1297,6 +1290,39 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertNotIn('id="reload-page"', index_html)
         self.assertNotIn("avatarHtml(", chat_pane)
         self.assertNotIn("UID ${esc", chat_pane)
+
+    def test_authenticated_boot_preloads_conversations_and_realtime_unread_state(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        start_services = app_js.split("function startMessageServices()", 1)[1].split(
+            "function buildNav", 1
+        )[0]
+        background_sync = app_js.split("function syncMessagesInBackground", 1)[1].split(
+            "function startMessageSyncTimer", 1
+        )[0]
+        summary_refresh = app_js.split("function refreshConversationSummary", 1)[1].split(
+            "function stopMessageSyncTimer", 1
+        )[0]
+        unread_recalculation = app_js.split("function recalculateUnreadTotal", 1)[1].split(
+            "function markConversationRead", 1
+        )[0]
+
+        self.assertEqual(app_js.count("void startMessageServices();"), 3)
+        self.assertIn("startMessageSyncTimer();", start_services)
+        self.assertIn("return syncMessagesInBackground({ force: true });", start_services)
+        self.assertIn("refreshConversationSummary()", background_sync)
+        self.assertIn("ensureTimConnected({ background: true })", background_sync)
+        self.assertIn("return Promise.allSettled(tasks);", background_sync)
+        self.assertNotIn('S.route === "msg" && !S.imConnected', background_sync)
+        self.assertIn("S.messageLastSummarySyncAt = 0", summary_refresh)
+        self.assertIn("recalculateUnreadTotal();", summary_refresh)
+        self.assertIn("updateUnreadBadges();", unread_recalculation)
+        self.assertIn("data-unread-badge", app_js)
+
+        tim_conversation_sync = app_js.split(
+            'if (typeof chat.getConversationList !== "function") return;', 1
+        )[1].split("void refreshVisiblePeerPresence", 1)[0]
+        self.assertIn("recalculateUnreadTotal();", tim_conversation_sync)
 
     def test_message_read_receipts_and_peer_presence_are_rendered(self) -> None:
         root = Path(__file__).resolve().parents[1]

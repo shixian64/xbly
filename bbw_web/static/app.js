@@ -1082,7 +1082,7 @@ function updateUnreadBadges() {
 
 function refreshConversationSummary({ force = false } = {}) {
   if (S.conversationRefreshPromise && !force) return S.conversationRefreshPromise;
-  const task = api("/api/im/conversations?page=1", { timeout: 9000 })
+  const task = api("/api/im/conversations?page=1", { timeout: 15000 })
     .then(({ data }) => {
       S.conversations = mergeConversationSources(itemsOf(data), S.conversations);
       recalculateUnreadTotal();
@@ -1090,16 +1090,15 @@ function refreshConversationSummary({ force = false } = {}) {
       void hydrateConversationProfiles();
       return S.conversations;
     })
-    .catch(() => S.conversations)
+    .catch(() => {
+      if (S.conversationRefreshPromise === task) S.messageLastSummarySyncAt = 0;
+      return S.conversations;
+    })
     .finally(() => {
       if (S.conversationRefreshPromise === task) S.conversationRefreshPromise = null;
     });
   S.conversationRefreshPromise = task;
   return task;
-}
-
-function warmConversationSummary() {
-  return refreshConversationSummary();
 }
 
 function stopMessageSyncTimer() {
@@ -1126,8 +1125,8 @@ function syncMessagesInBackground({ force = false } = {}) {
       tasks.push(loadConversationMessages(S.activePeer, { force: true }));
     }
   }
-  if (S.route === "msg" && !S.imConnected && !S.imConnecting && Date.now() >= S.imNextReconnectAt) {
-    tasks.push(ensureTimConnected());
+  if (!S.imConnected && !S.imConnecting && Date.now() >= S.imNextReconnectAt) {
+    tasks.push(ensureTimConnected({ background: true }));
   }
   return Promise.allSettled(tasks);
 }
@@ -1138,6 +1137,11 @@ function startMessageSyncTimer() {
   S.messageSyncTimer = setInterval(() => {
     void syncMessagesInBackground();
   }, MESSAGE_SYNC_TICK_MS);
+}
+
+function startMessageServices() {
+  startMessageSyncTimer();
+  return syncMessagesInBackground({ force: true });
 }
 
 function buildNav() {
@@ -6648,12 +6652,15 @@ async function connectTIM(credential, sessionGeneration = S.sessionGeneration) {
 }
 
 /** Fetch BFF UserSig and login TIM (idempotent when already connected). */
-async function ensureTimConnected({ force = false } = {}) {
+async function ensureTimConnected({ force = false, background = false } = {}) {
   const sessionGeneration = S.sessionGeneration;
   if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
   if (S.imConnected && S.chat && !force) return true;
   if (S._imConnecting && S.imConnectingGeneration === sessionGeneration) return S._imConnecting;
   if (S._imConnecting && S.imConnectingGeneration !== sessionGeneration) S._imConnecting = null;
+  const notifyConnection = (...args) => {
+    if (!background) toast(...args);
+  };
   setImConnectingUi(true);
   S.imConnectingGeneration = sessionGeneration;
   S._imConnecting = (async () => {
@@ -6664,7 +6671,7 @@ async function ensureTimConnected({ force = false } = {}) {
         const msg = localizedUiText(sdkErr?.message || "实时消息组件未加载");
         S.imLastError = msg;
         addImMessage(msg, "system");
-        toast(msg, "error", 4200);
+        notifyConnection(msg, "error", 4200);
         return false;
       }
       if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
@@ -6683,7 +6690,7 @@ async function ensureTimConnected({ force = false } = {}) {
         const msg = `后台消息组件不可用：${localizedUiText(worker.detail)}。请检查浏览器或安全软件设置。`;
         S.imLastError = msg;
         addImMessage(msg, "system");
-        toast("后台消息组件被拦截", "error", 5600);
+        notifyConnection("后台消息组件被拦截", "error", 5600);
         return false;
       }
       addImMessage(`TIM Web Worker 可用：${worker.detail}`, "system");
@@ -6698,7 +6705,7 @@ async function ensureTimConnected({ force = false } = {}) {
         );
         S.imLastError = msg;
         addImMessage(msg, "system");
-        toast("消息通道被网络/代理拦截", "error", 5600);
+        notifyConnection("消息通道被网络/代理拦截", "error", 5600);
         return false;
       }
       addImMessage(`WebSocket 可达：${net.detail}`, "system");
@@ -6725,7 +6732,7 @@ async function ensureTimConnected({ force = false } = {}) {
           const ok = await connectTIM(cred, sessionGeneration);
           if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
           if (ok) {
-            toast("消息通道已连接", "info", 3200);
+            notifyConnection("消息通道已连接", "info", 3200);
             return true;
           }
           lastErr = S.imLastError || "消息登录失败";
@@ -6754,7 +6761,7 @@ async function ensureTimConnected({ force = false } = {}) {
             "已启用 REST 发送通道（BFF → 腾讯 openim/sendmsg），新消息将自动同步。",
             "system"
           );
-          toast("已启用文本备用通道", "info", 4200);
+          notifyConnection("已启用文本备用通道", "info", 4200);
           return true;
         }
         addImMessage(`REST 健康检查未通过：${(h && (h.error_info || h.error_code)) || "unknown"}`, "system");
@@ -6766,14 +6773,14 @@ async function ensureTimConnected({ force = false } = {}) {
         localizedUiText(lastErr || "实时消息登录失败") +
         " · 文本备用通道也未成功。历史会话仍可用。";
       addImMessage(S.imLastError, "system");
-      toast("实时消息暂不可用，历史会话仍可用", "error", 5200);
+      notifyConnection("实时消息暂不可用，历史会话仍可用", "error", 5200);
       return false;
     } catch (error) {
       if (error instanceof AuthExpiredError) throw error;
       const msg = error?.message || "消息服务连接失败";
       S.imLastError = msg;
       addImMessage(msg, "system");
-      toast(msg, "error", 4200);
+      notifyConnection(msg, "error", 4200);
       return false;
     } finally {
       if (S.imConnectingGeneration === sessionGeneration) {
@@ -7919,8 +7926,7 @@ $("login-form").addEventListener("submit", (event) => {
     showLogin(false, true);
     updatePresence(!document.hidden);
     buildNav();
-    void warmConversationSummary();
-    startMessageSyncTimer();
+    void startMessageServices();
     const desired = hashRoute();
     go(isRouteAllowed(desired) ? desired : "nearby", { replace: !isRouteAllowed(desired), force: true });
     toast("登录成功");
@@ -8190,8 +8196,7 @@ window.addEventListener("pageshow", (event) => {
     S.imConnected = false;
     S.imNextReconnectAt = 0;
   }
-  startMessageSyncTimer();
-  void syncMessagesInBackground({ force: true });
+  void startMessageServices();
 });
 
 window.addEventListener("pagehide", (event) => {
@@ -8243,8 +8248,7 @@ syncVisualViewport();
       showLogin(false);
       S.serverHeartbeat = Boolean(data.auto_heartbeat ?? S.serverHeartbeat);
       updatePresence(!document.hidden);
-      void warmConversationSummary();
-      startMessageSyncTimer();
+      void startMessageServices();
       const desired = hashRoute();
       go(isRouteAllowed(desired) ? desired : "nearby", { replace: !isRouteAllowed(desired), force: true });
       return;

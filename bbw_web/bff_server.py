@@ -534,8 +534,10 @@ def _cached_profile(
     app: Any,
     uid: str,
     cache: Dict[str, tuple[float, Optional[Dict[str, Any]]]],
+    *,
+    fetch_on_miss: bool = True,
 ) -> Optional[Dict[str, Any]]:
-    """Read one display profile with a short per-session cache."""
+    """Read one display profile through a short per-session cache."""
     target = str(uid or "").strip()
     if not target:
         return None
@@ -546,6 +548,8 @@ def _cached_profile(
         ttl = PROFILE_CACHE_TTL_SEC if profile else PROFILE_CACHE_ERROR_TTL_SEC
         if now - cached_at < ttl:
             return dict(profile) if profile else None
+    if not fetch_on_miss:
+        return None
     profile: Optional[Dict[str, Any]] = None
     try:
         result = app.profile.get_user(target)
@@ -586,14 +590,14 @@ def conversation_envelope(
         Dict[str, tuple[float, Optional[Dict[str, Any]]]]
     ] = None,
 ) -> Dict[str, Any]:
-    """Attach the real peer profile required by the message-list avatar."""
+    """Attach cached peer display data without delaying the conversation summary."""
     payload = RE(result, "conversation")
     cache = profile_cache if profile_cache is not None else {}
     for item in payload["items"]:
         peer = str(item.get("peer_id") or item.get("conversation_user") or "").strip()
         if not peer or item.get("avatar"):
             continue
-        profile = _cached_profile(app, peer, cache)
+        profile = _cached_profile(app, peer, cache, fetch_on_miss=False)
         if not profile:
             continue
         avatar = str(profile.get("avatar") or profile.get("portrait") or "")
