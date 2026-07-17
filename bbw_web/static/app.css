@@ -4169,6 +4169,16 @@ html.flash-viewing body {
   height: 34px;
 }
 
+.moment-comment-avatar {
+  display: block;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: transparent;
+  padding: 0;
+}
+
 .moment-comment-body {
   min-width: 0;
   flex: 1;

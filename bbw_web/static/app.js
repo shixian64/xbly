@@ -2761,12 +2761,16 @@ function renderMomentCard(item, { showAuthor = true } = {}) {
   const name = post.nickname || (authorId ? `用户 ${authorId}` : "用户");
   const meta = [post.age && `${post.age} 岁`, post.gender, post.region, post.property].filter(Boolean).join(" · ");
   const topics = Array.isArray(post.topics) ? post.topics.filter(Boolean) : [];
+  const plate = String(post.plate || "").trim();
+  const visibilityScope = String(post.visibility_scope || "").trim();
   const flags = [
     post.is_pinned ? `<span class="badge green" data-pin-badge>个人主页置顶</span>` : "",
     String(post.posttip || "").includes("置顶") ? `<span class="badge green">置顶</span>` : "",
     String(post.posttip || "").includes("加精") ? `<span class="badge">精华</span>` : "",
-    post.plate ? `<span class="badge orange">${esc(post.plate)}</span>` : "",
-    post.visibility_scope ? `<span class="badge" data-visibility-badge>${esc(post.visibility_scope)}</span>` : "",
+    plate && plate !== "动态" ? `<span class="badge orange">${esc(plate)}</span>` : "",
+    visibilityScope && visibilityScope !== "公开"
+      ? `<span class="badge" data-visibility-badge>${esc(visibilityScope)}</span>`
+      : "",
   ]
     .filter(Boolean)
     .join("");
@@ -2816,11 +2820,19 @@ function momentCommentCard(item, postOwnerId) {
   const comment = item && typeof item === "object" ? item : {};
   const currentUid = String(S.user?.uid || S.user?.id || "");
   const canModerate = currentUid && currentUid === String(postOwnerId || "") && !comment.is_self;
-  const name = comment.nickname || (comment.author_id ? `用户 ${comment.author_id}` : "用户");
+  const authorId = String(comment.author_id || "");
+  const name = comment.nickname || (authorId ? `用户 ${authorId}` : "用户");
+  const avatar = avatarHtml(comment.avatar);
+  const avatarControl =
+    avatar && authorId
+      ? `<button type="button" class="moment-comment-avatar" data-action="open-profile" data-uid="${esc(
+          authorId
+        )}" aria-label="查看${esc(name)}的资料">${avatar}</button>`
+      : avatar;
   return `<article class="moment-comment" data-comment-row data-comment-id="${esc(comment.id || "")}">
-    ${avatarHtml(comment.avatar)}
+    ${avatarControl}
     <div class="moment-comment-body"><div class="moment-comment-head"><button type="button" data-action="open-profile" data-uid="${esc(
-      comment.author_id || ""
+      authorId
     )}">${esc(name)}</button><time>${esc(comment.time || "")}</time></div>
       <p>${esc(comment.content || (comment.is_forbidden ? "该评论已隐藏" : ""))}</p>
       <div class="moment-comment-actions"><button type="button" class="${comment.is_liked ? "on" : ""}" data-action="moment-comment-like" data-id="${esc(comment.id || "")}" data-liked="${
@@ -8760,8 +8772,13 @@ async function handleAction(action, button) {
     });
     if (toastEnv(data, `已设为${button.dataset.scope}`)) {
       const card = momentCardForButton(button);
+      const scope = String(button.dataset.scope || "");
       let badge = card?.querySelector("[data-visibility-badge]");
-      if (!badge && card) {
+      if (scope === "公开") {
+        badge?.remove();
+        const flags = card?.querySelector(".moment-flags");
+        if (flags && !flags.children.length) flags.remove();
+      } else if (!badge && card) {
         let flags = card.querySelector(".moment-flags");
         if (!flags) {
           card.querySelector(".moment-card-head")?.insertAdjacentHTML("afterend", '<div class="moment-flags"></div>');
@@ -8770,7 +8787,7 @@ async function handleAction(action, button) {
         flags?.insertAdjacentHTML("beforeend", '<span class="badge" data-visibility-badge></span>');
         badge = card.querySelector("[data-visibility-badge]");
       }
-      if (badge) badge.textContent = button.dataset.scope || "";
+      if (badge) badge.textContent = scope;
       button.closest("details")?.removeAttribute("open");
       clearMomentCache();
     }

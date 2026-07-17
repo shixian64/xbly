@@ -2024,6 +2024,35 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('String(posts.at(-1)?.id || "")', moments_loader)
         self.assertIn(".moments-tab-panel.is-loading", app_css)
 
+    def test_moment_comment_avatar_opens_profile_dialog(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
+
+        comment_card = app_js.split("function momentCommentCard", 1)[1].split(
+            "function momentCommentsHtml", 1
+        )[0]
+        self.assertIn('class="moment-comment-avatar"', comment_card)
+        self.assertIn('data-action="open-profile"', comment_card)
+        self.assertIn('data-uid="${esc(', comment_card)
+        self.assertIn('aria-label="查看${esc(name)}的资料"', comment_card)
+        self.assertIn(".moment-comment-avatar", app_css)
+
+    def test_moment_cards_hide_redundant_dynamic_and_public_badges(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+
+        moment_card = app_js.split("function renderMomentCard", 1)[1].split(
+            "function momentCard", 1
+        )[0]
+        visibility_action = app_js.split('if (action === "moment-visibility")', 1)[1].split(
+            'if (action === "moment-pin")', 1
+        )[0]
+        self.assertIn('plate && plate !== "动态"', moment_card)
+        self.assertIn('visibilityScope && visibilityScope !== "公开"', moment_card)
+        self.assertIn('if (scope === "公开")', visibility_action)
+        self.assertIn("badge?.remove()", visibility_action)
+
     def test_profile_dialog_can_load_target_user_moments(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
