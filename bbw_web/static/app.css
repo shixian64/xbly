@@ -30,9 +30,9 @@
   --radius-sm: 12px;
   --radius: 18px;
   --radius-lg: 26px;
-  --side-w: 254px;
+  --side-w: 169.333px;
   --top-h: 72px;
-  --bottom-h: 66px;
+  --bottom-h: 44px;
   --content-max: 1120px;
   --message-content-max: 1800px;
   --safe-top: env(safe-area-inset-top, 0px);
@@ -4454,7 +4454,7 @@ html.flash-viewing body {
 
 @media (min-width: 961px) {
   :root {
-    --side-w: clamp(196px, 18vw, 254px);
+    --side-w: clamp(130.667px, 12vw, 169.333px);
   }
 
   body.message-route-active .topbar {
