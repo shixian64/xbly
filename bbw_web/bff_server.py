@@ -53,6 +53,8 @@ MAX_JSON_BODY_BYTES = 256 * 1024
 COOKIE_SECURE = False
 PROFILE_CACHE_TTL_SEC = 15 * 60.0
 PROFILE_CACHE_ERROR_TTL_SEC = 30.0
+FRIEND_APPLICATION_PAGE_SIZE = 15
+FRIEND_APPLICATION_SCAN_PAGES = 5
 RATE_LIMIT_LOCK = threading.Lock()
 RATE_LIMIT_BUCKETS: Dict[str, List[float]] = {}
 MUTATION_LOCK = threading.Lock()
@@ -254,14 +256,73 @@ def _accepted_friend_ids(app: Any, current_uid: str) -> Set[str]:
         return set()
 
 
-def _friend_applications(app: Any, current_uid: str, result: Any = None) -> Tuple[Any, List[Dict[str, Any]]]:
-    if result is None:
-        result = app.social.friend_apply_list("1")
-    items = N.normalize_friend_applications(result.data, current_uid)
-    accepted = _accepted_friend_ids(app, current_uid)
-    if accepted:
-        items = [item for item in items if str(item.get("id") or "") not in accepted]
-    return result, items
+def _friend_applications(
+    app: Any,
+    current_uid: str,
+    result: Any = None,
+    *,
+    start_page: int = 1,
+    scan_pages: int = FRIEND_APPLICATION_SCAN_PAGES,
+) -> Tuple[Any, List[Dict[str, Any]], Dict[str, Any]]:
+    """Return a bounded window of pending applications across upstream pages."""
+    first_page = max(1, int(start_page))
+    page_limit = max(1, min(int(scan_pages), FRIEND_APPLICATION_SCAN_PAGES))
+    primary = result or app.social.friend_apply_list(str(first_page))
+    page_results: List[Tuple[int, Any]] = [(first_page, primary)]
+    first_raw = N.extract_list(getattr(primary, "data", None))
+    if len(first_raw) >= FRIEND_APPLICATION_PAGE_SIZE and page_limit > 1:
+        pages = list(range(first_page + 1, first_page + page_limit))
+        with ThreadPoolExecutor(
+            max_workers=min(4, len(pages)), thread_name_prefix="bbw-friend-apply"
+        ) as pool:
+            results = list(pool.map(lambda page: app.social.friend_apply_list(str(page)), pages))
+        page_results.extend(zip(pages, results))
+
+    normalized: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    status_unknown = False
+    next_page = ""
+    scanned_pages = 0
+    for page, page_result in page_results:
+        if not getattr(page_result, "ok", False) and not _is_false_response(
+            page_result, "false"
+        ):
+            next_page = str(page)
+            break
+        raw_items = N.extract_list(getattr(page_result, "data", None))
+        scanned_pages += 1
+        for item in N.normalize_friend_applications(
+            getattr(page_result, "data", None), current_uid
+        ):
+            key = str(item.get("apply_id") or item.get("id") or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            if not item.get("request_status_known"):
+                status_unknown = True
+            if item.get("request_status") == "pending":
+                normalized.append(item)
+        if len(raw_items) < FRIEND_APPLICATION_PAGE_SIZE:
+            next_page = ""
+            break
+        next_page = str(page + 1)
+
+    if status_unknown and normalized:
+        accepted = _accepted_friend_ids(app, current_uid)
+        if accepted:
+            normalized = [
+                item
+                for item in normalized
+                if str(item.get("id") or "") not in accepted
+            ]
+    metadata = {
+        "page": str(first_page),
+        "next_page": next_page,
+        "has_more": bool(next_page),
+        "scanned_pages": scanned_pages,
+        "count": len(normalized),
+    }
+    return primary, normalized, metadata
 
 
 def _presence_uids(values: Any, limit: int = 100) -> List[str]:
@@ -1658,7 +1719,16 @@ class Handler(BaseHTTPRequestHandler):
             result = app.social.follow_list(q("uid") or q("id") or None)
             return self.ok(empty_list_envelope(result, RL(result), "关注列表为空"))
         if path == "/api/social/friend-apply":
-            result = app.social.friend_apply_list(q("page", "1"))
+            page = str(q("page", "1") or "1").strip()
+            if not page.isdigit() or not 1 <= int(page) <= 100000:
+                return self.ok({"ok": False, "error": "好友申请页码无效"}, 400)
+            result = app.social.friend_apply_list(page)
+            result, items, metadata = _friend_applications(
+                app,
+                str(app.session.uid or ""),
+                result,
+                start_page=int(page),
+            )
             if _is_false_response(result, "false"):
                 payload = empty_list_envelope(
                     result,
@@ -1666,16 +1736,18 @@ class Handler(BaseHTTPRequestHandler):
                     "好友申请列表为空",
                 )
                 payload["status"] = result.status
-                return self.ok({"ok": True, "count": 0} if q("summary", "0") == "1" else payload)
-            if q("summary", "0") == "1":
-                items = N.normalize_friend_applications(
-                    result.data, str(app.session.uid or "")
+                payload.update(metadata)
+                return self.ok(
+                    {"ok": True, **metadata}
+                    if q("summary", "0") == "1"
+                    else payload
                 )
-                return self.ok({"ok": bool(result.ok), "count": len(items)})
-            result, items = _friend_applications(app, str(app.session.uid or ""), result)
+            if q("summary", "0") == "1":
+                return self.ok({"ok": bool(result.ok), **metadata})
             payload = N.envelope(result, items=items)
             payload["list"] = items
             payload["status"] = result.status
+            payload.update(metadata)
             return self.ok(payload)
         if path == "/api/social/friends":
             result = app.social.friends()
@@ -2299,7 +2371,9 @@ class Handler(BaseHTTPRequestHandler):
                         verified = True
                         pending = False
                         break
-                    _, remaining = _friend_applications(app, current_uid)
+                    _, remaining, _metadata = _friend_applications(
+                        app, current_uid
+                    )
                     pending = any(
                         str(item.get("id") or "") == applicant_uid
                         or str(item.get("apply_id") or "") == apply_id

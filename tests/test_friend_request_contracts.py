@@ -160,6 +160,23 @@ class FriendRequestPersistenceContractTests(unittest.TestCase):
             ("friend_request", "active"),
         )
 
+    def test_accepting_or_observing_friend_closes_pending_request(self) -> None:
+        source = (ROOT / "bbw_web" / "jobs.py").read_text(encoding="utf-8-sig")
+
+        agree_block = source.split('if path == "/api/social/agree-friend":', 1)[
+            1
+        ].split("return {", 1)[0]
+        self.assertIn('kind="friend_request"', agree_block)
+        self.assertIn('status="inactive"', agree_block)
+        self.assertIn('"resolved_as": "accepted"', agree_block)
+
+        snapshot_block = source.split('if route == "/api/social/friends":', 1)[
+            1
+        ].split('if route in {"/api/social/visitors"', 1)[0]
+        self.assertIn('kind="friend_request"', snapshot_block)
+        self.assertIn('status="inactive"', snapshot_block)
+        self.assertIn('"resolved_as": "accepted"', snapshot_block)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -905,6 +905,34 @@ def ingest_social_snapshot(
             )
             relationships += 1
 
+            if route == "/api/social/friends":
+                request_relation = db.scalar(
+                    select(Relationship).where(
+                        Relationship.owner_user_id == owner_id,
+                        Relationship.provider == SYNC_SOURCE,
+                        Relationship.subject_upstream_uid == subject_uid,
+                        Relationship.kind == "friend_request",
+                    )
+                )
+                if request_relation is not None and request_relation.status == "active":
+                    relation_repo.upsert(
+                        owner_user_id=owner_id,
+                        provider=SYNC_SOURCE,
+                        subject_upstream_uid=subject_uid,
+                        kind="friend_request",
+                        status="inactive",
+                        started_at=request_relation.started_at,
+                        ended_at=now,
+                        extra_data=_merge_dict(
+                            request_relation.extra_data,
+                            {
+                                "resolved_as": "accepted",
+                                "resolved_at": now.isoformat(),
+                                "source_path": route,
+                            },
+                        ),
+                    )
+
             if route in {"/api/social/visitors", "/api/social/friend-apply"}:
                 identity = _stable_json_digest(
                     {
@@ -1039,6 +1067,33 @@ def record_product_event(owner_user_id: str, event_payload: Mapping[str, Any]) -
                 ),
             )
             relationship_id = relationship.id
+            if path == "/api/social/agree-friend":
+                request_relation = db.scalar(
+                    select(Relationship).where(
+                        Relationship.owner_user_id == owner_id,
+                        Relationship.provider == SYNC_SOURCE,
+                        Relationship.subject_upstream_uid == subject_uid,
+                        Relationship.kind == "friend_request",
+                    )
+                )
+                if request_relation is not None:
+                    RelationshipRepository(db).upsert(
+                        owner_user_id=owner_id,
+                        provider=SYNC_SOURCE,
+                        subject_upstream_uid=subject_uid,
+                        kind="friend_request",
+                        status="inactive",
+                        started_at=request_relation.started_at,
+                        ended_at=now,
+                        extra_data=_merge_dict(
+                            request_relation.extra_data,
+                            {
+                                "resolved_as": "accepted",
+                                "resolved_at": now.isoformat(),
+                                "last_event_type": event_type,
+                            },
+                        ),
+                    )
         return {
             "ok": True,
             "event_id": str(event.id),

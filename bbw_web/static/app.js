@@ -2660,6 +2660,36 @@ function socialCardForTab(item, tab) {
   return userCard(item, { profile: true });
 }
 
+function friendApplicationCountText(count, hasMore = false) {
+  const value = Math.max(0, Number(count || 0));
+  if (!value) return hasMore ? "待处理" : "";
+  return `${value}${hasMore ? "+" : ""}`;
+}
+
+function syncFriendApplicationCount(count, hasMore = false) {
+  const tab = root().querySelector('.relationship-tabs [data-tab="apply"]');
+  if (!tab) return;
+  const suffix = friendApplicationCountText(count, hasMore);
+  tab.textContent = suffix ? `好友申请 ${suffix}` : "好友申请";
+}
+
+function friendApplicationHtml(data) {
+  const content = envelopeHtml(
+    data,
+    (item) => socialCardForTab(item, "apply"),
+    "暂无好友申请",
+    "新的好友申请会显示在这里"
+  );
+  const nextPage = String(data?.next_page || "").trim();
+  return `<div data-friend-application-items>${content}</div>${
+    nextPage
+      ? `<div class="moment-load-more" data-friend-application-more><button type="button" class="btn secondary" data-action="friend-apply-load-more" data-page="${esc(
+          nextPage
+        )}">加载更多申请</button></div>`
+      : ""
+  }`;
+}
+
 function giftCard(item) {
   const gift = item && typeof item === "object" ? item : { name: String(item || "礼物") };
   return `<article class="gift-card">
@@ -7190,6 +7220,7 @@ async function loadSocialTab(tab, signal) {
   const activeTab = normalizeSocialTab(tab);
   let body = "";
   let applyCount = 0;
+  let applyHasMore = false;
 
   if (activeTab === "friends") {
     const [friendResult, applyResult] = await Promise.allSettled([
@@ -7199,6 +7230,7 @@ async function loadSocialTab(tab, signal) {
     if (friendResult.status !== "fulfilled") throw friendResult.reason;
     const friends = itemsOf(friendResult.value.data);
     applyCount = applyResult.status === "fulfilled" ? Number(applyResult.value.data?.count || 0) : 0;
+    applyHasMore = applyResult.status === "fulfilled" && applyResult.value.data?.has_more === true;
     body = `<section class="section contact-surface"><div class="contact-search"><label class="sr-only" for="friend-filter">搜索好友</label><input id="friend-filter" type="search" placeholder="搜索昵称或 UID" autocomplete="off" /></div>${friendListHtml(
       friends
     )}</section>`;
@@ -7238,18 +7270,21 @@ async function loadSocialTab(tab, signal) {
     };
     const { data } = await api(paths[activeTab], { signal });
     const [title, detail] = copy[activeTab];
-    body = `<section class="section"><div class="section-head"><div><h2>${title}</h2><p>${detail}</p></div><button type="button" class="btn secondary small" data-action="refresh-route">刷新</button></div>${envelopeHtml(
-      data,
-      (item) => socialCardForTab(item, activeTab),
-      "列表还是空的",
-      detail
-    )}</section>`;
+    if (activeTab === "apply") {
+      applyCount = Number(data?.count || itemsOf(data).length || 0);
+      applyHasMore = data?.has_more === true;
+    }
+    body = `<section class="section"><div class="section-head"><div><h2>${title}</h2><p>${detail}</p></div><button type="button" class="btn secondary small" data-action="refresh-route">刷新</button></div>${
+      activeTab === "apply"
+        ? friendApplicationHtml(data)
+        : envelopeHtml(data, (item) => socialCardForTab(item, activeTab), "列表还是空的", detail)
+    }</section>`;
   }
 
-  return { tab: activeTab, body, applyCount };
+  return { tab: activeTab, body, applyCount, applyHasMore };
 }
 
-function socialTabsHtml(tab, applyCount = 0) {
+function socialTabsHtml(tab, applyCount = 0, applyHasMore = false) {
   const tabMeta = [
     ["friends", "通讯录"],
     ["apply", "好友申请"],
@@ -7260,7 +7295,8 @@ function socialTabsHtml(tab, applyCount = 0) {
   ];
   return tabMeta
       .map(([id, label]) => {
-        const count = id === "apply" && applyCount ? ` ${applyCount}` : "";
+        const countText = id === "apply" ? friendApplicationCountText(applyCount, applyHasMore) : "";
+        const count = countText ? ` ${countText}` : "";
         return `<button type="button" class="tab-chip${tab === id ? " on" : ""}" data-action="social-tab" data-tab="${id}" role="tab" aria-selected="${
           tab === id
         }">${label}${count}</button>`;
@@ -7274,7 +7310,8 @@ async function pageSocial(signal) {
   return `<section class="relationship-toolbar"><div><h2>关系中心</h2><p>统一管理通讯录、好友申请、关注、粉丝、访客和黑名单</p></div></section>
     <nav class="tab-row relationship-tabs ui-scrollbar ui-scrollbar--compact" role="tablist" aria-label="关系中心分类">${socialTabsHtml(
       view.tab,
-      view.applyCount
+      view.applyCount,
+      view.applyHasMore
     )}</nav><div id="social-tab-panel" class="social-tab-panel" role="tabpanel">${view.body}</div>${relationshipToolsHtml()}`;
 }
 
@@ -7321,6 +7358,7 @@ async function switchSocialTab(tab, { visitorTab = S.visitorTab, force = false }
     const view = await loadSocialTab(activeTab, controller.signal);
     if (controller.signal.aborted || seq !== S.routeSeq || S.route !== "social" || S.socialTab !== activeTab) return;
     panel.innerHTML = view.body;
+    syncFriendApplicationCount(view.applyCount, view.applyHasMore);
   } catch (error) {
     if (error?.name === "AbortError" || seq !== S.routeSeq || S.route !== "social") return;
     if (error instanceof AuthExpiredError) return;
@@ -9112,9 +9150,39 @@ async function handleAction(action, button) {
     }
     return;
   }
+  if (action === "friend-apply-load-more") {
+    const page = String(button.dataset.page || "").trim();
+    if (!/^\d+$/.test(page)) throw new Error("好友申请页码无效");
+    const section = button.closest(".section");
+    const container = section?.querySelector("[data-friend-application-items]");
+    const more = button.closest("[data-friend-application-more]");
+    const { data } = await api(`/api/social/friend-apply?page=${encodeURIComponent(page)}`);
+    if (data?.ok === false) throw new Error(errorInfo(data, "好友申请加载失败").title);
+    const items = itemsOf(data);
+    if (container && items.length) {
+      let stack = container.querySelector(".stack");
+      if (!stack) {
+        container.innerHTML = '<div class="stack"></div>';
+        stack = container.querySelector(".stack");
+      }
+      stack?.insertAdjacentHTML(
+        "beforeend",
+        items.map((item) => socialCardForTab(item, "apply")).join("")
+      );
+    }
+    const nextPage = String(data?.next_page || "").trim();
+    if (nextPage) {
+      button.dataset.page = nextPage;
+      button.disabled = false;
+      button.textContent = "加载更多申请";
+    } else {
+      more?.remove();
+    }
+    const loadedCount = container?.querySelectorAll(".user-card").length || 0;
+    syncFriendApplicationCount(loadedCount, Boolean(nextPage));
+    return;
+  }
   if (action === "agree-friend") {
-    const card = button.closest(".user-card");
-    const container = card?.parentElement || null;
     const { data } = await api("/api/social/agree-friend", {
       method: "POST",
       body: JSON.stringify({
@@ -9125,10 +9193,7 @@ async function handleAction(action, button) {
     });
     if (toastEnv(data, "已同意好友申请")) {
       clearRelationshipCache(["friends", "apply"]);
-      card?.remove();
-      if (container && !container.querySelector(".user-card")) {
-        container.innerHTML = emptyState("暂无好友申请", "新的好友申请会显示在这里");
-      }
+      await switchSocialTab("apply", { force: true });
     }
     return;
   }

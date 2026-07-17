@@ -315,6 +315,7 @@ class NormalizerContractTests(unittest.TestCase):
                     "friendid": "9",
                     "friendnickname": "申请人",
                     "friendportrait": "images/friend.jpg",
+                    "agree": "0",
                 }
             ],
             current_uid="10001",
@@ -322,6 +323,25 @@ class NormalizerContractTests(unittest.TestCase):
         self.assertEqual(application["id"], "9")
         self.assertEqual(application["nickname"], "申请人")
         self.assertEqual(application["apply_id"], "apply-1")
+        self.assertEqual(application["request_status"], "pending")
+        self.assertTrue(application["request_status_known"])
+        self.assertTrue(application["is_pending"])
+        self.assertFalse(application["is_accepted"])
+
+        accepted_application = normalize_friend_applications(
+            [
+                {
+                    "id": "apply-2",
+                    "uid": "10001",
+                    "friendid": "10",
+                    "agree": "1",
+                }
+            ],
+            current_uid="10001",
+        )[0]
+        self.assertEqual(accepted_application["request_status"], "accepted")
+        self.assertFalse(accepted_application["is_pending"])
+        self.assertTrue(accepted_application["is_accepted"])
 
         friend = normalize_friends(
             [

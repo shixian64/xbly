@@ -934,8 +934,58 @@ class SocialBffRoutingTests(unittest.TestCase):
         self.assertEqual(response[0], 200)
 
         calls, response = self._run_get("/api/social/friend-apply?page=1")
-        self.assertEqual(calls, [("friend_apply", "1"), ("friends", None)])
+        self.assertEqual(calls, [("friend_apply", "1")])
         self.assertEqual(response[1]["items"], [])
+
+    def test_friend_applications_scan_past_accepted_first_page(self) -> None:
+        calls = []
+        pages = {
+            "1": [
+                {
+                    "id": f"accepted-{index}",
+                    "uid": "42",
+                    "friendid": f"friend-{index}",
+                    "agree": "1",
+                }
+                for index in range(bff_server.FRIEND_APPLICATION_PAGE_SIZE)
+            ],
+            "2": [
+                {
+                    "id": "pending-1",
+                    "uid": "42",
+                    "friendid": "9",
+                    "friendnickname": "申请人一",
+                    "agree": "0",
+                },
+                {
+                    "id": "pending-2",
+                    "uid": "42",
+                    "friendid": "10",
+                    "friendnickname": "申请人二",
+                    "agree": "0",
+                },
+            ],
+        }
+
+        def friend_apply_list(page):
+            calls.append(page)
+            rows = pages.get(page, [])
+            return ApiResult(True, 200, json.dumps(rows, ensure_ascii=False), data=rows)
+
+        app = SimpleNamespace(social=SimpleNamespace(friend_apply_list=friend_apply_list))
+        result, items, metadata = bff_server._friend_applications(
+            app,
+            "42",
+            start_page=1,
+            scan_pages=2,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(calls, ["1", "2"])
+        self.assertEqual([item["id"] for item in items], ["9", "10"])
+        self.assertEqual(metadata["count"], 2)
+        self.assertFalse(metadata["has_more"])
+        self.assertEqual(metadata["next_page"], "")
 
     def test_message_history_rejects_unexpected_html_response(self) -> None:
         html = "<!DOCTYPE html><html><body>not message json</body></html>"
@@ -2173,6 +2223,11 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('readConversationPeers: new Map()', app_js)
         self.assertIn('refreshList: false', app_js)
         self.assertIn('data-action="agree-friend" data-id=', app_js)
+        self.assertIn("function friendApplicationHtml(data)", app_js)
+        self.assertIn('data-action="friend-apply-load-more"', app_js)
+        self.assertIn("function syncFriendApplicationCount", app_js)
+        self.assertIn('await switchSocialTab("apply", { force: true })', app_js)
+        self.assertIn("applyResult.value.data?.has_more === true", app_js)
         self.assertIn("clearRelationshipCache", app_js)
         self.assertIn('data-action="social-tab"', app_js)
         self.assertNotIn("<strong>访客足迹</strong><span>谁看过我、我看过谁</span>", app_js)

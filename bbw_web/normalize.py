@@ -746,6 +746,13 @@ def normalize_friend_application(item: Any, current_uid: str = "") -> Optional[D
 
     if not applicant_id:
         return None
+    raw_agree = str(_first(d, ["agree", "agreed", "accepted"], "")).strip().lower()
+    request_status_known = raw_agree not in {"", "none", "null", "undefined"}
+    request_status = (
+        "accepted"
+        if raw_agree in {"1", "true", "yes", "accepted", "agreed"}
+        else "pending"
+    )
     profile_online = ""
     if nested_id == applicant_id:
         profile_online = str((nested_user or {}).get("online") or "")
@@ -793,6 +800,10 @@ def normalize_friend_application(item: Any, current_uid: str = "") -> Optional[D
             if part
         ),
         "apply_id": apply_id or applicant_id,
+        "request_status": request_status,
+        "request_status_known": request_status_known,
+        "is_pending": request_status == "pending",
+        "is_accepted": request_status == "accepted",
     }
 
 
@@ -820,6 +831,10 @@ def normalize_friends(data: Any, current_uid: str = "") -> List[Dict[str, Any]]:
                 )
             )
             normalized["apply_id"] = ""
+            normalized.pop("request_status", None)
+            normalized.pop("request_status_known", None)
+            normalized.pop("is_pending", None)
+            normalized.pop("is_accepted", None)
             out.append(normalized)
             continue
         user = normalize_user(item)
