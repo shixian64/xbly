@@ -1104,14 +1104,19 @@ class Handler(BaseHTTPRequestHandler):
             403,
         )
 
+    def broad_im_credentials_disabled_payload(
+        self, capabilities: Dict[str, bool]
+    ) -> Dict[str, Any]:
+        return {
+            "ok": False,
+            "code": "IM_DIRECT_CREDENTIALS_DISABLED",
+            "error": "网页版私信统一使用服务端受控消息通道",
+            "capabilities": capabilities,
+        }
+
     def deny_broad_im_credentials(self, capabilities: Dict[str, bool]) -> None:
         self.ok(
-            {
-                "ok": False,
-                "code": "IM_CREDENTIAL_PERMISSION_REQUIRED",
-                "error": "实时私信凭证仅向管理员授权的用户开放；匹配私信和已有会话将使用受控消息通道",
-                "capabilities": capabilities,
-            },
+            Handler.broad_im_credentials_disabled_payload(self, capabilities),
             403,
         )
 
@@ -1241,23 +1246,7 @@ class Handler(BaseHTTPRequestHandler):
                 k: {"ok": v.ok, "code": v.code, "message": v.message}
                 for k, v in app.bootstrap(include_im=False).items()
             }
-            if capabilities["proactive_private_message"]:
-                try:
-                    tim = {
-                        "ok": True,
-                        **u.native.im.tim_login_payload(
-                            prefer="server",
-                            allow_local_fallback=False,
-                        ),
-                    }
-                except Exception as e:
-                    tim = {"ok": False, "error": _safe_error(e, "消息登录凭证获取失败")}
-            else:
-                tim = {
-                    "ok": False,
-                    "code": "IM_CREDENTIAL_PERMISSION_REQUIRED",
-                    "error": "实时私信凭证仅向管理员授权的用户开放",
-                }
+            tim = Handler.broad_im_credentials_disabled_payload(self, capabilities)
             u.persist()
             return self.ok(
                 {
@@ -1618,46 +1607,10 @@ class Handler(BaseHTTPRequestHandler):
             )
         if path == "/api/im/tim":
             capabilities = Handler.web_user_capabilities(self, u)
-            if not capabilities["proactive_private_message"]:
-                return Handler.deny_broad_im_credentials(self, capabilities)
-            # Prefer server UserSig (tximsign.php puts sig in message=).
-            # Product routes must never mint a local UserSig implicitly.  Deployments
-            # without control of the upstream TIM application degrade to HTTP history.
-            try:
-                payload = u.native.im.tim_login_payload(
-                    prefer="server",
-                    allow_local_fallback=False,
-                )
-                if not payload.get("userSig") or not payload.get("userID"):
-                    return self.ok(
-                        {
-                            "ok": False,
-                            "error": {
-                                "title": "消息登录凭证不完整",
-                                "detail": "缺少用户标识或登录签名，请重新登录后再试",
-                            },
-                        },
-                        400,
-                    )
-                # Never echo full userSig length into logs; client gets it once.
-                return self.ok(
-                    {
-                        "ok": True,
-                        **payload,
-                        "sig_len": len(str(payload.get("userSig") or "")),
-                    }
-                )
-            except Exception as e:
-                return self.ok(
-                    {"ok": False, "error": _safe_error(e, "消息登录凭证获取失败")},
-                    400,
-                )
+            return Handler.deny_broad_im_credentials(self, capabilities)
         if path == "/api/im/rong":
             capabilities = Handler.web_user_capabilities(self, u)
-            if not capabilities["proactive_private_message"]:
-                return Handler.deny_broad_im_credentials(self, capabilities)
-            c = u.native.im.rong_register()
-            return self.ok({"ok": c.ok, **c.to_dict()})
+            return Handler.deny_broad_im_credentials(self, capabilities)
         if path == "/api/im/rest/health":
             # Proves APK-derived secret works against Tencent REST (not browser WSS).
             sample = str(app.session.uid or "1")
@@ -1747,20 +1700,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.ok(payload)
         if path == "/api/im/bootstrap":
             capabilities = Handler.web_user_capabilities(self, u)
-            if not capabilities["proactive_private_message"]:
-                return Handler.deny_broad_im_credentials(self, capabilities)
-            try:
-                return self.ok(
-                    u.native.im.bootstrap(
-                        prefer_tim="server",
-                        allow_local_fallback=False,
-                    )
-                )
-            except Exception as e:
-                return self.ok(
-                    {"ok": False, "error": _safe_error(e, "IM 凭证获取失败")},
-                    400,
-                )
+            return Handler.deny_broad_im_credentials(self, capabilities)
         if path == "/api/im/stickers":
             return self.ok(RE(app.im.stickers(), "sticker"))
         if path == "/api/im/conversations":
@@ -2909,6 +2849,7 @@ def _web_user_capabilities(
     return {
         "match_pool_online_list": True,
         "proactive_private_message": enabled,
+        "direct_im_credentials": False,
     }
 
 

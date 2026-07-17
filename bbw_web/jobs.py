@@ -1799,48 +1799,6 @@ def archive_media_job(outbox_id: str) -> dict[str, Any]:
             prepared.cleanup()
 
 
-def transcode_moment_video_job(
-    asset_id: str, source_url: str
-) -> dict[str, Any]:
-    """Create one cached H.264 derivative for browser-incompatible moment video."""
-    # Import lazily so normal synchronization/media jobs do not import ffmpeg
-    # orchestration or FastAPI-facing helpers on worker startup.
-    from bbw_web.moment_video import MomentVideoError, transcode_job
-
-    try:
-        return transcode_job(asset_id, source_url)
-    except MomentVideoError as exc:
-        # Invalid, oversized or undecodable inputs will not improve on an
-        # automatic retry. Finish deterministically; the API exposes only a
-        # generic failure and still allows a tightly rate-limited manual retry.
-        if "timed out" in str(exc).lower():
-            raise
-        return {
-            "ok": False,
-            "permanent": True,
-            "error_type": type(exc).__name__,
-        }
-    except MediaArchiveError as exc:
-        if "cannot be resolved" in str(exc).lower():
-            raise
-        return {
-            "ok": False,
-            "permanent": True,
-            "error_type": type(exc).__name__,
-        }
-    except httpx.HTTPStatusError as exc:
-        status = int(exc.response.status_code)
-        # Request Timeout, Too Early and Too Many Requests are explicitly
-        # transient; re-raise so the queue's delayed Retry policy handles them.
-        if 400 <= status < 500 and status not in {408, 425, 429}:
-            return {
-                "ok": False,
-                "permanent": True,
-                "error_type": "UpstreamMediaUnavailable",
-            }
-        raise
-
-
 def cleanup_expired_data() -> dict[str, Any]:
     """Delete expired private R2 objects first, then release quota and purge rows."""
 

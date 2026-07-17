@@ -70,6 +70,7 @@ const S = {
   labEnabled: false,
   roomkitAvailable: false,
   proactivePrivateMessageEnabled: false,
+  directImCredentialsEnabled: false,
   matchMessagePeers: new Set(),
   routeController: null,
   routeSeq: 0,
@@ -1125,6 +1126,7 @@ function applyUser(user) {
   avatar.hidden = true;
   if (!user) {
     S.proactivePrivateMessageEnabled = false;
+    S.directImCredentialsEnabled = false;
     S.matchMessagePeers.clear();
     $("side-name").textContent = "游客";
     $("side-meta").textContent = "尚未登录";
@@ -1163,24 +1165,32 @@ function applyUser(user) {
 
 function applyCapabilities(capabilities) {
   if (!capabilities || typeof capabilities !== "object") return;
+  const previousProactive = S.proactivePrivateMessageEnabled;
+  const previousDirectCredentials = S.directImCredentialsEnabled;
   if (Object.prototype.hasOwnProperty.call(capabilities, "proactive_private_message")) {
-    const enabled = capabilities.proactive_private_message === true;
-    if (enabled !== S.proactivePrivateMessageEnabled) {
-      S.proactivePrivateMessageEnabled = enabled;
-      S.pageCache.delete("nearby");
-      [...S.pageCache.keys()].forEach((key) => {
-        if (String(key).startsWith("match:")) S.pageCache.delete(key);
-      });
-      S.pageCache.clear();
-      syncPrivateMessageControls();
-      if (S.authenticated && (S.imMode || S.chat || S.imConnecting)) {
-        void cleanupIM().finally(() => {
-          if (!S.authenticated) return;
-          S.imNextReconnectAt = 0;
-          void ensureTimConnected({ force: true, background: true });
-        });
-      }
-    }
+    S.proactivePrivateMessageEnabled = capabilities.proactive_private_message === true;
+  }
+  if (Object.prototype.hasOwnProperty.call(capabilities, "direct_im_credentials")) {
+    S.directImCredentialsEnabled = capabilities.direct_im_credentials === true;
+  }
+  const proactiveChanged = previousProactive !== S.proactivePrivateMessageEnabled;
+  const directCredentialsChanged =
+    previousDirectCredentials !== S.directImCredentialsEnabled;
+  if (!proactiveChanged && !directCredentialsChanged) return;
+  if (proactiveChanged) {
+    S.pageCache.delete("nearby");
+    [...S.pageCache.keys()].forEach((key) => {
+      if (String(key).startsWith("match:")) S.pageCache.delete(key);
+    });
+    S.pageCache.clear();
+    syncPrivateMessageControls();
+  }
+  if (S.authenticated && (S.imMode || S.chat || S.imConnecting)) {
+    void cleanupIM().finally(() => {
+      if (!S.authenticated) return;
+      S.imNextReconnectAt = 0;
+      void ensureTimConnected({ force: true, background: true });
+    });
   }
 }
 
@@ -7802,7 +7812,7 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
   S.imConnectingGeneration = sessionGeneration;
   S._imConnecting = (async () => {
     try {
-      if (!S.proactivePrivateMessageEnabled) {
+      if (!S.directImCredentialsEnabled) {
         try {
           setImConnectingUi(true, "正在启用受控消息通道…");
           const { data: health } = await api("/api/im/rest/health", { timeout: 12000 });

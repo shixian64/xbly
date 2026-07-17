@@ -22,10 +22,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
+import httpx
 from redis import Redis
 
 from bbw_prod.config import get_settings
-from bbw_web.media_archive import PreparedMedia, download_and_prepare
+from bbw_web.media_archive import MediaArchiveError, PreparedMedia, download_and_prepare
 from bbw_web.normalize import resolve_media_url
 from bbw_web.r2 import R2Storage
 
@@ -651,7 +652,7 @@ def transcode_h264(source: Path, probe: VideoProbe) -> PreparedMedia:
 
 
 def transcode_job(asset_id: str, source_url: str) -> dict[str, Any]:
-    """RQ entry implementation; the public wrapper lives in ``jobs.py``."""
+    """Create one cached H.264 derivative for a browser-incompatible video."""
     asset_id = validate_asset_id(asset_id)
     settings = get_settings()
     source_url = verified_source_url(source_url, asset_id)
@@ -719,3 +720,42 @@ def transcode_job(asset_id: str, source_url: str) -> dict[str, Any]:
             compatible.cleanup()
         if source is not None:
             source.cleanup()
+
+
+def transcode_moment_video_job(
+    asset_id: str, source_url: str
+) -> dict[str, Any]:
+    """RQ entry point kept independent from the application protocol stack."""
+
+    try:
+        return transcode_job(asset_id, source_url)
+    except MomentVideoError as exc:
+        # Invalid, oversized or undecodable inputs will not improve on an
+        # automatic retry. Finish deterministically; the API exposes only a
+        # generic failure and still allows a tightly rate-limited manual retry.
+        if "timed out" in str(exc).lower():
+            raise
+        return {
+            "ok": False,
+            "permanent": True,
+            "error_type": type(exc).__name__,
+        }
+    except MediaArchiveError as exc:
+        if "cannot be resolved" in str(exc).lower():
+            raise
+        return {
+            "ok": False,
+            "permanent": True,
+            "error_type": type(exc).__name__,
+        }
+    except httpx.HTTPStatusError as exc:
+        status = int(exc.response.status_code)
+        # Request Timeout, Too Early and Too Many Requests are explicitly
+        # transient; re-raise so the queue's delayed Retry policy handles them.
+        if 400 <= status < 500 and status not in {408, 425, 429}:
+            return {
+                "ok": False,
+                "permanent": True,
+                "error_type": "UpstreamMediaUnavailable",
+            }
+        raise

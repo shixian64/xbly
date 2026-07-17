@@ -201,6 +201,28 @@ class AuditLogRepository(Repository[AuditLog]):
 class ConversationRepository(Repository[Conversation]):
     model = Conversation
 
+    def exists_for_peer(
+        self,
+        owner_user_id: uuid.UUID,
+        peer_upstream_uid: str,
+        *,
+        provider: str = "tim",
+        kind: str = "direct",
+    ) -> bool:
+        return (
+            self.db.scalar(
+                select(Conversation.id)
+                .where(
+                    Conversation.owner_user_id == owner_user_id,
+                    Conversation.provider == provider,
+                    Conversation.peer_upstream_uid == peer_upstream_uid,
+                    Conversation.kind == kind,
+                )
+                .limit(1)
+            )
+            is not None
+        )
+
     def list_for_owner(
         self, owner_user_id: uuid.UUID, *, offset: int = 0, limit: int = 100
     ) -> list[Conversation]:

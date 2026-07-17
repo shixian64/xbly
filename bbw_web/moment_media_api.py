@@ -249,7 +249,7 @@ def prepare_moment_video(body: PrepareMomentVideo, request: Request) -> dict[str
 
     try:
         queue.enqueue(
-            "bbw_web.jobs.transcode_moment_video_job",
+            "bbw_web.moment_video.transcode_moment_video_job",
             asset_id,
             source_url,
             job_id=job_id_for_asset(asset_id),

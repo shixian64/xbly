@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -129,6 +132,10 @@ class MomentVideoCompatibilityContracts(unittest.TestCase):
     def test_rq_r2_and_runtime_wiring_is_present(self) -> None:
         api = (ROOT / "bbw_web" / "api.py").read_text(encoding="utf-8")
         jobs = (ROOT / "bbw_web" / "jobs.py").read_text(encoding="utf-8")
+        moment_video = (ROOT / "bbw_web" / "moment_video.py").read_text(encoding="utf-8")
+        moment_media_api = (ROOT / "bbw_web" / "moment_media_api.py").read_text(
+            encoding="utf-8"
+        )
         worker = (ROOT / "bbw_web" / "worker.py").read_text(encoding="utf-8")
         r2 = (ROOT / "bbw_web" / "r2.py").read_text(encoding="utf-8")
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
@@ -138,11 +145,16 @@ class MomentVideoCompatibilityContracts(unittest.TestCase):
         persistence = (ROOT / "bbw_web" / "persistence.py").read_text(encoding="utf-8")
 
         self.assertIn("app.include_router(moment_media_router)", api)
-        self.assertIn("def transcode_moment_video_job(", jobs)
-        self.assertIn("except MomentVideoError as exc", jobs)
-        self.assertIn("except MediaArchiveError as exc", jobs)
-        self.assertIn("UpstreamMediaUnavailable", jobs)
-        self.assertIn("status not in {408, 425, 429}", jobs)
+        self.assertIn("def transcode_moment_video_job(", moment_video)
+        self.assertIn("except MomentVideoError as exc", moment_video)
+        self.assertIn("except MediaArchiveError as exc", moment_video)
+        self.assertIn("UpstreamMediaUnavailable", moment_video)
+        self.assertIn("status not in {408, 425, 429}", moment_video)
+        self.assertNotIn("def transcode_moment_video_job(", jobs)
+        self.assertIn(
+            '"bbw_web.moment_video.transcode_moment_video_job"',
+            moment_media_api,
+        )
         self.assertIn("compat_media_deleted", jobs)
         self.assertIn("cached_assets_for_cleanup", jobs)
         self.assertIn("Worker(queues, connection=connection)", worker)
@@ -182,6 +194,33 @@ class MomentVideoCompatibilityContracts(unittest.TestCase):
         self.assertIn("def authorize_moment_video(", persistence)
         self.assertIn("def can_access_moment_video(", persistence)
         self.assertIn('path == "/api/moments/posts"', persistence)
+
+    def test_transcode_entrypoint_imports_without_protocol_secrets(self) -> None:
+        env = os.environ.copy()
+        env["BBW_ENV"] = "production"
+        env["BBW_TXIM_SECRET_KEY_FILE"] = ""
+        env["BBW_ROOMKIT_BUSINESS_TOKEN_FILE"] = ""
+        env.pop("BBW_TXIM_SECRET_KEY", None)
+        env.pop("BBW_ROOMKIT_BUSINESS_TOKEN", None)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; "
+                    "from bbw_web.moment_video import transcode_moment_video_job; "
+                    "assert callable(transcode_moment_video_job); "
+                    "assert 'bbw_protocol.sign' not in sys.modules"
+                ),
+            ],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

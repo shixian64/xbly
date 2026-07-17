@@ -7,8 +7,11 @@ import json
 import sys
 import types
 import unittest
+import uuid
+from contextlib import contextmanager
 from html.parser import HTMLParser
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -165,6 +168,7 @@ class ProductionContractTests(unittest.TestCase):
 
     def test_private_message_policy_uses_server_owned_match_and_conversation_grants(self) -> None:
         persistence = self.read("bbw_web/persistence.py")
+        repositories = self.read("bbw_prod/repositories.py")
         api = self.read("bbw_web/api.py")
 
         for marker in (
@@ -184,9 +188,47 @@ class ProductionContractTests(unittest.TestCase):
             self.assertIn(marker, persistence)
         self.assertIn("identity.match_pool_online_list_enabled", persistence)
         self.assertIn("metadata[\"server_owned\"] = True", persistence)
+        self.assertIn("ConversationRepository(db).exists_for_peer(", persistence)
+        self.assertIn("def exists_for_peer(", repositories)
+        self.assertIn("Conversation.peer_upstream_uid == peer_upstream_uid", repositories)
+        self.assertIn('Conversation.kind == kind', repositories)
         self.assertIn("persistence.can_message_peer(", api)
         self.assertIn("MATCH_DM_GRANT_PERSISTENCE_FAILED", api)
         self.assertIn("persistence.remember_message_policy_response(", api)
+
+    def test_archived_direct_conversation_authorizes_private_message_peer(self) -> None:
+        try:
+            from bbw_web.persistence import RuntimePersistence, UserIdentity
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        class FakeDb:
+            def __init__(self, scalar_values: list[object | None]) -> None:
+                self.scalar_values = list(scalar_values)
+                self.statements: list[object] = []
+
+            def scalar(self, statement: object) -> object | None:
+                self.statements.append(statement)
+                return self.scalar_values.pop(0)
+
+        runtime = RuntimePersistence.__new__(RuntimePersistence)
+        identity = UserIdentity(
+            user_id=uuid.uuid4(),
+            external_account_id=uuid.uuid4(),
+            upstream_uid="42",
+        )
+
+        for scalar_values, expected in (([None, object()], True), ([None, None], False)):
+            with self.subTest(archived_conversation=expected):
+                db = FakeDb(scalar_values)
+
+                @contextmanager
+                def fake_session_scope():
+                    yield db
+
+                with patch("bbw_web.persistence.session_scope", fake_session_scope):
+                    self.assertIs(runtime.can_message_peer(identity, "9"), expected)
+                self.assertEqual(len(db.statements), 2)
 
     def test_admin_user_detail_race_and_sensitive_field_contracts(self) -> None:
         js = self.read("bbw_web/static/admin.js")

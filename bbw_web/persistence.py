@@ -21,6 +21,7 @@ from bbw_prod.crypto import CredentialCipher, normalize_phone
 from bbw_prod.db import session_scope
 from bbw_prod.models import ExternalAccount, Relationship, utcnow
 from bbw_prod.repositories import (
+    ConversationRepository,
     ExternalAccountRepository,
     RelationshipRepository,
     UserRepository,
@@ -1044,7 +1045,12 @@ class RuntimePersistence:
                     Relationship.ended_at.is_(None),
                 )
             )
-        return grant is not None
+            if grant is not None:
+                return True
+            return ConversationRepository(db).exists_for_peer(
+                identity.user_id,
+                target,
+            )
 
     def message_policy_match_peers(
         self, identity: UserIdentity, *, limit: int = 2000
