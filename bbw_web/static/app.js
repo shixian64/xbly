@@ -1015,10 +1015,6 @@ function scrubAuthenticatedDom() {
   if (tools) tools.classList.add("hide");
   const profileBody = $("profile-dialog-body");
   if (profileBody) profileBody.replaceChildren();
-  const title = $("page-title");
-  if (title) title.textContent = "身边";
-  const subtitle = $("page-subtitle");
-  if (subtitle) subtitle.textContent = "看看此刻谁也在这里";
   const toastElement = $("toast");
   if (toastElement) {
     toastElement.textContent = "";
@@ -1520,9 +1516,6 @@ function syncNav() {
     if (current || bottomBranchOn) button.setAttribute("aria-current", "page");
     else button.removeAttribute("aria-current");
   });
-  const nav = navItems().find((item) => item.id === S.route) || PRIMARY_NAV[0];
-  $("page-title").textContent = nav.name;
-  $("page-subtitle").textContent = nav.desc;
   syncMessageReadAction();
 }
 
