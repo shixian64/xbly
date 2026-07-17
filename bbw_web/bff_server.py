@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import math
+import socket
 import sys
 import threading
 import time
@@ -30,6 +31,17 @@ from bbw_web import flash_photo as F  # noqa: E402
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 COOKIE_NAME = "bbw_sid"
 STORE: Optional[SessionStore] = None
+
+
+class ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
+    """Reject a second local server instead of sharing the same Windows port."""
+
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 LAB_ENABLED = False
 CORS_ALLOW_ORIGINS: Set[str] = set()
 MAX_JSON_BODY_BYTES = 256 * 1024
@@ -1078,8 +1090,26 @@ class Handler(BaseHTTPRequestHandler):
             tab = q("tab", "推荐")
             cursor = q("cursor", q("page", "1"))
             current_uid = str(app.session.uid or "")
-            if tab == "我的":
-                result = app.social.user_posts(current_uid, page=cursor)
+            target_uid = str(q("uid", "") or "").strip()
+            if target_uid or tab == "我的":
+                page = str(q("page", cursor) or "1").strip()
+                if not page.isdigit() or not 1 <= int(page) <= 100000:
+                    return self.ok({"ok": False, "error": "动态页码无效"}, 400)
+                if target_uid:
+                    if target_uid == "0" or not target_uid.isdigit() or len(target_uid) > 32:
+                        return self.ok({"ok": False, "error": "用户 UID 无效"}, 400)
+                    result = app.social.profile_posts(target_uid, page=page)
+                else:
+                    target_uid = current_uid
+                    result = app.social.user_posts(current_uid, page=page)
+                payload = RM(result, "post", current_uid)
+                payload.update(
+                    feed_type="user",
+                    target_uid=target_uid,
+                    page=page,
+                    next_page=str(int(page) + 1) if payload.get("items") else "",
+                )
+                return self.ok(payload)
             else:
                 allowed_tabs = {"推荐", "附近", "最新", "招募令", "关注"}
                 if tab not in allowed_tabs:
@@ -2500,7 +2530,15 @@ def main(argv=None) -> int:
         persist_sessions=args.persist_sessions,
         allow_weak_onekey=args.enable_lab,
     )
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    try:
+        httpd = ExclusiveThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as exc:
+        print(
+            f"无法启动 Web 服务：{args.host}:{args.port} 已被其他进程占用（{exc}）",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 2
     print(f"小贝 Web App  http://{args.host}:{args.port}/", flush=True)
     print("  主导航: 身边/消息/匹配/动态/我的", flush=True)
     print(

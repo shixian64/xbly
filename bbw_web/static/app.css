@@ -1546,6 +1546,10 @@ summary:focus-visible {
   display: none;
 }
 
+.avatar.avatar-loading {
+  visibility: hidden;
+}
+
 .avatar-sm {
   width: 38px;
   height: 38px;
@@ -3993,6 +3997,10 @@ html.flash-viewing body {
   grid-column: 1 / -1;
 }
 
+.profile-dialog-actions .profile-moments-button {
+  grid-column: 1 / -1;
+}
+
 .profile-dialog-section {
   margin-top: 1rem;
   border-top: 1px solid var(--line);
@@ -4012,6 +4020,31 @@ html.flash-viewing body {
   margin-top: 0.35rem;
   color: var(--muted);
   font-size: 0.78rem;
+}
+
+.profile-moments-section[hidden] {
+  display: none;
+}
+
+.profile-dialog-section-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 0.7rem;
+}
+
+.profile-dialog-section-head p {
+  margin-top: 0.2rem;
+}
+
+.profile-moment-feed {
+  margin-top: 0.75rem;
+}
+
+.profile-moment-feed .moment-card {
+  border-radius: 16px;
+  box-shadow: none;
+  padding: 0.85rem;
 }
 
 .lab-code {

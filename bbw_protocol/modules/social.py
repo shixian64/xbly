@@ -166,12 +166,28 @@ class SocialAPI:
         )
 
     def user_posts(self, authid: Optional[str] = None, page: str = "1") -> ApiResult:
+        """Read posts from the v154 ``我的动态`` flow.
+
+        This retained self-management entry uses tenant ``99999``. ``page`` is
+        a one-based decimal page number (``1``, ``2``, ...).
+        """
         return self.c.request(
             self.c.url("someonesluntannew", i="99999"),
             {
                 "myid": self.c.session.uid,
                 "authid": authid or self.c.session.uid,
-                "pageindex": page,
+                "pageindex": str(page or "1"),
+            },
+        )
+
+    def profile_posts(self, authid: str, page: str = "1") -> ApiResult:
+        """Read another user's posts from the active v154 profile page."""
+        return self.c.request(
+            self.c.url("someonesluntannew", i="999999"),
+            {
+                "myid": self.c.session.uid,
+                "authid": authid,
+                "pageindex": str(page or "1"),
             },
         )
 

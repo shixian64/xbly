@@ -33,6 +33,20 @@ from bbw_web.store import WebUser, _session_path
 
 
 class BffEnvelopeTests(unittest.TestCase):
+    def test_local_web_server_rejects_a_second_listener_on_the_same_port(self) -> None:
+        first = bff_server.ExclusiveThreadingHTTPServer(
+            ("127.0.0.1", 0), bff_server.Handler
+        )
+        second = None
+        try:
+            address = first.server_address
+            with self.assertRaises(OSError):
+                second = bff_server.ExclusiveThreadingHTTPServer(address, bff_server.Handler)
+        finally:
+            if second is not None:
+                second.server_close()
+            first.server_close()
+
     def test_avatar_media_sentinels_are_not_treated_as_image_urls(self) -> None:
         for value in (
             "0",
@@ -562,6 +576,20 @@ class ProtocolRoutingTests(unittest.TestCase):
         SocialAPI(FakeClient()).posts("推荐", "1")
         self.assertEqual(calls[2][1]["platename"], "精华")
 
+        SocialAPI(FakeClient()).user_posts("42", "2")
+        self.assertEqual(calls[3][0], "99999:someonesluntannew")
+        self.assertEqual(
+            calls[3][1],
+            {"myid": "42", "authid": "42", "pageindex": "2"},
+        )
+
+        SocialAPI(FakeClient()).profile_posts("9", "3")
+        self.assertEqual(calls[4][0], "999999:someonesluntannew")
+        self.assertEqual(
+            calls[4][1],
+            {"myid": "42", "authid": "9", "pageindex": "3"},
+        )
+
 
 class SocialBffRoutingTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -812,6 +840,82 @@ class SocialBffRoutingTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(response[1]["code"], "PROFILE_LOCATION_MISSING")
         self.assertTrue(response[1]["location_required"])
+
+    def test_user_moments_target_uid_and_numbered_pages(self) -> None:
+        def run(path):
+            calls = []
+
+            def user_posts(uid, page="1"):
+                calls.append(("self", uid, page))
+                if page == "4":
+                    return ApiResult(False, 200, "false", data=False)
+                return ApiResult(
+                    True,
+                    200,
+                    "[]",
+                    data=[{"id": f"post-{page}", "authid": uid, "posttext": "动态"}],
+                )
+
+            def profile_posts(uid, page="1"):
+                calls.append(("profile", uid, page))
+                if page == "4":
+                    return ApiResult(False, 200, "false", data=False)
+                return ApiResult(
+                    True,
+                    200,
+                    "[]",
+                    data=[{"id": f"post-{page}", "authid": uid, "posttext": "动态"}],
+                )
+
+            app = SimpleNamespace(
+                session=SimpleNamespace(uid="42"),
+                social=SimpleNamespace(user_posts=user_posts, profile_posts=profile_posts),
+            )
+            web_user = SimpleNamespace(app=app)
+
+            class Harness:
+                def __init__(self):
+                    self.path = path
+                    self.response = None
+
+                def _check_api_origin(self):
+                    return True
+
+                def sid(self):
+                    return "sid"
+
+                def user(self, _sid):
+                    return web_user
+
+                def ok(self, obj, status=200, **_kwargs):
+                    self.response = (status, obj)
+                    return self.response
+
+            harness = Harness()
+            bff_server.Handler.do_GET(harness)
+            return calls, harness.response
+
+        calls, response = run("/api/moments/posts?uid=9&page=2")
+        self.assertEqual(calls, [("profile", "9", "2")])
+        self.assertEqual(response[1]["target_uid"], "9")
+        self.assertEqual(response[1]["page"], "2")
+        self.assertEqual(response[1]["next_page"], "3")
+        self.assertFalse(response[1]["items"][0]["is_self"])
+
+        calls, response = run("/api/moments/posts?tab=%E6%88%91%E7%9A%84&page=3")
+        self.assertEqual(calls, [("self", "42", "3")])
+        self.assertTrue(response[1]["items"][0]["is_self"])
+        self.assertEqual(response[1]["next_page"], "4")
+
+        calls, response = run("/api/moments/posts?uid=9&page=4")
+        self.assertEqual(calls, [("profile", "9", "4")])
+        self.assertTrue(response[1]["ok"])
+        self.assertEqual(response[1]["items"], [])
+        self.assertEqual(response[1]["next_page"], "")
+
+        calls, response = run("/api/moments/posts?uid=bad&page=1")
+        self.assertEqual(calls, [])
+        self.assertEqual(response[0], 400)
 
     def test_agree_friend_uses_applicant_uid_and_verifies_friend_state(self) -> None:
         calls, response = self._run_agree_post({"uid": "9", "apply_id": "apply-1"})
@@ -1150,8 +1254,33 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertNotIn("panel.innerHTML = `<div class=\"tab-panel-loading\"", moments_switch)
         self.assertIn("seq !== S.momentsFeedSeq", moments_switch)
         self.assertNotIn('start: "1"', moments_loader)
-        self.assertIn('const nextCursor = String(posts.at(-1)?.id || "")', moments_loader)
+        self.assertIn('activeTab === "我的" ? { tab: activeTab, page: "1" }', moments_loader)
+        self.assertIn('String(data?.next_page || "")', moments_loader)
+        self.assertIn('String(posts.at(-1)?.id || "")', moments_loader)
         self.assertIn(".moments-tab-panel.is-loading", app_css)
+
+    def test_profile_dialog_can_load_target_user_moments(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
+        index_html = (root / "bbw_web" / "static" / "index.html").read_text(encoding="utf-8")
+
+        for marker in (
+            'data-action="profile-moments-toggle"',
+            'aria-controls="profile-moments"',
+            'id="profile-moments"',
+            'id="profile-moment-feed"',
+            'data-action="profile-moment-load-more"',
+            'new URLSearchParams({ uid, page: "1" })',
+            'new URLSearchParams({ uid, page })',
+            'data?.feed_type !== "user"',
+            'String(data?.target_uid || "") !== String(uid || "")',
+            'button.dataset.page = String(data?.next_page || Number(page) + 1)',
+        ):
+            self.assertIn(marker, app_js)
+        self.assertIn(".profile-moment-feed", app_css)
+        self.assertIn(".profile-moments-button", app_css)
+        self.assertIn("-profile-moments", index_html)
 
     def test_bottle_card_uses_apk_content_and_readable_visual_hierarchy(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -1188,7 +1317,11 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertNotIn("avatar.textContent", app_js)
         self.assertIn("mediaUrl(validAvatarValue(url))", avatar_renderer)
         self.assertIn('if (!src) return "";', avatar_renderer)
-        self.assertIn('aria-hidden="true" hidden', avatar_renderer)
+        self.assertIn('class="avatar avatar-loading"', avatar_renderer)
+        self.assertIn('aria-hidden="true"', avatar_renderer)
+        self.assertIn('avatar.classList.remove("avatar-loading")', avatar_renderer)
+        self.assertIn(".avatar.avatar-loading", app_css)
+        self.assertIn("visibility: hidden", app_css)
         self.assertIn("data-avatar-image", avatar_renderer)
         self.assertIn('loading="eager"', avatar_renderer)
         self.assertNotIn('loading="lazy"', avatar_renderer)
@@ -1263,6 +1396,9 @@ class SocialFrontendContractTests(unittest.TestCase):
             "function visitorCard", 1
         )[0]
         chat_pane = app_js.split("function chatPaneHtml()", 1)[1].split("function refreshMessageConversationRegion", 1)[0]
+        select_action = app_js.split(
+            'if (action === "open-chat" || action === "select-conversation")', 1
+        )[1].split('if (action === "close-conversation")', 1)[0]
 
         self.assertIn("messageSyncTimer: null", app_js)
         self.assertIn("ensureConversationForPeer(uid", app_js)
@@ -1290,6 +1426,8 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertNotIn('id="reload-page"', index_html)
         self.assertNotIn("avatarHtml(", chat_pane)
         self.assertNotIn("UID ${esc", chat_pane)
+        self.assertIn('refreshList: action !== "select-conversation"', select_action)
+        self.assertNotIn("refreshList: true", select_action)
 
     def test_authenticated_boot_preloads_conversations_and_realtime_unread_state(self) -> None:
         root = Path(__file__).resolve().parents[1]

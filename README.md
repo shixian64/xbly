@@ -83,6 +83,8 @@ python -m bbw_protocol.cli repl
 # —— 产品化 Web App（PC 侧栏 / 手机五项底栏）——
 python -m bbw_web --port 8765
 # http://127.0.0.1:8765/
+# 这是 memory-only 本地入口，不注册管理 API；只看管理页面可访问：
+# http://127.0.0.1:8765/static/admin.html
 # 身边·消息·匹配·动态·我的；侧栏按所属主模块展开二级入口
 # 手机录音需要受信任的 HTTPS 安全上下文，部署说明见 bbw_web/README.md
 # 授权研究时才使用：python -m bbw_web --enable-lab
@@ -102,6 +104,252 @@ print(app.native.im.tim_login_payload())   # 给 TIM Web SDK
 ```
 
 会话默认写入仓库根目录 `session.json`（已 gitignore）。
+
+---
+
+## Windows 本地测试管理端
+
+`py -3 -m bbw_web --port 8765` 启动的是旧的内存会话入口，只提供用户端和旧 BFF，不能登录管理端：
+
+- 只查看管理界面：`http://127.0.0.1:8765/static/admin.html`
+- 完整测试管理端：必须启动 `bbw_web.api:app`，并准备 PostgreSQL、Redis 和本地 Secret。
+
+以下命令均在仓库根目录的同一个 PowerShell 窗口执行。先停止占用 8765 端口的旧服务。
+
+### 1. 启动本地 PostgreSQL 和 Redis
+
+首次运行：
+
+```powershell
+docker run -d --name bbw-pg-local `
+  -p 127.0.0.1:55432:5432 `
+  -e POSTGRES_USER=bbw `
+  -e POSTGRES_PASSWORD=BbwLocalDb_2026 `
+  -e POSTGRES_DB=bbw `
+  -v bbw-pg-local-data:/var/lib/postgresql/data `
+  postgres:16-alpine
+
+docker run -d --name bbw-redis-local `
+  -p 127.0.0.1:56379:6379 `
+  -v bbw-redis-local-data:/data `
+  redis:7.4-alpine redis-server --appendonly yes
+```
+
+容器已经创建过时直接启动：
+
+```powershell
+docker start bbw-pg-local bbw-redis-local
+```
+
+安装生产 Web 依赖：
+
+```powershell
+py -3 -m pip install -r requirements.txt
+```
+
+### 2. 生成仅用于本机的 Secret
+
+本地 Secret 使用 `local_*` 文件名，位于已经被 Git 忽略的 `docker/secrets/`，不会覆盖生产文件：
+
+```powershell
+$secretDir = Join-Path $PWD "docker\secrets"
+New-Item -ItemType Directory -Force $secretDir | Out-Null
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+
+function New-LocalKeyFile([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) {
+        $bytes = New-Object byte[] 32
+        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+        [IO.File]::WriteAllText($path, [Convert]::ToBase64String($bytes), $utf8)
+    }
+}
+
+New-LocalKeyFile "$secretDir\local_app_master_key"
+New-LocalKeyFile "$secretDir\local_phone_hmac_key"
+New-LocalKeyFile "$secretDir\local_session_hmac_key"
+
+if (-not (Test-Path "$secretDir\local_credential_keyring")) {
+    [IO.File]::WriteAllText("$secretDir\local_credential_keyring", "{}", $utf8)
+}
+if (-not (Test-Path "$secretDir\local_admin_initial_password")) {
+    [IO.File]::WriteAllText(
+        "$secretDir\local_admin_initial_password",
+        "BbwLocal#2026Test",
+        $utf8
+    )
+}
+```
+
+不要在数据库已有密文后删除或重新生成这三个密钥文件，否则旧账号凭据和管理端 TOTP 将无法解密。
+
+### 3. 配置本地运行环境
+
+```powershell
+$env:BBW_ENV = "development"
+$env:BBW_DATABASE_URL = "postgresql+psycopg://bbw:BbwLocalDb_2026@127.0.0.1:55432/bbw"
+$env:BBW_REDIS_URL = "redis://127.0.0.1:56379/0"
+
+$env:BBW_CREDENTIAL_MASTER_KEY_FILE = "$secretDir\local_app_master_key"
+$env:BBW_CREDENTIAL_KEYS_FILE = "$secretDir\local_credential_keyring"
+$env:BBW_PHONE_HMAC_KEY_FILE = "$secretDir\local_phone_hmac_key"
+$env:BBW_SESSION_HMAC_KEY_FILE = "$secretDir\local_session_hmac_key"
+
+$env:BBW_ADMIN_INITIAL_USERNAME = "admin"
+$env:BBW_ADMIN_INITIAL_PASSWORD_FILE = "$secretDir\local_admin_initial_password"
+
+# 本地使用 HTTP，不能使用生产环境的 Secure/__Host- Cookie。
+$env:BBW_COOKIE_SECURE = "false"
+$env:BBW_USER_COOKIE_NAME = "bbw_sid"
+$env:BBW_ADMIN_COOKIE_NAME = "bbw_admin_sid"
+$env:BBW_TRUST_PROXY_HEADERS = "false"
+```
+
+这些环境变量只对当前 PowerShell 窗口有效；重新打开终端后需要再次设置。
+
+### 4. 初始化数据库并启动完整 Web
+
+```powershell
+py -3 -m alembic upgrade head
+
+py -3 -m uvicorn bbw_web.api:app `
+  --host 127.0.0.1 `
+  --port 8765 `
+  --workers 1
+```
+
+打开：
+
+```text
+用户端：http://127.0.0.1:8765/
+管理端：http://127.0.0.1:8765/admin
+```
+
+首次空数据库的管理账号：
+
+```text
+用户名：admin
+密码：BbwLocal#2026Test
+```
+
+初始密码只在数据库不存在管理员时使用。修改管理密码后，后续登录应使用新密码。未配置 Cloudflare R2 时，可以测试管理员、邀请码、用户、聊天、关系、活动和审计功能，但媒体上传及临时访问地址不可用。
+
+---
+
+## Ubuntu 服务器部署
+
+生产部署的完整说明、Cloudflare/R2 配置、安全边界、备份和上线检查表见
+[docs/14_PRODUCTION_DEPLOYMENT.md](docs/14_PRODUCTION_DEPLOYMENT.md)。下面是首次部署的最短流程。
+
+推荐环境：Ubuntu 24.04 LTS、3 vCPU、2 GB RAM、30 GB 磁盘并配置 Swap。服务器需要提前安装 Docker Engine 和 Docker Compose Plugin，并准备：
+
+- 一个已经接入 Cloudflare DNS 代理的域名。
+- 一个保持私有的 Cloudflare R2 Bucket。
+- 仅限该 Bucket 的 R2 Access Key ID 和 Secret Access Key。
+- 当前有效的腾讯 IM Secret Key 与 RoomKit Business Token。
+
+### 1. 获取项目并填写非敏感配置
+
+```bash
+git clone https://github.com/shixian64/xbly.git
+cd xbly
+
+cp .env.example .env
+nano .env
+chmod 600 .env
+```
+
+`.env` 至少需要填写：
+
+```dotenv
+TZ=Asia/Shanghai
+BBW_DATA_ROOT=/var/lib/bbw
+APP_DOMAIN=你的正式域名
+ACME_EMAIL=你的证书联系邮箱
+POSTGRES_DB=bbw
+POSTGRES_USER=bbw
+R2_ACCOUNT_ID=你的Cloudflare账户ID
+R2_BUCKET=你的私有Bucket名称
+TURNSTILE_SITE_KEY=
+ADMIN_INITIAL_USERNAME=admin
+APP_IMAGE=bbw-app:local
+```
+
+密码、主密钥、协议密钥、R2 Secret 和 Turnstile Secret 禁止写入 `.env`。
+
+### 2. 初始化 Docker Secret 和宿主机目录
+
+```bash
+chmod 700 docker/init-secrets.sh docker/prepare-host.sh
+bash docker/init-secrets.sh
+```
+
+脚本会：
+
+- 随机生成 PostgreSQL 密码、凭据主密钥、HMAC 密钥和初始管理员密码。
+- 交互录入腾讯 IM、RoomKit、R2 凭据。
+- 可选录入 Turnstile Secret；未启用时直接回车。
+
+然后设置 Secret 文件权限并准备 Caddy 持久目录：
+
+```bash
+find docker/secrets -maxdepth 1 -type f \
+  ! -name README.md ! -name .gitignore \
+  -exec chmod 444 {} \;
+
+sudo env BBW_DATA_ROOT=/var/lib/bbw bash docker/prepare-host.sh
+```
+
+`BBW_DATA_ROOT` 必须与 `.env` 中的值一致。
+
+### 3. 检查、构建并启动
+
+```bash
+docker compose config --quiet
+docker compose build --pull
+docker compose up -d
+docker compose ps
+```
+
+首次启动顺序为 PostgreSQL、Redis、数据库迁移、App/Worker/Scheduler、Caddy。查看日志：
+
+```bash
+docker compose logs --tail 100 postgres redis migrate app worker scheduler caddy
+```
+
+验证服务：
+
+```bash
+curl -fsS "https://你的正式域名/api/health"
+docker compose exec postgres sh -c \
+  'pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+docker compose exec redis redis-cli ping
+```
+
+访问入口：
+
+```text
+用户端：https://你的正式域名/
+管理端：https://你的正式域名/admin
+```
+
+初始管理员用户名来自 `.env` 的 `ADMIN_INITIAL_USERNAME`，初始密码位于：
+
+```bash
+cat docker/secrets/admin_initial_password
+```
+
+首次登录后应立即修改管理员密码、绑定身份验证器，并更换 bootstrap 初始密码文件。不要把初始密码输出到日志或发送到聊天工具。
+
+### 4. 上线前必须确认
+
+- 云安全组和防火墙不开放 `8000`、`5432`、`6379`，公网只开放 `80/443` 和受限 SSH。
+- R2 Bucket 没有公共开发 URL，浏览器只能获得最长 5 分钟的签名读取地址。
+- `/admin` 已完成修改密码、TOTP、邀请码、用户启停和敏感查看审计测试。
+- 已生成至少一份 PostgreSQL 手工备份，并离线保存全部 Docker Secret。
+- 已在上游控制台轮换历史上曾进入源码的协议密钥。
+
+自动异地备份、自动主密钥轮换、真实 Cloudflare/R2/上游端到端联调仍需按照生产部署文档中的上线检查表执行。
 
 ---
 

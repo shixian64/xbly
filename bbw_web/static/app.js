@@ -1393,17 +1393,16 @@ function actionRoute(action) {
 function avatarHtml(url) {
   const src = mediaUrl(validAvatarValue(url));
   if (!src) return "";
-  // The wrapper stays hidden until the real image loads. Native lazy loading
-  // cannot be used here: an image below display:none may never enter the lazy
-  // loading queue, so no load event would be available to reveal the wrapper.
-  return `<span class="avatar" aria-hidden="true" hidden><img src="${esc(
+  // Reserve the real avatar's dimensions while it loads so a list refresh does
+  // not collapse every row and then expand it again as images decode.
+  return `<span class="avatar avatar-loading" aria-hidden="true"><img src="${esc(
     src
   )}" alt="" loading="eager" decoding="async" referrerpolicy="no-referrer" data-avatar-image /></span>`;
 }
 
 function revealLoadedAvatar(image) {
   const avatar = image?.closest?.(".avatar");
-  if (avatar) avatar.hidden = false;
+  if (avatar) avatar.classList.remove("avatar-loading");
 }
 
 function discardFailedAvatar(image) {
@@ -5496,11 +5495,11 @@ function momentsTabDescription(tab, data = null) {
 
 async function loadMomentsTab(tab, signal) {
   const activeTab = normalizeMomentsTab(tab);
-  const params = new URLSearchParams({ tab: activeTab, cursor: "1" });
+  const params = new URLSearchParams(activeTab === "我的" ? { tab: activeTab, page: "1" } : { tab: activeTab, cursor: "1" });
   if (S.momentsSearch && activeTab !== "我的") params.set("search", S.momentsSearch);
   const { data } = await api(`/api/moments/posts?${params.toString()}`, { signal });
   const posts = itemsOf(data);
-  const nextCursor = String(posts.at(-1)?.id || "");
+  const nextCursor = activeTab === "我的" ? String(data?.next_page || "") : String(posts.at(-1)?.id || "");
   return { tab: activeTab, data, posts, nextCursor };
 }
 
@@ -5964,6 +5963,88 @@ function setPanel(id, html) {
   if (panel) panel.innerHTML = html;
 }
 
+function profileMomentsHtml(data, uid, displayName) {
+  const posts = itemsOf(data);
+  const nextPage = String(data?.next_page || "");
+  return `<div class="profile-dialog-section-head"><div><h3>动态</h3><p>${esc(
+    displayName || `用户 ${uid}`
+  )}的公开动态</p></div></div>
+    <div id="profile-moment-feed" class="moment-feed profile-moment-feed" aria-live="polite">${envelopeHtml(
+      data,
+      momentCard,
+      "还没有可见动态",
+      "对方暂未发布动态，或当前没有你可以查看的内容"
+    )}</div>
+    ${
+      posts.length && nextPage
+        ? `<div class="moment-load-more"><button type="button" class="btn secondary" data-action="profile-moment-load-more" data-uid="${esc(
+            uid
+          )}" data-page="${esc(nextPage)}">加载更多</button></div>`
+        : ""
+    }`;
+}
+
+function requireProfileMomentsEnvelope(data, uid) {
+  if (data?.feed_type !== "user" || String(data?.target_uid || "") !== String(uid || "")) {
+    throw new Error("动态服务尚未更新，请重启 Web 服务后重试");
+  }
+  return data;
+}
+
+async function toggleProfileMoments(button) {
+  const section = $("profile-moments");
+  const uid = String(button.dataset.uid || "").trim();
+  if (!section || !uid) return;
+  if (section.dataset.loaded === "1" && !section.hidden) {
+    section.hidden = true;
+    button.textContent = "查看动态";
+    button.setAttribute("aria-expanded", "false");
+    return;
+  }
+  section.hidden = false;
+  button.textContent = "收起动态";
+  button.setAttribute("aria-expanded", "true");
+  if (section.dataset.loaded === "1") {
+    section.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    return;
+  }
+  section.innerHTML = loadingState("正在读取动态…");
+  section.dataset.uid = uid;
+  try {
+    const params = new URLSearchParams({ uid, page: "1" });
+    const { data } = await api(`/api/moments/posts?${params.toString()}`);
+    if (!button.isConnected || section.dataset.uid !== uid) return;
+    section.innerHTML = profileMomentsHtml(requireProfileMomentsEnvelope(data, uid), uid, button.dataset.name || "");
+    section.dataset.loaded = "1";
+    section.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  } catch (error) {
+    if (!button.isConnected || section.dataset.uid !== uid) return;
+    section.innerHTML = errorState(error?.message || "动态读取失败");
+    button.textContent = "重新加载动态";
+    throw error;
+  }
+}
+
+async function loadMoreProfileMoments(button) {
+  const uid = String(button.dataset.uid || "").trim();
+  const page = String(button.dataset.page || "").trim();
+  const section = $("profile-moments");
+  const feed = $("profile-moment-feed");
+  if (!uid || !/^\d+$/.test(page) || !section || !feed || section.dataset.uid !== uid) return;
+  const params = new URLSearchParams({ uid, page });
+  const { data } = await api(`/api/moments/posts?${params.toString()}`);
+  if (!button.isConnected || section.dataset.uid !== uid) return;
+  requireProfileMomentsEnvelope(data, uid);
+  const posts = itemsOf(data);
+  if (!posts.length) {
+    button.textContent = "没有更多动态";
+    button.dataset.locked = "true";
+    return;
+  }
+  feed.insertAdjacentHTML("beforeend", posts.map(momentCard).join(""));
+  button.dataset.page = String(data?.next_page || Number(page) + 1);
+}
+
 function closeProfileDialog() {
   S.profileSeq += 1;
   if (S.profileController) S.profileController.abort();
@@ -6012,7 +6093,8 @@ async function openProfile(uid) {
     return;
   }
   const name = user.nickname || user.name || `用户 ${target}`;
-  const isSelf = target === currentUid;
+  const profileUid = String(user.id || user.uid || target);
+  const isSelf = profileUid === currentUid;
   const details = [
     user.age && `${user.age} 岁`,
     user.sex || user.gender,
@@ -6027,20 +6109,23 @@ async function openProfile(uid) {
       isSelf
         ? `<button type="button" class="btn primary" data-route="me">返回我的页面</button>`
         : `<button type="button" class="btn primary" data-action="open-chat" data-uid="${esc(
-            user.id || user.uid || target
+            profileUid
           )}" data-name="${esc(name)}" data-avatar="${esc(user.avatar || user.portrait || "")}">聊天</button><button type="button" class="btn secondary" data-action="follow-user" data-uid="${esc(
-            user.id || user.uid || target
+            profileUid
           )}">关注</button>`
-    }</section>
+    }<button type="button" class="btn soft profile-moments-button" data-action="profile-moments-toggle" data-uid="${esc(
+      profileUid
+    )}" data-name="${esc(name)}" aria-controls="profile-moments" aria-expanded="false">查看动态</button></section>
     <section class="profile-dialog-section"><h3>个人介绍</h3><p>${esc(user.signature || "对方还没有填写个人介绍")}</p></section>
     <section class="profile-dialog-section"><h3>基本资料</h3>${keyValueView({
-      uid: user.id || user.uid || target,
+      uid: profileUid,
       age: user.age || "—",
       gender: user.sex || user.gender || "—",
       property: user.property || "—",
       city: user.city || user.region || "—",
       online: user.online || "—",
-    })}</section>`;
+    })}</section>
+    <section class="profile-dialog-section profile-moments-section" id="profile-moments" data-uid="${esc(profileUid)}" hidden></section>`;
 }
 
 async function refreshMatchStats() {
@@ -7021,6 +7106,8 @@ async function handleAction(action, button) {
     S.momentsSearch = "";
     return switchMomentsTab(S.momentsTab, { force: true });
   }
+  if (action === "profile-moments-toggle") return toggleProfileMoments(button);
+  if (action === "profile-moment-load-more") return loadMoreProfileMoments(button);
   if (action === "moment-toggle-comments") {
     const card = momentCardForButton(button);
     const panel = card?.querySelector("[data-comment-panel]");
@@ -7047,18 +7134,22 @@ async function handleAction(action, button) {
   if (action === "moment-load-more") {
     const tab = button.dataset.tab || S.momentsTab;
     const cursor = button.dataset.cursor || "";
-    const params = new URLSearchParams({ tab, cursor });
+    const params = new URLSearchParams(tab === "我的" ? { tab, page: cursor } : { tab, cursor });
     if (S.momentsSearch && tab !== "我的") params.set("search", S.momentsSearch);
     const { data } = await api(`/api/moments/posts?${params.toString()}`);
     const posts = itemsOf(data);
     const feed = $("moment-feed");
     if (!posts.length) {
       button.textContent = "没有更多动态";
-      button.disabled = true;
+      button.dataset.locked = "true";
       return;
     }
     feed?.insertAdjacentHTML("beforeend", posts.map(momentCard).join(""));
-    button.dataset.cursor = String(posts.at(-1)?.id || "");
+    button.dataset.cursor = tab === "我的" ? String(data?.next_page || "") : String(posts.at(-1)?.id || "");
+    if (!button.dataset.cursor) {
+      button.textContent = "没有更多动态";
+      button.dataset.locked = "true";
+    }
     return;
   }
   if (action === "moment-delete") {
@@ -7268,7 +7359,10 @@ async function handleAction(action, button) {
     } else {
       refreshMessageConversationRegion({
         focusComposer: action === "select-conversation",
-        refreshList: true,
+        // Selecting an existing card only changes its active/read state. Keep
+        // the list nodes (and loaded avatars/scroll position) to avoid a full
+        // list reflow on every click; open-chat may still add a new card.
+        refreshList: action !== "select-conversation",
       });
       void loadConversationMessages(uid);
     }
