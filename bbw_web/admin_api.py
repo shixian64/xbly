@@ -228,6 +228,16 @@ class UserMatchPoolOnlineListBody(_StrictBody):
         return value.strip()
 
 
+class UserNearbyCustomCityBody(_StrictBody):
+    enabled: StrictBool
+    reason: str = Field(min_length=3, max_length=500)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def strip_reason(cls, value: str) -> str:
+        return value.strip()
+
+
 class PasswordChangeBody(_StrictBody):
     current_password: str = Field(min_length=1, max_length=1024)
     new_password: str = Field(min_length=12, max_length=1024)
@@ -768,6 +778,7 @@ def _user_public(user: User, account: ExternalAccount | None) -> dict[str, Any]:
         "match_pool_online_list_enabled": bool(
             user.match_pool_online_list_enabled
         ),
+        "nearby_custom_city_enabled": bool(user.nearby_custom_city_enabled),
         "last_login_at": _iso(user.last_login_at),
         "last_authenticated_at": _iso(account.last_authenticated_at) if account else None,
         "last_sync_at": _iso(account.last_sync_at) if account else None,
@@ -1698,6 +1709,45 @@ def set_user_match_pool_online_list(
                     "changed": changed,
                     "scope": ["proactive_private_message"],
                     "online_list_always_available": True,
+                },
+            )
+            item = _user_public(user, account)
+    except Exception as exc:
+        if isinstance(exc, ServiceError):
+            _raise_service_error(exc)
+        raise
+    return {"ok": True, "user": item, "changed": changed}
+
+
+@router.post("/users/{user_id}/nearby-custom-city")
+def set_user_nearby_custom_city(
+    user_id: uuid.UUID,
+    body: UserNearbyCustomCityBody,
+    request: Request,
+    context: AdminContext = Depends(_admin_context),
+) -> dict[str, Any]:
+    try:
+        with session_scope() as db:
+            account = ExternalAccountRepository(db).get_for_user(user_id)
+            user = _require_user(db, user_id, for_update=True)
+            old_enabled = bool(user.nearby_custom_city_enabled)
+            new_enabled = bool(body.enabled)
+            changed = old_enabled != new_enabled
+            user.nearby_custom_city_enabled = new_enabled
+            _audit_service(db, request).record(
+                actor_type="admin",
+                action="user.nearby_custom_city_changed",
+                admin_user_id=context.admin_user_id,
+                target_user_id=user_id,
+                resource_type="user_feature",
+                resource_id="nearby_custom_city",
+                reason=body.reason,
+                client_ip=context.client_ip,
+                details={
+                    "old_enabled": old_enabled,
+                    "new_enabled": new_enabled,
+                    "changed": changed,
+                    "scope": ["nearby_custom_city_filter"],
                 },
             )
             item = _user_public(user, account)

@@ -81,7 +81,6 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("logout")
 
     # content
-    sub.add_parser("gifts")
     sub.add_parser("recommend")
     sub.add_parser("ads")
     sub.add_parser("censor")
@@ -106,9 +105,6 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("reset-num")
 
     # economy
-    sub.add_parser("svip-try")
-    sp = sub.add_parser("exchange-vip")
-    sp.add_argument("--vip-id", default="5")
     sp = sub.add_parser("withdraw")
     sp.add_argument("--alipay")
     sp.add_argument("--name")
@@ -123,23 +119,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("txim-sign")
     sub.add_parser("online")
 
-    # native adapters (IM / face / pay)
-    sub.add_parser("native-status", help="IM/face/pay adapter capability snapshot")
+    # native adapters (IM / face / RoomKit)
+    sub.add_parser("native-status", help="IM/face/RoomKit adapter capability snapshot")
     sp = sub.add_parser("im-tim", help="TIM login payload (UserSig)")
     sp.add_argument("--prefer", default="local", choices=("local", "server"))
     sp.add_argument("--uid", default=None)
     sub.add_parser("im-rong", help="RongCloud register + token")
     sp = sub.add_parser("im-boot", help="TIM + Rong bootstrap JSON")
     sp.add_argument("--prefer", default="local", choices=("local", "server"))
-    sp = sub.add_parser("pay-coin", help="prepare coin recharge order")
-    sp.add_argument("--channel", default="wechat", choices=("wechat", "alipay"))
-    sp.add_argument("--coin-id", default="1")
-    sp = sub.add_parser("pay-vip", help="prepare VIP/SVIP order")
-    sp.add_argument("--channel", default="wechat", choices=("wechat", "alipay"))
-    sp.add_argument("--level", default="vip", choices=("vip", "svip"))
-    sp.add_argument("--vipid", required=True, help="server-defined VIP product id")
-    sp = sub.add_parser("pay-card", help="buy match card with 乐园币")
-    sp.add_argument("--card-id", default="1")
     sub.add_parser("face-status", help="face real-name pipeline hint")
     sp = sub.add_parser("face-init", help="InitFaceVerify0 (needs real metaInfo from ZIM)")
     sp.add_argument("--name", required=True)
@@ -213,8 +200,6 @@ def main(argv=None) -> int:
         app.save(args.session)
         return _print_result(r, raw)
 
-    if args.cmd == "gifts":
-        return _print_result(app.content.gift_list(), raw)
     if args.cmd == "recommend":
         return _print_result(app.content.recommend(), raw)
     if args.cmd == "ads":
@@ -249,10 +234,6 @@ def main(argv=None) -> int:
     if args.cmd == "reset-num":
         return _print_result(app.profile.reset_num(), raw)
 
-    if args.cmd == "svip-try":
-        return _print_result(app.economy.svip_try(), raw)
-    if args.cmd == "exchange-vip":
-        return _print_result(app.economy.money_exchange_vip(int(args.vip_id)), raw)
     if args.cmd == "withdraw":
         return _print_result(
             app.economy.withdraw(args.alipay, args.name, args.amount), raw
@@ -302,24 +283,6 @@ def main(argv=None) -> int:
             )
         )
         return 0
-    if args.cmd == "pay-coin":
-        if args.channel == "alipay":
-            res = app.native.pay.prepare_coin_alipay(args.coin_id)
-        else:
-            res = app.native.pay.prepare_coin_wechat(args.coin_id)
-        print(json.dumps(res.to_dict(), ensure_ascii=False, indent=2))
-        return 0 if res.ok else 1
-    if args.cmd == "pay-vip":
-        if args.channel == "alipay":
-            res = app.native.pay.prepare_vip_alipay(args.level, vipid=args.vipid)
-        else:
-            res = app.native.pay.prepare_vip_wechat(args.level, vipid=args.vipid)
-        print(json.dumps(res.to_dict(), ensure_ascii=False, indent=2))
-        return 0 if res.ok else 1
-    if args.cmd == "pay-card":
-        res = app.native.pay.buy_match_card(args.card_id)
-        print(json.dumps(res.to_dict(), ensure_ascii=False, indent=2))
-        return 0 if res.ok else 1
     if args.cmd == "face-status":
         print(json.dumps(app.native.face.status_hint(), ensure_ascii=False, indent=2))
         return 0
@@ -367,7 +330,7 @@ def run_repl(app: BeibeiwuApp) -> int:
         if line == "help":
             print("whoami | save | login <phone> <pass> | onekey <phone>")
             print("call <action> [k=v ...] | redis <action> [k=v ...]")
-            print("follow <uid> | nick <name> | me | gifts | bootstrap")
+            print("follow <uid> | nick <name> | me | bootstrap")
             print("actions [cat] | quit")
             continue
         parts = line.split()
@@ -397,8 +360,6 @@ def run_repl(app: BeibeiwuApp) -> int:
                 _print_result(app.profile.reset_nickname(parts[1]))
             elif cmd == "me":
                 _print_result(app.profile.get_me())
-            elif cmd == "gifts":
-                _print_result(app.content.gift_list())
             elif cmd == "bootstrap":
                 out = {k: v.ok for k, v in app.bootstrap().items()}
                 print(out)

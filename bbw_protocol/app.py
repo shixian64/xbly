@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .client import ApiResult, ProtocolClient
+from .client import ApiResult, ProtocolClient, commerce_action_disabled
 from .modules.auth import AuthAPI
 from .modules.content import ContentAPI
 from .modules.economy import EconomyAPI
@@ -31,9 +31,8 @@ class BeibeiwuApp:
         app.profile.reset_nickname("Vom")
         app.save()
 
-    Native sidecars (IM / face / pay adapters):
+    Native sidecars (IM / face / RoomKit adapters):
         app.native.im.tim_login_payload()
-        app.native.pay.prepare_coin_wechat("1")
     """
 
     def __init__(self, session: Optional[Session] = None):
@@ -53,7 +52,7 @@ class BeibeiwuApp:
 
     @property
     def native(self):
-        """IM / face / pay adapters (lazy import)."""
+        """IM / face / RoomKit adapters (lazy import)."""
         if self._native is None:
             from .adapters import NativeBundle
 
@@ -103,7 +102,7 @@ class BeibeiwuApp:
         hb.start()
         return hb
 
-    # ---- generic escape hatch (all 400 actions) ----
+    # ---- generic escape hatch (commerce actions are blocked by ProtocolClient) ----
     def call(self, action: str, **params: Any) -> ApiResult:
         return self.client.call(action, params)
 
@@ -130,15 +129,18 @@ class BeibeiwuApp:
     def list_actions(self, category: Optional[str] = None) -> List[str]:
         cat = self.catalog()
         if category:
-            return list(cat.get("categories", {}).get(category, []))
+            return [
+                action
+                for action in cat.get("categories", {}).get(category, [])
+                if not commerce_action_disabled(action)
+            ]
         actions = set(cat.get("shorts", [])) | set(cat.get("dos", []))
-        return sorted(actions)
+        return sorted(action for action in actions if not commerce_action_disabled(action))
 
     def bootstrap(self, *, include_im: bool = True) -> Dict[str, ApiResult]:
         """Pull common public + personal data after login (like app cold start)."""
         out: Dict[str, ApiResult] = {}
         out["ad"] = self.content.is_show_ad()
-        out["gifts"] = self.content.gift_list()
         out["recommend"] = self.content.recommend()
         out["censor"] = self.content.chat_censorship()
         out["online"] = self.misc.update_online(first=True)

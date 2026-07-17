@@ -165,6 +165,7 @@ class CapturingHandler(legacy.Handler):
         body: bytes,
         client_ip: str,
         match_pool_online_list_enabled: Optional[bool] = None,
+        nearby_custom_city_enabled: Optional[bool] = None,
         message_peer_authorizer: Optional[Callable[[str], bool]] = None,
         message_policy_match_peers: Iterable[str] = (),
     ) -> None:
@@ -177,6 +178,7 @@ class CapturingHandler(legacy.Handler):
         self.wfile = io.BytesIO()
         self.client_address = (client_ip, 0)
         self._request_match_pool_online_list_enabled = match_pool_online_list_enabled
+        self._request_nearby_custom_city_enabled = nearby_custom_city_enabled
         self._request_message_peer_authorizer = message_peer_authorizer
         self._request_message_policy_match_peers = tuple(message_policy_match_peers)
         self.request_version = "HTTP/1.1"
@@ -557,6 +559,9 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
         client_ip=client_ip,
         match_pool_online_list_enabled=(
             identity.match_pool_online_list_enabled if identity is not None else None
+        ),
+        nearby_custom_city_enabled=(
+            identity.nearby_custom_city_enabled if identity is not None else None
         ),
         message_peer_authorizer=(
             (

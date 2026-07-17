@@ -125,6 +125,7 @@ class ProductionContractTests(unittest.TestCase):
             "/users/{user_id}",
             "/users/{user_id}/status",
             "/users/{user_id}/match-pool-online-list",
+            "/users/{user_id}/nearby-custom-city",
             "/users/{user_id}/credentials",
             "/users/{user_id}/conversations",
             "/users/{user_id}/messages",
@@ -160,11 +161,15 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn('id="admin-user-status-dialog"', html)
         self.assertIn("ADMIN_ENDPOINTS.userMatchPoolOnlineList", js)
         self.assertIn('id="admin-match-pool-online-list-dialog"', html)
+        self.assertIn("ADMIN_ENDPOINTS.userNearbyCustomCity", js)
+        self.assertIn('id="admin-nearby-custom-city-dialog"', html)
         self.assertIn('featureInput.setAttribute("role", "switch")', js)
         self.assertIn("user.match_pool_online_list_changed", api)
         self.assertIn("修改非匹配主动私信授权", html)
         self.assertIn("非匹配主动私信", js)
         self.assertIn("在线用户列表、资料、动态和好友申请始终可用", js)
+        self.assertIn("user.nearby_custom_city_changed", api)
+        self.assertIn("附近的人自定义城市", js)
 
     def test_private_message_policy_uses_server_owned_match_and_conversation_grants(self) -> None:
         persistence = self.read("bbw_web/persistence.py")
@@ -523,6 +528,9 @@ class ProductionContractTests(unittest.TestCase):
         permission_migration = self.read(
             "migrations/versions/20260717_0002_match_pool_online_list_permission.py"
         )
+        nearby_permission_migration = self.read(
+            "migrations/versions/20260717_0003_nearby_custom_city_permission.py"
+        )
         self.assertIn("password_encrypted: Mapped[dict[str, Any] | None]", models)
         self.assertIn('name="fk_media_objects_message_owner"', models)
         self.assertIn('ForeignKey("admin_users.id", ondelete="RESTRICT")', models)
@@ -535,6 +543,11 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn('"match_pool_online_list_enabled"', permission_migration)
         self.assertIn('server_default=sa.text("false")', permission_migration)
         self.assertIn('op.drop_column("users", "match_pool_online_list_enabled")', permission_migration)
+        self.assertIn("nearby_custom_city_enabled: Mapped[bool]", models)
+        self.assertIn('down_revision: Union[str, Sequence[str], None] = "20260717_0002"', nearby_permission_migration)
+        self.assertIn('"nearby_custom_city_enabled"', nearby_permission_migration)
+        self.assertIn('server_default=sa.text("false")', nearby_permission_migration)
+        self.assertIn('op.drop_column("users", "nearby_custom_city_enabled")', nearby_permission_migration)
 
     def test_new_login_flushes_user_before_external_account(self) -> None:
         services = self.read("bbw_prod/services.py")
@@ -553,7 +566,7 @@ class ProductionContractTests(unittest.TestCase):
             'if path == "/api/auth/logout":', 1
         )[0]
         sms_login = source.split('if path == "/api/auth/sms-login":', 1)[1].split(
-            'if path == "/api/auth/password":', 1
+            "\n        u = self.user(sid)", 1
         )[0]
         self.assertNotIn("app.bootstrap()", password_login)
         self.assertNotIn("_enrich_session_profile", password_login)

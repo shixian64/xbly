@@ -11,14 +11,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from bbw_protocol.adapters.pay import PayAdapter  # noqa: E402
 from bbw_protocol.app import BeibeiwuApp  # noqa: E402
 from bbw_protocol.cli import build_parser  # noqa: E402
-from bbw_protocol.client import ApiResult, _parse_result  # noqa: E402
+from bbw_protocol.client import ApiResult, ProtocolClient, _parse_result  # noqa: E402
 from bbw_protocol.modules.im import ImAPI  # noqa: E402
 from bbw_protocol.modules.match import MatchAPI  # noqa: E402
 from bbw_protocol.modules.profile import ProfileAPI  # noqa: E402
 from bbw_protocol.modules.social import SocialAPI  # noqa: E402
+from bbw_protocol.session import Session  # noqa: E402
 from bbw_web import bff_server as BFF  # noqa: E402
 from bbw_web.normalize import (  # noqa: E402
     normalize_bottles,
@@ -537,71 +537,39 @@ class SocialAndImRoutingContractTests(unittest.TestCase):
         )
 
 
-class FakeApp:
-    def __init__(self, result: ApiResult):
-        self.result = result
-        self.calls = []
-        self.session = SimpleNamespace(uid="42")
-        self.economy = SimpleNamespace(
-            buy_coin_wechat=lambda coin_id: result,
-            buy_coin_alipay=lambda coin_id: result,
-        )
+class CommerceRemovalContractTests(unittest.TestCase):
+    def test_dedicated_purchase_and_recharge_surfaces_are_removed(self) -> None:
+        parser = build_parser()
+        commands = parser._subparsers._group_actions[0].choices
+        for command in ("gifts", "svip-try", "exchange-vip", "pay-coin", "pay-vip", "pay-card"):
+            self.assertNotIn(command, commands)
 
-    def call(self, action: str, **body):
-        self.calls.append((action, body))
-        return self.result
+        self.assertFalse((ROOT / "bbw_protocol" / "adapters" / "pay.py").exists())
+        bundle = (ROOT / "bbw_protocol" / "adapters" / "bundle.py").read_text(encoding="utf-8")
+        economy = (ROOT / "bbw_protocol" / "modules" / "economy.py").read_text(encoding="utf-8")
+        self.assertNotIn("self.pay", bundle)
+        for marker in ("buy_coin_", "money_exchange_vip", "svip_try", "send_gift", "send_vip", "vip_level_order"):
+            self.assertNotIn(marker, economy)
 
+    def test_server_membership_fields_remain_in_session_contract(self) -> None:
+        session = Session()
+        session.update_from_user({"vip": "1700000000", "svip": "1800000000"})
+        self.assertEqual(session.vip, "1700000000")
+        self.assertEqual(session.svip, "1800000000")
+        self.assertEqual(session.summary()["vip"], "1700000000")
+        self.assertEqual(session.summary()["svip"], "1800000000")
 
-class PaymentContractTests(unittest.TestCase):
-    def test_pay_vip_cli_accepts_the_required_product_id(self) -> None:
-        args = build_parser().parse_args(["pay-vip", "--vipid", "5"])
-        self.assertEqual(args.vipid, "5")
+    def test_low_level_client_blocks_commerce_actions_before_network(self) -> None:
+        calls = []
+        client = ProtocolClient(Session())
+        client._http = SimpleNamespace(request=lambda *args, **kwargs: calls.append((args, kwargs)))
 
-    def test_vip_requires_and_passes_vipid(self) -> None:
-        valid = ApiResult(
-            True,
-            200,
-            "",
-            data={"data": {"prepayid": "prepay", "sign": "signed"}},
-            code="200",
-        )
-        app = FakeApp(valid)
-        result = PayAdapter(app).prepare_vip_wechat("vip", vipid="5")
-        self.assertTrue(result.ok)
-        self.assertEqual(app.calls[0][0], "Payunifiedorder2vipXBXX")
-        self.assertEqual(app.calls[0][1]["vipid"], "5")
-        self.assertEqual(result.order_params["prepayId"], "prepay")
+        result = client.call("buyCoinWechatXBXX", coinId="1")
 
-        missing_app = FakeApp(valid)
-        missing = PayAdapter(missing_app).prepare_vip_wechat("vip")
-        self.assertFalse(missing.ok)
-        self.assertEqual(missing.code, "MISSING_VIPID")
-        self.assertEqual(missing_app.calls, [])
-
-    def test_order_success_requires_channel_fields(self) -> None:
-        incomplete = ApiResult(True, 200, "{}", data={}, code="200")
-        app = FakeApp(incomplete)
-        wechat = PayAdapter(app).prepare_vip_wechat("svip", vipid="7")
-        self.assertFalse(wechat.ok)
-        self.assertEqual(wechat.code, "INVALID_ORDER_PAYLOAD")
-
-        coin = PayAdapter(app).prepare_coin_wechat("1")
-        self.assertFalse(coin.ok)
-        self.assertEqual(coin.code, "INVALID_ORDER_PAYLOAD")
-
-    def test_alipay_vip_requires_order_string(self) -> None:
-        valid = ApiResult(
-            True,
-            200,
-            "",
-            data={"result": {"orderString": "app_id=1&sign=abc"}},
-            code="200",
-        )
-        app = FakeApp(valid)
-        result = PayAdapter(app).prepare_vip_alipay("vip", vipid="8")
-        self.assertTrue(result.ok)
-        self.assertEqual(app.calls[0][1]["vipid"], "8")
-        self.assertEqual(result.order_params["orderString"], "app_id=1&sign=abc")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, 403)
+        self.assertEqual(result.code, "COMMERCE_DISABLED")
+        self.assertEqual(calls, [])
 
 
 class CatalogMetadataContractTests(unittest.TestCase):
@@ -640,30 +608,31 @@ class MutationGuardContractTests(unittest.TestCase):
             BFF.RECENT_MUTATIONS.clear()
 
     def test_key_is_sid_path_and_complete_payload(self) -> None:
-        payload = {"channel": "wechat", "coin_id": "1", "meta": {"a": 1, "b": 2}}
-        self.assertTrue(BFF._mutation_allowed("sid-a", "/api/pay/coin", payload, 60.0))
+        payload = {"alipay": "a@b.com", "name": "测试", "amount": "1", "meta": {"a": 1, "b": 2}}
+        self.assertTrue(BFF._mutation_allowed("sid-a", "/api/wallet/withdraw", payload, 60.0))
         # JSON object ordering does not change the complete parsed payload.
-        reordered = {"meta": {"b": 2, "a": 1}, "coin_id": "1", "channel": "wechat"}
-        self.assertFalse(BFF._mutation_allowed("sid-a", "/api/pay/coin", reordered, 60.0))
-        self.assertTrue(BFF._mutation_allowed("sid-b", "/api/pay/coin", payload, 60.0))
-        self.assertTrue(BFF._mutation_allowed("sid-a", "/api/pay/vip", payload, 60.0))
-        changed = {**payload, "coin_id": "2"}
-        self.assertTrue(BFF._mutation_allowed("sid-a", "/api/pay/coin", changed, 60.0))
+        reordered = {"meta": {"b": 2, "a": 1}, "amount": "1", "name": "测试", "alipay": "a@b.com"}
+        self.assertFalse(BFF._mutation_allowed("sid-a", "/api/wallet/withdraw", reordered, 60.0))
+        self.assertTrue(BFF._mutation_allowed("sid-b", "/api/wallet/withdraw", payload, 60.0))
+        changed = {**payload, "amount": "2"}
+        self.assertTrue(BFF._mutation_allowed("sid-a", "/api/wallet/withdraw", changed, 60.0))
 
     def test_authenticated_financial_post_returns_duplicate_contract(self) -> None:
         calls = []
 
-        def buy_match_card(card_id: str):
-            calls.append(card_id)
-            return SimpleNamespace(to_dict=lambda: {"ok": True, "card_id": card_id})
+        def withdraw(alipay: str, name: str, amount: str, authid: str):
+            calls.append((alipay, name, amount, authid))
+            return ApiResult(True, 200, "true", data=True)
 
         web_user = SimpleNamespace(
-            app=SimpleNamespace(),
-            native=SimpleNamespace(pay=SimpleNamespace(buy_match_card=buy_match_card)),
+            app=SimpleNamespace(
+                economy=SimpleNamespace(withdraw=withdraw),
+                session=SimpleNamespace(uid="42"),
+            ),
         )
 
         class Harness:
-            path = "/api/pay/card"
+            path = "/api/wallet/withdraw"
 
             def __init__(self, sid: str, payload: dict):
                 self._sid = sid
@@ -691,28 +660,35 @@ class MutationGuardContractTests(unittest.TestCase):
         old_store = BFF.STORE
         BFF.STORE = SimpleNamespace()
         try:
-            first = Harness("sid-a", {"card_id": "1"})
+            first = Harness("sid-a", {"alipay": "a@b.com", "name": "测试", "amount": "1"})
             BFF.Handler.do_POST(first)
             self.assertTrue(first.authenticated)
             self.assertEqual(first.response[0], 200)
-            self.assertEqual(calls, ["1"])
+            self.assertEqual(calls, [("a@b.com", "测试", "1", "42")])
 
-            duplicate = Harness("sid-a", {"card_id": "1"})
+            duplicate = Harness("sid-a", {"alipay": "a@b.com", "name": "测试", "amount": "1"})
             BFF.Handler.do_POST(duplicate)
             self.assertTrue(duplicate.authenticated)
             self.assertEqual(duplicate.response[0], 409)
             self.assertEqual(duplicate.response[1]["code"], "DUPLICATE_REQUEST")
             self.assertIn("重复提交", duplicate.response[1]["error"])
-            self.assertEqual(calls, ["1"])
+            self.assertEqual(calls, [("a@b.com", "测试", "1", "42")])
 
-            changed_payload = Harness("sid-a", {"card_id": "2"})
+            changed_payload = Harness("sid-a", {"alipay": "a@b.com", "name": "测试", "amount": "2"})
             BFF.Handler.do_POST(changed_payload)
             self.assertEqual(changed_payload.response[0], 200)
 
-            other_sid = Harness("sid-b", {"card_id": "1"})
+            other_sid = Harness("sid-b", {"alipay": "a@b.com", "name": "测试", "amount": "1"})
             BFF.Handler.do_POST(other_sid)
             self.assertEqual(other_sid.response[0], 200)
-            self.assertEqual(calls, ["1", "2", "1"])
+            self.assertEqual(
+                calls,
+                [
+                    ("a@b.com", "测试", "1", "42"),
+                    ("a@b.com", "测试", "2", "42"),
+                    ("a@b.com", "测试", "1", "42"),
+                ],
+            )
         finally:
             BFF.STORE = old_store
 

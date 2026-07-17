@@ -34,9 +34,61 @@ AGORA_RTM = (
 )
 FACE_INIT = "https://applet.banghua.xin/otherinterface/aliyun/InitFaceVerify0.php"
 FACE_DESC = "https://applet.banghua.xin/otherinterface/aliyun/DescribeFaceVerify0.php"
-ALIPAY_ORDER = (
-    "https://applet.banghua.xin/otherinterface/alipay-sdk-PHP/alipaybeiyuan2.php"
+
+# Purchase, recharge and client-side membership mutation actions are intentionally
+# unavailable.  Read-only membership fields continue to arrive through profile and
+# session payloads, so server-issued VIP/SVIP entitlements remain intact.
+DISABLED_COMMERCE_ACTIONS = frozenset(
+    {
+        "addaicoin",
+        "alipayaddorder2",
+        "alipayaddorder2svipxbxx",
+        "alipayaddorder2vipxbxx",
+        "buycard",
+        "buycoinalipayxbxx",
+        "buycoinwechatxbxx",
+        "buystoregoodsnew",
+        "exchangegroup",
+        "fanslevelorder",
+        "getcouponlist",
+        "getgiftlist",
+        "getmysupervisionorder",
+        "getnewestcoupon",
+        "getstore",
+        "getsupervisemeorder",
+        "incomeexchangemoney",
+        "moneyexchangevip",
+        "paychatcall",
+        "payunifiedorder2",
+        "payunifiedorder2svipxbxx",
+        "payunifiedorder2vipxbxx",
+        "recommendlevelorder",
+        "refundsvipandvip",
+        "sendgift1",
+        "sendgift2",
+        "sendstoregoodsnew",
+        "sendvip",
+        "sorttovip",
+        "supervisorlevelorder",
+        "sviptry",
+        "viplevelorder",
+    }
 )
+
+
+def commerce_action_disabled(action: Any) -> bool:
+    return str(action or "").strip().lower() in DISABLED_COMMERCE_ACTIONS
+
+
+def disabled_commerce_target(url: str) -> str:
+    parsed = parse.urlparse(str(url or ""))
+    query = parse.parse_qs(parsed.query)
+    action = str((query.get("do") or query.get("action") or [""])[0]).strip()
+    if commerce_action_disabled(action):
+        return action
+    if parsed.path.lower().endswith("/alipaybeiyuan2.php"):
+        return "alipaybeiyuan2.php"
+    return ""
 
 
 @dataclass
@@ -266,6 +318,25 @@ class ProtocolClient:
         token: Optional[str] = None,
         _allow_reauth: bool = True,
     ) -> ApiResult:
+        blocked_target = disabled_commerce_target(url)
+        candidate_fields = multipart if multipart is not None else body
+        if not blocked_target and isinstance(candidate_fields, dict):
+            for key in ("do", "action"):
+                candidate = candidate_fields.get(key)
+                if commerce_action_disabled(candidate):
+                    blocked_target = str(candidate)
+                    break
+        if blocked_target:
+            result = ApiResult(
+                False,
+                403,
+                "",
+                code="COMMERCE_DISABLED",
+                message="购买、充值及会员开通操作已停用",
+                kind="error",
+            )
+            self.last = result
+            return result
         uid = uid if uid is not None else self.session.uid
         token = token if token is not None else self.session.token
         hdrs = sign.auth_headers(uid, token, with_author_sig=with_author_sig)

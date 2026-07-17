@@ -51,6 +51,7 @@ class UserIdentity:
     external_account_id: uuid.UUID
     upstream_uid: str
     match_pool_online_list_enabled: bool = False
+    nearby_custom_city_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -759,6 +760,9 @@ class RuntimePersistence:
             match_pool_online_list_enabled=bool(
                 completion.user.match_pool_online_list_enabled
             ),
+            nearby_custom_city_enabled=bool(
+                completion.user.nearby_custom_city_enabled
+            ),
         )
         web_user.clear_pending()
         self._attach_runtime(web_user, identity)
@@ -850,6 +854,7 @@ class RuntimePersistence:
                 match_pool_online_list_enabled=bool(
                     user.match_pool_online_list_enabled
                 ),
+                nearby_custom_city_enabled=bool(user.nearby_custom_city_enabled),
             )
         self._attach_runtime(web_user, identity)
         return web_user
@@ -860,6 +865,7 @@ class RuntimePersistence:
         web_user.match_pool_online_list_enabled = bool(
             identity.match_pool_online_list_enabled
         )
+        web_user.nearby_custom_city_enabled = bool(identity.nearby_custom_city_enabled)
         web_user.app.client.response_hook = lambda meta, result: self.capture_upstream_response(
             identity=identity, request_meta=meta, result=result
         )
@@ -923,6 +929,7 @@ class RuntimePersistence:
                 match_pool_online_list_enabled=bool(
                     user.match_pool_online_list_enabled
                 ),
+                nearby_custom_city_enabled=bool(user.nearby_custom_city_enabled),
             )
 
     def revoke_session(self, sid: str, *, reason: str = "logout") -> bool:
@@ -958,6 +965,7 @@ class RuntimePersistence:
                 match_pool_online_list_enabled=bool(
                     user.match_pool_online_list_enabled
                 ),
+                nearby_custom_city_enabled=bool(user.nearby_custom_city_enabled),
             )
 
     def grant_message_peers(

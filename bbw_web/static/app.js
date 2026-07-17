@@ -15,7 +15,7 @@ const PRIMARY_NAV = [
     desc: "资料、礼仪与个人服务",
     children: [
       { id: "social", name: "关系中心", desc: "好友、关注、访客与黑名单" },
-      { id: "wallet", name: "钱包与会员", desc: "乐园币、会员、提现与礼物" },
+      { id: "wallet", name: "资产与权益", desc: "余额、提现、礼物背包与会员权益" },
       { id: "tasks", name: "任务与奖励", desc: "完成任务领取奖励" },
     ],
   },
@@ -28,9 +28,8 @@ const MINE_NAV = [
 
 const LAB_NAV = { id: "lab", name: "协议台", desc: "仅限已启用的调试环境" };
 const LEGACY_RELATION_ROUTES = { friends: "friends", visitors: "visitors" };
-const LEGACY_MATCH_ROUTES = { room: "room" };
 const SOCIAL_TABS = ["friends", "apply", "follows", "fans", "visitors", "black"];
-const MATCH_HUB_TABS = ["match", "room"];
+const MATCH_HUB_TABS = ["match", "bottle"];
 const SYSTEM_CUSTOMER_SERVICE_UID = "1";
 const MESSAGE_SYNC_TICK_MS = 3000;
 const MESSAGE_SUMMARY_CHAT_MS = 25 * 1000;
@@ -58,6 +57,8 @@ const MOMENT_VIDEO_INITIAL_FRAME_WAIT_MS = 15000;
 const MOMENT_VIDEO_COMPAT_TIMEOUT_MS = 32 * 60 * 1000;
 const MATCH_GENDERS = ["不限", "男", "女"];
 const MATCH_PROPERTIES = ["双", "Z", "B"];
+const DISCOVERY_TABS = ["online", "nearby"];
+const DISCOVERY_AGES = ["不限", "18-24", "25-34", "35-44", "45+"];
 
 const S = {
   user: null,
@@ -68,9 +69,9 @@ const S = {
   loginStage: "credentials",
   inviteLoginAvailable: null,
   labEnabled: false,
-  roomkitAvailable: false,
   proactivePrivateMessageEnabled: false,
   directImCredentialsEnabled: false,
+  nearbyCustomCityEnabled: false,
   matchMessagePeers: new Set(),
   routeController: null,
   routeSeq: 0,
@@ -78,6 +79,14 @@ const S = {
   meStats: null,
   meStatsAt: 0,
   matchTab: "match",
+  nearbyTab: "online",
+  nearbyFilters: {
+    online: { gender: "不限", property: "不限", age: "不限", city: "" },
+    nearby: { gender: "不限", property: "不限", age: "不限", city: "" },
+  },
+  nearbyLocation: null,
+  nearbyLoadSeq: 0,
+  nearbyController: null,
   momentsTab: "推荐",
   momentsSearch: "",
   momentsFeedSeq: 0,
@@ -1168,16 +1177,21 @@ function applyCapabilities(capabilities) {
   if (!capabilities || typeof capabilities !== "object") return;
   const previousProactive = S.proactivePrivateMessageEnabled;
   const previousDirectCredentials = S.directImCredentialsEnabled;
+  const previousNearbyCustomCity = S.nearbyCustomCityEnabled;
   if (Object.prototype.hasOwnProperty.call(capabilities, "proactive_private_message")) {
     S.proactivePrivateMessageEnabled = capabilities.proactive_private_message === true;
   }
   if (Object.prototype.hasOwnProperty.call(capabilities, "direct_im_credentials")) {
     S.directImCredentialsEnabled = capabilities.direct_im_credentials === true;
   }
+  if (Object.prototype.hasOwnProperty.call(capabilities, "nearby_custom_city")) {
+    S.nearbyCustomCityEnabled = capabilities.nearby_custom_city === true;
+  }
   const proactiveChanged = previousProactive !== S.proactivePrivateMessageEnabled;
   const directCredentialsChanged =
     previousDirectCredentials !== S.directImCredentialsEnabled;
-  if (!proactiveChanged && !directCredentialsChanged) return;
+  const nearbyCustomCityChanged = previousNearbyCustomCity !== S.nearbyCustomCityEnabled;
+  if (!proactiveChanged && !directCredentialsChanged && !nearbyCustomCityChanged) return;
   if (proactiveChanged) {
     S.pageCache.delete("nearby");
     [...S.pageCache.keys()].forEach((key) => {
@@ -1186,7 +1200,8 @@ function applyCapabilities(capabilities) {
     S.pageCache.clear();
     syncPrivateMessageControls();
   }
-  if (S.authenticated && (S.imMode || S.chat || S.imConnecting)) {
+  if (nearbyCustomCityChanged) S.pageCache.delete("nearby");
+  if ((proactiveChanged || directCredentialsChanged) && S.authenticated && (S.imMode || S.chat || S.imConnecting)) {
     void cleanupIM().finally(() => {
       if (!S.authenticated) return;
       S.imNextReconnectAt = 0;
@@ -1231,11 +1246,7 @@ function navItems() {
 }
 
 function isRouteAllowed(id) {
-  return (
-    navItems().some((item) => item.id === id) ||
-    Object.prototype.hasOwnProperty.call(LEGACY_RELATION_ROUTES, id) ||
-    Object.prototype.hasOwnProperty.call(LEGACY_MATCH_ROUTES, id)
-  );
+  return navItems().some((item) => item.id === id) || Object.prototype.hasOwnProperty.call(LEGACY_RELATION_ROUTES, id);
 }
 
 function navParentRoute(id) {
@@ -1678,6 +1689,10 @@ async function switchMineTab(id, { force = false, replace = false } = {}) {
     go(target, { force, replace });
     return;
   }
+  if (target !== "nearby" && S.nearbyController) {
+    S.nearbyController.abort();
+    S.nearbyController = null;
+  }
   if (target === S.route && !force) return;
 
   if (S.routeController) S.routeController.abort();
@@ -1780,12 +1795,6 @@ function hydrateRenderedRoute(route, signal, seq) {
 
 async function activateRoute(id, { force = false } = {}) {
   if (!S.authenticated) return;
-  const legacyMatchTab = LEGACY_MATCH_ROUTES[id];
-  if (legacyMatchTab) {
-    S.matchTab = legacyMatchTab;
-    go("match", { replace: true, force: true, matchTab: legacyMatchTab });
-    return;
-  }
   const legacyTab = LEGACY_RELATION_ROUTES[id];
   if (legacyTab) {
     S.socialTab = legacyTab;
@@ -1919,7 +1928,6 @@ function envelopeHtml(envelope, renderer, emptyTitle = "暂无内容", emptyDeta
 }
 
 function actionRoute(action) {
-  if (action === "wallet" || action === "buy_card") return action === "wallet" ? "wallet" : "match";
   if (action === "relogin") return "me";
   return "";
 }
@@ -2839,43 +2847,6 @@ function momentCommentsHtml(data, card, commentForbid = false) {
   return `${list}${composer}`;
 }
 
-function roomCard(item) {
-  const room = item && typeof item === "object" ? item : { name: String(item || "房间") };
-  const title = room.room_name || room.title || room.name || room.nickname || "语音房间";
-  const online = room.online_count ?? room.online_num;
-  const hasOnline = online !== null && online !== undefined && online !== "";
-  const cover = mediaUrl(room.cover || room.theme_picture_url || room.background_url);
-  const ownerAvatar = mediaUrl(room.owner_avatar);
-  const sub =
-    room.subtitle ||
-    [hasOnline ? `${online} 人在线` : "", room.owner_name ? `房主 ${room.owner_name}` : "", room.room_type || room.type, room.desc]
-      .filter(Boolean)
-      .join(" · ") ||
-    "正在等待新的声音";
-  const badges = [
-    room.is_private ? '<span class="badge orange">私密房间</span>' : "",
-    room.is_stopped ? '<span class="badge">已结束</span>' : "",
-  ].filter(Boolean);
-  const owner = ownerAvatar
-    ? `<span class="room-owner-avatar"><img src="${esc(ownerAvatar)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.parentElement.remove()" /></span>`
-    : "";
-  return `<article class="room-card${room.is_stopped ? " is-stopped" : ""}">${
-    cover
-      ? `<span class="room-cover"><img src="${esc(cover)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.parentElement.remove()" /></span>`
-      : ""
-  }<div class="card-copy"><div class="card-title-line"><strong>${esc(title)}</strong>${owner}</div><span>${esc(
-    sub
-  )}</span></div>${badges.length ? `<div class="room-badges">${badges.join("")}</div>` : ""}</article>`;
-}
-
-function songCard(item) {
-  const song = item && typeof item === "object" ? item : { name: String(item || "歌曲") };
-  const title = song.song_name || song.title || song.name || song.nickname || "歌曲";
-  const sub = song.artist || song.singer || song.subtitle || "点歌曲库";
-  return `<article class="song-card"><div class="card-copy"><strong>${esc(title)}</strong><span>${esc(sub)}</span></div>
-    <span class="badge">音乐</span></article>`;
-}
-
 function bottleCard(item) {
   const bottle = item && typeof item === "object" ? item : { content: String(item || "") };
   const name = bottle.nickname || "匿名留言";
@@ -3028,10 +2999,7 @@ const DISPLAY_FIELD_LABELS = Object.freeze({
   source: "数据来源",
   entity: "数据类型",
   product_notice: "业务说明",
-  pay_notice: "支付说明",
   channel: "渠道",
-  coin_id: "商品编号",
-  vipid: "会员商品编号",
   amount: "金额",
   referral: "推荐码",
   task: "任务信息",
@@ -3124,7 +3092,7 @@ function displayFieldValue(key, value) {
   if (booleanLike && normalized === "1") return "是";
   if (booleanLike && normalized === "0") return "否";
   if (DISPLAY_VALUE_LABELS[normalized]) return DISPLAY_VALUE_LABELS[normalized];
-  if (["message", "detail", "error", "error_info", "product_notice", "pay_notice", "label"].includes(leaf)) {
+  if (["message", "detail", "error", "error_info", "product_notice", "label"].includes(leaf)) {
     return localizedSystemText(raw, "请查看操作结果");
   }
   return raw;
@@ -3187,7 +3155,7 @@ function operationView(data, successTitle = "操作已提交") {
     )}`;
   }
   const notice = localizedSystemText(data.product_notice || data.message || successTitle, successTitle);
-  return `<div class="notice"><strong>${esc(localizedSystemText(successTitle, "操作已提交"))}</strong><div>${esc(notice)}</div></div>${detailsView(data, "订单/操作信息")}`;
+  return `<div class="notice"><strong>${esc(localizedSystemText(successTitle, "操作已提交"))}</strong><div>${esc(notice)}</div></div>${detailsView(data, "操作信息")}`;
 }
 
 function resultPayload(data) {
@@ -6740,56 +6708,248 @@ async function openFlashViewer(uniqueid) {
   }
 }
 
+function normalizeDiscoveryTab(value) {
+  return DISCOVERY_TABS.includes(value) ? value : "online";
+}
+
+function discoveryFilterState(tab) {
+  const activeTab = normalizeDiscoveryTab(tab);
+  const filters = S.nearbyFilters[activeTab] || {};
+  return {
+    gender: MATCH_GENDERS.includes(filters.gender) ? filters.gender : "不限",
+    property: filters.property === "不限" || MATCH_PROPERTIES.includes(filters.property) ? filters.property : "不限",
+    age: DISCOVERY_AGES.includes(filters.age) ? filters.age : "不限",
+    city: String(filters.city || "").trim(),
+  };
+}
+
+function discoverySelectOptions(values, selected) {
+  return values
+    .map((value) => `<option value="${esc(value)}"${value === selected ? " selected" : ""}>${esc(value)}</option>`)
+    .join("");
+}
+
+function discoveryTabsHtml(tab) {
+  const activeTab = normalizeDiscoveryTab(tab);
+  const tabs = [
+    ["online", "在线列表"],
+    ["nearby", "附近的人"],
+  ];
+  return `<nav class="discovery-tabs" role="tablist" aria-label="身边的人">${tabs
+    .map(
+      ([id, label]) => `<button type="button" id="discovery-tab-${id}" class="discovery-tab${activeTab === id ? " on" : ""}" role="tab" aria-selected="${String(
+        activeTab === id
+      )}" aria-controls="discovery-panel" data-action="nearby-tab" data-tab="${id}">${label}</button>`
+    )
+    .join("")}</nav>`;
+}
+
+function discoveryUserCard(item, tab) {
+  const user = item && typeof item === "object" ? { ...item } : { nickname: String(item || "用户") };
+  const id = String(user.user_id || user.uid || user.id || "");
+  user.subtitle = [
+    id && `UID ${id}`,
+    user.sex || user.gender,
+    user.property,
+    user.age && `${user.age} 岁`,
+    user.city,
+    user.distance,
+    String(user.signature || "").slice(0, 24),
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return userCard(user, {
+    chat: true,
+    profile: true,
+    addFriend: true,
+    chatOrigin: tab === "nearby" ? "nearby" : "online_list",
+  });
+}
+
+function discoveryPanelHtml(data, tab, { locationError = "" } = {}) {
+  const activeTab = normalizeDiscoveryTab(tab);
+  const filters = discoveryFilterState(activeTab);
+  const isNearby = activeTab === "nearby";
+  const title = isNearby ? "附近的人" : "在线列表";
+  const people = itemsOf(data);
+  const locationLabel = String(data?.location?.label || "").trim();
+  const filterSummary = [
+    `性别 ${filters.gender}`,
+    `属性 ${filters.property}`,
+    `年龄 ${filters.age}`,
+    locationLabel,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const customCityField =
+    isNearby && S.nearbyCustomCityEnabled
+      ? `<label class="discovery-filter-field discovery-city-field"><span>城市</span><input name="city" value="${esc(
+          filters.city
+        )}" maxlength="40" placeholder="留空使用资料城市或当前位置" autocomplete="address-level2" /></label>`
+      : "";
+  let content;
+  if (data?.location_required) {
+    content = `<div class="empty-state discovery-location-state"><div><strong>需要获取位置信息</strong><span>${esc(
+      locationError || data?.error?.detail || "资料中没有配置城市，请允许浏览器获取当前位置后继续。"
+    )}</span><button type="button" class="btn primary small" data-action="nearby-request-location">获取当前位置</button></div></div>`;
+  } else if (data && data.ok === false) {
+    const info = errorInfo(data, `${title}加载失败`);
+    content = `<div class="error-state"><div><strong>${esc(info.title)}</strong><span>${esc(
+      info.detail || "请稍后重试"
+    )}</span><button type="button" class="btn secondary small" data-action="nearby-refresh">重新加载</button></div></div>`;
+  } else if (people.length) {
+    content = `<div class="people-grid">${people
+      .slice(0, 50)
+      .map((item) => discoveryUserCard(item, activeTab))
+      .join("")}</div>`;
+  } else {
+    content = emptyState(
+      isNearby ? "当前条件下没有附近用户" : "当前条件下没有在线用户",
+      "可以调整筛选条件或稍后再试"
+    );
+  }
+  return `<section class="discovery-content"><form class="surface-card discovery-filter-form" data-form="nearby-filter" data-tab="${activeTab}">
+      <label class="discovery-filter-field"><span>性别</span><select name="gender">${discoverySelectOptions(
+        MATCH_GENDERS,
+        filters.gender
+      )}</select></label>
+      <label class="discovery-filter-field"><span>属性</span><select name="property">${discoverySelectOptions(
+        ["不限", ...MATCH_PROPERTIES],
+        filters.property
+      )}</select></label>
+      <label class="discovery-filter-field"><span>年龄</span><select name="age">${discoverySelectOptions(
+        DISCOVERY_AGES,
+        filters.age
+      )}</select></label>
+      ${customCityField}
+      <div class="discovery-filter-actions"><button type="submit" class="btn primary small">应用筛选</button><button type="button" class="btn secondary small" data-action="nearby-refresh">刷新列表</button></div>
+    </form>
+    <div class="section-head discovery-result-head"><div><h2>${title}</h2><p>${esc(filterSummary)}${data?.count != null ? ` · ${esc(
+      data.count
+    )} 人` : ""}</p></div></div>
+    <div class="discovery-results">${content}</div>
+  </section>`;
+}
+
+function discoveryRequestPath(tab, filters, location = S.nearbyLocation) {
+  const activeTab = normalizeDiscoveryTab(tab);
+  const params = new URLSearchParams({
+    page: "1",
+    gender: filters.gender,
+    property: filters.property,
+    age: filters.age,
+  });
+  if (activeTab === "nearby") {
+    if (S.nearbyCustomCityEnabled && filters.city) params.set("city", filters.city);
+    if (!filters.city && location?.latitude != null && location?.longitude != null) {
+      params.set("latitude", String(location.latitude));
+      params.set("longitude", String(location.longitude));
+    }
+  }
+  const endpoint = activeTab === "nearby" ? "/api/match/nearby-users" : "/api/match/online-users";
+  return `${endpoint}?${params.toString()}`;
+}
+
+async function fetchDiscoveryPeople(tab, { signal } = {}) {
+  const activeTab = normalizeDiscoveryTab(tab);
+  const filters = discoveryFilterState(activeTab);
+  const { data } = await api(discoveryRequestPath(activeTab, filters), { signal });
+  applyCapabilities(data?.capabilities);
+  return data;
+}
+
+function requestNearbyLocation() {
+  if (!navigator.geolocation) return Promise.reject(new Error("当前浏览器不支持位置获取"));
+  return new Promise((resolve, reject) => {
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const latitude = Number(position.coords?.latitude);
+        const longitude = Number(position.coords?.longitude);
+        if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+          reject(new Error("浏览器返回的位置信息无效"));
+          return;
+        }
+        resolve({ latitude, longitude, accuracy: Number(position.coords?.accuracy || 0) });
+      },
+      (error) => {
+        const messages = {
+          1: "位置权限未授权，请在浏览器设置中允许后重试",
+          2: "暂时无法获取当前位置，请检查系统定位服务",
+          3: "获取当前位置超时，请重试",
+        };
+        reject(new Error(messages[error?.code] || "获取当前位置失败"));
+      },
+      { enableHighAccuracy: false, timeout: 12000, maximumAge: 10 * 60 * 1000 }
+    );
+  });
+}
+
+function syncDiscoveryTabs(tab) {
+  const activeTab = normalizeDiscoveryTab(tab);
+  root().querySelectorAll(".discovery-tab[data-tab]").forEach((button) => {
+    const selected = button.dataset.tab === activeTab;
+    button.classList.toggle("on", selected);
+    button.setAttribute("aria-selected", String(selected));
+  });
+  const panel = $("discovery-panel");
+  if (panel) panel.setAttribute("aria-labelledby", `discovery-tab-${activeTab}`);
+}
+
+async function loadDiscoveryPanel(tab, { requestLocation = true, forceLocation = false } = {}) {
+  const activeTab = normalizeDiscoveryTab(tab);
+  S.nearbyTab = activeTab;
+  S.nearbyLoadSeq += 1;
+  const seq = S.nearbyLoadSeq;
+  S.nearbyController?.abort();
+  const controller = new AbortController();
+  S.nearbyController = controller;
+  syncDiscoveryTabs(activeTab);
+  const panel = $("discovery-panel");
+  if (!panel) return;
+  panel.innerHTML = `<div class="tab-panel-loading">正在加载${activeTab === "nearby" ? "附近的人" : "在线列表"}…</div>`;
+  S.pageCache.delete(routeCacheKey("nearby"));
+  try {
+    if (forceLocation) S.nearbyLocation = await requestNearbyLocation();
+    let data = await fetchDiscoveryPeople(activeTab, { signal: controller.signal });
+    if (activeTab === "nearby" && data?.location_required && requestLocation && !forceLocation) {
+      panel.innerHTML = `<div class="tab-panel-loading">资料中没有城市，正在申请获取当前位置…</div>`;
+      try {
+        S.nearbyLocation = await requestNearbyLocation();
+        data = await fetchDiscoveryPeople(activeTab, { signal: controller.signal });
+      } catch (error) {
+        if (seq !== S.nearbyLoadSeq || controller.signal.aborted) return;
+        panel.innerHTML = discoveryPanelHtml(data, activeTab, { locationError: error.message || String(error) });
+        return;
+      }
+    }
+    if (seq !== S.nearbyLoadSeq || controller.signal.aborted || S.route !== "nearby") return;
+    panel.innerHTML = discoveryPanelHtml(data, activeTab);
+  } catch (error) {
+    if (error?.name === "AbortError" || seq !== S.nearbyLoadSeq || S.route !== "nearby") return;
+    panel.innerHTML = `<div class="error-state"><div><strong>列表加载失败</strong><span>${esc(
+      error.message || String(error)
+    )}</span><button type="button" class="btn secondary small" data-action="nearby-refresh">重新加载</button></div></div>`;
+  } finally {
+    if (S.nearbyController === controller) S.nearbyController = null;
+  }
+}
+
 async function pageNearby(signal) {
   const { data } = await api("/api/home", { signal });
   applyCapabilities(data.capabilities);
   if (data.user) applyUser(data.user);
-  const [peopleResult, slideResult] = await Promise.allSettled([
-    api("/api/match/online-users?page=1", { signal }),
-    api("/api/slide", { signal }),
-  ]);
-  if (peopleResult.status === "fulfilled" && peopleResult.value?.data) {
-    applyCapabilities(peopleResult.value.data.capabilities);
+  const activeTab = normalizeDiscoveryTab(S.nearbyTab);
+  let peopleData;
+  try {
+    peopleData = await fetchDiscoveryPeople(activeTab, { signal });
+  } catch (error) {
+    if (error?.name === "AbortError") throw error;
+    peopleData = { ok: false, error: error.message || String(error), items: [], count: 0 };
   }
-  const user = data.user || S.user || {};
-  const name = user.nickname || "新朋友";
-  const heartbeat = data.heartbeat && data.heartbeat.running ? "在线状态已同步" : "当前在线";
-  const people =
-    peopleResult.status === "fulfilled" && peopleResult.value
-      ? itemsOf(peopleResult.value.data)
-      : [];
-  const slides = slideResult.status === "fulfilled" ? itemsOf(slideResult.value.data) : [];
-  const welcomeTitle = `${name}，看看现在谁在线`;
-  const welcomeDetail = user.is_realname
-    ? S.proactivePrivateMessageEnabled
-      ? "可以从资料、共同话题或一条礼貌的消息开始认识对方。"
-      : "可以查看资料、动态或申请添加好友；匹配成功后可以向对方发起私信。"
-    : "完成实名后可使用更多匹配和互动能力。";
-  return `<section class="welcome-strip"><div><span>${esc(heartbeat)}</span><h2>${esc(welcomeTitle)}</h2><p>${
-    welcomeDetail
-  }</p></div><button type="button" class="btn primary" data-route="match">开始匹配</button></section>
-    <section class="quick-entry-grid" aria-label="常用社交入口">
-      <button type="button" class="quick-entry" data-route="msg"><strong>聊天列表</strong><span>继续最近的对话</span></button>
-      <button type="button" class="quick-entry" data-action="social-open-tab" data-tab="friends"><strong>通讯录</strong><span>联系已添加的好友</span></button>
-      <button type="button" class="quick-entry" data-action="social-open-tab" data-tab="visitors"><strong>访客记录</strong><span>查看彼此的访问记录</span></button>
-      <button type="button" class="quick-entry" data-route="moments"><strong>动态广场</strong><span>看看大家正在分享什么</span></button>
-    </section>
-    <section class="section"><div class="section-head"><div><h2>此刻在线</h2><p>可以查看资料、动态或申请添加好友</p></div><button type="button" class="btn secondary small" data-action="refresh-route">换一批</button></div>${
-      people.length
-        ? `<div class="people-grid">${people
-            .slice(0, 18)
-            .map((item) => userCard(item, { chat: true, profile: true, addFriend: true }))
-            .join("")}</div>`
-        : emptyState("暂时没有发现在线用户", "可以先去匹配页，稍后再回来看看", "match")
-    }</section>
-    ${
-      slides.length
-        ? `<section class="section"><div class="section-head"><div><h2>今日话题</h2><p>找一个自然的开场方式</p></div></div><div class="slide-scroll ui-scrollbar ui-scrollbar--compact">${slides
-            .map(slideCard)
-            .join("")}</div></section>`
-        : ""
-    }
-    `;
+  return `<div class="discovery-page">${discoveryTabsHtml(activeTab)}<div id="discovery-panel" class="discovery-panel" role="tabpanel" aria-labelledby="discovery-tab-${activeTab}">${discoveryPanelHtml(
+    peopleData,
+    activeTab
+  )}</div></div>`;
 }
 
 async function pageMessages(signal) {
@@ -6842,20 +7002,23 @@ async function pageMatching(signal) {
       </form>
     </section>
 
-    <section class="section"><div class="section-head match-section-head"><div><h2>更多相遇方式</h2><p>换一种更轻松的方式开始交流</p></div></div><div class="match-mode-grid">
-      <button type="button" class="match-mode-card is-disabled" disabled><span class="match-mode-tag">客户端专属</span><strong>语音匹配</strong><span>使用实时语音快速认识新朋友</span><small>需要官方客户端音频能力</small></button>
-      <button type="button" class="match-mode-card" data-action="match-pick"><span class="match-mode-tag">轻社交</span><strong>捡漂流瓶</strong><span>读一段陌生人的心情和故事</span><small>立即捡一个漂流瓶</small></button>
-      <button type="button" class="match-mode-card" data-action="match-users"><span class="match-mode-tag">匹配池</span><strong>在线列表</strong><span>看看此刻还有谁正在等待相遇</span><small>可查看资料并申请添加好友</small></button>
-    </div></section>
+    <section class="section"><div class="section-head match-section-head"><div><h2>发布约会邀请</h2><p>真诚具体的内容，更容易获得回应</p></div></div><form class="surface-card match-compose-card" data-form="dating-publish"><div class="match-compose-head"><span>约会邀请</span><h3>描述想一起做的事</h3><p>说明时间、活动或你的期待。</p></div><div class="field"><label for="dating-text">约会说明</label><input id="dating-text" name="text" maxlength="160" placeholder="例如：周末一起看展或散步" required /></div><button type="submit" class="btn secondary full">发布约会</button></form></section>
 
-    <section class="section"><div class="section-head match-section-head"><div><h2>主动表达</h2><p>真诚具体的内容，更容易获得回应</p></div></div><div class="match-compose-grid">
-      <form class="surface-card match-compose-card" data-form="bottle-throw"><div class="match-compose-head"><span>漂流瓶</span><h3>留下一句想说的话</h3><p>把此刻的心情交给一个未知的人。</p></div><div class="field"><label for="bottle-text">漂流瓶内容</label><textarea class="ui-scrollbar" id="bottle-text" name="text" rows="3" maxlength="160" placeholder="例如：今天遇到了一件开心的小事" required></textarea><small class="field-note">最多 160 字，支持换行</small></div><button type="submit" class="btn secondary full">投入海中</button></form>
-      <form class="surface-card match-compose-card" data-form="dating-publish"><div class="match-compose-head"><span>约会邀请</span><h3>描述想一起做的事</h3><p>说明时间、活动或你的期待。</p></div><div class="field"><label for="dating-text">约会说明</label><input id="dating-text" name="text" maxlength="160" placeholder="例如：周末一起看展或散步" required /></div><button type="submit" class="btn secondary full">发布约会</button></form>
-    </div></section>
-
-    <section class="section match-result-section"><div class="section-head match-section-head"><div><h2>匹配结果</h2><p>新的相遇会集中显示在这里</p></div><button type="button" class="btn secondary small" data-action="buy-card">购买匹配卡</button></div><div id="match-result" class="match-result-surface">${emptyState(
+    <section class="section match-result-section"><div class="section-head match-section-head"><div><h2>匹配结果</h2><p>新的相遇会集中显示在这里</p></div></div><div id="match-result" class="match-result-surface">${emptyState(
       "准备好后开始匹配",
       "设置条件并选择匹配方式，结果会显示在这里"
+    )}</div></section>
+  </div>`;
+}
+
+async function pageBottle(signal) {
+  void signal;
+  return `<div class="match-page bottle-page">
+    <section class="match-overview bottle-overview"><div class="match-overview-copy"><span class="match-kicker">漂流瓶</span><h2>遇见一段陌生人的心情</h2><p>可以捡起一个漂流瓶，也可以留下此刻想说的话。</p></div><button type="button" class="btn primary" data-action="match-pick">捡一个漂流瓶</button></section>
+    <section class="section"><form class="surface-card match-compose-card" data-form="bottle-throw"><div class="match-compose-head"><span>投入漂流瓶</span><h3>留下一句想说的话</h3><p>把此刻的心情交给一个未知的人。</p></div><div class="field"><label for="bottle-text">漂流瓶内容</label><textarea class="ui-scrollbar" id="bottle-text" name="text" rows="4" maxlength="160" placeholder="例如：今天遇到了一件开心的小事" required></textarea><small class="field-note">最多 160 字，支持换行</small></div><button type="submit" class="btn secondary full">投入海中</button></form></section>
+    <section class="section match-result-section"><div class="section-head match-section-head"><div><h2>漂流瓶</h2><p>捡到或投递的结果会显示在这里</p></div></div><div id="match-result" class="match-result-surface">${emptyState(
+      "还没有捡起漂流瓶",
+      "点击捡一个漂流瓶，看看陌生人留下的话"
     )}</div></section>
   </div>`;
 }
@@ -6864,9 +7027,9 @@ function matchHubHeader(tab) {
   const activeTab = normalizeMatchTab(tab);
   const tabs = [
     ["match", "匹配"],
-    ["room", "语音房"],
+    ["bottle", "漂流瓶"],
   ];
-  return `<section class="match-hub-header"><div class="match-hub-copy"><span>相遇方式</span><strong>选择匹配或语音房</strong><p>切换标签，下方显示对应功能。</p></div><nav class="match-hub-tabs" role="tablist" aria-label="相遇方式">${tabs
+  return `<section class="match-hub-header"><div class="match-hub-copy"><span>相遇方式</span><strong>选择匹配或漂流瓶</strong><p>切换标签，只更新下方内容。</p></div><nav class="match-hub-tabs" role="tablist" aria-label="相遇方式">${tabs
     .map(
       ([id, label]) => `<button type="button" id="match-hub-tab-${id}" role="tab" class="match-hub-tab${activeTab === id ? " on" : ""}" aria-selected="${
         activeTab === id
@@ -7155,70 +7318,10 @@ async function switchSocialTab(tab, { visitorTab = S.visitorTab, force = false }
   }
 }
 
-function normalizeRoomCreateResult(data) {
-  const upstreamValue = String(data?.value ?? "").trim().toLowerCase();
-  if (
-    data &&
-    data.ok === false &&
-    data.code === "FALSE_RESPONSE" &&
-    Number(data.status) === 200 &&
-    ["no", "false"].includes(upstreamValue)
-  ) {
-    const message = "当前账号暂时无法创建语音房";
-    return {
-      ...data,
-      ok: false,
-      code: "ROOM_CREATE_UNAVAILABLE",
-      message,
-      availability: "unavailable",
-      outcome: "rejected",
-      upstream_code: data.code,
-      error: {
-        title: "暂时无法创建语音房",
-        detail: "服务端未开放本次建房请求，可能受账号权限、房间资格或业务开关限制；服务端没有返回更具体原因。",
-        action: "none",
-        code: "ROOM_CREATE_UNAVAILABLE",
-        message,
-      },
-    };
-  }
-  return data;
-}
-
-async function pageRoom(signal) {
-  const { data } = await api("/api/room/top", { signal });
-  // Older running BFF processes still expose getRoomTop=false as FALSE_RESPONSE.
-  // Keep this page-specific fallback so a static refresh immediately matches the APK's empty-list behavior.
-  const roomTop =
-    data && data.ok === false && data.code === "FALSE_RESPONSE" && data.entity === "room" && Number(data.status) === 200
-      ? { ...data, ok: true, code: "", message: "", error: null, items: [], list: [], count: 0, availability: "empty" }
-      : data;
-  const roomListDetail = S.roomkitAvailable
-    ? "当前先显示旧版推荐，也可以读取官方客户端使用的独立房间服务"
-    : "当前显示旧版推荐房间";
-  return `<section class="hero-card"><div class="hero-copy"><p class="eyebrow">语音房</p><h2>语音房</h2><p>网页版当前仅提供房间榜单及接口状态查询，尚未接入实时语音。</p></div><div class="hero-actions"><button type="button" class="btn secondary" data-action="room-auth">检查权限接口</button></div></section>
-    <div class="notice warn mt-sm"><strong>网页版暂不支持实时语音</strong><div>当前无法进入房间收听、上麦或通话。官方客户端包含对应能力，实际可用性以服务端为准。</div></div>
-    <section class="section"><div class="section-head"><div><h2>热门房间</h2><p>${roomListDetail}</p></div><div class="button-row">${
-      S.roomkitAvailable
-        ? '<button type="button" class="btn primary small" data-action="room-native-refresh">读取客户端房间列表</button>'
-        : ""
-    }<button type="button" class="btn secondary small" data-action="refresh-route">刷新旧版榜单</button></div></div><div id="room-list">${envelopeHtml(
-      roomTop,
-      roomCard,
-      "暂无热门房间",
-      "服务端当前没有返回可展示的房间，可稍后刷新。"
-    )}</div></section>
-    <section class="section"><div class="form-grid">
-      <form class="surface-card" data-form="room-create"><div class="section-head"><div><h2>创建房间</h2><p>仅提交服务端建房请求，不代表网页版可进入房间通话</p></div></div><div class="field"><label for="room-type">房间类型</label><input id="room-type" name="type" value="处CP" required /></div><button type="submit" class="btn primary full mt-sm">提交建房请求</button></form>
-      <form class="surface-card" data-form="room-ktv"><div class="section-head"><div><h2>点歌搜索</h2><p>仅搜索曲库，网页版暂不支持房间内点唱和播放</p></div></div><div class="field"><label for="room-keyword">歌名或歌手</label><input id="room-keyword" name="query" placeholder="输入关键词" required /></div><button type="submit" class="btn secondary full mt-sm">搜索曲库</button></form>
-      <form class="surface-card span-all" data-form="room-rtc"><div class="section-head"><div><h2>实时音频接口状态</h2><p>仅检查凭证接口响应，不代表网页版已接入实时音频</p></div></div><div class="inline-form"><div class="field"><label for="room-channel">房间频道号</label><input id="room-channel" name="channel" placeholder="输入房间频道号" required /></div><button type="submit" class="btn secondary">检查接口状态</button></div></form>
-    </div><div id="room-result" class="result-panel"></div></section>`;
-}
-
 async function pageMatch(signal) {
   const tab = normalizeMatchTab(S.matchTab);
   S.matchTab = tab;
-  const content = tab === "room" ? await pageRoom(signal) : await pageMatching(signal);
+  const content = tab === "bottle" ? await pageBottle(signal) : await pageMatching(signal);
   return `<div class="match-hub">${matchHubHeader(tab)}<div id="match-hub-panel" class="match-hub-panel" role="tabpanel" aria-labelledby="match-hub-tab-${tab}">${content}</div></div>`;
 }
 
@@ -7252,10 +7355,10 @@ async function switchMatchHubTab(tab) {
   history.pushState(null, "", matchRouteHash(activeTab));
   S.pageCache.delete(routeCacheKey("match"));
   panel.setAttribute("aria-busy", "true");
-  panel.innerHTML = `<div class="match-panel-loading"><span>正在切换到${activeTab === "room" ? "语音房" : "匹配"}…</span></div>`;
+  panel.innerHTML = `<div class="match-panel-loading"><span>正在切换到${activeTab === "bottle" ? "漂流瓶" : "匹配"}…</span></div>`;
 
   try {
-    const content = activeTab === "room" ? await pageRoom(controller.signal) : await pageMatching(controller.signal);
+    const content = activeTab === "bottle" ? await pageBottle(controller.signal) : await pageMatching(controller.signal);
     if (controller.signal.aborted || seq !== S.routeSeq || S.route !== "match" || S.matchTab !== activeTab) return;
     panel.innerHTML = content;
   } catch (error) {
@@ -7271,21 +7374,18 @@ async function pageWallet(signal) {
   const { data } = await api("/api/wallet", { signal });
   if (data.user) applyUser(data.user);
   const user = data.user || S.user || {};
+  const membership = data.membership || user;
   const gifts = itemsOf(data.my_gifts);
-  return `<div class="stats-grid">${statCard(user.money ?? "0", "乐园币")}${statCard(membershipText(user.vip), "普通会员")}${statCard(
-    membershipText(user.svip),
+  return `<div class="stats-grid">${statCard(user.money ?? "0", "乐园币余额")}${statCard(membershipText(membership.vip), "普通会员")}${statCard(
+    membershipText(membership.svip),
     "高级会员"
   )}${statCard(user.is_realname ? "已完成" : "未完成", "实名认证")}</div>
-    <section class="section"><div class="surface-card"><div class="section-head"><div><h2>会员服务</h2><p>提交前请确认服务端返回的业务说明</p></div></div><div class="button-row"><button type="button" class="btn secondary" data-action="wallet-svip">申请高级会员试用</button><button type="button" class="btn secondary" data-action="wallet-exchange">余额兑换普通会员</button></div></div></section>
-    <section class="section"><div class="form-grid">
-      <form class="surface-card" data-form="wallet-coin"><div class="section-head"><div><h2>创建充币订单</h2><p>创建订单参数不等于到账</p></div></div><div class="field"><label for="coin-channel">支付方式</label><select id="coin-channel" name="channel"><option value="wechat">微信</option><option value="alipay">支付宝</option></select></div><div class="field"><label for="coin-id">商品编号</label><input id="coin-id" name="coin_id" value="1" inputmode="numeric" required /></div><button type="submit" class="btn primary full mt-sm">确认创建订单</button></form>
-      <form class="surface-card" data-form="wallet-vip"><div class="section-head"><div><h2>创建会员订单</h2><p>开通结果以官方收银和服务端状态为准</p></div></div><div class="field"><label for="vip-channel">支付方式</label><select id="vip-channel" name="channel"><option value="wechat">微信</option><option value="alipay">支付宝</option></select></div><div class="field"><label for="vip-level">会员等级</label><select id="vip-level" name="level"><option value="vip">普通会员</option><option value="svip">高级会员</option></select></div><div class="field"><label for="vip-product-id">会员商品编号</label><input id="vip-product-id" name="vipid" value="5" inputmode="numeric" required /></div><button type="submit" class="btn secondary full mt-sm">确认创建订单</button></form>
-    </div></section>
+    <section class="section"><div class="surface-card"><div class="section-head"><div><h2>会员权益</h2><p>会员状态由服务端资料下发并自动刷新</p></div></div><div class="notice"><strong>服务端权益已保留</strong><div>当前页面只展示服务端返回的普通会员和高级会员状态，不在本项目内修改会员有效期。</div></div></div></section>
     <section class="section"><div class="surface-card"><div class="section-head"><div><h2>提现</h2><p>需要完成实名；请仔细确认账户和金额</p></div></div><form class="inline-form" data-form="wallet-withdraw"><div class="field"><label for="withdraw-account">支付宝账号</label><input id="withdraw-account" name="alipay" autocomplete="off" required /></div><div class="field"><label for="withdraw-name">真实姓名</label><input id="withdraw-name" name="name" autocomplete="off" required /></div><div class="field"><label for="withdraw-amount">金额</label><input id="withdraw-amount" name="amount" type="number" min="0.01" step="0.01" inputmode="decimal" required /></div><button type="submit" class="btn danger">确认提现</button></form></div></section>
     <section class="section"><div class="section-head"><div><h2>我的礼物</h2><p>背包中的礼物会独立展示，不再混作用户</p></div></div>${
       gifts.length
         ? `<div class="gift-scroll ui-scrollbar ui-scrollbar--compact">${gifts.map(giftCard).join("")}</div>`
-        : emptyState("背包还没有礼物", "收到或购买的礼物会出现在这里")
+        : emptyState("背包还没有礼物", "收到或由服务端发放的礼物会出现在这里")
     }</section><div id="wallet-result" class="result-panel"></div>`;
 }
 
@@ -7555,18 +7655,27 @@ async function refreshMatchStats() {
 }
 
 async function runMatch(path, body = {}) {
-  setPanel("match-result", loadingState("正在寻找合适的人…"));
+  const isBottle = path.includes("bottle");
+  setPanel("match-result", loadingState(isBottle ? "正在捡漂流瓶…" : "正在寻找合适的人…"));
   const { data } = await api(path, { method: "POST", body: JSON.stringify(body) });
-  if (!path.includes("bottle")) rememberMatchMessagePeers(data);
+  if (!isBottle) rememberMatchMessagePeers(data);
   const success = data.active_property && Array.isArray(data.filters?.properties) && data.filters.properties.length > 1
     ? `本次按属性 ${data.active_property} 匹配`
     : "请求已完成";
   toastEnv(data, success);
-  const renderer = path.includes("bottle")
+  const renderer = isBottle
     ? bottleCard
     : (item) => userCard(item, { chat: true, profile: true, chatOrigin: "match" });
-  setPanel("match-result", envelopeHtml(data, renderer, "暂时没有结果", "稍后再试，或检查匹配次数"));
-  await refreshMatchStats();
+  setPanel(
+    "match-result",
+    envelopeHtml(
+      data,
+      renderer,
+      isBottle ? "暂时没有捡到漂流瓶" : "暂时没有匹配结果",
+      isBottle ? "稍后再来捡一个" : "稍后再试，或检查匹配次数"
+    )
+  );
+  if (!isBottle) await refreshMatchStats();
 }
 
 function formatTimLoginError(error, source = "") {
@@ -8448,6 +8557,8 @@ async function logout() {
     S.routeController = null;
     if (S.profileController) S.profileController.abort();
     S.profileController = null;
+    if (S.nearbyController) S.nearbyController.abort();
+    S.nearbyController = null;
     S.authenticated = false;
     S.sessionGeneration += 1;
     S.user = null;
@@ -8469,6 +8580,14 @@ async function logout() {
     S.profileSeq += 1;
     S.route = "nearby";
     S.matchTab = "match";
+    S.nearbyTab = "online";
+    S.nearbyFilters = {
+      online: { gender: "不限", property: "不限", age: "不限", city: "" },
+      nearby: { gender: "不限", property: "不限", age: "不限", city: "" },
+    };
+    S.nearbyLocation = null;
+    S.nearbyLoadSeq += 1;
+    S.nearbyCustomCityEnabled = false;
     S.momentsTab = "推荐";
     S.momentsSearch = "";
     S.momentsFeedSeq = 0;
@@ -8559,6 +8678,12 @@ async function handleAction(action, button) {
   if (action === "match-tab") {
     const tab = normalizeMatchTab(button.dataset.tab);
     return switchMatchHubTab(tab);
+  }
+  if (action === "nearby-tab") return loadDiscoveryPanel(button.dataset.tab);
+  if (action === "nearby-refresh") return loadDiscoveryPanel(S.nearbyTab);
+  if (action === "nearby-request-location") {
+    S.nearbyLocation = null;
+    return loadDiscoveryPanel("nearby", { forceLocation: true });
   }
   if (action === "moment-tab") {
     const tab = normalizeMomentsTab(button.dataset.tab);
@@ -9026,79 +9151,6 @@ async function handleAction(action, button) {
   if (action === "match-online") return runMatch("/api/match/online");
   if (action === "match-local") return runMatch("/api/match/local");
   if (action === "match-pick") return runMatch("/api/match/bottle-pick");
-  if (action === "match-users") {
-    setPanel("match-result", loadingState("正在读取在线列表…"));
-    const { data } = await api("/api/match/online-users");
-    applyCapabilities(data.capabilities);
-    setPanel(
-      "match-result",
-      envelopeHtml(
-        data,
-        (item) => userCard(item, { chat: true, profile: true, addFriend: true }),
-        "暂无在线用户",
-        "稍后再来看看"
-      )
-    );
-    return;
-  }
-  if (action === "buy-card") {
-    if (!window.confirm("确认使用乐园币购买默认匹配卡？请以服务端返回的价格和结果为准。")) return;
-    const { data } = await api("/api/pay/card", { method: "POST", body: JSON.stringify({ card_id: "1" }) });
-    toastEnv(data, "购买请求已提交");
-    setPanel("match-result", operationView(data, "匹配卡购买请求已提交"));
-    await refreshMatchStats();
-    return;
-  }
-  if (action === "room-auth") {
-    const { data } = await api("/api/room/auth");
-    setPanel("room-result", operationView(data, "房间权限已读取"));
-    return;
-  }
-  if (action === "room-native-refresh") {
-    const panel = $("room-list");
-    const previous = panel?.innerHTML || "";
-    if (panel) panel.innerHTML = loadingState("正在登录客户端房间服务并读取列表…");
-    let data;
-    try {
-      const response = await api("/api/room/native-list", {
-        method: "POST",
-        body: JSON.stringify({ page: 1, size: 10 }),
-        timeout: 10000,
-      });
-      data = response.data;
-    } catch (error) {
-      if (panel) panel.innerHTML = previous;
-      throw error;
-    }
-    if (data && data.ok) {
-      setPanel("room-list", envelopeHtml(data, roomCard, "暂无客户端语音房", "客户端房间服务当前没有返回可展示的语音房。"));
-      setPanel(
-        "room-result",
-        `<div class="notice"><strong>客户端房间列表已更新</strong><div>${esc(
-          data.message || `共读取 ${itemsOf(data).length} 个房间`
-        )}</div></div>`
-      );
-      toast(data.message || "客户端房间列表已更新");
-    } else {
-      if (panel) panel.innerHTML = previous;
-      setPanel("room-result", operationView(data, "客户端房间服务状态"));
-      toastEnv(data, "客户端房间列表已更新");
-    }
-    return;
-  }
-  if (action === "wallet-svip") {
-    const { data } = await api("/api/wallet/svip-try", { method: "POST", body: "{}" });
-    toastEnv(data, "试用申请已提交");
-    setPanel("wallet-result", operationView(data, "高级会员试用申请已提交"));
-    return;
-  }
-  if (action === "wallet-exchange") {
-    if (!window.confirm("确认使用余额兑换默认普通会员商品？")) return;
-    const { data } = await api("/api/wallet/exchange-vip", { method: "POST", body: JSON.stringify({ vip_id: 5 }) });
-    toastEnv(data, "兑换请求已提交");
-    setPanel("wallet-result", operationView(data, "普通会员兑换请求已提交"));
-    return;
-  }
   if (action === "receive-task") {
     const id = button.dataset.id;
     if (!id) throw new Error("缺少任务编号");
@@ -9202,6 +9254,21 @@ async function handleProductForm(form, submitter) {
     setPanel("topic-create-result", operationView(data, "话题创建请求已提交"));
     return;
   }
+  if (kind === "nearby-filter") {
+    const tab = normalizeDiscoveryTab(form.dataset.tab || S.nearbyTab);
+    const gender = String(values.gender || "不限");
+    const property = String(values.property || "不限");
+    const age = String(values.age || "不限");
+    const city = String(values.city || "").trim();
+    if (!MATCH_GENDERS.includes(gender)) throw new Error("请选择有效的性别条件");
+    if (property !== "不限" && !MATCH_PROPERTIES.includes(property)) throw new Error("请选择有效的属性条件");
+    if (!DISCOVERY_AGES.includes(age)) throw new Error("请选择有效的年龄条件");
+    if (city && (!S.nearbyCustomCityEnabled || tab !== "nearby")) throw new Error("自定义城市筛选需要管理员授权");
+    if (city.length > 40) throw new Error("城市名称不能超过 40 个字符");
+    S.nearbyFilters[tab] = { gender, property, age, city };
+    if (city) S.nearbyLocation = null;
+    return loadDiscoveryPanel(tab);
+  }
   if (kind === "match-filter") {
     const gender = String(values.gender || "不限");
     const properties = selectedMatchProperties(form);
@@ -9258,61 +9325,6 @@ async function handleProductForm(form, submitter) {
     });
     toastEnv(data, "举报已提交");
     if (data.ok) form.reset();
-    return;
-  }
-  if (kind === "room-create") {
-    const response = await api("/api/room/create", { method: "POST", body: JSON.stringify({ type: values.type || "处CP" }) });
-    const data = normalizeRoomCreateResult(response.data);
-    toastEnv(data, "创建房间请求已提交");
-    setPanel("room-result", operationView(data, "创建房间请求已提交"));
-    return;
-  }
-  if (kind === "room-ktv") {
-    const { data } = await api("/api/room/ktv-search", {
-      method: "POST",
-      body: JSON.stringify({ q: String(values.query || "").trim() }),
-    });
-    setPanel("room-result", envelopeHtml(data, songCard, "没有找到歌曲", "换个歌名或歌手试试"));
-    return;
-  }
-  if (kind === "room-rtc") {
-    const { data } = await api("/api/room/rtc-token", {
-      method: "POST",
-      body: JSON.stringify({ channel: String(values.channel || "").trim() }),
-    });
-    if (!data || data.ok === false) {
-      setPanel("room-result", operationView(data, "实时音频接口状态"));
-    } else {
-      setPanel(
-        "room-result",
-        `<div class="notice"><strong>实时音频接口已响应</strong><div>这只表示旧版凭证接口可访问，网页版仍未接入实时音频。</div></div>${detailsView(
-          data,
-          "接口响应"
-        )}`
-      );
-    }
-    return;
-  }
-  if (kind === "wallet-coin") {
-    if (!window.confirm("确认创建充币订单？创建订单不代表已经支付或到账。")) return;
-    const { data } = await api("/api/pay/coin", {
-      method: "POST",
-      body: JSON.stringify({ channel: values.channel, coin_id: values.coin_id }),
-    });
-    toastEnv(data, "充币订单参数已生成");
-    setPanel("wallet-result", operationView(data, "充币订单创建结果"));
-    return;
-  }
-  if (kind === "wallet-vip") {
-    if (!window.confirm("确认创建会员订单？开通结果以官方收银和服务端状态为准。")) return;
-    const vipid = String(values.vipid || "").trim();
-    if (!vipid) throw new Error("请输入会员商品编号");
-    const { data } = await api("/api/pay/vip", {
-      method: "POST",
-      body: JSON.stringify({ channel: values.channel, level: values.level || "vip", vipid }),
-    });
-    toastEnv(data, "会员订单参数已生成");
-    setPanel("wallet-result", operationView(data, "会员订单创建结果"));
     return;
   }
   if (kind === "wallet-withdraw") {
@@ -9394,7 +9406,6 @@ async function loadFeatures() {
     const { data } = await api("/api/features", { authOptional: true, timeout: 6000 });
     const features = data && data.features;
     S.serverHeartbeat = Boolean(data?.auto_heartbeat);
-    S.roomkitAvailable = Boolean(data?.capabilities?.roomkit_list);
     S.inviteLoginAvailable = Boolean(data?.capabilities?.invite_login);
     S.labEnabled = Boolean(
       data?.lab_enabled === true ||

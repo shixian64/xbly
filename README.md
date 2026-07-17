@@ -19,12 +19,12 @@
 |---|---|---|
 | 签名与会话（SIGN / EXPIRE / AUTHOR） | ✅ 可本地复现 | `bbw_protocol.sign` |
 | 登录 / 短信 / 改密 / 一键登录 | ✅ | `cli login` · `auth` |
-| 398 个 v154 活跃 action（catalog 405，含 7 个历史下线项） | ✅ 名称面/调用器 | `app.call*` · `call_url` · multipart |
+| v154 action catalog（历史分析保留） | ✅ 非商业 action 可调用 | `app.call*` · `call_url` · multipart；商业 action 统一停用 |
 | 匹配 / 任务 / 资料 / 社交 / 房间 | ✅ HTTP | 各 `modules/*` |
 | IM 凭证（腾讯 UserSig / 融云） | ✅ 凭证 | `app.native.im` |
 | IM 实时收发 | ⚠️ 需官方 SDK | `bbw_web` + TIM |
 | 刷脸实名 | ⚠️ 仅 HTTP 编排 | `app.native.face` · 活体靠阿里云 |
-| 支付下单 | ⚠️ 仅 order 参数 | `app.native.pay` · 收银官方 |
+| 服务端会员权益 | ✅ 只读保留 | 登录和资料响应中的 `vip` / `svip` 状态 |
 | 产品化 Web App（PC/手机） | ✅ 主流程 | 本地：`python -m bbw_web`；生产：`compose.yaml` + `bbw_web.api` |
 | 多用户持久化与管理端 | ✅ | PostgreSQL、Redis、私有 R2；管理入口 `/admin` |
 
@@ -39,7 +39,7 @@ xbly/
 ├── bbw_protocol/          # 协议核（无 Web 依赖）
 │   ├── sign / session / client / app / cli
 │   ├── modules/           # auth profile social match …
-│   └── adapters/          # IM · face · pay 边车
+│   └── adapters/          # IM · face · RoomKit 边车
 ├── bbw_web/               # 多用户 BFF + 静态页（与核隔离）
 │   ├── store.py           # web_sid → BeibeiwuApp
 │   ├── bff_server.py
@@ -369,16 +369,17 @@ Browser SPA（社交娱乐风 · PC 侧栏 / 手机五项底栏）
    bbw_web BFF（全功能语义 API + 多用户）
         │
         ▼
-   BeibeiwuApp ── adapters ──► TIM / 刷脸 / 支付 SDK（可选）
+   BeibeiwuApp ── adapters ──► TIM / 刷脸 / RoomKit SDK（可选）
         │
         ▼
    banghua HTTP（与 APK 相同 do= / 签名 / token）
 ```
 
-- **Web 目标**：按 APK 的“身边 / 消息 / 匹配 / 动态 / 我的”组织主流程；匹配页顶部通过“匹配 / 语音房”标签切换下方功能区，关系中心、钱包与会员、任务与奖励归入我的。
+- **Web 目标**：按 APK 的“身边 / 消息 / 匹配 / 动态 / 我的”组织主流程；匹配页顶部通过“匹配 / 漂流瓶”标签切换下方功能区，关系中心、资产与权益、任务与奖励归入我的。
 - **产品与研究隔离**：默认关闭协议台、任意 action、会话列表和弱一键登录；仅 `--enable-lab` 显式开启。
 - **会话安全**：SID 只存在 HttpOnly Cookie；CORS 默认关闭。本地入口默认使用内存会话，生产 FastAPI 入口使用 PostgreSQL 与 Redis 持久 Session。
-- **原生边界**：IM 长连接 / 刷脸活体 / 微信收银仍依赖厂商 SDK 或官方 App。
+- **会员边界**：项目不提供购买、充值、会员开通、试用或余额兑换入口；服务端下发的 `vip` / `svip` 状态继续持久化并展示。
+- **原生边界**：IM 长连接 / 刷脸活体仍依赖厂商 SDK 或官方 App。
 
 ---
 
@@ -395,7 +396,7 @@ Browser SPA（社交娱乐风 · PC 侧栏 / 手机五项底栏）
 | — | 假刷脸 certifyId 不改 `rp_verify_time` | 服务端有效 |
 | — | v154 跟版：版本号 / `Id2MetaVerifyRequest` / 小说接口下线 | 见 [13](docs/13_APK_V154_DIFF.md) |
 
-**不能指望协议完成的：** 真实刷脸通过、微信/支付宝资金到账、无 SDK 的 IM 长连接。
+**不能指望协议完成的：** 真实刷脸通过、无 SDK 的 IM 长连接。
 
 ---
 
@@ -414,7 +415,7 @@ Browser SPA（社交娱乐风 · PC 侧栏 / 手机五项底栏）
 | [09 游客矩阵](docs/09_GUEST_CAPABILITY_MATRIX.md) | L0/L1 能力 |
 | [10 协议客户端](docs/10_PROTOCOL_CLIENT.md) | CLI / API 说明 |
 | [11 功能与实名覆盖](docs/11_FEATURE_REALNAME_AND_COVERAGE.md) | 门禁与覆盖 |
-| [12 原生集成](docs/12_NATIVE_INTEGRATION.md) | IM / 刷脸 / 支付 |
+| [12 原生集成](docs/12_NATIVE_INTEGRATION.md) | IM / 刷脸 / RoomKit |
 | [13 v154 diff](docs/13_APK_V154_DIFF.md) | 148→154 |
 | [14 生产部署](docs/14_PRODUCTION_DEPLOYMENT.md) | Docker、PostgreSQL、Redis、R2、管理端与运维 |
 | [api_catalog.json](docs/api_catalog.json) | action 目录 |

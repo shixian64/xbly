@@ -1324,6 +1324,118 @@ class MatchRoutingContractTests(unittest.TestCase):
                     enabled,
                 )
 
+    def test_online_user_list_accepts_gender_property_and_age_filters(self) -> None:
+        calls, response = self._run_online_users(
+            query="?gender=女&property=B&age=25-34&page=3"
+        )
+
+        self.assertEqual(calls[0]["gender"], "女")
+        self.assertEqual(calls[0]["property"], "B")
+        self.assertEqual(calls[0]["pageIndex"], "3")
+        self.assertEqual(response[1]["filters"], {"gender": "女", "property": "B", "age": "25-34"})
+        self.assertEqual(response[1]["items"], [])
+
+    def test_nearby_users_default_to_profile_city_and_custom_city_requires_permission(self) -> None:
+        calls = []
+        result = ApiResult(
+            True,
+            200,
+            '[{"id":"9","nickname":"同城","city":"福州"},{"id":"10","nickname":"异地","city":"厦门"}]',
+            data=[
+                {"id": "9", "nickname": "同城", "city": "福州", "gender": "女", "property": "B", "age": "30"},
+                {"id": "10", "nickname": "异地", "city": "厦门", "gender": "女", "property": "B", "age": "30"},
+            ],
+        )
+
+        class Match:
+            def online_users(self, **params):
+                calls.append(params)
+                return result
+
+        app = SimpleNamespace(
+            session=SimpleNamespace(uid="42", raw_user={"id": "42", "region": "福建-福州市"}),
+            match=Match(),
+        )
+        web_user = SimpleNamespace(app=app, match_pool_online_list_enabled=False)
+
+        class Harness:
+            def __init__(self, query, custom_city_enabled=False):
+                self.path = f"/api/match/nearby-users{query}"
+                self.response = None
+                self._request_nearby_custom_city_enabled = custom_city_enabled
+
+            def _check_api_origin(self):
+                return True
+
+            def sid(self):
+                return "sid"
+
+            def user(self, _sid):
+                return web_user
+
+            def ok(self, obj, status=200, **_kwargs):
+                self.response = (status, obj)
+                return self.response
+
+        default_harness = Harness("?gender=女&property=B&age=25-34")
+        bff_server.Handler.do_GET(default_harness)
+        self.assertEqual(default_harness.response[0], 200)
+        self.assertEqual([item["id"] for item in default_harness.response[1]["items"]], ["9"])
+        self.assertEqual(default_harness.response[1]["location"]["mode"], "profile_city")
+
+        denied_harness = Harness("?city=厦门")
+        bff_server.Handler.do_GET(denied_harness)
+        self.assertEqual(denied_harness.response[0], 403)
+        self.assertEqual(denied_harness.response[1]["code"], "CUSTOM_CITY_PERMISSION_REQUIRED")
+
+        allowed_harness = Harness("?city=厦门", custom_city_enabled=True)
+        bff_server.Handler.do_GET(allowed_harness)
+        self.assertEqual([item["id"] for item in allowed_harness.response[1]["items"]], ["10"])
+        self.assertEqual(allowed_harness.response[1]["location"]["mode"], "custom_city")
+
+    def test_nearby_users_request_browser_location_when_profile_city_is_missing(self) -> None:
+        result = ApiResult(True, 200, "[]", data=[])
+
+        class Match:
+            def online_users(self, **_params):
+                return result
+
+        app = SimpleNamespace(
+            session=SimpleNamespace(uid="42", raw_user={"id": "42"}),
+            match=Match(),
+            profile=SimpleNamespace(get_me=lambda: ApiResult(True, 200, "[]", data=[])),
+        )
+        web_user = SimpleNamespace(
+            app=app,
+            match_pool_online_list_enabled=False,
+            persist=lambda: None,
+        )
+
+        class Harness:
+            path = "/api/match/nearby-users"
+
+            def __init__(self):
+                self.response = None
+
+            def _check_api_origin(self):
+                return True
+
+            def sid(self):
+                return "sid"
+
+            def user(self, _sid):
+                return web_user
+
+            def ok(self, obj, status=200, **_kwargs):
+                self.response = (status, obj)
+                return self.response
+
+        harness = Harness()
+        bff_server.Handler.do_GET(harness)
+        self.assertEqual(harness.response[0], 200)
+        self.assertTrue(harness.response[1]["location_required"])
+        self.assertEqual(harness.response[1]["code"], "NEARBY_LOCATION_REQUIRED")
+
     def test_match_filter_is_saved_and_apk_profile_params_are_used(self) -> None:
         calls, session, response = self._run_match(
             "/api/match/online", {"gender": "女", "property": "B"}
@@ -1728,35 +1840,23 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('data-me-stat="friends"', page_me)
         self.assertIn("PAGE_CACHE_TTL_MS = 2 * 60 * 1000", app_js)
 
-    def test_room_page_states_limited_web_support_truthfully(self) -> None:
+    def test_voice_room_ui_is_removed_from_match_hub(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
-        app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
-        bff_server_py = (root / "bbw_web" / "bff_server.py").read_text(encoding="utf-8")
 
-        for marker in (
-            "网页版当前仅提供房间榜单及接口状态查询，尚未接入实时语音。",
-            "网页版暂不支持实时语音",
-            "当前无法进入房间收听、上麦或通话。",
-            "服务端当前没有返回可展示的房间，可稍后刷新。",
-            "仅提交服务端建房请求，不代表网页版可进入房间通话",
-            "仅检查凭证接口响应，不代表网页版已接入实时音频",
-            'data-action="room-native-refresh">读取客户端房间列表',
-            'api("/api/room/native-list"',
-            "S.roomkitAvailable = Boolean(data?.capabilities?.roomkit_list);",
+        for removed in (
+            "语音房",
+            "语音匹配",
+            "function pageRoom",
+            "function roomCard",
+            'data-action="room-auth"',
+            'data-action="room-native-refresh"',
+            'data-form="room-create"',
+            'data-form="room-ktv"',
+            'data-form="room-rtc"',
+            "LEGACY_MATCH_ROUTES",
         ):
-            self.assertIn(marker, app_js)
-        self.assertNotIn("稍后再来听听", app_js)
-        self.assertIn('data.code === "FALSE_RESPONSE" && data.entity === "room"', app_js)
-        self.assertIn("function normalizeRoomCreateResult(data)", app_js)
-        self.assertIn('code: "ROOM_CREATE_UNAVAILABLE"', app_js)
-        self.assertIn("room_top_envelope(app.room.top())", bff_server_py)
-        self.assertIn("room_create_envelope(", bff_server_py)
-        self.assertIn('if path == "/api/room/native-list"', bff_server_py)
-        self.assertIn('"roomkit_list": True', bff_server_py)
-        self.assertIn('"invite_login": INVITE_LOGIN_ENABLED', bff_server_py)
-        self.assertIn(".room-cover", app_css)
-        self.assertIn(".room-owner-avatar", app_css)
+            self.assertNotIn(removed, app_js)
 
     def test_match_page_uses_responsive_preference_workbench(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -1771,11 +1871,11 @@ class SocialFrontendContractTests(unittest.TestCase):
             'history.pushState(null, "", matchRouteHash(activeTab))',
             'return switchMatchHubTab(tab);',
             '["match", "匹配"]',
-            '["room", "语音房"]',
+            '["bottle", "漂流瓶"]',
+            "async function pageBottle(signal)",
             'class="match-overview"',
             'data-form="match-filter"',
-            'class="match-mode-grid"',
-            'class="match-compose-grid"',
+            'data-form="bottle-throw"',
             "data-match-filter-summary",
             'const MATCH_PROPERTIES = ["双", "Z", "B"]',
             'matchFilterOption("property", value, properties, "checkbox")',
@@ -1790,20 +1890,26 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('url("/static/match-hub-bg.png")', app_css)
         self.assertTrue(match_hub_background.is_file())
         self.assertNotIn('statCard(display.online ?? "—", "在线免费")', app_js)
+        switch_match = app_js.split("async function switchMatchHubTab", 1)[1].split(
+            "async function pageWallet", 1
+        )[0]
+        self.assertIn("panel.innerHTML = content", switch_match)
+        self.assertNotIn("root().innerHTML", switch_match)
 
     def test_online_user_list_remains_available_for_profiles_and_friend_requests(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
         bff_server_py = (root / "bbw_web" / "bff_server.py").read_text(encoding="utf-8")
 
-        nearby = app_js.split("async function pageNearby", 1)[1].split(
+        nearby = app_js.split("function normalizeDiscoveryTab", 1)[1].split(
+            "async function pageMessages", 1
+        )[0]
+        nearby_page = app_js.split("async function pageNearby", 1)[1].split(
             "async function pageMessages", 1
         )[0]
         matching = app_js.split("async function pageMatching", 1)[1].split(
-            "function matchHubHeader", 1
-        )[0]
-        match_users_action = app_js.split('if (action === "match-users")', 1)[1].split(
-            'if (action === "buy-card")', 1
+            "async function pageBottle", 1
         )[0]
         user_card = app_js.split("function userCard(item, options = {})", 1)[1].split(
             "function formatSocialTime", 1
@@ -1811,22 +1917,30 @@ class SocialFrontendContractTests(unittest.TestCase):
 
         self.assertIn("proactivePrivateMessageEnabled: false", app_js)
         self.assertIn("directImCredentialsEnabled: false", app_js)
-        self.assertIn('api("/api/match/online-users?page=1", { signal })', nearby)
-        self.assertNotIn("Promise.resolve(null)", nearby)
-        self.assertIn('data-action="match-users"', matching)
-        self.assertIn("可查看资料并申请添加好友", matching)
-        self.assertIn(
-            "userCard(item, { chat: true, profile: true, addFriend: true })",
-            nearby,
-        )
-        self.assertIn(
-            "userCard(item, { chat: true, profile: true, addFriend: true })",
-            match_users_action,
-        )
+        self.assertIn('["online", "在线列表"]', nearby)
+        self.assertIn('["nearby", "附近的人"]', nearby)
+        self.assertIn('data-form="nearby-filter"', nearby)
+        self.assertIn('name="gender"', nearby)
+        self.assertIn('name="property"', nearby)
+        self.assertIn('name="age"', nearby)
+        self.assertIn('"/api/match/online-users"', nearby)
+        self.assertIn('"/api/match/nearby-users"', nearby)
+        self.assertIn("async function loadDiscoveryPanel", nearby)
+        self.assertIn("panel.innerHTML = discoveryPanelHtml", nearby)
+        self.assertIn("navigator.geolocation.getCurrentPosition", nearby)
+        self.assertNotIn('class="welcome-strip"', nearby_page)
+        self.assertNotIn('class="quick-entry-grid"', nearby_page)
+        self.assertNotIn('data-action="match-users"', matching)
+        self.assertNotIn("在线列表", matching)
+        self.assertIn("return userCard(user, {", nearby)
+        self.assertIn("addFriend: true", nearby)
         self.assertIn("if (options.addFriend && id)", user_card)
         self.assertIn('data-action="add-friend"', user_card)
         self.assertIn('data-action="open-profile"', user_card)
         self.assertIn('"match_pool_online_list": True', bff_server_py)
+        self.assertIn('"nearby_custom_city"', bff_server_py)
+        self.assertIn(".discovery-tabs", app_css)
+        self.assertIn(".discovery-filter-form", app_css)
         self.assertNotIn("MATCH_POOL_ONLINE_LIST_FORBIDDEN", bff_server_py)
 
     def test_unprivileged_non_match_users_cannot_display_or_trigger_private_chat(self) -> None:
@@ -2000,11 +2114,11 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('id: "social"', app_js)
         self.assertIn('const SOCIAL_TABS = ["friends", "apply", "follows", "fans", "visitors", "black"]', app_js)
         self.assertIn('name: "关系中心"', app_js)
-        self.assertIn('const LEGACY_MATCH_ROUTES = { room: "room" }', app_js)
-        self.assertIn('["room", "语音房"]', app_js)
-        self.assertNotIn('{ id: "room", name: "语音房"', app_js)
-        self.assertNotIn("room: pageRoom,", app_js)
-        self.assertIn('name: "钱包与会员"', app_js)
+        self.assertIn('const MATCH_HUB_TABS = ["match", "bottle"]', app_js)
+        self.assertNotIn("LEGACY_MATCH_ROUTES", app_js)
+        self.assertNotIn('["room", "语音房"]', app_js)
+        self.assertNotIn("function pageRoom", app_js)
+        self.assertIn('name: "资产与权益"', app_js)
         self.assertIn('name: "任务与奖励"', app_js)
         self.assertIn('const LEGACY_RELATION_ROUTES = { friends: "friends", visitors: "visitors" }', app_js)
         self.assertIn("function socialRouteHash", app_js)
@@ -2034,6 +2148,42 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('data-action="social-tab"', app_js)
         self.assertNotIn("<strong>访客足迹</strong><span>谁看过我、我看过谁</span>", app_js)
         self.assertNotIn('class="message-shortcuts"', app_js)
+
+    def test_purchase_and_recharge_ui_and_bff_routes_are_removed_but_membership_remains(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        bff_server_py = (root / "bbw_web" / "bff_server.py").read_text(encoding="utf-8")
+        pay_adapter = root / "bbw_protocol" / "adapters" / "pay.py"
+
+        for removed in (
+            'data-action="buy-card"',
+            'data-action="wallet-svip"',
+            'data-action="wallet-exchange"',
+            'data-form="wallet-coin"',
+            'data-form="wallet-vip"',
+            'api("/api/pay/card"',
+            'api("/api/pay/coin"',
+            'api("/api/pay/vip"',
+        ):
+            self.assertNotIn(removed, app_js)
+        for removed in (
+            'if path == "/api/pay/coin"',
+            'if path == "/api/pay/vip"',
+            'if path == "/api/pay/card"',
+            'if path == "/api/pay/capabilities"',
+            'if path == "/api/wallet/svip-try"',
+            'if path == "/api/wallet/exchange-vip"',
+            'if path == "/api/wallet/send-gift"',
+        ):
+            self.assertNotIn(removed, bff_server_py)
+        self.assertFalse(pay_adapter.exists())
+        self.assertIn("const membership = data.membership || user", app_js)
+        self.assertIn("会员状态由服务端资料下发并自动刷新", app_js)
+        self.assertIn('"membership": {', bff_server_py)
+        self.assertIn('"source": "server"', bff_server_py)
+        self.assertIn('"read_only": True', bff_server_py)
+        self.assertIn('"vip": str(user.get("vip") or "0")', bff_server_py)
+        self.assertIn('"svip": str(user.get("svip") or "0")', bff_server_py)
 
     def test_system_customer_service_conversation_is_read_only(self) -> None:
         root = Path(__file__).resolve().parents[1]

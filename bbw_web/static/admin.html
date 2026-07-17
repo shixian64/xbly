@@ -7,95 +7,200 @@
   <meta name="robots" content="noindex, nofollow, noarchive" />
   <meta name="color-scheme" content="light" />
   <meta http-equiv="Cache-Control" content="no-store" />
-  <title>系统管理</title>
-  <link rel="stylesheet" href="/static/admin.css?v=20260717-admin-security-v3-match-pool-permission-private-message-policy" />
+  <title>XBLY 管理工作台</title>
+  <link rel="stylesheet" href="/static/admin.css?v=20260717-admin-workspace-v5" />
 </head>
 <body>
+  <a class="admin-skip-link" href="#admin-content">跳到主要内容</a>
   <noscript><p class="admin-noscript">管理端需要启用 JavaScript，当前页面不会提交或保存登录信息。</p></noscript>
   <div id="admin-toast" class="admin-toast" role="status" aria-live="polite" aria-atomic="true" hidden></div>
 
   <main id="admin-login-screen" class="admin-login-screen">
-    <section class="admin-login-card" aria-labelledby="admin-login-title">
-      <header>
-        <p class="admin-eyebrow">受限访问</p>
-        <h1 id="admin-login-title">系统管理</h1>
-        <p>仅限授权管理员使用。登录、数据查看和敏感操作都会写入审计日志。</p>
-      </header>
-      <form id="admin-login-form" class="admin-form" method="post" action="/admin" novalidate>
-        <div class="admin-field">
-          <label for="admin-username">管理员账号</label>
-          <input id="admin-username" name="username" type="text" autocomplete="username" maxlength="80" required />
+    <div class="admin-login-frame">
+      <section class="admin-login-intro" aria-labelledby="admin-login-intro-title">
+        <p class="admin-eyebrow">XBLY 管理工作台</p>
+        <h1 id="admin-login-intro-title">让关键管理信息更清晰、更完整</h1>
+        <p>统一掌握用户、邀请、数据资产、审计记录与系统安全状态，在一个工作台完成日常治理。</p>
+        <div class="admin-login-capabilities" aria-label="管理能力">
+          <span>用户全景数据</span>
+          <span>邀请与准入管理</span>
+          <span>敏感操作审计</span>
+          <span>安全访问控制</span>
         </div>
-        <div class="admin-field">
-          <label for="admin-password">管理员密码</label>
-          <input id="admin-password" name="password" type="password" autocomplete="current-password" maxlength="1024" required />
-        </div>
-        <button id="admin-login-submit" class="admin-button admin-button-primary admin-button-full" type="submit">登录管理端</button>
-        <p id="admin-login-message" class="admin-form-message" role="alert"></p>
-      </form>
-    </section>
+      </section>
+      <section class="admin-login-card" aria-labelledby="admin-login-title">
+        <header>
+          <p class="admin-eyebrow">受限访问</p>
+          <h2 id="admin-login-title">登录系统管理</h2>
+          <p>仅限授权管理员使用。登录、数据查看和敏感操作都会写入审计日志。</p>
+        </header>
+        <form id="admin-login-form" class="admin-form" method="post" action="/admin" novalidate>
+          <div class="admin-field">
+            <label for="admin-username">管理员账号</label>
+            <input id="admin-username" name="username" type="text" autocomplete="username" maxlength="80" required />
+          </div>
+          <div class="admin-field">
+            <label for="admin-password">管理员密码</label>
+            <input id="admin-password" name="password" type="password" autocomplete="current-password" maxlength="1024" required />
+          </div>
+          <button id="admin-login-submit" class="admin-button admin-button-primary admin-button-full" type="submit">登录管理工作台</button>
+          <p id="admin-login-message" class="admin-form-message" role="alert"></p>
+        </form>
+      </section>
+    </div>
   </main>
 
   <div id="admin-shell" class="admin-shell" hidden>
     <header class="admin-topbar">
-      <div>
-        <p class="admin-eyebrow">XBLY</p>
-        <h1>系统管理</h1>
+      <div class="admin-topbar-leading">
+        <button id="admin-sidebar-toggle" class="admin-button admin-button-secondary admin-navigation-toggle" type="button" aria-controls="admin-sidebar" aria-expanded="true">收起导航</button>
+        <div class="admin-brand-copy">
+          <p class="admin-eyebrow">XBLY 管理工作台</p>
+          <h1>系统管理</h1>
+        </div>
       </div>
+      <form id="admin-global-search-form" class="admin-global-search" role="search" method="get" action="/admin">
+        <label class="admin-visually-hidden" for="admin-global-search">全局搜索用户</label>
+        <input id="admin-global-search" name="search" type="search" maxlength="160" placeholder="搜索用户昵称、内部编号或上游编号" />
+        <button class="admin-button admin-button-primary" type="submit">搜索用户</button>
+      </form>
       <div class="admin-topbar-session">
         <div class="admin-session-copy">
           <strong id="admin-identity">管理员</strong>
           <span id="admin-session-status">会话已验证</span>
+          <span id="admin-totp-indicator">身份验证器状态待确认</span>
           <span id="admin-unlock-status" class="admin-unlock-status" hidden>敏感访问已锁定</span>
         </div>
-        <button id="admin-lock-sensitive" class="admin-button admin-button-secondary" type="button" hidden>锁定敏感访问</button>
-        <button id="admin-refresh" class="admin-button admin-button-secondary" type="button">刷新当前页面</button>
-        <button id="admin-logout" class="admin-button admin-button-danger" type="button">退出管理端</button>
+        <div class="admin-topbar-actions">
+          <button id="admin-lock-sensitive" class="admin-button admin-button-secondary" type="button" hidden>锁定敏感访问</button>
+          <button id="admin-refresh" class="admin-button admin-button-secondary" type="button">刷新数据</button>
+          <button id="admin-logout" class="admin-button admin-button-danger" type="button">退出管理端</button>
+        </div>
       </div>
     </header>
 
     <div class="admin-layout">
-      <aside class="admin-sidebar" aria-label="管理功能">
+      <button id="admin-sidebar-backdrop" class="admin-sidebar-backdrop" type="button" aria-label="关闭管理导航" hidden><span class="admin-visually-hidden">关闭管理导航</span></button>
+      <aside id="admin-sidebar" class="admin-sidebar" aria-label="管理功能">
+        <div class="admin-sidebar-heading">
+          <strong>管理导航</strong>
+          <span>全局资源治理</span>
+        </div>
         <nav id="admin-navigation" class="admin-navigation">
-          <button type="button" data-admin-view="overview" aria-current="page">概览</button>
-          <button type="button" data-admin-view="invites">邀请码</button>
-          <button type="button" data-admin-view="users">用户数据</button>
-          <button type="button" data-admin-view="audit">审计日志</button>
-          <button type="button" data-admin-view="security">安全设置</button>
+          <section class="admin-navigation-group" aria-labelledby="admin-nav-workbench">
+            <h2 id="admin-nav-workbench" class="admin-navigation-group-title">工作台</h2>
+            <button type="button" data-admin-view="overview" aria-current="page">
+              <span class="admin-navigation-label">运行概览</span>
+              <span class="admin-navigation-description">关键指标、容量与运行状态</span>
+            </button>
+          </section>
+          <section class="admin-navigation-group" aria-labelledby="admin-nav-members">
+            <h2 id="admin-nav-members" class="admin-navigation-group-title">用户与准入</h2>
+            <button type="button" data-admin-view="users">
+              <span class="admin-navigation-label">用户管理</span>
+              <span class="admin-navigation-description">资料、内容、关系与权限</span>
+            </button>
+            <button type="button" data-admin-view="invites">
+              <span class="admin-navigation-label">邀请码管理</span>
+              <span class="admin-navigation-description">创建、筛选与停用</span>
+            </button>
+          </section>
+          <section class="admin-navigation-group" aria-labelledby="admin-nav-governance">
+            <h2 id="admin-nav-governance" class="admin-navigation-group-title">治理与安全</h2>
+            <button type="button" data-admin-view="audit">
+              <span class="admin-navigation-label">审计日志</span>
+              <span class="admin-navigation-description">追踪读取与敏感操作</span>
+            </button>
+            <button type="button" data-admin-view="security">
+              <span class="admin-navigation-label">安全与访问</span>
+              <span class="admin-navigation-description">身份验证与管理员密码</span>
+            </button>
+          </section>
         </nav>
-        <p class="admin-sidebar-note">管理端不会在浏览器持久存储任何登录信息或敏感数据。</p>
+        <div class="admin-sidebar-note">
+          <strong>隐私保护</strong>
+          <p>管理端不会在浏览器持久存储登录信息或敏感数据，页面隐藏时会主动清理敏感内容。</p>
+        </div>
       </aside>
 
       <main id="admin-content" class="admin-content" tabindex="-1">
+        <div class="admin-context-bar" aria-label="当前位置与数据状态">
+          <p class="admin-breadcrumb"><span>系统管理</span><span aria-hidden="true">/</span><strong id="admin-breadcrumb-current">运行概览</strong></p>
+          <p id="admin-page-updated">数据尚未刷新</p>
+        </div>
         <section id="admin-view-overview" class="admin-view" data-view="overview" aria-labelledby="admin-overview-title">
           <header class="admin-section-header">
             <div>
+              <p class="admin-section-kicker">工作台</p>
               <h2 id="admin-overview-title">运行概览</h2>
-              <p>查看用户、存储、同步任务和近期运行状态。</p>
+              <p>从用户、会话、数据资产和存储容量四个维度快速判断系统状态。</p>
             </div>
           </header>
+          <div id="admin-overview-alerts" class="admin-health-grid" aria-live="polite"></div>
           <div id="admin-overview-metrics" class="admin-metric-grid" aria-live="polite"></div>
-          <div class="admin-panel-grid">
+          <div class="admin-panel-grid admin-panel-grid-overview">
             <section class="admin-panel" aria-labelledby="admin-storage-title">
-              <h3 id="admin-storage-title">媒体存储</h3>
+              <div class="admin-panel-title">
+                <div>
+                  <p class="admin-panel-kicker">容量管理</p>
+                  <h3 id="admin-storage-title">媒体存储</h3>
+                </div>
+              </div>
               <div id="admin-overview-storage"></div>
             </section>
-            <section class="admin-panel" aria-labelledby="admin-jobs-title">
-              <h3 id="admin-jobs-title">会话与归档</h3>
-              <div id="admin-overview-jobs"></div>
+            <section class="admin-panel" aria-labelledby="admin-health-title">
+              <div class="admin-panel-title">
+                <div>
+                  <p class="admin-panel-kicker">运行状态</p>
+                  <h3 id="admin-health-title">访问与可用性</h3>
+                </div>
+              </div>
+              <div id="admin-overview-health"></div>
             </section>
           </div>
+          <section class="admin-panel admin-overview-data-panel" aria-labelledby="admin-jobs-title">
+            <div class="admin-panel-title">
+              <div>
+                <p class="admin-panel-kicker">数据资产</p>
+                <h3 id="admin-jobs-title">归档与治理规模</h3>
+              </div>
+              <p>统计系统当前保存的核心业务与审计数据。</p>
+            </div>
+            <div id="admin-overview-jobs"></div>
+          </section>
+          <section class="admin-panel admin-quick-panel" aria-labelledby="admin-quick-title">
+            <div class="admin-panel-title">
+              <div>
+                <p class="admin-panel-kicker">快捷入口</p>
+                <h3 id="admin-quick-title">常用管理任务</h3>
+              </div>
+              <p>直接进入高频管理场景，减少层级跳转。</p>
+            </div>
+            <div class="admin-quick-actions">
+              <button class="admin-quick-action" type="button" data-admin-jump="users"><strong>查看用户</strong><span>检索用户并查看完整数据</span></button>
+              <button class="admin-quick-action" type="button" data-admin-jump="invites"><strong>管理邀请码</strong><span>创建或停用准入凭证</span></button>
+              <button class="admin-quick-action" type="button" data-admin-jump="audit"><strong>追踪审计</strong><span>核查管理员与系统操作</span></button>
+              <button class="admin-quick-action" type="button" data-admin-jump="security"><strong>检查安全</strong><span>管理身份验证与访问状态</span></button>
+            </div>
+          </section>
         </section>
 
         <section id="admin-view-invites" class="admin-view" data-view="invites" aria-labelledby="admin-invites-title" hidden>
           <header class="admin-section-header">
             <div>
+              <p class="admin-section-kicker">用户与准入</p>
               <h2 id="admin-invites-title">邀请码管理</h2>
-              <p>创建、查询和禁用邀请码。邀请码原码只在创建成功时显示一次。</p>
+              <p>精细控制准入用途、可用次数与有效期。邀请码原码只在创建成功时显示一次。</p>
             </div>
           </header>
           <section class="admin-panel" aria-labelledby="admin-invite-create-title">
-            <h3 id="admin-invite-create-title">创建邀请码</h3>
+            <div class="admin-panel-title">
+              <div>
+                <p class="admin-panel-kicker">新增准入</p>
+                <h3 id="admin-invite-create-title">创建邀请码</h3>
+              </div>
+              <p>建议为不同渠道填写明确用途，并设置合理的使用次数和失效时间。</p>
+            </div>
             <form id="admin-invite-create-form" class="admin-inline-form" method="post" action="/admin" novalidate>
               <div class="admin-field">
                 <label for="admin-invite-label">用途说明</label>
@@ -114,7 +219,10 @@
           </section>
           <section class="admin-panel" aria-labelledby="admin-invite-list-title">
             <div class="admin-panel-heading">
-              <h3 id="admin-invite-list-title">邀请码列表</h3>
+              <div>
+                <p class="admin-panel-kicker">准入记录</p>
+                <h3 id="admin-invite-list-title">邀请码列表</h3>
+              </div>
               <form id="admin-invite-filter-form" class="admin-filter-form" method="post" action="/admin">
                 <label for="admin-invite-status">状态</label>
                 <select id="admin-invite-status" name="status">
@@ -125,8 +233,10 @@
                   <option value="disabled">已禁用</option>
                 </select>
                 <button class="admin-button admin-button-secondary" type="submit">筛选</button>
+                <button id="admin-invite-filter-reset" class="admin-button admin-button-quiet" type="button">重置</button>
               </form>
             </div>
+            <p id="admin-invite-summary" class="admin-result-summary" aria-live="polite">等待加载邀请码数据</p>
             <div id="admin-invite-table" class="admin-table-region" aria-live="polite"></div>
             <div id="admin-invite-pagination" class="admin-pagination"></div>
           </section>
@@ -135,13 +245,17 @@
         <section id="admin-view-users" class="admin-view" data-view="users" aria-labelledby="admin-users-title" hidden>
           <header class="admin-section-header">
             <div>
-              <h2 id="admin-users-title">用户数据</h2>
-              <p>查看用户资料、聊天、媒体、关系、活动、原始响应及受保护的登录凭据。</p>
+              <p class="admin-section-kicker">用户与准入</p>
+              <h2 id="admin-users-title">用户管理</h2>
+              <p>按用户查看资料、会话、媒体、关系、活动、原始响应、访问权限及受保护凭据。</p>
             </div>
           </header>
           <section id="admin-user-list-panel" class="admin-panel" aria-labelledby="admin-user-list-title">
             <div class="admin-panel-heading">
-              <h3 id="admin-user-list-title">用户列表</h3>
+              <div>
+                <p class="admin-panel-kicker">用户检索</p>
+                <h3 id="admin-user-list-title">用户列表</h3>
+              </div>
               <form id="admin-user-filter-form" class="admin-filter-form" method="post" action="/admin">
                 <div class="admin-field admin-field-compact">
                   <label for="admin-user-query">搜索</label>
@@ -156,8 +270,10 @@
                   </select>
                 </div>
                 <button class="admin-button admin-button-secondary" type="submit">筛选</button>
+                <button id="admin-user-filter-reset" class="admin-button admin-button-quiet" type="button">重置</button>
               </form>
             </div>
+            <p id="admin-user-summary" class="admin-result-summary" aria-live="polite">等待加载用户数据</p>
             <div id="admin-user-table" class="admin-table-region" aria-live="polite"></div>
             <div id="admin-user-pagination" class="admin-pagination"></div>
           </section>
@@ -165,22 +281,25 @@
           <section id="admin-user-detail" class="admin-user-detail" aria-labelledby="admin-user-detail-title" hidden>
             <header class="admin-detail-header">
               <div>
-                <p class="admin-eyebrow">用户详情</p>
+                <p class="admin-section-kicker">用户全景</p>
                 <h3 id="admin-user-detail-title">用户数据</h3>
                 <p id="admin-user-detail-subtitle"></p>
               </div>
               <button id="admin-user-detail-close" class="admin-button admin-button-secondary" type="button">返回用户列表</button>
             </header>
-            <nav id="admin-user-tabs" class="admin-tabs" aria-label="用户数据分类">
-              <button type="button" data-user-tab="profile" aria-current="page">资料</button>
-              <button type="button" data-user-tab="messages">聊天记录</button>
-              <button type="button" data-user-tab="media">媒体</button>
-              <button type="button" data-user-tab="relationships">关系</button>
-              <button type="button" data-user-tab="activities">活动</button>
-              <button type="button" data-user-tab="raw">原始响应</button>
-              <button type="button" data-user-tab="credentials">登录凭据</button>
+            <nav id="admin-user-tabs" class="admin-tabs" role="tablist" aria-label="用户数据分类">
+              <span class="admin-tab-group-label" role="presentation">基本信息</span>
+              <button id="admin-user-tab-profile" type="button" role="tab" aria-controls="admin-user-detail-content" aria-selected="true" data-user-tab="profile" aria-current="page">用户概况</button>
+              <span class="admin-tab-group-label" role="presentation">互动数据</span>
+              <button id="admin-user-tab-messages" type="button" role="tab" aria-controls="admin-user-detail-content" aria-selected="false" data-user-tab="messages">会话与消息</button>
+              <button id="admin-user-tab-media" type="button" role="tab" aria-controls="admin-user-detail-content" aria-selected="false" data-user-tab="media">媒体资源</button>
+              <button id="admin-user-tab-relationships" type="button" role="tab" aria-controls="admin-user-detail-content" aria-selected="false" data-user-tab="relationships">关系</button>
+              <button id="admin-user-tab-activities" type="button" role="tab" aria-controls="admin-user-detail-content" aria-selected="false" data-user-tab="activities">活动</button>
+              <span class="admin-tab-group-label" role="presentation">敏感数据</span>
+              <button id="admin-user-tab-raw" type="button" role="tab" aria-controls="admin-user-detail-content" aria-selected="false" data-user-tab="raw">原始响应</button>
+              <button id="admin-user-tab-credentials" type="button" role="tab" aria-controls="admin-user-detail-content" aria-selected="false" data-user-tab="credentials">登录凭据</button>
             </nav>
-            <div id="admin-user-detail-content" class="admin-panel admin-detail-content" aria-live="polite"></div>
+            <div id="admin-user-detail-content" class="admin-panel admin-detail-content" role="tabpanel" aria-labelledby="admin-user-tab-profile" aria-live="polite" tabindex="0"></div>
             <div id="admin-user-detail-pagination" class="admin-pagination"></div>
           </section>
         </section>
@@ -188,11 +307,16 @@
         <section id="admin-view-audit" class="admin-view" data-view="audit" aria-labelledby="admin-audit-title" hidden>
           <header class="admin-section-header">
             <div>
+              <p class="admin-section-kicker">治理与安全</p>
               <h2 id="admin-audit-title">审计日志</h2>
-              <p>日志默认保存一百八十天，管理端不提供删除功能。</p>
+              <p>按操作者、操作类型和目标用户追踪管理活动。日志默认保存一百八十天且不提供在线删除。</p>
             </div>
           </header>
           <section class="admin-panel">
+            <div class="admin-audit-notice">
+              <strong>审计原则</strong>
+              <span>数据读取、权限变更、敏感解锁与凭据查看均应具备可追溯记录。</span>
+            </div>
             <form id="admin-audit-filter-form" class="admin-filter-form admin-filter-form-wide" method="post" action="/admin">
               <div class="admin-field admin-field-compact">
                 <label for="admin-audit-action">操作类型</label>
@@ -202,8 +326,19 @@
                 <label for="admin-audit-target">目标用户内部编号</label>
                 <input id="admin-audit-target" name="target_user_id" type="text" maxlength="64" />
               </div>
+              <div class="admin-field admin-field-compact">
+                <label for="admin-audit-actor">操作者类型</label>
+                <select id="admin-audit-actor" name="actor_type">
+                  <option value="">全部</option>
+                  <option value="admin">管理员</option>
+                  <option value="system">系统任务</option>
+                  <option value="user">用户</option>
+                </select>
+              </div>
               <button class="admin-button admin-button-secondary" type="submit">筛选</button>
+              <button id="admin-audit-filter-reset" class="admin-button admin-button-quiet" type="button">重置</button>
             </form>
+            <p id="admin-audit-summary" class="admin-result-summary" aria-live="polite">等待加载审计数据</p>
             <div id="admin-audit-table" class="admin-table-region" aria-live="polite"></div>
             <div id="admin-audit-pagination" class="admin-pagination"></div>
           </section>
@@ -212,13 +347,20 @@
         <section id="admin-view-security" class="admin-view" data-view="security" aria-labelledby="admin-security-title" hidden>
           <header class="admin-section-header">
             <div>
-              <h2 id="admin-security-title">安全设置</h2>
-              <p>管理身份验证器和管理员密码。身份验证器是查看用户明文登录凭据和原始响应内容的必要条件。</p>
+              <p class="admin-section-kicker">治理与安全</p>
+              <h2 id="admin-security-title">安全与访问</h2>
+              <p>统一管理身份验证器、敏感访问状态和管理员密码，降低高风险操作暴露面。</p>
             </div>
           </header>
+          <div id="admin-security-summary" class="admin-security-summary" aria-live="polite"></div>
           <div class="admin-panel-grid">
             <section class="admin-panel" aria-labelledby="admin-totp-title">
-              <h3 id="admin-totp-title">身份验证器</h3>
+              <div class="admin-panel-title">
+                <div>
+                  <p class="admin-panel-kicker">二次验证</p>
+                  <h3 id="admin-totp-title">身份验证器</h3>
+                </div>
+              </div>
               <div id="admin-totp-status"></div>
               <form id="admin-totp-start-form" class="admin-form admin-form-compact" method="post" action="/admin" novalidate>
                 <div class="admin-field">
@@ -256,7 +398,12 @@
             </section>
 
             <section class="admin-panel" aria-labelledby="admin-password-title">
-              <h3 id="admin-password-title">修改管理员密码</h3>
+              <div class="admin-panel-title">
+                <div>
+                  <p class="admin-panel-kicker">账号安全</p>
+                  <h3 id="admin-password-title">修改管理员密码</h3>
+                </div>
+              </div>
               <form id="admin-password-form" class="admin-form" method="post" action="/admin" novalidate>
                 <div class="admin-field">
                   <label for="admin-current-password">当前密码</label>
@@ -370,6 +517,23 @@
     </form>
   </dialog>
 
-  <script src="/static/admin.js?v=20260717-admin-security-v3-match-pool-permission-private-message-policy"></script>
+  <dialog id="admin-nearby-custom-city-dialog" class="admin-dialog" aria-labelledby="admin-nearby-custom-city-title">
+    <form id="admin-nearby-custom-city-form" class="admin-dialog-card" method="post" action="/admin" novalidate>
+      <header>
+        <h2 id="admin-nearby-custom-city-title">修改自定义城市筛选授权</h2>
+        <p id="admin-nearby-custom-city-description"></p>
+      </header>
+      <div class="admin-field">
+        <label for="admin-nearby-custom-city-reason">操作理由</label>
+        <textarea id="admin-nearby-custom-city-reason" name="reason" rows="3" minlength="3" maxlength="500" required></textarea>
+      </div>
+      <div class="admin-dialog-actions">
+        <button id="admin-nearby-custom-city-submit" class="admin-button admin-button-primary" type="submit">确认修改授权</button>
+        <button id="admin-nearby-custom-city-cancel" class="admin-button admin-button-secondary" type="button">取消</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/static/admin.js?v=20260717-admin-workspace-v5"></script>
 </body>
 </html>

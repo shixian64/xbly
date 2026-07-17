@@ -104,6 +104,7 @@ class WebUser:
     label: str = ""  # optional display label
     persist_sessions: bool = False
     match_pool_online_list_enabled: bool = False
+    nearby_custom_city_enabled: bool = False
     match_message_peers: set[str] = field(default_factory=set, repr=False)
     conversation_message_peers: set[str] = field(default_factory=set, repr=False)
     pending_until: Optional[float] = field(default=None, repr=False)
@@ -213,6 +214,7 @@ class WebUser:
             "match_pool_online_list": True,
             "proactive_private_message": enabled,
             "direct_im_credentials": False,
+            "nearby_custom_city": bool(self.nearby_custom_city_enabled),
         }
 
 

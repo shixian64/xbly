@@ -7,16 +7,15 @@
 | 可协议化 | 说明 |
 |---|---|
 | ✅ 登录/改密/短信/一键登录 | `auth` |
-| ✅ 公开内容读取 | 礼物/推荐/广告/敏感词… |
+| ✅ 公开内容读取 | 推荐/广告/敏感词… |
 | ✅ 社交 | follow/粉丝/黑名单/举报… |
 | ✅ 资料 | 用户信息/改昵称/隐私… |
-| ✅ 经济 | VIP/金币/送礼/提现下单参数 |
+| ✅ 资产与权益 | 服务端会员状态、礼物背包与提现；购买、充值和会员开通已停用 |
 | ✅ 房间/匹配/IM 辅助 HTTP | token 获取、列表、redis 缓存接口 |
 | ✅ **action 名称面 + 调用器** | 默认 action 用 `app.call`；特殊租户/URL/Redis/multipart 用对应 `call_*` |
 | ⚠️ 腾讯/融云 **实时长连接** | `adapters.im` 出凭证；收发需 TIM/融云 SDK（见 `bbw_web`） |
 | ✅ APK RoomKit 房间列表 | `adapters.roomkit` 独立登录并读取 `/mic/room/list`；Authorization 与主协议会话隔离 |
 | ⚠️ 阿里云刷脸 | `adapters.face` 编排 Init/Describe；活体 metaInfo 仍靠 ZIM |
-| ⚠️ 支付收银台 | `adapters.pay` 规范 order_params；收银靠微信/支付宝官方 |
 
 完整 action 目录：`../docs/api_catalog.json`（v154 活跃 **398**；历史并集 **405**，含 7 个已下线小说 action）。
 
@@ -33,11 +32,9 @@ cd <repo-root>
 python -m bbw_protocol.cli whoami
 python -m bbw_protocol.cli login --phone YOUR_PHONE --password "YOUR_PASS"
 python -m bbw_protocol.cli bootstrap
-python -m bbw_protocol.cli gifts
 python -m bbw_protocol.cli follow 1
 python -m bbw_protocol.cli me
 python -m bbw_protocol.cli nick Vom
-python -m bbw_protocol.cli call getGiftList
 python -m bbw_protocol.cli call follow me=YOUR_UID you=1 quietly_follow=1
 python -m bbw_protocol.cli actions --cat social
 python -m bbw_protocol.cli repl
@@ -55,7 +52,6 @@ app.auth.login_password("YOUR_PHONE", "password")
 app.save()
 
 print(app.whoami())
-print(app.content.gift_list().raw[:200])
 print(app.social.follow("12345").message)
 print(app.profile.reset_nickname("Vom").message)
 
@@ -64,9 +60,8 @@ app.call("getRoomTop")
 app.call_redis("getUserRoomInfo", uid=app.session.uid)
 app.im.local_user_sig()  # 本地腾讯 IM UserSig
 
-# 原生能力适配（凭证 / 下单 / 刷脸编排）
+# 原生能力适配（凭证 / 刷脸 / RoomKit 编排）
 print(app.native.im.tim_login_payload())
-print(app.native.pay.prepare_coin_wechat("1").to_dict())
 print(app.native.face.status_hint())
 print(app.native.roomkit.rooms(page=1, size=10).data)
 ```
@@ -77,8 +72,6 @@ print(app.native.roomkit.rooms(page=1, size=10).data)
 python -m bbw_protocol.cli native-status
 python -m bbw_protocol.cli im-tim --prefer local
 python -m bbw_protocol.cli im-rong
-python -m bbw_protocol.cli pay-coin --channel wechat --coin-id 1
-python -m bbw_protocol.cli pay-vip --channel wechat --level vip --vipid 5
 python -m bbw_protocol.cli face-status
 ```
 
@@ -105,7 +98,8 @@ bbw_web/               # Web 层（多用户）—— 独立包
 | 短信登录 | `auth.sms_send` + `sms_login` |
 | 关注 | `social.follow` |
 | 改昵称 | `profile.reset_nickname`（需实名） |
-| 送礼物 | `economy.send_gift*`（需余额） |
+| 查看服务端会员状态 | `session.vip` / `session.svip` |
+| 查看礼物背包 | `economy.my_gifts` |
 | 开房间 | `room.create`（服务端条件） |
 | 进 IM | `im.tencent_sign` / `local_user_sig` + 外部 IM SDK |
 | 未封装的按钮 | `call("ExactDoName", **formFields)` |
@@ -113,13 +107,13 @@ bbw_web/               # Web 层（多用户）—— 独立包
 ## 设计说明
 
 1. **Header** 与 APK `OkHttpInstance.startHttp` 一致。  
-2. **通用 `call`** 保证目录内 action 都可达，不要求每个都先写死方法。  
+2. **通用 `call`** 可调用非商业 action；购买、充值、会员开通和礼物商店相关 action 会在网络请求前返回 `COMMERCE_DISABLED`。
 3. 常用路径提供语义化 API，便于脚本化「像人一样用」。  
 4. 错误码统一到 `ApiResult`（json/text/empty/700/403…）。
 
 ## 限制（诚实说明）
 
-- 不能 1:1 复刻全部原生 SDK 体验（人脸、支付 UI、IM 实时）。  
+- 不能 1:1 复刻全部原生 SDK 体验（人脸、IM 实时）。
 - 部分接口参数需对照 jadx 或抓包补全；未知参数用 `call` 试验。  
 - 服务端门禁（实名/余额/礼仪分）协议层同样生效。  
 - 仅供 CTF/授权安全研究。

@@ -58,11 +58,6 @@ RATE_LIMIT_BUCKETS: Dict[str, List[float]] = {}
 MUTATION_LOCK = threading.Lock()
 RECENT_MUTATIONS: Dict[str, float] = {}
 FINANCIAL_PATHS = {
-    "/api/pay/coin",
-    "/api/pay/vip",
-    "/api/pay/card",
-    "/api/wallet/exchange-vip",
-    "/api/wallet/send-gift",
     "/api/wallet/withdraw",
 }
 
@@ -566,6 +561,223 @@ def _nearby_location_missing() -> Dict[str, Any]:
         "list": [],
         "count": 0,
         "location_required": True,
+    }
+
+
+DISCOVERY_AGE_RANGES: Dict[str, Tuple[Optional[int], Optional[int]]] = {
+    "不限": (None, None),
+    "": (None, None),
+    "18-24": (18, 24),
+    "25-34": (25, 34),
+    "35-44": (35, 44),
+    "45+": (45, None),
+}
+NEARBY_RADIUS_KM = 100.0
+
+
+def _discovery_gender(value: Any) -> str:
+    gender = str(value or "不限").strip()
+    return gender if gender in N.MATCH_GENDERS else ""
+
+
+def _discovery_property(value: Any) -> str:
+    property_ = str(value or "不限").strip()
+    return property_ if property_ == "不限" or property_ in N.MATCH_PROPERTIES else ""
+
+
+def _discovery_age_range(value: Any) -> Optional[Tuple[Optional[int], Optional[int]]]:
+    return DISCOVERY_AGE_RANGES.get(str(value or "不限").strip())
+
+
+def _numeric_age(value: Any) -> Optional[int]:
+    digits = "".join(char for char in str(value or "") if char.isdigit())
+    if not digits:
+        return None
+    age = int(digits)
+    return age if 1 <= age <= 120 else None
+
+
+def _normalized_gender(value: Any) -> str:
+    raw = str(value or "").strip().casefold()
+    if raw in {"男", "male", "m", "1"}:
+        return "男"
+    if raw in {"女", "female", "f", "2"}:
+        return "女"
+    return str(value or "").strip()
+
+
+def _filter_discovery_users(
+    items: List[Dict[str, Any]],
+    *,
+    current_uid: str,
+    gender: str,
+    property_: str,
+    age_range: Tuple[Optional[int], Optional[int]],
+) -> List[Dict[str, Any]]:
+    minimum_age, maximum_age = age_range
+    filtered: List[Dict[str, Any]] = []
+    for item in items:
+        if str(item.get("id") or "") == current_uid:
+            continue
+        if gender != "不限" and _normalized_gender(item.get("sex")) != gender:
+            continue
+        if property_ != "不限" and str(item.get("property") or "").strip() != property_:
+            continue
+        if minimum_age is not None or maximum_age is not None:
+            age = _numeric_age(item.get("age"))
+            if age is None:
+                continue
+            if minimum_age is not None and age < minimum_age:
+                continue
+            if maximum_age is not None and age > maximum_age:
+                continue
+        filtered.append(item)
+    return filtered
+
+
+def _city_key(value: Any) -> str:
+    region = _clean_profile_region(value).casefold()
+    for separator in ("/", "|", ",", "，", "-"):
+        if separator in region:
+            region = region.split(separator)[-1]
+    region = "".join(region.split())
+    for suffix in ("特别行政区", "自治州", "地区", "盟", "市"):
+        if region.endswith(suffix) and len(region) > len(suffix):
+            region = region[: -len(suffix)]
+            break
+    return region
+
+
+def _same_city(left: Any, right: Any) -> bool:
+    left_key = _city_key(left)
+    right_key = _city_key(right)
+    if not left_key or not right_key:
+        return False
+    return left_key == right_key or left_key in right_key or right_key in left_key
+
+
+def _custom_city(value: Any) -> str:
+    city = str(value or "").strip()
+    if not city:
+        return ""
+    if len(city) > 40 or any(ord(char) < 32 for char in city):
+        return ""
+    return city
+
+
+def _coordinate(value: Any, minimum: float, maximum: float) -> Optional[float]:
+    try:
+        number = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or not minimum <= number <= maximum:
+        return None
+    return number
+
+
+def _profile_coordinates(source: Any) -> Optional[Tuple[float, float]]:
+    if isinstance(source, str):
+        try:
+            source = json.loads(source)
+        except Exception:
+            return None
+    if isinstance(source, dict):
+        latitude = _coordinate(
+            source.get("latitude") or source.get("lat") or source.get("poi_lat"),
+            -90.0,
+            90.0,
+        )
+        longitude = _coordinate(
+            source.get("longitude")
+            or source.get("lng")
+            or source.get("lon")
+            or source.get("poi_lng"),
+            -180.0,
+            180.0,
+        )
+        if latitude is not None and longitude is not None:
+            return latitude, longitude
+        for key in ("user", "userinfo", "userInfo", "userInfoList", "profile", "data", "json_obj"):
+            nested = source.get(key)
+            if isinstance(nested, (dict, list, str)):
+                coordinates = _profile_coordinates(nested)
+                if coordinates is not None:
+                    return coordinates
+    elif isinstance(source, list):
+        for item in source:
+            coordinates = _profile_coordinates(item)
+            if coordinates is not None:
+                return coordinates
+    return None
+
+
+def _raw_user_coordinates(data: Any) -> Dict[str, Tuple[float, float]]:
+    coordinates: Dict[str, Tuple[float, float]] = {}
+    for row in N.extract_list(data):
+        user = N.normalize_user(row) or {}
+        uid = str(user.get("id") or "")
+        point = _profile_coordinates(row)
+        if uid and point is not None:
+            coordinates[uid] = point
+    return coordinates
+
+
+def _distance_km(left: Tuple[float, float], right: Tuple[float, float]) -> float:
+    lat1, lon1 = (math.radians(value) for value in left)
+    lat2, lon2 = (math.radians(value) for value in right)
+    delta_lat = lat2 - lat1
+    delta_lon = lon2 - lon1
+    value = (
+        math.sin(delta_lat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2) ** 2
+    )
+    return 6371.0088 * 2 * math.asin(min(1.0, math.sqrt(value)))
+
+
+def _with_discovery_distance(item: Dict[str, Any], distance_km: float) -> Dict[str, Any]:
+    updated = dict(item)
+    distance = f"{distance_km:.1f} 公里" if distance_km < 10 else f"{distance_km:.0f} 公里"
+    updated["distance"] = distance
+    parts = [
+        f"UID {updated.get('id')}" if updated.get("id") else "",
+        str(updated.get("role") or ""),
+        str(updated.get("city") or ""),
+        distance,
+        str(updated.get("signature") or "")[:24],
+    ]
+    updated["subtitle"] = " · ".join(part for part in parts if part)
+    return updated
+
+
+def _current_profile_region(web_user: Any) -> str:
+    app = web_user.app
+    current_uid = str(app.session.uid or "")
+    raw_user = getattr(app.session, "raw_user", {}) or {}
+    region = _profile_region(raw_user, current_uid)
+    if region:
+        return region
+    profile = _enrich_session_profile(web_user)
+    raw_user = getattr(app.session, "raw_user", {}) or {}
+    return _profile_region(raw_user, current_uid) or _profile_region(profile, current_uid)
+
+
+def _nearby_people_location_missing(capabilities: Dict[str, bool]) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "code": "NEARBY_LOCATION_REQUIRED",
+        "message": "需要获取位置信息",
+        "error": {
+            "title": "需要获取位置信息",
+            "detail": "资料中没有配置城市，请允许浏览器获取当前位置后继续。",
+            "action": "request_location",
+            "code": "NEARBY_LOCATION_REQUIRED",
+            "message": "需要获取位置信息",
+        },
+        "items": [],
+        "list": [],
+        "count": 0,
+        "location_required": True,
+        "capabilities": capabilities,
     }
 
 
@@ -1078,6 +1290,11 @@ class Handler(BaseHTTPRequestHandler):
                 "_request_match_pool_online_list_enabled",
                 None,
             ),
+            nearby_custom_city_enabled=getattr(
+                self,
+                "_request_nearby_custom_city_enabled",
+                None,
+            ),
         )
 
     def can_message_peer(self, user: Any, peer: Any) -> bool:
@@ -1270,8 +1487,6 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         # ---- content / square ----
-        if path == "/api/gifts":
-            return self.ok(RG(app.content.gift_list()))
         if path == "/api/recommend":
             return self.ok(RE(app.content.recommend(q("type", "getSlide")), "slide"))
         if path == "/api/slide":
@@ -1529,19 +1744,96 @@ class Handler(BaseHTTPRequestHandler):
                     "nums_ok": nums.ok,
                 }
             )
-        if path == "/api/match/online-users":
+        if path in {"/api/match/online-users", "/api/match/nearby-users"}:
             capabilities = Handler.web_user_capabilities(self, u)
-            profile = N.normalize_user(
-                getattr(app.session, "raw_user", {}) or {}
-            ) or {}
-            payload = RL(
-                app.match.online_users(
-                    id=app.session.uid,
-                    gender=profile.get("sex") or q("gender"),
-                    property=profile.get("property") or q("property"),
-                    pageIndex=q("page", q("pageIndex", "1")),
+            gender = _discovery_gender(q("gender", "不限"))
+            property_ = _discovery_property(q("property", "不限"))
+            age_value = str(q("age", "不限") or "不限").strip()
+            age_range = _discovery_age_range(age_value)
+            if not gender or not property_ or age_range is None:
+                return self.ok({"ok": False, "error": "筛选条件无效"}, 400)
+
+            custom_city_value = str(q("city", "") or "").strip()
+            custom_city = _custom_city(custom_city_value)
+            if custom_city_value and not custom_city:
+                return self.ok({"ok": False, "error": "城市名称无效"}, 400)
+            if custom_city and not capabilities.get("nearby_custom_city"):
+                return self.ok(
+                    {
+                        "ok": False,
+                        "code": "CUSTOM_CITY_PERMISSION_REQUIRED",
+                        "error": "自定义城市筛选需要管理员授权",
+                        "capabilities": capabilities,
+                    },
+                    403,
                 )
+
+            latitude_value = str(q("latitude", "") or "").strip()
+            longitude_value = str(q("longitude", "") or "").strip()
+            latitude = _coordinate(latitude_value, -90.0, 90.0) if latitude_value else None
+            longitude = _coordinate(longitude_value, -180.0, 180.0) if longitude_value else None
+            if bool(latitude_value) != bool(longitude_value) or (
+                latitude_value and (latitude is None or longitude is None)
+            ):
+                return self.ok({"ok": False, "error": "位置信息无效"}, 400)
+
+            result = app.match.online_users(
+                id=app.session.uid,
+                gender=gender,
+                property=property_,
+                pageIndex=q("page", q("pageIndex", "1")),
             )
+            payload = RL(result)
+            source_items = list(payload.get("items") or [])
+            items = _filter_discovery_users(
+                source_items,
+                current_uid=str(app.session.uid or ""),
+                gender=gender,
+                property_=property_,
+                age_range=age_range,
+            )
+            payload["source_count"] = len(source_items)
+            payload["filters"] = {
+                "gender": gender,
+                "property": property_,
+                "age": age_value,
+            }
+
+            if path == "/api/match/nearby-users":
+                configured_city = _current_profile_region(u)
+                target_city = custom_city or configured_city
+                if target_city:
+                    items = [item for item in items if _same_city(item.get("city"), target_city)]
+                    payload["location"] = {
+                        "mode": "custom_city" if custom_city else "profile_city",
+                        "city": target_city,
+                        "label": f"当前城市：{target_city}",
+                    }
+                elif latitude is not None and longitude is not None:
+                    origin = (latitude, longitude)
+                    coordinate_map = _raw_user_coordinates(getattr(result, "data", None))
+                    nearby_items: List[Tuple[float, Dict[str, Any]]] = []
+                    for item in items:
+                        point = coordinate_map.get(str(item.get("id") or ""))
+                        if point is None:
+                            continue
+                        distance = _distance_km(origin, point)
+                        if distance <= NEARBY_RADIUS_KM:
+                            nearby_items.append((distance, _with_discovery_distance(item, distance)))
+                    nearby_items.sort(key=lambda value: value[0])
+                    items = [item for _distance, item in nearby_items]
+                    payload["location"] = {
+                        "mode": "browser_location",
+                        "city": "",
+                        "label": f"当前位置附近 {int(NEARBY_RADIUS_KM)} 公里",
+                        "radius_km": NEARBY_RADIUS_KM,
+                    }
+                else:
+                    return self.ok(_nearby_people_location_missing(capabilities))
+
+            payload["items"] = items[:50]
+            payload["list"] = payload["items"]
+            payload["count"] = len(payload["items"])
             payload["capabilities"] = capabilities
             return self.ok(payload)
         if path == "/api/match/bottles":
@@ -1574,23 +1866,25 @@ class Handler(BaseHTTPRequestHandler):
 
         # ---- wallet ----
         if path == "/api/wallet":
-            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="bbw-wallet") as pool:
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="bbw-wallet") as pool:
                 me_future = pool.submit(app.profile.get_me)
                 myg_future = pool.submit(app.economy.my_gifts)
-                glist_future = pool.submit(app.economy.gift_list)
                 me = me_future.result()
                 myg = myg_future.result()
-                glist = glist_future.result()
             u.persist()
+            user = N.session_user_dto(app.whoami())
             return self.ok(
                 {
                     "ok": True,
-                    "user": N.session_user_dto(app.whoami()),
+                    "user": user,
                     "me": R(me),
                     "my_gifts": RG(myg),
-                    "gift_shop": RG(glist),
-                    "pay": u.native.pay.capabilities(),
-                    "pay_notice": "下单成功只表示拿到支付参数，不等于资金到账；请在官方收银台完成支付。",
+                    "membership": {
+                        "vip": str(user.get("vip") or "0"),
+                        "svip": str(user.get("svip") or "0"),
+                        "source": "server",
+                        "read_only": True,
+                    },
                 }
             )
 
@@ -1756,8 +2050,6 @@ class Handler(BaseHTTPRequestHandler):
             return self.ok(u.heartbeat.status() if u.heartbeat else {"running": False})
         if path == "/api/face/status":
             return self.ok(u.native.face.status_hint())
-        if path == "/api/pay/capabilities":
-            return self.ok(u.native.pay.capabilities())
         if path == "/api/misc/online":
             return self.ok(R(app.misc.update_online()))
 
@@ -2584,79 +2876,6 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
             # wallet / economy
-            if path == "/api/pay/coin":
-                ch = (data.get("channel") or "wechat").lower()
-                if ch not in {"wechat", "alipay"}:
-                    return self.ok({"ok": False, "error": "不支持的支付渠道"}, 400)
-                cid = str(data.get("coin_id") or "1")
-                res = (
-                    u.native.pay.prepare_coin_alipay(cid)
-                    if ch == "alipay"
-                    else u.native.pay.prepare_coin_wechat(cid)
-                )
-                d = res.to_dict()
-                d["product_notice"] = (
-                    "仅创建支付订单参数，不等于充值到账。请在微信/支付宝官方收银台完成支付后刷新余额。"
-                )
-                if d.get("ok"):
-                    d["message"] = d.get("message") or "订单参数已生成（未支付）"
-                else:
-                    d["error"] = N.explain_error(
-                        str(d.get("code") or ""),
-                        str(d.get("message") or ""),
-                        str(d.get("raw") or "")[:200],
-                    )
-                return self.ok(d)
-            if path == "/api/pay/vip":
-                ch = (data.get("channel") or "wechat").lower()
-                lv = str(data.get("level") or "vip")
-                if ch not in {"wechat", "alipay"}:
-                    return self.ok({"ok": False, "error": "不支持的支付渠道"}, 400)
-                if lv not in {"vip", "svip"}:
-                    return self.ok({"ok": False, "error": "不支持的会员等级"}, 400)
-                vipid = str(data.get("vipid") or data.get("vip_id") or "").strip()
-                if not vipid:
-                    return self.ok({"ok": False, "error": "请选择有效的会员商品编号"}, 400)
-                extra = _params(data)
-                for key in ("channel", "level", "vipid", "vip_id"):
-                    extra.pop(key, None)
-                res = (
-                    u.native.pay.prepare_vip_alipay(lv, vipid=vipid, **extra)
-                    if ch == "alipay"
-                    else u.native.pay.prepare_vip_wechat(lv, vipid=vipid, **extra)
-                )
-                d = res.to_dict()
-                d["product_notice"] = "仅创建会员订单参数，不等于开通成功。"
-                return self.ok(d)
-            if path == "/api/pay/card":
-                res = u.native.pay.buy_match_card(str(data.get("card_id") or "1"))
-                d = res.to_dict()
-                if not d.get("ok"):
-                    d["error"] = N.explain_error(
-                        str(d.get("code") or ""),
-                        str(d.get("message") or ""),
-                        "",
-                    )
-                return self.ok(d)
-            if path == "/api/wallet/svip-try":
-                return self.ok(R(app.economy.svip_try(app.session.uid)))
-            if path == "/api/wallet/exchange-vip":
-                try:
-                    vip_id = int(data.get("vip_id") or data.get("vipid") or 5)
-                except (TypeError, ValueError):
-                    return self.ok({"ok": False, "error": "会员商品编号无效"}, 400)
-                if vip_id <= 0:
-                    return self.ok({"ok": False, "error": "会员商品编号无效"}, 400)
-                return self.ok(
-                    R(
-                        app.economy.money_exchange_vip(
-                            vip_id,
-                            coupon_id=str(data.get("coupon_id") or data.get("couponid") or "0"),
-                        )
-                    )
-                )
-            if path == "/api/wallet/send-gift":
-                return self.ok(R(app.economy.send_gift1(**_params(data))))
             if path == "/api/wallet/withdraw":
                 alipay = str(data.get("alipay") or data.get("alilogonid") or "").strip()
                 name = str(data.get("name") or data.get("aliname") or "").strip()
@@ -2867,6 +3086,7 @@ def _web_user_capabilities(
     user: Any,
     *,
     match_pool_online_list_enabled: Optional[bool] = None,
+    nearby_custom_city_enabled: Optional[bool] = None,
 ) -> Dict[str, bool]:
     enabled = (
         bool(getattr(user, "match_pool_online_list_enabled", False))
@@ -2877,7 +3097,13 @@ def _web_user_capabilities(
         "match_pool_online_list": True,
         "proactive_private_message": enabled,
         "direct_im_credentials": False,
+        "nearby_custom_city": (
+            bool(getattr(user, "nearby_custom_city_enabled", False))
+            if nearby_custom_city_enabled is None
+            else bool(nearby_custom_city_enabled)
+        ),
     }
+
 
 
 def _features() -> List[Dict[str, str]]:
@@ -2892,9 +3118,9 @@ FEATURES: List[Dict[str, str]] = [
     {"id": "me", "name": "我的", "desc": "关系统计、资料、实名与设置"},
     {"id": "social", "name": "关系中心", "desc": "通讯录、申请、关注、粉丝、访客与黑名单"},
     {"id": "room", "name": "语音房", "desc": "旧版榜单、客户端房间列表与接口状态"},
-    {"id": "wallet", "name": "钱包与会员", "desc": "礼物、会员、充值与提现"},
+    {"id": "wallet", "name": "资产与权益", "desc": "余额、提现、礼物背包与服务端会员权益"},
     {"id": "tasks", "name": "任务与奖励", "desc": "任务列表与奖励领取"},
-    {"id": "lab", "name": "协议台", "desc": "任意 do= 调用"},
+    {"id": "lab", "name": "协议台", "desc": "非商业 do= 调用"},
 ]
 
 

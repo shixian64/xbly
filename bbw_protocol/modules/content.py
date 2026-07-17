@@ -11,9 +11,6 @@ class ContentAPI:
     def __init__(self, client: ProtocolClient):
         self.c = client
 
-    def gift_list(self) -> ApiResult:
-        return self.c.call("getGiftList")
-
     def slide(self, slidesort: str = "1") -> ApiResult:
         return self.c.call("getSlide", slidesort=slidesort)
 

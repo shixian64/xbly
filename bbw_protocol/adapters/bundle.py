@@ -7,19 +7,17 @@ from typing import Any, Dict
 from ..app import BeibeiwuApp
 from .face import FaceAdapter
 from .im import ImAdapter
-from .pay import PayAdapter
 from .roomkit import RoomKitAdapter
 from .tim_rest import TimRestClient
 
 
 class NativeBundle:
-    """Attach IM / face / pay / RoomKit adapters to a protocol app."""
+    """Attach IM / face / RoomKit adapters to a protocol app."""
 
     def __init__(self, app: BeibeiwuApp):
         self.app = app
         self.im = ImAdapter(app)
         self.face = FaceAdapter(app)
-        self.pay = PayAdapter(app)
         self.roomkit = RoomKitAdapter(app)
         self.tim_rest = TimRestClient()
 
@@ -43,7 +41,6 @@ class NativeBundle:
                 "forge": "not viable (see analysis/08)",
             },
             "roomkit": self.roomkit.public_status(),
-            "pay": self.pay.capabilities(),
         }
 
     def web_bootstrap(self, prefer_tim: str = "local") -> Dict[str, Any]:
@@ -51,6 +48,5 @@ class NativeBundle:
         return {
             "whoami": self.app.whoami(),
             "im": self.im.bootstrap(prefer_tim=prefer_tim),
-            "pay_meta": self.pay.capabilities(),
             "face_pipeline": self.face.status_hint()["pipeline"],
         }

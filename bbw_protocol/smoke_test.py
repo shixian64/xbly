@@ -29,7 +29,6 @@ def main() -> int:
     app.save()
 
     for name, fn in [
-        ("gifts", app.content.gift_list),
         ("recommend", app.content.recommend),
         ("ads", app.content.is_show_ad),
         ("censor", app.content.chat_censorship),
@@ -38,7 +37,6 @@ def main() -> int:
         ("reset_num", app.profile.reset_num),
         ("follow", lambda: app.social.follow("1")),
         ("nick", lambda: app.profile.reset_nickname("Vom")),
-        ("svip_try", app.economy.svip_try),
         ("withdraw", lambda: app.economy.withdraw("a@b.com", "t", "1")),
         ("room_create", app.room.create),
         ("usersig", lambda: type("R", (), {"ok": True, "code": "", "message": app.im.local_user_sig()[:40], "raw": ""})()),
@@ -59,7 +57,7 @@ def main() -> int:
     print(json.dumps({"whoami": app.whoami(), "results": results}, ensure_ascii=False, indent=2))
     # soft assert core
     assert results["login"]["ok"] or results["login"].get("uid") != "0"
-    assert "gifts" in results
+    assert "recommend" in results
     print("SMOKE OK")
     return 0
 
