@@ -26,7 +26,7 @@ from typing import Any, Literal, Mapping, NoReturn
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 from sqlalchemy import func, or_, select, text as sql_text
 
 from bbw_prod.db import session_scope
@@ -210,6 +210,16 @@ class InviteCreateBody(_StrictBody):
 
 class UserStatusBody(_StrictBody):
     status: Literal["active", "disabled"]
+    reason: str = Field(min_length=3, max_length=500)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def strip_reason(cls, value: str) -> str:
+        return value.strip()
+
+
+class UserMatchPoolOnlineListBody(_StrictBody):
+    enabled: StrictBool
     reason: str = Field(min_length=3, max_length=500)
 
     @field_validator("reason", mode="before")
@@ -755,6 +765,9 @@ def _user_public(user: User, account: ExternalAccount | None) -> dict[str, Any]:
         "media_used_bytes": int(user.media_used_bytes),
         "media_quota_bytes": int(user.media_quota_bytes),
         "chat_retention_days": int(user.chat_retention_days),
+        "match_pool_online_list_enabled": bool(
+            user.match_pool_online_list_enabled
+        ),
         "last_login_at": _iso(user.last_login_at),
         "last_authenticated_at": _iso(account.last_authenticated_at) if account else None,
         "last_sync_at": _iso(account.last_sync_at) if account else None,
@@ -1653,6 +1666,44 @@ def set_user_status(
             _raise_service_error(exc)
         raise
     return {"ok": True, "user": item, "revoked_sessions": revoked}
+
+
+@router.post("/users/{user_id}/match-pool-online-list")
+def set_user_match_pool_online_list(
+    user_id: uuid.UUID,
+    body: UserMatchPoolOnlineListBody,
+    request: Request,
+    context: AdminContext = Depends(_admin_context),
+) -> dict[str, Any]:
+    try:
+        with session_scope() as db:
+            account = ExternalAccountRepository(db).get_for_user(user_id)
+            user = _require_user(db, user_id, for_update=True)
+            old_enabled = bool(user.match_pool_online_list_enabled)
+            new_enabled = bool(body.enabled)
+            changed = old_enabled != new_enabled
+            user.match_pool_online_list_enabled = new_enabled
+            _audit_service(db, request).record(
+                actor_type="admin",
+                action="user.match_pool_online_list_changed",
+                admin_user_id=context.admin_user_id,
+                target_user_id=user_id,
+                resource_type="user_feature",
+                resource_id="match_pool_online_list",
+                reason=body.reason,
+                client_ip=context.client_ip,
+                details={
+                    "old_enabled": old_enabled,
+                    "new_enabled": new_enabled,
+                    "changed": changed,
+                },
+            )
+            item = _user_public(user, account)
+    except Exception as exc:
+        if isinstance(exc, ServiceError):
+            _raise_service_error(exc)
+        raise
+    return {"ok": True, "user": item, "changed": changed}
 
 
 @router.post("/users/{user_id}/credentials")

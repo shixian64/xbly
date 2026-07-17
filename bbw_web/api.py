@@ -164,6 +164,7 @@ class CapturingHandler(legacy.Handler):
         headers: Any,
         body: bytes,
         client_ip: str,
+        match_pool_online_list_enabled: Optional[bool] = None,
     ) -> None:
         # BaseHTTPRequestHandler.__init__ immediately starts reading a socket;
         # intentionally do not call it here.
@@ -173,6 +174,7 @@ class CapturingHandler(legacy.Handler):
         self.rfile = io.BytesIO(body)
         self.wfile = io.BytesIO()
         self.client_address = (client_ip, 0)
+        self._request_match_pool_online_list_enabled = match_pool_online_list_enabled
         self.request_version = "HTTP/1.1"
         self.close_connection = True
         self._held_user_lock = None
@@ -443,11 +445,6 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
     if sid and identity is None and legacy.STORE is not None:
         legacy.STORE.drop(sid)
 
-    if sid and identity is not None and legacy.STORE is not None and legacy.STORE.get(sid) is None:
-        restored = persistence.restore_web_user(sid)
-        if restored is not None:
-            legacy.STORE.put(restored)
-
     if path.startswith("/api/") and path != "/api/health":
         limiter_identity = (
             f"user:{identity.user_id}" if identity is not None else f"ip:{client_ip}"
@@ -471,6 +468,38 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
                 status_code=429,
                 headers={"Retry-After": "60"},
             )
+
+    if (
+        path == "/api/match/online-users"
+        and identity is not None
+        and not identity.match_pool_online_list_enabled
+    ):
+        denied = {
+            "ok": False,
+            "code": "MATCH_POOL_ONLINE_LIST_FORBIDDEN",
+            "error": "匹配池在线列表仅向管理员授权的用户开放",
+            "capabilities": {"match_pool_online_list": False},
+        }
+        try:
+            persistence.capture_product_response(
+                sid=sid,
+                identity=identity,
+                method=request.method,
+                path=path,
+                query=dict(request.query_params),
+                request_data=request_json,
+                response_data=denied,
+                status=403,
+                client_ip=client_ip,
+            )
+        except Exception:
+            LOGGER.exception("match-pool permission denial capture failed")
+        return JSONResponse(denied, status_code=403)
+
+    if sid and identity is not None and legacy.STORE is not None and legacy.STORE.get(sid) is None:
+        restored = persistence.restore_web_user(sid)
+        if restored is not None:
+            legacy.STORE.put(restored)
 
     if request.method == "POST" and path == "/api/auth/sms-send":
         phone = str(request_json.get("phone") or "").strip()
@@ -540,6 +569,9 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
         headers=headers,
         body=raw_body,
         client_ip=client_ip,
+        match_pool_online_list_enabled=(
+            identity.match_pool_online_list_enabled if identity is not None else None
+        ),
     )
     try:
         if request.method == "GET":

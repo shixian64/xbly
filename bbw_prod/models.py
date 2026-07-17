@@ -108,6 +108,9 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, SerializableMixin, Base):
     chat_retention_days: Mapped[int] = mapped_column(
         SmallInteger, nullable=False, default=180, server_default="180"
     )
+    match_pool_online_list_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

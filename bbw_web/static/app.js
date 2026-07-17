@@ -60,6 +60,7 @@ const S = {
   inviteLoginAvailable: null,
   labEnabled: false,
   roomkitAvailable: false,
+  matchPoolOnlineListEnabled: false,
   routeController: null,
   routeSeq: 0,
   pageCache: new Map(),
@@ -1031,6 +1032,7 @@ function applyUser(user) {
   avatar.replaceChildren();
   avatar.hidden = true;
   if (!user) {
+    S.matchPoolOnlineListEnabled = false;
     $("side-name").textContent = "游客";
     $("side-meta").textContent = "尚未登录";
     return;
@@ -1063,6 +1065,20 @@ function applyUser(user) {
     );
     avatar.appendChild(image);
     image.src = src;
+  }
+}
+
+function applyCapabilities(capabilities) {
+  if (!capabilities || typeof capabilities !== "object") return;
+  if (Object.prototype.hasOwnProperty.call(capabilities, "match_pool_online_list")) {
+    const enabled = capabilities.match_pool_online_list === true;
+    if (enabled !== S.matchPoolOnlineListEnabled) {
+      S.matchPoolOnlineListEnabled = enabled;
+      S.pageCache.delete("nearby");
+      [...S.pageCache.keys()].forEach((key) => {
+        if (String(key).startsWith("match:")) S.pageCache.delete(key);
+      });
+    }
   }
 }
 
@@ -1552,7 +1568,14 @@ async function activateRoute(id, { force = false } = {}) {
   closeDrawer();
   const cacheKey = routeCacheKey(target);
   const cached = S.pageCache.get(cacheKey);
-  if (!force && target !== "msg" && cached && Date.now() - cached.time < PAGE_CACHE_TTL_MS) {
+  const permissionSensitiveRoute = target === "nearby" || target === "match";
+  if (
+    !force &&
+    target !== "msg" &&
+    !permissionSensitiveRoute &&
+    cached &&
+    Date.now() - cached.time < PAGE_CACHE_TTL_MS
+  ) {
     root().innerHTML = cached.html;
     root().focus({ preventScroll: true });
     centerActiveRelationshipTab();
@@ -1568,7 +1591,9 @@ async function activateRoute(id, { force = false } = {}) {
     if (controller.signal.aborted || seq !== S.routeSeq) return;
     const rendered = `<div class="page-enter">${html}</div>`;
     root().innerHTML = rendered;
-    if (target !== "msg") S.pageCache.set(cacheKey, { html: rendered, time: Date.now() });
+    if (target !== "msg" && !permissionSensitiveRoute) {
+      S.pageCache.set(cacheKey, { html: rendered, time: Date.now() });
+    }
     root().focus({ preventScroll: true });
     centerActiveRelationshipTab();
     hydrateRenderedRoute(target, controller.signal, seq);
@@ -5628,20 +5653,26 @@ async function openFlashViewer(uniqueid) {
 }
 
 async function pageNearby(signal) {
-  const [homeResult, peopleResult, slideResult] = await Promise.allSettled([
-    api("/api/home", { signal }),
-    api("/api/match/online-users?page=1", { signal }),
+  const { data } = await api("/api/home", { signal });
+  applyCapabilities(data.capabilities);
+  if (data.user) applyUser(data.user);
+  const [peopleResult, slideResult] = await Promise.allSettled([
+    S.matchPoolOnlineListEnabled ? api("/api/match/online-users?page=1", { signal }) : Promise.resolve(null),
     api("/api/slide", { signal }),
   ]);
-  if (homeResult.status !== "fulfilled") throw homeResult.reason;
-  const data = homeResult.value.data;
-  if (data.user) applyUser(data.user);
+  if (peopleResult.status === "fulfilled" && peopleResult.value?.data) {
+    applyCapabilities(peopleResult.value.data.capabilities);
+  }
   const user = data.user || S.user || {};
   const name = user.nickname || "新朋友";
   const heartbeat = data.heartbeat && data.heartbeat.running ? "在线状态已同步" : "当前在线";
-  const people = peopleResult.status === "fulfilled" ? itemsOf(peopleResult.value.data) : [];
+  const people =
+    S.matchPoolOnlineListEnabled && peopleResult.status === "fulfilled" && peopleResult.value
+      ? itemsOf(peopleResult.value.data)
+      : [];
   const slides = slideResult.status === "fulfilled" ? itemsOf(slideResult.value.data) : [];
-  return `<section class="welcome-strip"><div><span>${esc(heartbeat)}</span><h2>${esc(name)}，看看现在谁在线</h2><p>${
+  const welcomeTitle = S.matchPoolOnlineListEnabled ? `${name}，看看现在谁在线` : `${name}，开始一次新的相遇`;
+  return `<section class="welcome-strip"><div><span>${esc(heartbeat)}</span><h2>${esc(welcomeTitle)}</h2><p>${
     user.is_realname ? "可以从资料、共同话题或一条礼貌的消息开始认识对方。" : "完成实名后可使用更多匹配和互动能力。"
   }</p></div><button type="button" class="btn primary" data-route="match">开始匹配</button></section>
     <section class="quick-entry-grid" aria-label="常用社交入口">
@@ -5650,14 +5681,18 @@ async function pageNearby(signal) {
       <button type="button" class="quick-entry" data-action="social-open-tab" data-tab="visitors"><strong>访客记录</strong><span>查看彼此的访问记录</span></button>
       <button type="button" class="quick-entry" data-route="moments"><strong>动态广场</strong><span>看看大家正在分享什么</span></button>
     </section>
-    <section class="section"><div class="section-head"><div><h2>此刻在线</h2><p>看看谁也在寻找新的相遇</p></div><button type="button" class="btn secondary small" data-action="refresh-route">换一批</button></div>${
-      people.length
-        ? `<div class="people-grid">${people
-            .slice(0, 18)
-            .map((item) => userCard(item, { chat: true, profile: true }))
-            .join("")}</div>`
-        : emptyState("暂时没有发现在线用户", "可以先去匹配页，稍后再回来看看", "match")
-    }</section>
+    ${
+      S.matchPoolOnlineListEnabled
+        ? `<section class="section"><div class="section-head"><div><h2>此刻在线</h2><p>看看谁也在寻找新的相遇</p></div><button type="button" class="btn secondary small" data-action="refresh-route">换一批</button></div>${
+            people.length
+              ? `<div class="people-grid">${people
+                  .slice(0, 18)
+                  .map((item) => userCard(item, { chat: true, profile: true }))
+                  .join("")}</div>`
+              : emptyState("暂时没有发现在线用户", "可以先去匹配页，稍后再回来看看", "match")
+          }</section>`
+        : ""
+    }
     ${
       slides.length
         ? `<section class="section"><div class="section-head"><div><h2>今日话题</h2><p>找一个自然的开场方式</p></div></div><div class="slide-scroll ui-scrollbar ui-scrollbar--compact">${slides
@@ -5691,6 +5726,7 @@ async function pageMessages(signal) {
 
 async function pageMatching(signal) {
   const { data } = await api("/api/match/status", { signal });
+  applyCapabilities(data.capabilities);
   if (data.user) applyUser(data.user);
   const display = data.display || (data.status && data.status.display) || {};
   const filters = data.filters || data.status?.filters || {};
@@ -5720,7 +5756,11 @@ async function pageMatching(signal) {
     <section class="section"><div class="section-head match-section-head"><div><h2>更多相遇方式</h2><p>换一种更轻松的方式开始交流</p></div></div><div class="match-mode-grid">
       <button type="button" class="match-mode-card is-disabled" disabled><span class="match-mode-tag">客户端专属</span><strong>语音匹配</strong><span>使用实时语音快速认识新朋友</span><small>需要官方客户端音频能力</small></button>
       <button type="button" class="match-mode-card" data-action="match-pick"><span class="match-mode-tag">轻社交</span><strong>捡漂流瓶</strong><span>读一段陌生人的心情和故事</span><small>立即捡一个漂流瓶</small></button>
-      <button type="button" class="match-mode-card" data-action="match-users"><span class="match-mode-tag">匹配池</span><strong>在线列表</strong><span>看看此刻还有谁正在等待相遇</span><small>查看当前在线用户</small></button>
+      ${
+        S.matchPoolOnlineListEnabled
+          ? '<button type="button" class="match-mode-card" data-action="match-users"><span class="match-mode-tag">匹配池</span><strong>在线列表</strong><span>看看此刻还有谁正在等待相遇</span><small>查看当前在线用户</small></button>'
+          : ""
+      }
     </div></section>
 
     <section class="section"><div class="section-head match-section-head"><div><h2>主动表达</h2><p>真诚具体的内容，更容易获得回应</p></div></div><div class="match-compose-grid">
@@ -7761,8 +7801,18 @@ async function handleAction(action, button) {
   if (action === "match-local") return runMatch("/api/match/local");
   if (action === "match-pick") return runMatch("/api/match/bottle-pick");
   if (action === "match-users") {
+    if (!S.matchPoolOnlineListEnabled) {
+      setPanel("match-result", emptyState("在线列表未获授权", "该功能仅向管理员授权的用户开放"));
+      return;
+    }
     setPanel("match-result", loadingState("正在读取在线列表…"));
-    const { data } = await api("/api/match/online-users");
+    const { status, data } = await api("/api/match/online-users");
+    applyCapabilities(data.capabilities);
+    if (status === 403 || !S.matchPoolOnlineListEnabled) {
+      button.closest(".match-mode-card")?.remove();
+      setPanel("match-result", emptyState("在线列表授权已撤销", "该功能仅向管理员授权的用户开放"));
+      return;
+    }
     setPanel("match-result", envelopeHtml(data, (item) => userCard(item, { chat: true, profile: true }), "暂无在线用户", "稍后再来看看"));
     return;
   }
@@ -8271,6 +8321,7 @@ function completeBrowserLogin(data) {
   S.presenceWarningShown = false;
   S.meStats = null;
   S.meStatsAt = 0;
+  applyCapabilities(data.capabilities);
   applyUser(data.user);
   showLogin(false, true);
   buildNav();
@@ -8711,6 +8762,7 @@ syncVisualViewport();
     if (status === 200 && data.ok && data.user?.logged_in) {
       S.sessionGeneration += 1;
       S.authenticated = true;
+      applyCapabilities(data.capabilities);
       applyUser(data.user);
       showLogin(false);
       S.serverHeartbeat = Boolean(data.auto_heartbeat ?? S.serverHeartbeat);

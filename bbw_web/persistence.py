@@ -45,6 +45,7 @@ class UserIdentity:
     user_id: uuid.UUID
     external_account_id: uuid.UUID
     upstream_uid: str
+    match_pool_online_list_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -628,9 +629,12 @@ class RuntimePersistence:
             self.revoke_session(old_sid, reason="rotated")
         self._clear_login_failures(phone=phone, client_ip=client_ip)
         identity = UserIdentity(
-            completion.user.id,
-            completion.external_account.id,
-            str(completion.external_account.upstream_uid or upstream.uid),
+            user_id=completion.user.id,
+            external_account_id=completion.external_account.id,
+            upstream_uid=str(completion.external_account.upstream_uid or upstream.uid),
+            match_pool_online_list_enabled=bool(
+                completion.user.match_pool_online_list_enabled
+            ),
         )
         web_user.clear_pending()
         self._attach_runtime(web_user, identity)
@@ -715,13 +719,23 @@ class RuntimePersistence:
                 last_seen=state.last_seen_at.timestamp(),
                 persist_sessions=False,
             )
-            identity = UserIdentity(user.id, account.id, str(account.upstream_uid or ""))
+            identity = UserIdentity(
+                user_id=user.id,
+                external_account_id=account.id,
+                upstream_uid=str(account.upstream_uid or ""),
+                match_pool_online_list_enabled=bool(
+                    user.match_pool_online_list_enabled
+                ),
+            )
         self._attach_runtime(web_user, identity)
         return web_user
 
     def _attach_runtime(self, web_user: WebUser, identity: UserIdentity) -> None:
         web_user.internal_user_id = str(identity.user_id)
         web_user.external_account_id = str(identity.external_account_id)
+        web_user.match_pool_online_list_enabled = bool(
+            identity.match_pool_online_list_enabled
+        )
         web_user.app.client.response_hook = lambda meta, result: self.capture_upstream_response(
             identity=identity, request_meta=meta, result=result
         )
@@ -769,11 +783,22 @@ class RuntimePersistence:
             ).touch(sid)
             if state is None:
                 return None
+            user = UserRepository(db).get(state.user_id)
             account = ExternalAccountRepository(db).get_for_user(state.user_id)
+            if (
+                user is None
+                or user.status != "active"
+                or account is None
+                or account.id != state.external_account_id
+            ):
+                return None
             return UserIdentity(
-                state.user_id,
-                state.external_account_id,
-                str(account.upstream_uid if account else ""),
+                user_id=state.user_id,
+                external_account_id=state.external_account_id,
+                upstream_uid=str(account.upstream_uid or ""),
+                match_pool_online_list_enabled=bool(
+                    user.match_pool_online_list_enabled
+                ),
             )
 
     def revoke_session(self, sid: str, *, reason: str = "logout") -> bool:
@@ -795,9 +820,21 @@ class RuntimePersistence:
                 return None
             user = UserRepository(db).get(state.user_id)
             account = ExternalAccountRepository(db).get_for_user(state.user_id)
-            if user is None or user.status != "active" or account is None:
+            if (
+                user is None
+                or user.status != "active"
+                or account is None
+                or account.id != state.external_account_id
+            ):
                 return None
-            return UserIdentity(user.id, account.id, str(account.upstream_uid or ""))
+            return UserIdentity(
+                user_id=user.id,
+                external_account_id=account.id,
+                upstream_uid=str(account.upstream_uid or ""),
+                match_pool_online_list_enabled=bool(
+                    user.match_pool_online_list_enabled
+                ),
+            )
 
     def enqueue_message_archive(
         self,
@@ -969,6 +1006,7 @@ class RuntimePersistence:
             "/api/social/blacklist-me",
             "/api/moments/posts",
             "/api/moments/comments",
+            "/api/match/online-users",
             "/api/media/access",
         }
         should_record_event = (

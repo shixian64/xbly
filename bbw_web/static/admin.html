@@ -8,7 +8,7 @@
   <meta name="color-scheme" content="light" />
   <meta http-equiv="Cache-Control" content="no-store" />
   <title>系统管理</title>
-  <link rel="stylesheet" href="/static/admin.css?v=20260717-admin-security-v3" />
+  <link rel="stylesheet" href="/static/admin.css?v=20260717-admin-security-v3-match-pool-permission" />
 </head>
 <body>
   <noscript><p class="admin-noscript">管理端需要启用 JavaScript，当前页面不会提交或保存登录信息。</p></noscript>
@@ -353,6 +353,23 @@
     </form>
   </dialog>
 
-  <script src="/static/admin.js?v=20260717-admin-security-v3"></script>
+  <dialog id="admin-match-pool-online-list-dialog" class="admin-dialog" aria-labelledby="admin-match-pool-online-list-title">
+    <form id="admin-match-pool-online-list-form" class="admin-dialog-card" method="post" action="/admin" novalidate>
+      <header>
+        <h2 id="admin-match-pool-online-list-title">修改匹配池在线列表授权</h2>
+        <p id="admin-match-pool-online-list-description"></p>
+      </header>
+      <div class="admin-field">
+        <label for="admin-match-pool-online-list-reason">操作理由</label>
+        <textarea id="admin-match-pool-online-list-reason" name="reason" rows="3" minlength="3" maxlength="500" required></textarea>
+      </div>
+      <div class="admin-dialog-actions">
+        <button id="admin-match-pool-online-list-submit" class="admin-button admin-button-primary" type="submit">确认修改授权</button>
+        <button id="admin-match-pool-online-list-cancel" class="admin-button admin-button-secondary" type="button">取消</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/static/admin.js?v=20260717-admin-security-v3-match-pool-permission"></script>
 </body>
 </html>

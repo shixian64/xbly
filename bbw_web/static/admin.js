@@ -17,6 +17,8 @@ const ADMIN_ENDPOINTS = Object.freeze({
   users: `${ADMIN_API_ROOT}/users`,
   user: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}`,
   userStatus: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/status`,
+  userMatchPoolOnlineList: (userId) =>
+    `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/match-pool-online-list`,
   userCredentials: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/credentials`,
   userConversations: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/conversations`,
   userMessages: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/messages`,
@@ -59,6 +61,7 @@ const ADMIN_STATE = {
   pendingRawResponse: null,
   rawDetailVisible: false,
   pendingUserStatus: null,
+  pendingMatchPoolOnlineList: null,
   credentialDisplayTimer: null,
   oneTimeInvite: "",
   totpEnrollment: null,
@@ -82,6 +85,7 @@ const ADMIN_FIELD_LABELS = Object.freeze({
   media_quota_bytes: "媒体额度",
   media_used_bytes: "媒体已用空间",
   chat_retention_days: "聊天保存天数",
+  match_pool_online_list_enabled: "匹配池在线列表权限",
   invite_code_id: "邀请码记录编号",
   profile: "用户资料",
   device: "设备资料",
@@ -542,6 +546,13 @@ function closeUserStatusDialog() {
   if (dialog.open) dialog.close();
 }
 
+function closeMatchPoolOnlineListDialog() {
+  ADMIN_STATE.pendingMatchPoolOnlineList = null;
+  clearInputValues($("admin-match-pool-online-list-form"));
+  const dialog = $("admin-match-pool-online-list-dialog");
+  if (dialog.open) dialog.close();
+}
+
 function clearUnlockState() {
   clearInterval(ADMIN_STATE.unlockTimer);
   ADMIN_STATE.unlockTimer = null;
@@ -588,6 +599,7 @@ function clearSensitiveDom({ clearData = true } = {}) {
   clearOneTimeInvite();
   clearTotpEnrollment();
   closeUserStatusDialog();
+  closeMatchPoolOnlineListDialog();
   clearUnlockState();
   ADMIN_STATE.pendingCredentialUserId = "";
   closeUnlockDialog();
@@ -992,6 +1004,7 @@ async function loadUsers(page = ADMIN_STATE.userPage) {
         { label: "显示名称", render: userDisplayName },
         { label: "上游用户编号", render: (row) => userUpstreamUid(row) || "未提供" },
         { label: "状态", render: (row) => statusBadge(row.status || (row.disabled_at ? "disabled" : "active")) },
+        { label: "匹配池在线列表", render: (row) => (row.match_pool_online_list_enabled ? "已授权" : "未授权") },
         { label: "媒体使用", render: (row) => `${formatBytes(row.media_used_bytes || 0)} / ${formatBytes(row.media_quota_bytes || 0)}` },
         { label: "最近登录", render: (row) => formatDate(row.last_login_at) },
         { label: "创建时间", render: (row) => formatDate(row.created_at) },
@@ -1092,10 +1105,44 @@ function renderUserProfile() {
     "media_used_bytes",
     "media_quota_bytes",
     "chat_retention_days",
+    "match_pool_online_list_enabled",
     "created_at",
     "updated_at",
     "profile",
   ]);
+  const onlineListEnabled = Boolean(user.match_pool_online_list_enabled);
+  const featurePanel = element("section", "admin-feature-panel");
+  const featureCopy = element("div", "admin-feature-panel-copy");
+  featureCopy.appendChild(element("h4", "", "匹配池在线列表"));
+  featureCopy.appendChild(
+    element(
+      "p",
+      "",
+      "开启后，该用户可以在身边页和匹配页查看多人在线列表；关闭后，下一次请求会立即被拒绝。"
+    )
+  );
+  const featureToggle = element("label", "admin-feature-switch");
+  const featureInput = document.createElement("input");
+  featureInput.type = "checkbox";
+  featureInput.checked = onlineListEnabled;
+  featureInput.disabled = !ADMIN_STATE.selectedUserId;
+  featureInput.setAttribute("role", "switch");
+  featureInput.setAttribute("aria-label", "允许该用户查看匹配池在线列表");
+  const featureTrack = element("span", "admin-feature-switch-track");
+  featureTrack.setAttribute("aria-hidden", "true");
+  const featureLabel = element(
+    "span",
+    "admin-feature-switch-label",
+    onlineListEnabled ? "已授权" : "未授权"
+  );
+  featureInput.addEventListener("change", () => {
+    const targetEnabled = featureInput.checked;
+    featureInput.checked = !targetEnabled;
+    openMatchPoolOnlineListDialog(targetEnabled);
+  });
+  featureToggle.append(featureInput, featureTrack, featureLabel);
+  featurePanel.append(featureCopy, featureToggle);
+  container.appendChild(featurePanel);
   const currentStatus = user.status || (user.disabled_at ? "disabled" : "active");
   const targetStatus = currentStatus === "disabled" ? "active" : "disabled";
   const actionPanel = element("div", "admin-sensitive-panel");
@@ -1140,6 +1187,25 @@ function openUserStatusDialog(targetStatus) {
   const dialog = $("admin-user-status-dialog");
   if (!dialog.open) dialog.showModal();
   setTimeout(() => $("admin-user-status-reason").focus(), 0);
+}
+
+function openMatchPoolOnlineListDialog(enabled) {
+  if (!ADMIN_STATE.selectedUserId) return;
+  ADMIN_STATE.pendingMatchPoolOnlineList = {
+    userId: ADMIN_STATE.selectedUserId,
+    enabled: Boolean(enabled),
+  };
+  clearInputValues($("admin-match-pool-online-list-form"));
+  $("admin-match-pool-online-list-title").textContent = enabled
+    ? "授权匹配池在线列表"
+    : "撤销匹配池在线列表授权";
+  $("admin-match-pool-online-list-description").textContent = enabled
+    ? "授权后，该用户可以查看当前在线用户。请确认业务需要并填写操作理由。"
+    : "撤销后，该用户的下一次在线列表请求会立即被拒绝，无需等待重新登录。";
+  $("admin-match-pool-online-list-submit").textContent = enabled ? "确认授权" : "确认撤销授权";
+  const dialog = $("admin-match-pool-online-list-dialog");
+  if (!dialog.open) dialog.showModal();
+  setTimeout(() => $("admin-match-pool-online-list-reason").focus(), 0);
 }
 
 async function selectUserTab(tab) {
@@ -2022,6 +2088,38 @@ $("admin-user-status-cancel").addEventListener("click", closeUserStatusDialog);
 $("admin-user-status-dialog").addEventListener("cancel", (event) => {
   event.preventDefault();
   closeUserStatusDialog();
+});
+
+$("admin-match-pool-online-list-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const button = $("admin-match-pool-online-list-submit");
+  void withPending(button, async () => {
+    const pending = ADMIN_STATE.pendingMatchPoolOnlineList;
+    const requestState = captureUserDetailRequest("profile");
+    const reason = $("admin-match-pool-online-list-reason").value.trim();
+    if (!pending?.userId || typeof pending.enabled !== "boolean") {
+      throw new AdminApiError("匹配池在线列表授权操作已经失效，请重新打开用户详情");
+    }
+    if (reason.length < 3) throw new AdminApiError("请填写至少三个字符的操作理由");
+    const data = await adminApi(ADMIN_ENDPOINTS.userMatchPoolOnlineList(pending.userId), {
+      method: "POST",
+      body: JSON.stringify({ enabled: pending.enabled, reason }),
+    });
+    const updated = data.user || data.data?.user || data.data || {};
+    closeMatchPoolOnlineListDialog();
+    if (isCurrentUserDetailRequest(requestState) && requestState.userId === pending.userId) {
+      ADMIN_STATE.selectedUser = { ...(ADMIN_STATE.selectedUser || {}), ...updated };
+      renderUserProfile();
+    }
+    ADMIN_STATE.needsRefresh = true;
+    toast(pending.enabled ? "已授权匹配池在线列表" : "已撤销匹配池在线列表授权", "success", 4200);
+  });
+});
+
+$("admin-match-pool-online-list-cancel").addEventListener("click", closeMatchPoolOnlineListDialog);
+$("admin-match-pool-online-list-dialog").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeMatchPoolOnlineListDialog();
 });
 
 $("admin-audit-filter-form").addEventListener("submit", (event) => {

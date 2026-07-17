@@ -103,6 +103,7 @@ class WebUser:
     heartbeat: Optional[Heartbeat] = None
     label: str = ""  # optional display label
     persist_sessions: bool = False
+    match_pool_online_list_enabled: bool = False
     pending_until: Optional[float] = field(default=None, repr=False)
     profile_cache: Dict[str, tuple[float, Optional[Dict[str, Any]]]] = field(
         default_factory=dict,
@@ -187,6 +188,7 @@ class WebUser:
             "created_at": self.created_at,
             "last_seen": self.last_seen,
             "heartbeat": self.heartbeat.status() if self.heartbeat else {"running": False},
+            "capabilities": self.capabilities(),
             "user": {
                 "logged_in": bool(who.get("logged_in")),
                 "uid": str(who.get("uid") or ""),
@@ -201,6 +203,11 @@ class WebUser:
                 "money": str(who.get("money") or "0"),
                 "phone": phone,
             },
+        }
+
+    def capabilities(self) -> Dict[str, bool]:
+        return {
+            "match_pool_online_list": bool(self.match_pool_online_list_enabled),
         }
 
 

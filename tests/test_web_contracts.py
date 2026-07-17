@@ -1181,6 +1181,97 @@ class MatchRoutingContractTests(unittest.TestCase):
         bff_server.Handler.do_POST(harness)
         return calls, session, harness.response
 
+    def _run_online_users(
+        self,
+        enabled=None,
+        query: str = "",
+        request_enabled=None,
+    ):
+        calls = []
+        result = ApiResult(
+            True,
+            200,
+            '[{"id":"9","nickname":"N"}]',
+            data=[{"id": "9", "nickname": "N"}],
+        )
+
+        class Match:
+            def online_users(self, **params):
+                calls.append(params)
+                return result
+
+        app = SimpleNamespace(
+            session=SimpleNamespace(
+                uid="42",
+                raw_user={"id": "42", "gender": "男", "property": "Z"},
+            ),
+            match=Match(),
+        )
+        values = {"app": app}
+        if enabled is not None:
+            values["match_pool_online_list_enabled"] = enabled
+        web_user = SimpleNamespace(**values)
+
+        class Harness:
+            def __init__(self):
+                self.path = f"/api/match/online-users{query}"
+                self.response = None
+                if request_enabled is not None:
+                    self._request_match_pool_online_list_enabled = request_enabled
+
+            def _check_api_origin(self):
+                return True
+
+            def sid(self):
+                return "sid"
+
+            def user(self, _sid):
+                return web_user
+
+            def ok(self, obj, status=200, **_kwargs):
+                self.response = (status, obj)
+                return self.response
+
+        harness = Harness()
+        bff_server.Handler.do_GET(harness)
+        return calls, harness.response
+
+    def test_online_user_list_requires_explicit_administrator_grant(self) -> None:
+        for enabled in (None, False):
+            with self.subTest(enabled=enabled):
+                calls, response = self._run_online_users(
+                    enabled,
+                    "?enabled=true&admin=true",
+                )
+                self.assertEqual(calls, [])
+                self.assertEqual(response[0], 403)
+                self.assertFalse(response[1]["ok"])
+                self.assertEqual(
+                    response[1]["code"],
+                    "MATCH_POOL_ONLINE_LIST_FORBIDDEN",
+                )
+
+        calls, response = self._run_online_users(
+            True,
+            request_enabled=False,
+        )
+        self.assertEqual(calls, [])
+        self.assertEqual(response[0], 403)
+
+    def test_online_user_list_calls_upstream_only_after_grant(self) -> None:
+        calls, response = self._run_online_users(
+            False,
+            "?page=2",
+            request_enabled=True,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["id"], "42")
+        self.assertEqual(calls[0]["pageIndex"], "2")
+        self.assertEqual(response[0], 200)
+        self.assertTrue(response[1]["ok"])
+        self.assertTrue(response[1]["capabilities"]["match_pool_online_list"])
+
     def test_match_filter_is_saved_and_apk_profile_params_are_used(self) -> None:
         calls, session, response = self._run_match(
             "/api/match/online", {"gender": "女", "property": "B"}
@@ -1419,6 +1510,34 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('url("/static/match-hub-bg.png")', app_css)
         self.assertTrue(match_hub_background.is_file())
         self.assertNotIn('statCard(display.online ?? "—", "在线免费")', app_js)
+
+    def test_match_pool_online_list_is_hidden_and_not_requested_without_grant(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        bff_server_py = (root / "bbw_web" / "bff_server.py").read_text(encoding="utf-8")
+        api_py = (root / "bbw_web" / "api.py").read_text(encoding="utf-8")
+
+        nearby = app_js.split("async function pageNearby", 1)[1].split(
+            "async function pageMessages", 1
+        )[0]
+        matching = app_js.split("async function pageMatching", 1)[1].split(
+            "function matchHubHeader", 1
+        )[0]
+        self.assertIn("matchPoolOnlineListEnabled: false", app_js)
+        self.assertIn("applyCapabilities(data.capabilities)", nearby)
+        self.assertIn(
+            'S.matchPoolOnlineListEnabled ? api("/api/match/online-users?page=1", { signal }) : Promise.resolve(null)',
+            nearby,
+        )
+        self.assertIn("S.matchPoolOnlineListEnabled", matching)
+        self.assertIn('data-action="match-users"', matching)
+        self.assertIn('S.pageCache.delete("nearby")', app_js)
+        self.assertIn('const permissionSensitiveRoute = target === "nearby" || target === "match"', app_js)
+        self.assertIn("!permissionSensitiveRoute", app_js)
+        self.assertIn("MATCH_POOL_ONLINE_LIST_FORBIDDEN", bff_server_py)
+        self.assertIn("Handler.web_user_capabilities(self, u)", bff_server_py)
+        self.assertIn('"_request_match_pool_online_list_enabled"', bff_server_py)
+        self.assertIn("identity.match_pool_online_list_enabled", api_py)
 
     def test_moments_and_social_tabs_update_only_their_content_panels(self) -> None:
         root = Path(__file__).resolve().parents[1]

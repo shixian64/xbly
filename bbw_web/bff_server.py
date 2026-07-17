@@ -1059,6 +1059,16 @@ class Handler(BaseHTTPRequestHandler):
             self.ok({"ok": False, "error": "请先登录"}, 401)
             return None
 
+    def web_user_capabilities(self, user: Any) -> Dict[str, bool]:
+        return _web_user_capabilities(
+            user,
+            match_pool_online_list_enabled=getattr(
+                self,
+                "_request_match_pool_online_list_enabled",
+                None,
+            ),
+        )
+
     def do_OPTIONS(self) -> None:  # noqa: N802
         if not self._origin_allowed():
             return self.ok({"ok": False, "error": "cross-origin request rejected"}, 403)
@@ -1144,6 +1154,7 @@ class Handler(BaseHTTPRequestHandler):
                     "capabilities": {
                         "roomkit_list": True,
                         "invite_login": INVITE_LOGIN_ENABLED,
+                        **Handler.web_user_capabilities(self, u),
                     },
                     "lab_enabled": LAB_ENABLED,
                     "auto_heartbeat": STORE.auto_heartbeat,
@@ -1174,6 +1185,7 @@ class Handler(BaseHTTPRequestHandler):
                     "gifts": deferred,
                     "recommend": {**deferred, "entity": "slide"},
                     "heartbeat": u.heartbeat.status() if u.heartbeat else {"running": False},
+                    "capabilities": Handler.web_user_capabilities(self, u),
                 }
             )
 
@@ -1456,25 +1468,37 @@ class Handler(BaseHTTPRequestHandler):
                     "status": status,
                     "display": status["display"],
                     "filters": filters,
+                    "capabilities": Handler.web_user_capabilities(self, u),
                     # keep raw only for lab debugging if needed
                     "cards_ok": cards.ok,
                     "nums_ok": nums.ok,
                 }
             )
         if path == "/api/match/online-users":
+            capabilities = Handler.web_user_capabilities(self, u)
+            if not capabilities["match_pool_online_list"]:
+                return self.ok(
+                    {
+                        "ok": False,
+                        "code": "MATCH_POOL_ONLINE_LIST_FORBIDDEN",
+                        "error": "匹配池在线列表仅向管理员授权的用户开放",
+                        "capabilities": capabilities,
+                    },
+                    403,
+                )
             profile = N.normalize_user(
                 getattr(app.session, "raw_user", {}) or {}
             ) or {}
-            return self.ok(
-                RL(
-                    app.match.online_users(
-                        id=app.session.uid,
-                        gender=profile.get("sex") or q("gender"),
-                        property=profile.get("property") or q("property"),
-                        pageIndex=q("page", q("pageIndex", "1")),
-                    )
+            payload = RL(
+                app.match.online_users(
+                    id=app.session.uid,
+                    gender=profile.get("sex") or q("gender"),
+                    property=profile.get("property") or q("property"),
+                    pageIndex=q("page", q("pageIndex", "1")),
                 )
             )
+            payload["capabilities"] = capabilities
+            return self.ok(payload)
         if path == "/api/match/bottles":
             return self.ok(RE(app.match.my_bottles(uid=app.session.uid), "bottle"))
 
@@ -2702,6 +2726,21 @@ def _safe_error(exc: Exception, fallback: str) -> str:
     if LAB_ENABLED:
         return str(exc)[:300] or fallback
     return fallback
+
+
+def _web_user_capabilities(
+    user: Any,
+    *,
+    match_pool_online_list_enabled: Optional[bool] = None,
+) -> Dict[str, bool]:
+    enabled = (
+        bool(getattr(user, "match_pool_online_list_enabled", False))
+        if match_pool_online_list_enabled is None
+        else bool(match_pool_online_list_enabled)
+    )
+    return {
+        "match_pool_online_list": enabled,
+    }
 
 
 def _features() -> List[Dict[str, str]]:

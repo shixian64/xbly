@@ -121,6 +121,7 @@ class ProductionContractTests(unittest.TestCase):
             "/users",
             "/users/{user_id}",
             "/users/{user_id}/status",
+            "/users/{user_id}/match-pool-online-list",
             "/users/{user_id}/credentials",
             "/users/{user_id}/conversations",
             "/users/{user_id}/messages",
@@ -154,6 +155,10 @@ class ProductionContractTests(unittest.TestCase):
         self.assertNotIn("preserveUnlock: true", js)
         self.assertIn("ADMIN_ENDPOINTS.userStatus", js)
         self.assertIn('id="admin-user-status-dialog"', html)
+        self.assertIn("ADMIN_ENDPOINTS.userMatchPoolOnlineList", js)
+        self.assertIn('id="admin-match-pool-online-list-dialog"', html)
+        self.assertIn('featureInput.setAttribute("role", "switch")', js)
+        self.assertIn("user.match_pool_online_list_changed", api)
 
     def test_admin_user_detail_race_and_sensitive_field_contracts(self) -> None:
         js = self.read("bbw_web/static/admin.js")
@@ -292,6 +297,7 @@ class ProductionContractTests(unittest.TestCase):
         )[0]
         self.assertIn("self.invites.validate(invite_code, for_update=True)", existing_completion)
         self.assertIn("self.invites.consume_locked(invite)", existing_completion)
+
         self.assertIn("authenticated\": False", api)
         self.assertIn("status_code=202", pending_branch)
         self.assertIn("def _cancel_pending_runtime", api)
@@ -319,6 +325,9 @@ class ProductionContractTests(unittest.TestCase):
     def test_model_and_migration_owner_and_audit_constraints(self) -> None:
         models = self.read("bbw_prod/models.py")
         migration = self.read("migrations/versions/20260716_0001_initial_production.py")
+        permission_migration = self.read(
+            "migrations/versions/20260717_0002_match_pool_online_list_permission.py"
+        )
         self.assertIn("password_encrypted: Mapped[dict[str, Any] | None]", models)
         self.assertIn('name="fk_media_objects_message_owner"', models)
         self.assertIn('ForeignKey("admin_users.id", ondelete="RESTRICT")', models)
@@ -326,6 +335,11 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn("nullable=True", migration.split("'password_encrypted'", 1)[1][:100])
         self.assertIn("fk_media_objects_message_owner", migration)
         self.assertIn("audit log retention period has not elapsed", migration)
+        self.assertIn("match_pool_online_list_enabled: Mapped[bool]", models)
+        self.assertIn('down_revision: Union[str, Sequence[str], None] = "20260716_0001"', permission_migration)
+        self.assertIn('"match_pool_online_list_enabled"', permission_migration)
+        self.assertIn('server_default=sa.text("false")', permission_migration)
+        self.assertIn('op.drop_column("users", "match_pool_online_list_enabled")', permission_migration)
 
     def test_new_login_flushes_user_before_external_account(self) -> None:
         services = self.read("bbw_prod/services.py")
