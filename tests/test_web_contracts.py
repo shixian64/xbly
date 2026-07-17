@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,7 +30,30 @@ from bbw_web.normalize import (
     resolve_media_url,
     session_user_dto,
 )
-from bbw_web.store import WebUser, _session_path
+from bbw_web.store import RequestGate, WebUser, _session_path
+
+
+class RequestGateTests(unittest.TestCase):
+    def test_reads_share_the_gate_and_writer_waits_for_all_readers(self) -> None:
+        gate = RequestGate()
+        first = gate.acquire_read()
+        second = gate.acquire_read()
+        writer_acquired = threading.Event()
+
+        def write_request() -> None:
+            lease = gate.acquire_write()
+            writer_acquired.set()
+            lease.release()
+
+        thread = threading.Thread(target=write_request)
+        thread.start()
+        self.assertFalse(writer_acquired.wait(0.05))
+        first.release()
+        self.assertFalse(writer_acquired.wait(0.05))
+        second.release()
+        self.assertTrue(writer_acquired.wait(0.5))
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
 
 
 class BffEnvelopeTests(unittest.TestCase):
@@ -616,6 +640,21 @@ class SocialBffRoutingTests(unittest.TestCase):
             social=SimpleNamespace(
                 friends=lambda: calls.append(("friends", None)) or result,
                 friend_apply_list=lambda page: calls.append(("friend_apply", page)) or result,
+                follow_users=lambda _uid, page: calls.append(("follow_users", page))
+                or ApiResult(
+                    True,
+                    200,
+                    "[]",
+                    data=[{"you": "9", "yournickname": "关注用户"}],
+                ),
+                follow_list=lambda _uid: calls.append(("follow_list", None)) or result,
+                fans_users=lambda _uid, page: calls.append(("fans_users", page))
+                or ApiResult(
+                    True,
+                    200,
+                    "[]",
+                    data=[{"fansid": "10", "fansnickname": "粉丝用户"}],
+                ),
                 viewed_me=lambda page: calls.append(("seen_me", page)) or result,
                 i_viewed=lambda page: calls.append(("seen_by_me", page)) or result,
             ),
@@ -790,6 +829,19 @@ class SocialBffRoutingTests(unittest.TestCase):
         calls, response = self._run_get("/api/social/friend-apply?page=1")
         self.assertEqual(calls, [("friend_apply", "1"), ("friends", None)])
         self.assertEqual(response[1]["items"], [])
+
+    def test_social_summary_routes_skip_profile_enrichment_and_duplicate_friend_reads(self) -> None:
+        calls, response = self._run_get("/api/social/follows?summary=1")
+        self.assertEqual(calls, [("follow_users", "1")])
+        self.assertEqual(response[1]["count"], 1)
+
+        calls, response = self._run_get("/api/social/fans?summary=1")
+        self.assertEqual(calls, [("fans_users", "1")])
+        self.assertEqual(response[1]["count"], 1)
+
+        calls, response = self._run_get("/api/social/friend-apply?page=1&summary=1")
+        self.assertEqual(calls, [("friend_apply", "1")])
+        self.assertEqual(response[1]["count"], 0)
 
     def test_nearby_moments_use_profile_region_and_report_missing_location(self) -> None:
         def run(raw_user, profile_data=None):
@@ -1176,6 +1228,22 @@ class ImRevokeBffContractTests(unittest.TestCase):
 
 
 class SocialFrontendContractTests(unittest.TestCase):
+    def test_me_page_renders_profile_before_loading_relationship_counts(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        page_me = app_js.split("async function pageMe(signal)", 1)[1].split(
+            "async function pageLab", 1
+        )[0]
+        hydrate = app_js.split("async function hydrateMeStats", 1)[1].split(
+            "function hydrateRenderedRoute", 1
+        )[0]
+
+        self.assertIn('api("/api/profile/me", { signal })', page_me)
+        self.assertNotIn("/api/social/", page_me)
+        self.assertIn("?summary=1", hydrate)
+        self.assertIn('data-me-stat="friends"', page_me)
+        self.assertIn("PAGE_CACHE_TTL_MS = 2 * 60 * 1000", app_js)
+
     def test_room_page_states_limited_web_support_truthfully(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
@@ -1460,7 +1528,9 @@ class SocialFrontendContractTests(unittest.TestCase):
             "function markConversationRead", 1
         )[0]
 
-        self.assertEqual(app_js.count("void startMessageServices();"), 3)
+        self.assertEqual(app_js.count("void startMessageServices();"), 2)
+        self.assertIn("function scheduleAuthenticatedServices", app_js)
+        self.assertIn("scheduleAuthenticatedServices(1000);", app_js)
         self.assertIn("startMessageSyncTimer();", start_services)
         self.assertIn("return syncMessagesInBackground({ force: true });", start_services)
         self.assertIn("refreshConversationSummary()", background_sync)

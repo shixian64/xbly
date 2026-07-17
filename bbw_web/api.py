@@ -340,6 +340,11 @@ def _logout_expired_pending_user(web_user: Any) -> None:
             web_user.app.auth.logout()
     except Exception:
         pass
+    finally:
+        try:
+            web_user.app.client.close()
+        except Exception:
+            pass
 
 
 def _discard_pending_runtime(raw_sid: str) -> None:

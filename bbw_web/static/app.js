@@ -33,6 +33,8 @@ const MESSAGE_PEER_SYNC_REALTIME_MS = 12000;
 const MESSAGE_PEER_SYNC_FALLBACK_MS = 4000;
 const MESSAGE_ARCHIVE_RETRY_DELAYS_MS = [1500, 5000];
 const MESSAGE_ARCHIVE_MAX_IN_FLIGHT = 2;
+const PAGE_CACHE_TTL_MS = 2 * 60 * 1000;
+const ME_STATS_TTL_MS = 60 * 1000;
 // Tencent Chat Web SDK defaults to a 2-minute client recall window. The
 // application console may extend it; the admin REST recall route has no fixed
 // time limit while the message is still inside its roaming-storage lifetime.
@@ -55,6 +57,8 @@ const S = {
   routeController: null,
   routeSeq: 0,
   pageCache: new Map(),
+  meStats: null,
+  meStatsAt: 0,
   matchTab: "match",
   momentsTab: "推荐",
   momentsSearch: "",
@@ -108,6 +112,8 @@ const S = {
   presenceLoadingUids: new Set(),
   subscribedPresenceUids: new Set(),
   messageSyncTimer: null,
+  authenticatedServicesTimer: null,
+  authenticatedServicesPending: false,
   messageLastSummarySyncAt: 0,
   messageLastPeerSyncAt: 0,
   messageLastPeerSyncPeer: "",
@@ -475,6 +481,11 @@ async function api(path, options = {}) {
       S.authenticated = false;
       S.sessionGeneration += 1;
       S.user = null;
+      S.meStats = null;
+      S.meStatsAt = 0;
+      clearTimeout(S.authenticatedServicesTimer);
+      S.authenticatedServicesTimer = null;
+      S.authenticatedServicesPending = false;
       stopPresenceTimer();
       stopMessageSyncTimer();
       clearPeerMediaReconcile();
@@ -1192,6 +1203,17 @@ function startMessageServices() {
   return syncMessagesInBackground({ force: true });
 }
 
+function scheduleAuthenticatedServices(delay = 250) {
+  clearTimeout(S.authenticatedServicesTimer);
+  S.authenticatedServicesPending = false;
+  S.authenticatedServicesTimer = setTimeout(() => {
+    S.authenticatedServicesTimer = null;
+    if (!S.authenticated) return;
+    updatePresence(!document.hidden);
+    void startMessageServices();
+  }, delay);
+}
+
 function buildNav() {
   $("primary-nav").innerHTML = PRIMARY_NAV.map(navGroup).join("");
   $("secondary-nav").innerHTML = S.labEnabled ? navButton(LAB_NAV) : "";
@@ -1315,6 +1337,51 @@ function routeCacheKey(route) {
   return route;
 }
 
+function updateMeStatsDom() {
+  if (S.route !== "me") return;
+  ["friends", "follows", "fans", "visitors"].forEach((key) => {
+    const element = root().querySelector(`[data-me-stat="${key}"]`);
+    if (!element) return;
+    const value = Number(S.meStats?.[key]);
+    element.textContent = Number.isFinite(value) && value >= 0 ? String(value) : "—";
+  });
+}
+
+async function hydrateMeStats(signal, { force = false } = {}) {
+  updateMeStatsDom();
+  if (!force && S.meStats && Date.now() - S.meStatsAt < ME_STATS_TTL_MS) return;
+  const results = await Promise.allSettled([
+    api("/api/social/friends?summary=1", { signal }),
+    api("/api/social/follows?summary=1", { signal }),
+    api("/api/social/fans?summary=1", { signal }),
+    api("/api/social/visitors?type=seen_me&page=0&summary=1", { signal }),
+  ]);
+  if (signal?.aborted || S.route !== "me") return;
+  const previous = S.meStats || {};
+  const keys = ["friends", "follows", "fans", "visitors"];
+  S.meStats = Object.fromEntries(
+    keys.map((key, index) => {
+      const result = results[index];
+      const payload = result.status === "fulfilled" ? result.value.data : null;
+      const count = payload?.ok !== false ? Number(payload?.count) : NaN;
+      return [key, Number.isFinite(count) && count >= 0 ? count : previous[key]];
+    })
+  );
+  S.meStatsAt = Date.now();
+  updateMeStatsDom();
+}
+
+function hydrateRenderedRoute(route, signal, seq) {
+  if (route === "me") {
+    void hydrateMeStats(signal).catch((error) => {
+      if (error?.name !== "AbortError" && seq === S.routeSeq && S.route === "me") {
+        console.info("[me-stats]", error?.message || error);
+      }
+    });
+  }
+  if (S.authenticatedServicesPending) scheduleAuthenticatedServices(1000);
+}
+
 async function activateRoute(id, { force = false } = {}) {
   if (!S.authenticated) return;
   const legacyMatchTab = LEGACY_MATCH_ROUTES[id];
@@ -1364,10 +1431,11 @@ async function activateRoute(id, { force = false } = {}) {
   closeDrawer();
   const cacheKey = routeCacheKey(target);
   const cached = S.pageCache.get(cacheKey);
-  if (!force && target !== "msg" && cached && Date.now() - cached.time < 30000) {
+  if (!force && target !== "msg" && cached && Date.now() - cached.time < PAGE_CACHE_TTL_MS) {
     root().innerHTML = cached.html;
     root().focus({ preventScroll: true });
     centerActiveRelationshipTab();
+    hydrateRenderedRoute(target, controller.signal, seq);
     void refreshVisiblePeerPresence();
     return;
   }
@@ -1382,6 +1450,7 @@ async function activateRoute(id, { force = false } = {}) {
     if (target !== "msg") S.pageCache.set(cacheKey, { html: rendered, time: Date.now() });
     root().focus({ preventScroll: true });
     centerActiveRelationshipTab();
+    hydrateRenderedRoute(target, controller.signal, seq);
     if (target === "msg") scrollChatLogToBottom();
     void refreshVisiblePeerPresence();
     if (target === "msg" && !S.imConnected) {
@@ -1395,6 +1464,7 @@ async function activateRoute(id, { force = false } = {}) {
     if (error instanceof AuthExpiredError) return;
     if (seq !== S.routeSeq) return;
     root().innerHTML = errorState(error.message || String(error), target);
+    if (S.authenticatedServicesPending) scheduleAuthenticatedServices(1000);
   }
 }
 
@@ -5681,11 +5751,11 @@ async function loadSocialTab(tab, signal) {
   if (activeTab === "friends") {
     const [friendResult, applyResult] = await Promise.allSettled([
       api("/api/social/friends", { signal }),
-      api("/api/social/friend-apply?page=1", { signal }),
+      api("/api/social/friend-apply?page=1&summary=1", { signal }),
     ]);
     if (friendResult.status !== "fulfilled") throw friendResult.reason;
     const friends = itemsOf(friendResult.value.data);
-    applyCount = applyResult.status === "fulfilled" ? itemsOf(applyResult.value.data).length : 0;
+    applyCount = applyResult.status === "fulfilled" ? Number(applyResult.value.data?.count || 0) : 0;
     body = `<section class="section contact-surface"><div class="contact-search"><label class="sr-only" for="friend-filter">搜索好友</label><input id="friend-filter" type="search" placeholder="搜索昵称或 UID" autocomplete="off" /></div>${friendListHtml(
       friends
     )}</section>`;
@@ -5957,29 +6027,24 @@ async function pageTasks(signal) {
 }
 
 async function pageMe(signal) {
-  const results = await Promise.allSettled([
-    api("/api/profile/me", { signal }),
-    api("/api/social/friends", { signal }),
-    api("/api/social/follows", { signal }),
-    api("/api/social/fans", { signal }),
-    api("/api/social/visitors?type=seen_me&page=0", { signal }),
-  ]);
-  if (results[0].status !== "fulfilled") throw results[0].reason;
-  const data = results[0].value.data;
+  const { data } = await api("/api/profile/me", { signal });
   if (data.user) applyUser(data.user);
   const user = data.user || S.user || {};
   const name = user.nickname || "乐园用户";
-  const countAt = (index) => (results[index].status === "fulfilled" ? itemsOf(results[index].value.data).length : "—");
+  const countAt = (key) => {
+    const value = Number(S.meStats?.[key]);
+    return Number.isFinite(value) && value >= 0 ? String(value) : "—";
+  };
   return `<section class="profile-summary-card"><div class="profile-head">${avatarHtml(user.avatar || user.portrait)}<div><h2>${esc(
     name
   )}</h2><p>UID ${esc(user.uid || user.id || "—")} · ${user.is_realname ? "已实名" : "未实名"} · 乐园币 ${esc(
     user.money ?? "0"
   )}</p></div><button type="button" class="btn secondary small profile-edit-button" data-action="focus-nickname">编辑资料</button></div>
     <div class="profile-stats ui-scrollbar ui-scrollbar--compact">
-      <button type="button" data-action="social-open-tab" data-tab="friends"><strong>${esc(countAt(1))}</strong><span>好友</span></button>
-      <button type="button" data-action="social-open-tab" data-tab="follows"><strong>${esc(countAt(2))}</strong><span>关注</span></button>
-      <button type="button" data-action="social-open-tab" data-tab="fans"><strong>${esc(countAt(3))}</strong><span>粉丝</span></button>
-      <button type="button" data-action="social-open-tab" data-tab="visitors" data-visitor-tab="seen_me"><strong>${esc(countAt(4))}</strong><span>谁看过我</span></button>
+      <button type="button" data-action="social-open-tab" data-tab="friends"><strong data-me-stat="friends">${esc(countAt("friends"))}</strong><span>好友</span></button>
+      <button type="button" data-action="social-open-tab" data-tab="follows"><strong data-me-stat="follows">${esc(countAt("follows"))}</strong><span>关注</span></button>
+      <button type="button" data-action="social-open-tab" data-tab="fans"><strong data-me-stat="fans">${esc(countAt("fans"))}</strong><span>粉丝</span></button>
+      <button type="button" data-action="social-open-tab" data-tab="visitors" data-visitor-tab="seen_me"><strong data-me-stat="visitors">${esc(countAt("visitors"))}</strong><span>谁看过我</span></button>
     </div></section>
     <section class="section"><div class="quick-entry-grid me-entry-grid">
       <button type="button" class="quick-entry" data-route="msg"><strong>我的消息</strong><span>聊天与新朋友</span></button>
@@ -6859,9 +6924,9 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
         "system"
       );
 
-      // Prefer server sig only (official). Local is a single fallback after full destroy.
-      // Do NOT loop many times — singleton + pending login makes retries worse.
-      const order = ["server", "local"];
+      // Product mode only accepts the official server signature. Repeating the
+      // same unavailable credential source delays every authenticated route.
+      const order = ["server"];
       let lastErr = "";
       for (const prefer of order) {
         if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
@@ -7065,6 +7130,9 @@ async function logout() {
     closeChatMediaViewer();
     stopPresenceTimer();
     stopMessageSyncTimer();
+    clearTimeout(S.authenticatedServicesTimer);
+    S.authenticatedServicesTimer = null;
+    S.authenticatedServicesPending = false;
     clearPeerMediaReconcile();
     clearMessageArchiveDeliveryState();
     await cleanupIM();
@@ -7080,6 +7148,8 @@ async function logout() {
     S.socialTab = "friends";
     S.visitorTab = "seen_me";
     S.pageCache.clear();
+    S.meStats = null;
+    S.meStatsAt = 0;
     S.imMessages = [];
     S.imMessageLoadingPeers.clear();
     S.imMessageLoadedPeers.clear();
@@ -8032,11 +8102,12 @@ function completeBrowserLogin(data) {
   resetTurnstileChallenge({ hide: true });
   S.sessionGeneration += 1;
   S.authenticated = true;
+  S.meStats = null;
+  S.meStatsAt = 0;
   applyUser(data.user);
   showLogin(false, true);
-  updatePresence(!document.hidden);
   buildNav();
-  void startMessageServices();
+  S.authenticatedServicesPending = true;
   const desired = hashRoute();
   go(isRouteAllowed(desired) ? desired : "nearby", { replace: !isRouteAllowed(desired), force: true });
   toast("登录成功");
@@ -8470,8 +8541,7 @@ syncVisualViewport();
       applyUser(data.user);
       showLogin(false);
       S.serverHeartbeat = Boolean(data.auto_heartbeat ?? S.serverHeartbeat);
-      updatePresence(!document.hidden);
-      void startMessageServices();
+      S.authenticatedServicesPending = true;
       const desired = hashRoute();
       go(isRouteAllowed(desired) ? desired : "nearby", { replace: !isRouteAllowed(desired), force: true });
       return;

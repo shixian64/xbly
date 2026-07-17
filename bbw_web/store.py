@@ -27,6 +27,57 @@ SESSIONS_DIR = REPO_ROOT / "sessions"
 WEB_META_DIR = Path(__file__).resolve().parent / "data"
 
 
+class _RequestGateLease:
+    """One idempotent reader/writer gate lease held by an HTTP request."""
+
+    def __init__(self, gate: "RequestGate", *, write: bool) -> None:
+        self._gate = gate
+        self._write = write
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._gate._release(write=self._write)
+
+
+class RequestGate:
+    """Allow concurrent reads while keeping account mutations exclusive."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition(threading.Lock())
+        self._readers = 0
+        self._writer = False
+        self._waiting_writers = 0
+
+    def acquire_read(self) -> _RequestGateLease:
+        with self._condition:
+            while self._writer or self._waiting_writers:
+                self._condition.wait()
+            self._readers += 1
+        return _RequestGateLease(self, write=False)
+
+    def acquire_write(self) -> _RequestGateLease:
+        with self._condition:
+            self._waiting_writers += 1
+            try:
+                while self._writer or self._readers:
+                    self._condition.wait()
+                self._writer = True
+            finally:
+                self._waiting_writers -= 1
+        return _RequestGateLease(self, write=True)
+
+    def _release(self, *, write: bool) -> None:
+        with self._condition:
+            if write:
+                self._writer = False
+            else:
+                self._readers = max(0, self._readers - 1)
+            self._condition.notify_all()
+
+
 def _session_path(uid: Any) -> Optional[Path]:
     """Return a path confined to ``sessions/`` for a simple server uid."""
     value = str(uid or "").strip()
@@ -57,6 +108,7 @@ class WebUser:
         default_factory=dict,
         repr=False,
     )
+    request_gate: RequestGate = field(default_factory=RequestGate, repr=False)
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def touch(self) -> None:
@@ -277,6 +329,11 @@ class SessionStore:
                 name="bbw-pending-login-cleanup",
                 daemon=True,
             ).start()
+        else:
+            try:
+                u.app.client.close()
+            except Exception:
+                pass
         return True
 
     def purge_expired(self) -> int:

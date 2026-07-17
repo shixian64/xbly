@@ -14,6 +14,7 @@ import socket
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -162,38 +163,78 @@ def RL(r: Any) -> Dict[str, Any]:
     return d
 
 
-def _enrich_social_profiles(app: Any, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _fetch_social_profile(app: Any, uid: str) -> Optional[Dict[str, Any]]:
+    try:
+        result = app.profile.get_user(uid)
+        profiles = N.normalize_users(result.data)
+        return next(
+            (value for value in profiles if str(value.get("id") or "") == uid),
+            profiles[0] if profiles else None,
+        )
+    except Exception:
+        return None
+
+
+def _enrich_social_profiles(
+    app: Any,
+    items: List[Dict[str, Any]],
+    profile_cache: Optional[
+        Dict[str, tuple[float, Optional[Dict[str, Any]]]]
+    ] = None,
+) -> List[Dict[str, Any]]:
+    cache = profile_cache if profile_cache is not None else {}
+    pending: List[tuple[Dict[str, Any], str]] = []
+    resolved: Dict[str, Optional[Dict[str, Any]]] = {}
     for item in items[:20]:
         needs_profile = bool(item.pop("_needs_profile", False))
         uid = str(item.get("id") or "")
         if not needs_profile or not uid:
             continue
-        try:
-            result = app.profile.get_user(uid)
-            profiles = N.normalize_users(result.data)
-            profile = next(
-                (value for value in profiles if str(value.get("id") or "") == uid),
-                profiles[0] if profiles else None,
-            )
-            if not profile:
-                continue
-            item["nickname"] = profile.get("nickname") or item.get("nickname")
-            item["avatar"] = profile.get("avatar") or item.get("avatar")
-            item["city"] = profile.get("city") or item.get("city")
-            item["signature"] = profile.get("signature") or item.get("signature")
-            item["subtitle"] = profile.get("subtitle") or item.get("subtitle")
-        except Exception:
+        profile = _cached_profile(app, uid, cache, fetch_on_miss=False)
+        if profile:
+            resolved[uid] = profile
+        else:
+            pending.append((item, uid))
+
+    missing_uids = list(dict.fromkeys(uid for _item, uid in pending))
+    if missing_uids:
+        workers = min(4, len(missing_uids))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bbw-profile") as pool:
+            profiles = list(pool.map(lambda uid: _fetch_social_profile(app, uid), missing_uids))
+        cached_at = time.monotonic()
+        for uid, profile in zip(missing_uids, profiles):
+            resolved[uid] = profile
+            cache[uid] = (cached_at, dict(profile) if profile else None)
+        while len(cache) > 200:
+            oldest = min(cache, key=lambda key: cache[key][0])
+            cache.pop(oldest, None)
+
+    for item, uid in pending:
+        profile = resolved.get(uid)
+        if not profile:
             continue
+        item["nickname"] = profile.get("nickname") or item.get("nickname")
+        item["avatar"] = profile.get("avatar") or item.get("avatar")
+        item["city"] = profile.get("city") or item.get("city")
+        item["signature"] = profile.get("signature") or item.get("signature")
+        item["subtitle"] = profile.get("subtitle") or item.get("subtitle")
     for item in items[20:]:
         item.pop("_needs_profile", None)
     return items
 
 
-def RS(r: Any, current_uid: str = "", app: Any = None) -> Dict[str, Any]:
+def RS(
+    r: Any,
+    current_uid: str = "",
+    app: Any = None,
+    profile_cache: Optional[
+        Dict[str, tuple[float, Optional[Dict[str, Any]]]]
+    ] = None,
+) -> Dict[str, Any]:
     """Follow/fans endpoint normalized as the peer, never the logged-in user."""
     items = N.normalize_social_users(getattr(r, "data", None), current_uid)
     if app is not None:
-        items = _enrich_social_profiles(app, items)
+        items = _enrich_social_profiles(app, items, profile_cache)
     else:
         for item in items:
             item.pop("_needs_profile", None)
@@ -349,8 +390,15 @@ def RT(r: Any) -> Dict[str, Any]:
 
 def _load_tasks(app: Any) -> Tuple[List[Dict[str, Any]], Any, Any]:
     """Read the authoritative task list with the APK's red-dot API as fallback."""
-    create = app.call("createHotActivityList", uid=app.session.uid)
-    have = app.call("haveHotActivityList", uid=app.session.uid)
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="bbw-task") as pool:
+        create_future = pool.submit(
+            app.call, "createHotActivityList", uid=app.session.uid
+        )
+        have_future = pool.submit(
+            app.call, "haveHotActivityList", uid=app.session.uid
+        )
+        create = create_future.result()
+        have = have_future.result()
     items = N.normalize_tasks(getattr(create, "data", None))
     if not items:
         items = N.normalize_tasks(getattr(have, "data", None))
@@ -943,8 +991,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             user = STORE.require(sid)
             if self._held_user_lock is None:
-                user.lock.acquire()
-                self._held_user_lock = user.lock
+                method = str(getattr(self, "command", "GET") or "GET").upper()
+                if method in {"GET", "HEAD"}:
+                    self._held_user_lock = user.request_gate.acquire_read()
+                else:
+                    self._held_user_lock = user.request_gate.acquire_write()
             return user
         except KeyError:
             self.ok({"ok": False, "error": "请先登录"}, 401)
@@ -1048,18 +1099,22 @@ class Handler(BaseHTTPRequestHandler):
 
         # ---- dashboard ----
         if path in ("/api/app/home", "/api/home"):
-            gifts = app.content.gift_list()
-            rec = app.content.recommend()
             who = N.session_user_dto(app.whoami())
+            deferred = {
+                "ok": True,
+                "items": [],
+                "list": [],
+                "count": 0,
+                "deferred": True,
+            }
             return self.ok(
                 {
                     "ok": True,
                     "user": who,
-                    "gifts": RG(gifts),
-                    # Tuijiannew(type=getSlide) returns recommendation banners,
-                    # not user profiles. Keep the entity explicit so banner ids
-                    # are never rendered as usernames/UIDs by the Web client.
-                    "recommend": RE(rec, "slide"),
+                    # The Web landing page fetches people and slides separately.
+                    # Avoid two unused upstream calls on every route entry.
+                    "gifts": deferred,
+                    "recommend": {**deferred, "entity": "slide"},
                     "heartbeat": u.heartbeat.status() if u.heartbeat else {"running": False},
                 }
             )
@@ -1202,31 +1257,55 @@ class Handler(BaseHTTPRequestHandler):
 
         # ---- social ----
         if path == "/api/social/follows":
+            summary = q("summary", "0") == "1"
             # getFollowUser contains display profiles; getFollowList mostly
             # contains relationship ids and therefore renders numeric names.
             primary = app.social.follow_users(q("uid") or None, page=q("page", "1"))
-            payload = RS(primary, str(app.session.uid or ""), app)
+            payload = RS(
+                primary,
+                str(app.session.uid or ""),
+                None if summary else app,
+                getattr(u, "profile_cache", None),
+            )
             if payload.get("items"):
-                return self.ok(payload)
-            return self.ok(
-                RS(
-                    app.social.follow_list(q("uid") or None),
-                    str(app.session.uid or ""),
-                    app,
+                return self.ok(
+                    {"ok": payload.get("ok", True), "count": payload.get("count", 0)}
+                    if summary
+                    else payload
                 )
+            payload = RS(
+                app.social.follow_list(q("uid") or None),
+                str(app.session.uid or ""),
+                None if summary else app,
+                getattr(u, "profile_cache", None),
+            )
+            return self.ok(
+                {"ok": payload.get("ok", True), "count": payload.get("count", 0)}
+                if summary
+                else payload
             )
         if path == "/api/social/fans":
+            summary = q("summary", "0") == "1"
+            payload = RS(
+                app.social.fans_users(q("uid") or None, page=q("page", "1")),
+                str(app.session.uid or ""),
+                None if summary else app,
+                getattr(u, "profile_cache", None),
+            )
             return self.ok(
-                RS(
-                    app.social.fans_users(q("uid") or None, page=q("page", "1")),
-                    str(app.session.uid or ""),
-                    app,
-                )
+                {"ok": payload.get("ok", True), "count": payload.get("count", 0)}
+                if summary
+                else payload
             )
         if path == "/api/social/follow-list":
             return self.ok(RL(app.social.follow_list(q("uid") or q("id") or None)))
         if path == "/api/social/friend-apply":
             result = app.social.friend_apply_list(q("page", "1"))
+            if q("summary", "0") == "1":
+                items = N.normalize_friend_applications(
+                    result.data, str(app.session.uid or "")
+                )
+                return self.ok({"ok": bool(result.ok), "count": len(items)})
             result, items = _friend_applications(app, str(app.session.uid or ""), result)
             payload = N.envelope(result, items=items)
             payload["list"] = items
@@ -1235,6 +1314,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/social/friends":
             result = app.social.friends()
             items = N.normalize_friends(result.data, str(app.session.uid or ""))
+            if q("summary", "0") == "1":
+                return self.ok({"ok": bool(result.ok), "count": len(items)})
             payload = N.envelope(result, items=items)
             payload["list"] = items
             payload["status"] = result.status
@@ -1251,7 +1332,12 @@ class Handler(BaseHTTPRequestHandler):
                     {"ok": False, "error": "type 仅支持 seen_me 或 seen_by_me"},
                     400,
                 )
-            return self.ok(RL(result))
+            payload = RL(result)
+            if q("summary", "0") == "1":
+                return self.ok(
+                    {"ok": payload.get("ok", True), "count": payload.get("count", 0)}
+                )
+            return self.ok(payload)
         if path == "/api/social/blacklist":
             return self.ok(RL(app.social.my_blacklist()))
         if path == "/api/social/blacklist-me":
@@ -1259,8 +1345,11 @@ class Handler(BaseHTTPRequestHandler):
 
         # ---- match ----
         if path == "/api/match/status":
-            cards = app.call("getMyCard", uid=app.session.uid)
-            nums = app.call("getMatchNum", uid=app.session.uid)
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="bbw-match") as pool:
+                cards_future = pool.submit(app.call, "getMyCard", uid=app.session.uid)
+                nums_future = pool.submit(app.call, "getMatchNum", uid=app.session.uid)
+                cards = cards_future.result()
+                nums = nums_future.result()
             who = N.session_user_dto(app.whoami())
             status = N.normalize_match_status(cards.data, nums.data, who)
             raw_user = getattr(app.session, "raw_user", {}) or {}
@@ -1326,10 +1415,14 @@ class Handler(BaseHTTPRequestHandler):
 
         # ---- wallet ----
         if path == "/api/wallet":
-            me = app.profile.get_me()
+            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="bbw-wallet") as pool:
+                me_future = pool.submit(app.profile.get_me)
+                myg_future = pool.submit(app.economy.my_gifts)
+                glist_future = pool.submit(app.economy.gift_list)
+                me = me_future.result()
+                myg = myg_future.result()
+                glist = glist_future.result()
             u.persist()
-            myg = app.economy.my_gifts()
-            glist = app.economy.gift_list()
             return self.ok(
                 {
                     "ok": True,

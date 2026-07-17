@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
-from urllib import error, parse, request
+from urllib import parse
+
+import httpx
 
 from . import sign
 from .session import Session
@@ -213,6 +216,15 @@ class ProtocolClient:
         self.session = session or Session()
         self.timeout = timeout
         self.last: Optional[ApiResult] = None
+        self._http = httpx.Client(
+            follow_redirects=True,
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10,
+                keepalive_expiry=45.0,
+            ),
+            timeout=httpx.Timeout(float(timeout)),
+        )
         # Production BFF hooks.  The protocol package remains usable without
         # them by CLI/tests; the Web runtime attaches per-account callbacks.
         self.response_hook: Optional[
@@ -220,6 +232,10 @@ class ProtocolClient:
         ] = None
         self.reauth_callback: Optional[Callable[[], bool]] = None
         self._reauthing = False
+        self._reauth_lock = threading.Lock()
+
+    def close(self) -> None:
+        self._http.close()
 
     # ---- URL helpers ----
     def url(
@@ -270,16 +286,17 @@ class ProtocolClient:
             data = parse.urlencode(payload).encode("utf-8")
             hdrs["Content-Type"] = "application/x-www-form-urlencoded"
 
-        req = request.Request(url, data=data if method != "GET" else None, headers=hdrs, method=method)
         try:
-            with request.urlopen(req, timeout=self.timeout) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-                rh = {k: v for k, v in resp.headers.items()}
-                result = _parse_result(resp.status, raw, rh)
-        except error.HTTPError as e:
-            raw = e.read().decode("utf-8", errors="replace")
-            rh = {k: v for k, v in (e.headers.items() if e.headers else [])}
-            result = _parse_result(e.code, raw, rh)
+            response = self._http.request(
+                method,
+                url,
+                content=data if method != "GET" else None,
+                headers=hdrs,
+                timeout=float(self.timeout),
+            )
+            raw = response.content.decode("utf-8", errors="replace")
+            rh = {k: v for k, v in response.headers.items()}
+            result = _parse_result(response.status_code, raw, rh)
         except Exception as e:
             result = ApiResult(False, -1, f"EXC:{e}", kind="error", message=str(e))
 
@@ -305,13 +322,18 @@ class ProtocolClient:
             and self.reauth_callback is not None
             and self._looks_auth_expired(result)
         ):
-            try:
-                self._reauthing = True
-                refreshed = bool(self.reauth_callback())
-            except Exception:
-                refreshed = False
-            finally:
-                self._reauthing = False
+            original_token = str(token or "")
+            with self._reauth_lock:
+                if original_token and str(self.session.token or "") != original_token:
+                    refreshed = True
+                else:
+                    try:
+                        self._reauthing = True
+                        refreshed = bool(self.reauth_callback())
+                    except Exception:
+                        refreshed = False
+                    finally:
+                        self._reauthing = False
             if refreshed:
                 return self.request(
                     url,
