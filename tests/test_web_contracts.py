@@ -637,6 +637,15 @@ class SocialBffRoutingTests(unittest.TestCase):
         calls = []
         app = SimpleNamespace(
             session=SimpleNamespace(uid="42"),
+            profile=SimpleNamespace(
+                get_user=lambda uid, **_kwargs: calls.append(("profile", uid))
+                or ApiResult(
+                    True,
+                    200,
+                    "[]",
+                    data=[{"id": str(uid), "nickname": f"用户 {uid}"}],
+                )
+            ),
             social=SimpleNamespace(
                 friends=lambda: calls.append(("friends", None)) or result,
                 friend_apply_list=lambda page: calls.append(("friend_apply", page)) or result,
@@ -822,6 +831,10 @@ class SocialBffRoutingTests(unittest.TestCase):
         self.assertEqual(calls, [("presence", ["9", "10"])])
         self.assertEqual([item["label"] for item in response[1]["items"]], ["在线", "在线"])
 
+        calls, response = self._run_get("/api/profile/users?uids=9,10")
+        self.assertCountEqual(calls, [("profile", "9"), ("profile", "10")])
+        self.assertEqual(response[1]["count"], 2)
+
         calls, response = self._run_visit_post({"uid": "9"})
         self.assertEqual(calls, [("visit", "9")])
         self.assertEqual(response[0], 200)
@@ -829,6 +842,25 @@ class SocialBffRoutingTests(unittest.TestCase):
         calls, response = self._run_get("/api/social/friend-apply?page=1")
         self.assertEqual(calls, [("friend_apply", "1"), ("friends", None)])
         self.assertEqual(response[1]["items"], [])
+
+    def test_presence_prefers_web_ttl_and_skips_blocked_tim_rest(self) -> None:
+        backend = SimpleNamespace(
+            read_web_presence=lambda uids: {"9"} if "9" in uids else set(),
+            presence_rest_retry_after=lambda: 480,
+            mark_presence_rest_unavailable=lambda _code: None,
+        )
+        previous = bff_server.PRESENCE_BACKEND
+        bff_server.PRESENCE_BACKEND = backend
+        try:
+            calls, response = self._run_get("/api/im/presence?uids=9,10")
+        finally:
+            bff_server.PRESENCE_BACKEND = previous
+
+        self.assertEqual(calls, [])
+        self.assertEqual(response[1]["items"][0]["status"], "online")
+        self.assertEqual(response[1]["items"][0]["source"], "web")
+        self.assertEqual(response[1]["items"][1]["status"], "unknown")
+        self.assertEqual(response[1]["retry_after"], 480)
 
     def test_social_summary_routes_skip_profile_enrichment_and_duplicate_friend_reads(self) -> None:
         calls, response = self._run_get("/api/social/follows?summary=1")
@@ -1503,7 +1535,9 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("function timUserProfileRows(result)", app_js)
         self.assertIn("function rememberTimConversationProfiles(rows)", app_js)
         self.assertIn("S.chat.getUserProfile({ userIDList })", app_js)
-        self.assertIn("/api/profile/user?uid=", app_js)
+        self.assertIn("/api/profile/users?uids=", app_js)
+        self.assertIn("conversationProfileFetchedAt: new Map()", app_js)
+        self.assertIn("CONVERSATION_PROFILE_TTL_MS", app_js)
         self.assertIn("void hydrateConversationProfiles();", app_js)
         self.assertNotIn('data-action="im-connect"', app_js)
         self.assertNotIn('id="reload-page"', index_html)
@@ -1521,6 +1555,9 @@ class SocialFrontendContractTests(unittest.TestCase):
         background_sync = app_js.split("function syncMessagesInBackground", 1)[1].split(
             "function startMessageSyncTimer", 1
         )[0]
+        summary_sync = app_js.split("function syncConversationSummaryInBackground", 1)[1].split(
+            "function syncMessagesInBackground", 1
+        )[0]
         summary_refresh = app_js.split("function refreshConversationSummary", 1)[1].split(
             "function stopMessageSyncTimer", 1
         )[0]
@@ -1532,13 +1569,17 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("function scheduleAuthenticatedServices", app_js)
         self.assertIn("scheduleAuthenticatedServices(1000);", app_js)
         self.assertIn("startMessageSyncTimer();", start_services)
-        self.assertIn("return syncMessagesInBackground({ force: true });", start_services)
-        self.assertIn("refreshConversationSummary()", background_sync)
+        self.assertIn("loadArchivedConversationSummary()", start_services)
+        self.assertIn("runMessageSyncCycle({ force: true })", start_services)
+        self.assertIn("refreshConversationSummary()", summary_sync)
         self.assertIn("ensureTimConnected({ background: true })", background_sync)
         self.assertIn("return Promise.allSettled(tasks);", background_sync)
         self.assertNotIn('S.route === "msg" && !S.imConnected', background_sync)
-        self.assertIn("S.messageLastSummarySyncAt = 0", summary_refresh)
-        self.assertIn("recalculateUnreadTotal();", summary_refresh)
+        self.assertIn("S.conversationNextRefreshAt = Date.now() + CONVERSATION_REFRESH_ERROR_MS", summary_refresh)
+        self.assertIn("applyConversationSummaries(itemsOf(data), { broadcast: true })", summary_refresh)
+        self.assertIn("/api/archive/conversations?limit=100", app_js)
+        self.assertIn("BroadcastChannel(\"bbw-message-summary\")", app_js)
+        self.assertIn("navigator.locks.request", app_js)
         self.assertIn("updateUnreadBadges();", unread_recalculation)
         self.assertIn("data-unread-badge", app_js)
 
@@ -1555,6 +1596,8 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("/api/im/presence?uids=", app_js)
         self.assertIn("data-presence-uid", app_js)
         self.assertIn("presence: true", app_js)
+        self.assertIn('const unknown = presence.status === "unknown";', app_js)
+        self.assertIn('unknown ? "" : esc(', app_js)
         self.assertIn("MESSAGE_READ_BY_PEER", app_js)
         self.assertIn("USER_STATUS_UPDATED", app_js)
         self.assertIn('return optionalReadState(entry.peerRead', app_js)
@@ -1716,7 +1759,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn('img[data-media-source]', app_js)
         self.assertIn("MESSAGE_MODIFIED", app_js)
         self.assertIn("NET_STATE_CHANGE", app_js)
-        self.assertIn("MESSAGE_PEER_SYNC_FALLBACK_MS = 4000", app_js)
+        self.assertIn("MESSAGE_PEER_SYNC_FALLBACK_MS = 8 * 1000", app_js)
         self.assertIn("图片加载失败，点击重试", app_js)
         self.assertIn("function handleChatPlaybackError(media)", app_js)
         self.assertIn('data-action="retry-chat-playback"', app_js)
@@ -1882,7 +1925,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("window.isSecureContext", availability)
         self.assertIn("录音需要安全网页环境或本机访问", availability)
         self.assertIn("voiceRecordingAvailability()", recording)
-        self.assertIn("定时同步模式（约 4 秒，仅支持文本发送）", app_js)
+        self.assertIn("定时同步模式（约 8 秒，仅支持文本发送）", app_js)
         self.assertIn("尝试启用文本备用通道", app_js)
         self.assertIn("当前仅可发送文本", app_js)
 

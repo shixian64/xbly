@@ -758,6 +758,9 @@ def ingest_history_response(
                         "object_name": _bounded(item.get("object_name"), 128),
                         "avatar": _bounded(item.get("avatar"), 4096),
                         "user": _json_safe(item.get("user")),
+                        "last_message": _bounded(
+                            item.get("last_message") or item.get("content"), 500
+                        ),
                         "last_source": "history",
                     },
                 )

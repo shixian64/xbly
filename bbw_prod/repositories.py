@@ -201,6 +201,21 @@ class AuditLogRepository(Repository[AuditLog]):
 class ConversationRepository(Repository[Conversation]):
     model = Conversation
 
+    def list_for_owner(
+        self, owner_user_id: uuid.UUID, *, offset: int = 0, limit: int = 100
+    ) -> list[Conversation]:
+        stmt = (
+            select(Conversation)
+            .where(Conversation.owner_user_id == owner_user_id)
+            .order_by(
+                Conversation.last_message_at.desc().nullslast(),
+                Conversation.updated_at.desc(),
+            )
+            .offset(max(0, int(offset)))
+            .limit(min(max(1, int(limit)), 500))
+        )
+        return list(self.db.scalars(stmt))
+
     def get(self, owner_user_id: uuid.UUID, conversation_id: uuid.UUID) -> Conversation | None:
         return self.db.scalar(
             select(Conversation).where(
@@ -288,6 +303,25 @@ class MessageRepository(Repository[Message]):
             stmt = stmt.where(Message.occurred_at < before)
         stmt = stmt.order_by(Message.occurred_at.desc()).limit(min(limit, 500))
         return list(self.db.scalars(stmt))
+
+    def latest_for_conversations(
+        self,
+        owner_user_id: uuid.UUID,
+        conversation_ids: list[uuid.UUID],
+    ) -> dict[uuid.UUID, Message]:
+        ids = list(dict.fromkeys(conversation_ids))
+        if not ids:
+            return {}
+        stmt = (
+            select(Message)
+            .where(
+                Message.owner_user_id == owner_user_id,
+                Message.conversation_id.in_(ids),
+            )
+            .distinct(Message.conversation_id)
+            .order_by(Message.conversation_id, Message.occurred_at.desc(), Message.created_at.desc())
+        )
+        return {message.conversation_id: message for message in self.db.scalars(stmt)}
 
 
 class MediaObjectRepository(Repository[MediaObject]):

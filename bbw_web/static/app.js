@@ -27,10 +27,16 @@ const LEGACY_MATCH_ROUTES = { room: "room" };
 const SOCIAL_TABS = ["friends", "apply", "follows", "fans", "visitors", "black"];
 const MATCH_HUB_TABS = ["match", "room"];
 const SYSTEM_CUSTOMER_SERVICE_UID = "1";
-const MESSAGE_SYNC_TICK_MS = 2000;
-const MESSAGE_SUMMARY_SYNC_MS = 12000;
-const MESSAGE_PEER_SYNC_REALTIME_MS = 12000;
-const MESSAGE_PEER_SYNC_FALLBACK_MS = 4000;
+const MESSAGE_SYNC_TICK_MS = 3000;
+const MESSAGE_SUMMARY_CHAT_MS = 25 * 1000;
+const MESSAGE_SUMMARY_BACKGROUND_MS = 60 * 1000;
+const MESSAGE_PEER_SYNC_REALTIME_MS = 10 * 1000;
+const MESSAGE_PEER_SYNC_FALLBACK_MS = 8 * 1000;
+const CONVERSATION_REFRESH_MIN_MS = 8 * 1000;
+const CONVERSATION_REFRESH_ERROR_MS = 30 * 1000;
+const ARCHIVED_CONVERSATION_TTL_MS = 30 * 1000;
+const CONVERSATION_PROFILE_TTL_MS = 15 * 60 * 1000;
+const CONVERSATION_PROFILE_ERROR_TTL_MS = 60 * 1000;
 const MESSAGE_ARCHIVE_RETRY_DELAYS_MS = [1500, 5000];
 const MESSAGE_ARCHIVE_MAX_IN_FLIGHT = 2;
 const PAGE_CACHE_TTL_MS = 2 * 60 * 1000;
@@ -70,7 +76,12 @@ const S = {
   conversationListCollapsed: false,
   conversations: [],
   conversationRefreshPromise: null,
+  conversationLastRefreshAt: 0,
+  conversationNextRefreshAt: 0,
+  conversationArchivePromise: null,
+  conversationArchiveLoadedAt: 0,
   conversationProfilesByUid: new Map(),
+  conversationProfileFetchedAt: new Map(),
   conversationProfileLoadingUids: new Set(),
   readConversationPeers: new Map(),
   unreadTotal: 0,
@@ -111,7 +122,9 @@ const S = {
   presenceByUid: new Map(),
   presenceLoadingUids: new Set(),
   subscribedPresenceUids: new Set(),
+  presenceWarningShown: false,
   messageSyncTimer: null,
+  messageSyncChannel: null,
   authenticatedServicesTimer: null,
   authenticatedServicesPending: false,
   messageLastSummarySyncAt: 0,
@@ -367,7 +380,7 @@ function ensureTimUploadPluginLoaded() {
 function imConnectionStatusText() {
   if (S.imConnecting) return "正在连接消息服务…";
   if (S.imConnected && S.imMode === "sdk") return "实时消息已连接";
-  if (S.imConnected && S.imMode === "rest") return "定时同步模式（约 4 秒，仅支持文本发送）";
+  if (S.imConnected && S.imMode === "rest") return "定时同步模式（约 8 秒，仅支持文本发送）";
   return localizedUiText(S.imLastError || "消息服务尚未连接");
 }
 
@@ -488,6 +501,7 @@ async function api(path, options = {}) {
       S.authenticatedServicesPending = false;
       stopPresenceTimer();
       stopMessageSyncTimer();
+      closeMessageSyncChannel();
       clearPeerMediaReconcile();
       clearMessageArchiveDeliveryState();
       S._imConnecting = null;
@@ -1139,18 +1153,99 @@ function updateUnreadBadges() {
   });
 }
 
-function refreshConversationSummary({ force = false } = {}) {
-  if (S.conversationRefreshPromise && !force) return S.conversationRefreshPromise;
-  const task = api("/api/im/conversations?page=1", { timeout: 15000 })
+function messageSyncAccountId() {
+  return String(S.user?.uid || S.user?.id || "").trim();
+}
+
+function ensureMessageSyncChannel() {
+  if (S.messageSyncChannel || typeof BroadcastChannel === "undefined") return S.messageSyncChannel;
+  const channel = new BroadcastChannel("bbw-message-summary");
+  channel.onmessage = (event) => {
+    const payload = event?.data;
+    if (
+      !S.authenticated ||
+      !payload ||
+      payload.type !== "conversations" ||
+      String(payload.account || "") !== messageSyncAccountId() ||
+      !Array.isArray(payload.items)
+    ) {
+      return;
+    }
+    S.messageLastSummarySyncAt = Math.max(
+      S.messageLastSummarySyncAt,
+      Number(payload.updatedAt || Date.now())
+    );
+    applyConversationSummaries(payload.items, { broadcast: false });
+  };
+  S.messageSyncChannel = channel;
+  return channel;
+}
+
+function closeMessageSyncChannel() {
+  try {
+    S.messageSyncChannel?.close();
+  } catch {
+    // Best-effort cross-tab cleanup.
+  }
+  S.messageSyncChannel = null;
+}
+
+function applyConversationSummaries(items, { broadcast = false } = {}) {
+  S.conversations = mergeConversationSources(Array.isArray(items) ? items : [], S.conversations);
+  recalculateUnreadTotal();
+  refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
+  void hydrateConversationProfiles();
+  if (broadcast) {
+    const channel = ensureMessageSyncChannel();
+    try {
+      channel?.postMessage({
+        type: "conversations",
+        account: messageSyncAccountId(),
+        updatedAt: Date.now(),
+        items: S.conversations.slice(0, 200),
+      });
+    } catch {
+      // This tab still has the authoritative result.
+    }
+  }
+  return S.conversations;
+}
+
+function loadArchivedConversationSummary({ force = false } = {}) {
+  const now = Date.now();
+  if (S.conversationArchivePromise) return S.conversationArchivePromise;
+  if (!force && now - S.conversationArchiveLoadedAt < ARCHIVED_CONVERSATION_TTL_MS) {
+    return Promise.resolve(S.conversations);
+  }
+  const task = api("/api/archive/conversations?limit=100", { timeout: 5000 })
     .then(({ data }) => {
-      S.conversations = mergeConversationSources(itemsOf(data), S.conversations);
-      recalculateUnreadTotal();
-      refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
-      void hydrateConversationProfiles();
-      return S.conversations;
+      S.conversationArchiveLoadedAt = Date.now();
+      return applyConversationSummaries(itemsOf(data));
+    })
+    .catch(() => S.conversations)
+    .finally(() => {
+      if (S.conversationArchivePromise === task) S.conversationArchivePromise = null;
+    });
+  S.conversationArchivePromise = task;
+  return task;
+}
+
+function refreshConversationSummary({ force = false } = {}) {
+  const now = Date.now();
+  if (S.conversationRefreshPromise) return S.conversationRefreshPromise;
+  if (now < S.conversationNextRefreshAt) return Promise.resolve(S.conversations);
+  if (!force && now - S.conversationLastRefreshAt < CONVERSATION_REFRESH_MIN_MS) {
+    return Promise.resolve(S.conversations);
+  }
+  const task = loadArchivedConversationSummary()
+    .then(() => api("/api/im/conversations?page=1", { timeout: 15000 }))
+    .then(({ data }) => {
+      S.conversationLastRefreshAt = Date.now();
+      S.conversationNextRefreshAt = 0;
+      return applyConversationSummaries(itemsOf(data), { broadcast: true });
     })
     .catch(() => {
-      if (S.conversationRefreshPromise === task) S.messageLastSummarySyncAt = 0;
+      S.conversationNextRefreshAt = Date.now() + CONVERSATION_REFRESH_ERROR_MS;
       return S.conversations;
     })
     .finally(() => {
@@ -1165,14 +1260,24 @@ function stopMessageSyncTimer() {
   S.messageSyncTimer = null;
 }
 
+function conversationSummarySyncInterval() {
+  return S.route === "msg" ? MESSAGE_SUMMARY_CHAT_MS : MESSAGE_SUMMARY_BACKGROUND_MS;
+}
+
+function syncConversationSummaryInBackground({ force = false } = {}) {
+  if (!S.authenticated || document.hidden) return Promise.resolve([]);
+  const now = Date.now();
+  if (force || now - S.messageLastSummarySyncAt >= conversationSummarySyncInterval()) {
+    S.messageLastSummarySyncAt = now;
+    return Promise.allSettled([refreshConversationSummary(), refreshVisiblePeerPresence()]);
+  }
+  return Promise.resolve([]);
+}
+
 function syncMessagesInBackground({ force = false } = {}) {
   if (!S.authenticated || document.hidden) return Promise.resolve([]);
   const now = Date.now();
   const tasks = [];
-  if (force || now - S.messageLastSummarySyncAt >= MESSAGE_SUMMARY_SYNC_MS) {
-    S.messageLastSummarySyncAt = now;
-    tasks.push(refreshConversationSummary(), refreshVisiblePeerPresence());
-  }
   if (S.route === "msg" && S.activePeer) {
     const peerInterval = S.imConnected && S.imMode === "sdk"
       ? MESSAGE_PEER_SYNC_REALTIME_MS
@@ -1190,17 +1295,33 @@ function syncMessagesInBackground({ force = false } = {}) {
   return Promise.allSettled(tasks);
 }
 
+function runMessageSyncCycle({ force = false } = {}) {
+  if (!S.authenticated || document.hidden) return Promise.resolve([]);
+  const common = syncMessagesInBackground({ force });
+  const runSummary = () => syncConversationSummaryInBackground({ force });
+  const account = messageSyncAccountId() || "anonymous";
+  const summary = navigator.locks?.request
+    ? navigator.locks.request(
+        `bbw-message-summary-${account}`,
+        { ifAvailable: true, mode: "exclusive" },
+        (lock) => (lock ? runSummary() : [])
+      )
+    : runSummary();
+  return Promise.allSettled([common, summary]);
+}
+
 function startMessageSyncTimer() {
   stopMessageSyncTimer();
-  if (!S.authenticated) return;
+  if (!S.authenticated || document.hidden) return;
+  ensureMessageSyncChannel();
   S.messageSyncTimer = setInterval(() => {
-    void syncMessagesInBackground();
+    void runMessageSyncCycle();
   }, MESSAGE_SYNC_TICK_MS);
 }
 
 function startMessageServices() {
   startMessageSyncTimer();
-  return syncMessagesInBackground({ force: true });
+  return loadArchivedConversationSummary().then(() => runMessageSyncCycle({ force: true }));
 }
 
 function scheduleAuthenticatedServices(delay = 250) {
@@ -1527,7 +1648,7 @@ function discardFailedAvatar(image) {
   image?.closest?.(".avatar")?.remove();
 }
 
-const PEER_PRESENCE_TTL_MS = 30000;
+const PEER_PRESENCE_TTL_MS = 60 * 1000;
 
 function flagEnabled(value) {
   if (value === true || value === 1) return true;
@@ -1584,20 +1705,24 @@ function presenceBadgeHtml(uid, entity = {}, extraClass = "") {
   const target = String(uid || "").trim();
   if (!target) return "";
   const presence = peerPresence(target, entity);
+  if (presence.status === "hidden") return "";
+  const unknown = presence.status === "unknown";
   return `<span class="presence-badge presence-${esc(presence.status)}${extraClass ? ` ${esc(extraClass)}` : ""}" data-presence-uid="${esc(
     target
-  )}"${presence.status === "hidden" ? ' data-presence-hidden="true"' : ""} aria-label="在线状态：${esc(presence.label)}">${esc(
+  )}"${unknown ? " hidden" : ` aria-label="在线状态：${esc(presence.label)}"`}>${unknown ? "" : esc(
     presence.label
   )}</span>`;
 }
 
 function updatePeerPresenceDom() {
   document.querySelectorAll("[data-presence-uid]").forEach((element) => {
-    if (element.dataset.presenceHidden === "true") return;
     const presence = S.presenceByUid.get(String(element.dataset.presenceUid || ""));
     if (!presence) return;
-    element.textContent = presence.label;
-    element.setAttribute("aria-label", `在线状态：${presence.label}`);
+    const unknown = presence.status === "unknown" || presence.status === "hidden";
+    element.hidden = unknown;
+    element.textContent = unknown ? "" : presence.label;
+    if (unknown) element.removeAttribute("aria-label");
+    else element.setAttribute("aria-label", `在线状态：${presence.label}`);
     ["online", "offline", "away", "hidden", "unknown"].forEach((status) => {
       element.classList.toggle(`presence-${status}`, presence.status === status);
     });
@@ -1693,7 +1818,13 @@ async function refreshVisiblePeerPresence({ force = false } = {}) {
         )
       );
       results.forEach((result) => {
-        if (result.status === "fulfilled") rememberPeerPresence(itemsOf(result.value.data), "rest");
+        if (result.status !== "fulfilled") return;
+        const payload = result.value.data;
+        rememberPeerPresence(itemsOf(payload), "rest");
+        if ((payload?.ok === false || payload?.partial) && !S.presenceWarningShown) {
+          S.presenceWarningShown = true;
+          toast("部分用户的在线状态暂时不可用", "info", 4200);
+        }
       });
     }
     void subscribePeerPresence(uids);
@@ -1969,6 +2100,7 @@ function rememberTimConversationProfiles(rows) {
       avatar,
       portrait: avatar,
     });
+    S.conversationProfileFetchedAt.set(peer, Date.now());
   });
 }
 
@@ -1988,6 +2120,7 @@ function conversationProfileForPeer(rows, peer) {
 }
 
 async function hydrateConversationProfiles() {
+  const now = Date.now();
   const peers = [...new Set(
     S.conversations
       .filter(isC2CConversation)
@@ -1996,9 +2129,14 @@ async function hydrateConversationProfiles() {
       .filter(
         (peer) => {
           const profile = S.conversationProfilesByUid.get(peer);
+          const fetchedAt = Number(S.conversationProfileFetchedAt.get(peer) || 0);
+          const ttl = validAvatarValue(profile?.avatar, profile?.portrait)
+            ? CONVERSATION_PROFILE_TTL_MS
+            : CONVERSATION_PROFILE_ERROR_TTL_MS;
           return (
             peer &&
             !validAvatarValue(profile?.avatar, profile?.portrait) &&
+            now - fetchedAt >= ttl &&
             !S.conversationProfileLoadingUids.has(peer)
           );
         }
@@ -2025,18 +2163,22 @@ async function hydrateConversationProfiles() {
       const profile = S.conversationProfilesByUid.get(peer);
       return !validAvatarValue(profile?.avatar, profile?.portrait);
     });
-    for (let index = 0; index < unresolved.length; index += 6) {
-      const batch = unresolved.slice(index, index + 6);
-      await Promise.allSettled(
-        batch.map(async (peer) => {
-          const { data } = await api(`/api/profile/user?uid=${encodeURIComponent(peer)}`, {
-            timeout: 9000,
-          });
-          const profiles = itemsOf(data);
+    for (let index = 0; index < unresolved.length; index += 50) {
+      const batch = unresolved.slice(index, index + 50);
+      try {
+        const { data } = await api(
+          `/api/profile/users?uids=${encodeURIComponent(batch.join(","))}`,
+          { timeout: 12000 }
+        );
+        const profiles = itemsOf(data);
+        batch.forEach((peer) => {
           const profile = conversationProfileForPeer(profiles, peer);
-          S.conversationProfilesByUid.set(peer, profile);
-        })
-      );
+          if (profile) S.conversationProfilesByUid.set(peer, profile);
+          S.conversationProfileFetchedAt.set(peer, Date.now());
+        });
+      } catch {
+        batch.forEach((peer) => S.conversationProfileFetchedAt.set(peer, Date.now()));
+      }
       renderHydratedConversationProfiles();
     }
   } finally {
@@ -5530,7 +5672,8 @@ async function pageMessages(signal) {
   void signal;
   // Render cached summaries immediately; refresh in the background so entering
   // the message page never waits on the upstream history service.
-  void refreshConversationSummary();
+  void loadArchivedConversationSummary();
+  void runMessageSyncCycle();
   recalculateUnreadTotal();
   const active = activeConversation();
   if (active && !S.activePeerName) {
@@ -6620,7 +6763,7 @@ function attachTimHandlers(chat, TIM, credential) {
         S.imLastError = "";
         S.imNextReconnectAt = 0;
         updateImConnectionStatus();
-        void syncMessagesInBackground({ force: true });
+        void runMessageSyncCycle({ force: true });
       }
     };
     chat.on(TIM.EVENT.NET_STATE_CHANGE, S.imNetworkHandler);
@@ -6861,6 +7004,27 @@ async function connectTIM(credential, sessionGeneration = S.sessionGeneration) {
   }
 }
 
+async function diagnoseTimConnectionFailure() {
+  const [workerResult, websocketResult] = await Promise.allSettled([
+    probeTimWorker(),
+    probeTimWebsocket(5000),
+  ]);
+  const worker = workerResult.status === "fulfilled" ? workerResult.value : null;
+  const websocket = websocketResult.status === "fulfilled" ? websocketResult.value : null;
+  addImMessage(
+    worker?.ok
+      ? `后台消息组件诊断正常：${worker.detail}`
+      : `后台消息组件诊断失败：${localizedUiText(worker?.detail || workerResult.reason?.message || "未知原因")}`,
+    "system"
+  );
+  addImMessage(
+    websocket?.ok
+      ? `实时网络通道诊断正常：${websocket.detail}`
+      : `实时网络通道诊断失败：${localizedUiText(websocket?.detail || websocketResult.reason?.message || "未知原因")}`,
+    "system"
+  );
+}
+
 /** Fetch BFF UserSig and login TIM (idempotent when already connected). */
 async function ensureTimConnected({ force = false, background = false } = {}) {
   const sessionGeneration = S.sessionGeneration;
@@ -6886,43 +7050,17 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
       }
       if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
 
-      try {
-        await withTimeout(ensureTimUploadPluginLoaded(), 8000, "加载媒体上传组件");
-      } catch (pluginError) {
-        // Text messaging can still connect; media actions will surface this error explicitly.
-        addImMessage(`TIM 媒体上传插件暂不可用：${pluginError?.message || pluginError}`, "system");
-      }
-
-      addImMessage("检测 TIM Web Worker…", "system");
-      const worker = await probeTimWorker();
-      if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
-      if (!worker.ok) {
-        const msg = `后台消息组件不可用：${localizedUiText(worker.detail)}。请检查浏览器或安全软件设置。`;
-        S.imLastError = msg;
-        addImMessage(msg, "system");
-        notifyConnection("后台消息组件被拦截", "error", 5600);
-        return false;
-      }
-      addImMessage(`TIM Web Worker 可用：${worker.detail}`, "system");
-
-      addImMessage("检测腾讯 IM WebSocket…", "system");
-      const net = await probeTimWebsocket(5000);
-      if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
-      if (!net.ok) {
-        const msg = formatTimLoginError(
-          new Error(`浏览器无法连通实时消息网络通道（${net.detail || "失败"}）`),
-          ""
-        );
-        S.imLastError = msg;
-        addImMessage(msg, "system");
-        notifyConnection("消息通道被网络/代理拦截", "error", 5600);
-        return false;
-      }
-      addImMessage(`WebSocket 可达：${net.detail}`, "system");
-      addImMessage(
-        "提示：裸 WSS 握手成功不等于 TIM 登录成功；Clash Fake-IP 下常出现「可达但 login 超时」。",
-        "system"
-      );
+      const uploadPluginReady = withTimeout(
+        ensureTimUploadPluginLoaded(),
+        8000,
+        "加载媒体上传组件"
+      )
+        .then(() => true)
+        .catch((pluginError) => {
+          // Text messaging connects first; media actions can retry the plugin later.
+          addImMessage(`TIM 媒体上传插件暂不可用：${pluginError?.message || pluginError}`, "system");
+          return false;
+        });
 
       // Product mode only accepts the official server signature. Repeating the
       // same unavailable credential source delays every authenticated route.
@@ -6942,6 +7080,14 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
           const ok = await connectTIM(cred, sessionGeneration);
           if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
           if (ok) {
+            void uploadPluginReady.then((ready) => {
+              if (!ready || !S.chat || typeof S.chat.registerPlugin !== "function" || !window.TIMUploadPlugin) return;
+              try {
+                S.chat.registerPlugin({ "tim-upload-plugin": window.TIMUploadPlugin });
+              } catch {
+                // The SDK may already have registered the plugin during connectTIM.
+              }
+            });
             notifyConnection("消息通道已连接", "info", 3200);
             return true;
           }
@@ -6955,8 +7101,11 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
         }
       }
 
+      // Connectivity probes are diagnostics only. Running them before login
+      // delayed or blocked valid SDK sessions on production networks.
+      void diagnoseTimConnectionFailure();
+
       // Degraded mode: keep HTTP conversation history usable without realtime TIM.
-      // REST fallback: APK secret works against console.tim.qq.com (verified on this machine).
       // Enables send without browser TIM.login; receive still via history refresh.
       try {
         addImMessage("实时消息连接失败，尝试启用文本备用通道…", "system");
@@ -7130,6 +7279,7 @@ async function logout() {
     closeChatMediaViewer();
     stopPresenceTimer();
     stopMessageSyncTimer();
+    closeMessageSyncChannel();
     clearTimeout(S.authenticatedServicesTimer);
     S.authenticatedServicesTimer = null;
     S.authenticatedServicesPending = false;
@@ -7169,9 +7319,15 @@ async function logout() {
     S.presenceByUid.clear();
     S.presenceLoadingUids.clear();
     S.subscribedPresenceUids.clear();
+    S.presenceWarningShown = false;
     S.conversations = [];
     S.conversationRefreshPromise = null;
+    S.conversationLastRefreshAt = 0;
+    S.conversationNextRefreshAt = 0;
+    S.conversationArchivePromise = null;
+    S.conversationArchiveLoadedAt = 0;
     S.conversationProfilesByUid.clear();
+    S.conversationProfileFetchedAt.clear();
     S.conversationProfileLoadingUids.clear();
     S.readConversationPeers.clear();
     S.unreadTotal = 0;
@@ -8102,6 +8258,17 @@ function completeBrowserLogin(data) {
   resetTurnstileChallenge({ hide: true });
   S.sessionGeneration += 1;
   S.authenticated = true;
+  closeMessageSyncChannel();
+  S.conversations = [];
+  S.conversationRefreshPromise = null;
+  S.conversationLastRefreshAt = 0;
+  S.conversationNextRefreshAt = 0;
+  S.conversationArchivePromise = null;
+  S.conversationArchiveLoadedAt = 0;
+  S.conversationProfilesByUid.clear();
+  S.conversationProfileFetchedAt.clear();
+  S.presenceByUid.clear();
+  S.presenceWarningShown = false;
   S.meStats = null;
   S.meStatsAt = 0;
   applyUser(data.user);
@@ -8460,7 +8627,12 @@ document.addEventListener("visibilitychange", () => {
   }
   if (!S.authenticated) return;
   updatePresence(!document.hidden);
-  if (!document.hidden) void syncMessagesInBackground({ force: true });
+  if (!document.hidden) {
+    startMessageSyncTimer();
+    void runMessageSyncCycle({ force: true });
+  } else {
+    stopMessageSyncTimer();
+  }
 });
 
 window.addEventListener("blur", () => {
@@ -8492,6 +8664,7 @@ window.addEventListener("pagehide", (event) => {
   stopMessageSyncTimer();
   clearPeerMediaReconcile();
   if (!event.persisted) {
+    closeMessageSyncChannel();
     revokeAllChatObjectUrls();
     S.imMediaRetryState.clear();
     if (S.loginStage === "invite") {

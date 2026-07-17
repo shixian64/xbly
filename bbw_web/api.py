@@ -681,6 +681,7 @@ async def lifespan(application: FastAPI):
     legacy.COOKIE_SECURE = bool(settings.cookie_secure)
     legacy.COOKIE_NAME = str(settings.user_cookie_name)
     legacy.MAX_JSON_BODY_BYTES = int(settings.max_json_body_bytes)
+    legacy.PRESENCE_BACKEND = persistence
     legacy.STORE = SessionStore(
         ttl_sec=float(settings.user_idle_ttl_seconds),
         auto_heartbeat=False,
@@ -699,6 +700,7 @@ async def lifespan(application: FastAPI):
         yield
     finally:
         legacy.INVITE_LOGIN_ENABLED = False
+        legacy.PRESENCE_BACKEND = None
         if legacy.STORE is not None:
             legacy.STORE.close()
         persistence.close()

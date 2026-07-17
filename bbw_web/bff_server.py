@@ -32,6 +32,7 @@ from bbw_web import flash_photo as F  # noqa: E402
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 COOKIE_NAME = "bbw_sid"
 STORE: Optional[SessionStore] = None
+PRESENCE_BACKEND: Any = None
 
 
 class ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
@@ -677,6 +678,43 @@ def conversation_envelope(
     return payload
 
 
+def _batch_cached_profiles(
+    app: Any,
+    uids: List[str],
+    cache: Dict[str, tuple[float, Optional[Dict[str, Any]]]],
+) -> List[Dict[str, Any]]:
+    targets = list(
+        dict.fromkeys(
+            str(uid or "").strip() for uid in uids if str(uid or "").strip()
+        )
+    )
+    resolved: Dict[str, Optional[Dict[str, Any]]] = {}
+    missing: List[str] = []
+    now = time.monotonic()
+    for uid in targets:
+        cached = cache.get(uid)
+        if cached:
+            cached_at, profile = cached
+            ttl = PROFILE_CACHE_TTL_SEC if profile else PROFILE_CACHE_ERROR_TTL_SEC
+            if now - cached_at < ttl:
+                resolved[uid] = dict(profile) if profile else None
+                continue
+        missing.append(uid)
+    if missing:
+        with ThreadPoolExecutor(
+            max_workers=min(4, len(missing)), thread_name_prefix="bbw-profile-batch"
+        ) as pool:
+            profiles = list(pool.map(lambda uid: _fetch_social_profile(app, uid), missing))
+        cached_at = time.monotonic()
+        for uid, profile in zip(missing, profiles):
+            resolved[uid] = profile
+            cache[uid] = (cached_at, dict(profile) if profile else None)
+        while len(cache) > 200:
+            oldest = min(cache, key=lambda key: cache[key][0])
+            cache.pop(oldest, None)
+    return [dict(resolved[uid]) for uid in targets if resolved.get(uid)]
+
+
 def _is_false_response(r: Any, *accepted: str) -> bool:
     """Match explicit false/no business responses without weakening global parsing."""
     status = int(getattr(r, "status", 0) or 0)
@@ -1250,6 +1288,14 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 )
             )
+        if path == "/api/profile/users":
+            requested = _presence_uids((qs.get("uids") or []) + (qs.get("uid") or []), limit=100)
+            if not requested:
+                return self.ok({"ok": False, "error": "缺少用户 UID"}, 400)
+            items = _batch_cached_profiles(app, requested, u.profile_cache)
+            return self.ok(
+                {"ok": True, "items": items, "list": items, "count": len(items)}
+            )
         if path == "/api/profile/reset-num":
             return self.ok(R(app.profile.reset_num(q("type", "昵称")), include_value=True))
         if path == "/api/profile/etiquette":
@@ -1484,28 +1530,81 @@ class Handler(BaseHTTPRequestHandler):
             requested = _presence_uids((qs.get("uids") or []) + (qs.get("uid") or []))
             if not requested:
                 return self.ok({"ok": False, "error": "缺少用户 UID"}, 400)
+            web_online: Set[str] = set()
+            retry_after = 0
+            if PRESENCE_BACKEND is not None:
+                try:
+                    web_online = set(PRESENCE_BACKEND.read_web_presence(requested))
+                    retry_after = int(PRESENCE_BACKEND.presence_rest_retry_after())
+                except Exception:
+                    web_online = set()
+                    retry_after = 0
+            unresolved = [uid for uid in requested if uid not in web_online]
+            normalized: Dict[str, Any] = {
+                "ok": False,
+                "items": [],
+                "list": [],
+                "count": 0,
+                "message": "在线状态暂时不可用",
+            }
             try:
-                result = u.native.tim_rest.query_online(requested)
-                return self.ok(_normalize_presence_result(result, requested))
+                if unresolved and retry_after <= 0:
+                    result = u.native.tim_rest.query_online(unresolved)
+                    normalized = _normalize_presence_result(result, unresolved)
+                    if not result.ok and PRESENCE_BACKEND is not None:
+                        PRESENCE_BACKEND.mark_presence_rest_unavailable(result.error_code)
+                        retry_after = int(PRESENCE_BACKEND.presence_rest_retry_after())
+                elif not unresolved:
+                    normalized = {
+                        "ok": True,
+                        "items": [],
+                        "list": [],
+                        "count": 0,
+                        "message": "在线状态已更新",
+                    }
             except Exception:
-                items = [
+                if PRESENCE_BACKEND is not None:
+                    try:
+                        PRESENCE_BACKEND.mark_presence_rest_unavailable(0)
+                        retry_after = int(PRESENCE_BACKEND.presence_rest_retry_after())
+                    except Exception:
+                        pass
+            by_uid = {
+                str(item.get("uid") or ""): item
+                for item in normalized.get("items", [])
+                if isinstance(item, dict) and item.get("uid")
+            }
+            for uid in web_online:
+                by_uid[uid] = {
+                    "uid": uid,
+                    "status": "online",
+                    "label": "在线",
+                    "is_online": True,
+                    "source": "web",
+                }
+            items = [
+                by_uid.get(
+                    uid,
                     {
                         "uid": uid,
                         "status": "unknown",
                         "label": "状态未知",
                         "is_online": None,
-                    }
-                    for uid in requested
-                ]
-                return self.ok(
-                    {
-                        "ok": False,
-                        "items": items,
-                        "list": items,
-                        "count": len(items),
-                        "message": "在线状态暂时不可用",
-                    }
+                    },
                 )
+                for uid in requested
+            ]
+            available = bool(normalized.get("ok")) or bool(web_online)
+            payload = {
+                "ok": available,
+                "partial": not bool(normalized.get("ok")) and bool(unresolved),
+                "items": items,
+                "list": items,
+                "count": len(items),
+                "message": "在线状态已更新" if available else "在线状态暂时不可用",
+                "retry_after": max(0, retry_after),
+            }
+            return self.ok(payload)
         if path == "/api/im/bootstrap":
             try:
                 return self.ok(

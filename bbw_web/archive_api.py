@@ -7,6 +7,8 @@ from typing import Any, Literal, Optional
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
+from bbw_prod.db import session_scope
+from bbw_prod.repositories import ConversationRepository, MessageRepository
 from bbw_web import bff_server as legacy
 
 
@@ -73,6 +75,86 @@ class MessageReport(BaseModel):
 
 def _sid(request: Request) -> str:
     return str(request.cookies.get(legacy.COOKIE_NAME) or "")
+
+
+def _message_preview(message: Any) -> str:
+    if message is None:
+        return ""
+    body = str(message.body or "").strip()
+    if body:
+        return body[:500]
+    return {
+        "image": "图片",
+        "audio": "语音",
+        "video": "视频",
+        "file": "文件",
+        "location": "位置",
+        "face": "表情",
+        "custom": "消息",
+    }.get(str(message.message_type or "").lower(), "消息")
+
+
+@router.get("/conversations")
+def archived_conversations(request: Request, limit: int = 100) -> dict[str, Any]:
+    persistence = request.app.state.persistence
+    identity = persistence.require_identity(_sid(request))
+    if identity is None:
+        raise HTTPException(status_code=401, detail="请先登录")
+    if not persistence.rate_limit(
+        f"archive-conversations:{identity.user_id}", limit=120, window_seconds=60
+    ):
+        raise HTTPException(status_code=429, detail="会话缓存读取过于频繁")
+
+    with session_scope() as db:
+        conversations = ConversationRepository(db).list_for_owner(
+            identity.user_id, limit=min(max(1, int(limit)), 200)
+        )
+        latest = MessageRepository(db).latest_for_conversations(
+            identity.user_id, [conversation.id for conversation in conversations]
+        )
+        items: list[dict[str, Any]] = []
+        for conversation in conversations:
+            metadata = (
+                dict(conversation.extra_data)
+                if isinstance(conversation.extra_data, dict)
+                else {}
+            )
+            user = metadata.get("user") if isinstance(metadata.get("user"), dict) else {}
+            message = latest.get(conversation.id)
+            occurred_at = message.occurred_at if message is not None else conversation.last_message_at
+            preview = _message_preview(message) or str(metadata.get("last_message") or "")[:500]
+            avatar = str(
+                metadata.get("avatar")
+                or user.get("avatar")
+                or user.get("portrait")
+                or ""
+            )
+            peer = str(conversation.peer_upstream_uid or "").strip()
+            if not peer:
+                continue
+            items.append(
+                {
+                    "id": str(conversation.id),
+                    "conversation_id": str(conversation.upstream_conversation_id or f"C2C{peer}"),
+                    "conversation_type": "C2C",
+                    "source": "archive",
+                    "peer_id": peer,
+                    "conversation_user": peer,
+                    "nickname": str(
+                        conversation.title
+                        or user.get("nickname")
+                        or user.get("name")
+                        or peer
+                    ),
+                    "avatar": avatar,
+                    "user": user,
+                    "last_message": preview,
+                    "content": preview,
+                    "timestamp": occurred_at.isoformat() if occurred_at is not None else "",
+                    "unread_count": max(0, int(conversation.unread_count or 0)),
+                }
+            )
+    return {"ok": True, "items": items, "list": items, "count": len(items)}
 
 
 @router.post("/messages", status_code=status.HTTP_202_ACCEPTED)

@@ -182,6 +182,8 @@ def _sanitize_profile(value: Any) -> Any:
 
 class RuntimePersistence:
     PENDING_LOGIN_SECONDS = 5 * 60
+    WEB_PRESENCE_TTL_SECONDS = 120
+    PRESENCE_REST_FAILURE_TTL_SECONDS = 10 * 60
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -238,6 +240,66 @@ class RuntimePersistence:
         pipe.expire(redis_key, int(window_seconds) + 2)
         count, _ = pipe.execute()
         return int(count) <= int(limit)
+
+    def _web_presence_key(self, upstream_uid: str) -> str:
+        digest = hashlib.sha256(str(upstream_uid or "").encode("utf-8")).hexdigest()
+        return f"{self.settings.redis_prefix}:presence:web:{digest}"
+
+    def set_web_presence(self, upstream_uid: str, *, active: bool) -> None:
+        uid = str(upstream_uid or "").strip()
+        if not uid:
+            return
+        key = self._web_presence_key(uid)
+        if active:
+            self.redis.set(key, b"1", ex=self.WEB_PRESENCE_TTL_SECONDS)
+        else:
+            self.redis.delete(key)
+
+    def read_web_presence(self, upstream_uids: list[str]) -> set[str]:
+        uids = [str(uid or "").strip() for uid in upstream_uids]
+        keys = [self._web_presence_key(uid) for uid in uids if uid]
+        if not keys:
+            return set()
+        values = self.redis.mget(keys)
+        return {
+            uid
+            for uid, value in zip((uid for uid in uids if uid), values)
+            if value is not None
+        }
+
+    def _presence_rest_failure_key(self) -> str:
+        return f"{self.settings.redis_prefix}:presence:tim-rest-unavailable"
+
+    def mark_presence_rest_unavailable(self, error_code: int = 0) -> None:
+        ttl = self.PRESENCE_REST_FAILURE_TTL_SECONDS if int(error_code or 0) == 70009 else 60
+        self.redis.set(
+            self._presence_rest_failure_key(),
+            str(int(error_code or 0)).encode("ascii"),
+            ex=ttl,
+        )
+
+    def presence_rest_retry_after(self) -> int:
+        ttl = int(self.redis.ttl(self._presence_rest_failure_key()) or 0)
+        return max(0, ttl)
+
+    def _claim_response_digest(
+        self,
+        namespace: str,
+        identity: UserIdentity,
+        digest: str,
+        *,
+        ttl_seconds: int = 600,
+    ) -> bool:
+        key = self._response_digest_key(namespace, identity, digest)
+        return bool(self.redis.set(key, b"1", nx=True, ex=max(1, int(ttl_seconds))))
+
+    def _response_digest_key(
+        self, namespace: str, identity: UserIdentity, digest: str
+    ) -> str:
+        return (
+            f"{self.settings.redis_prefix}:dedupe:{namespace}:"
+            f"{identity.user_id}:{digest}"
+        )
 
     def login_security_state(self, *, phone: str, client_ip: str) -> dict[str, Any]:
         """Return only the browser-facing Turnstile state, never failure counts."""
@@ -805,24 +867,50 @@ class RuntimePersistence:
         identity = identity or self.require_identity(str(sid or ""))
         if identity is None:
             return
-        if path in {"/api/im/messages", "/api/im/conversations"} and response_data:
+        transport_ok = 200 <= int(status) < 300
+        response_ok = transport_ok and response_data.get("ok") is not False
+        if transport_ok and path == "/api/frontback":
+            self.set_web_presence(
+                identity.upstream_uid,
+                active=str(request_data.get("frontorback") or "1") == "1",
+            )
+        elif transport_ok and path in {
+            "/api/online",
+            "/api/heartbeat/start",
+            "/api/heartbeat/once",
+        }:
+            self.set_web_presence(identity.upstream_uid, active=True)
+        elif transport_ok and path in {"/api/auth/logout", "/api/heartbeat/stop"}:
+            self.set_web_presence(identity.upstream_uid, active=False)
+        elif response_ok:
+            if path in {
+                "/api/auth/login",
+                "/api/auth/sms-login",
+            }:
+                self.set_web_presence(identity.upstream_uid, active=True)
+        if (
+            response_ok
+            and path in {"/api/im/messages", "/api/im/conversations"}
+            and response_data
+        ):
             digest = hashlib.sha256(
                 json.dumps(response_data, sort_keys=True, ensure_ascii=False).encode("utf-8")
             ).hexdigest()
-            try:
-                self.default_queue.enqueue(
-                    "bbw_web.jobs.ingest_history_response",
-                    str(identity.user_id),
-                    str(identity.external_account_id),
-                    path,
-                    query,
-                    response_data,
-                    job_id=f"history-response-{identity.user_id}-{digest}",
-                    result_ttl=600,
-                    failure_ttl=86400,
-                )
-            except Exception:
-                pass
+            if self._claim_response_digest("history", identity, digest):
+                try:
+                    self.default_queue.enqueue(
+                        "bbw_web.jobs.ingest_history_response",
+                        str(identity.user_id),
+                        str(identity.external_account_id),
+                        path,
+                        query,
+                        response_data,
+                        job_id=f"history-response-{identity.user_id}-{digest}",
+                        result_ttl=600,
+                        failure_ttl=86400,
+                    )
+                except Exception:
+                    self.redis.delete(self._response_digest_key("history", identity, digest))
         social_snapshot_paths = {
             "/api/social/follows",
             "/api/social/fans",
@@ -841,20 +929,25 @@ class RuntimePersistence:
                     ensure_ascii=False,
                 ).encode("utf-8")
             ).hexdigest()
-            try:
-                self.default_queue.enqueue(
-                    "bbw_web.jobs.ingest_social_snapshot",
-                    str(identity.user_id),
-                    str(identity.external_account_id),
-                    path,
-                    query,
-                    response_data,
-                    job_id=f"social-snapshot-{identity.user_id}-{snapshot_digest}",
-                    result_ttl=600,
-                    failure_ttl=86400,
-                )
-            except Exception:
-                pass
+            if self._claim_response_digest("social-snapshot", identity, snapshot_digest):
+                try:
+                    self.default_queue.enqueue(
+                        "bbw_web.jobs.ingest_social_snapshot",
+                        str(identity.user_id),
+                        str(identity.external_account_id),
+                        path,
+                        query,
+                        response_data,
+                        job_id=f"social-snapshot-{identity.user_id}-{snapshot_digest}",
+                        result_ttl=600,
+                        failure_ttl=86400,
+                    )
+                except Exception:
+                    self.redis.delete(
+                        self._response_digest_key(
+                            "social-snapshot", identity, snapshot_digest
+                        )
+                    )
         method_upper = method.upper()
         excluded_post_paths = {
             "/api/auth/login",
@@ -876,8 +969,6 @@ class RuntimePersistence:
             "/api/social/blacklist-me",
             "/api/moments/posts",
             "/api/moments/comments",
-            "/api/im/conversations",
-            "/api/im/messages",
             "/api/media/access",
         }
         should_record_event = (
@@ -908,14 +999,17 @@ class RuntimePersistence:
                 json.dumps(event_payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
             ).hexdigest()
             event_payload["idempotency_key"] = digest
-            try:
-                self.default_queue.enqueue(
-                    "bbw_web.jobs.record_product_event",
-                    str(identity.user_id),
-                    event_payload,
-                    job_id=f"product-event-{identity.user_id}-{digest}",
-                    result_ttl=600,
-                    failure_ttl=86400,
-                )
-            except Exception:
-                pass
+            if self._claim_response_digest("product-event", identity, digest):
+                try:
+                    self.default_queue.enqueue(
+                        "bbw_web.jobs.record_product_event",
+                        str(identity.user_id),
+                        event_payload,
+                        job_id=f"product-event-{identity.user_id}-{digest}",
+                        result_ttl=600,
+                        failure_ttl=86400,
+                    )
+                except Exception:
+                    self.redis.delete(
+                        self._response_digest_key("product-event", identity, digest)
+                    )
