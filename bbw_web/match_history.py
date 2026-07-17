@@ -18,6 +18,7 @@ from bbw_prod.repositories import ActivityEventRepository
 
 
 MATCH_HISTORY_PROVIDER = "web-match"
+MATCH_HISTORY_RETENTION_DAYS = 180
 MATCH_HISTORY_EVENT_TYPES = {
     "/api/match/online": ("match.online", "online"),
     "/api/match/local": ("match.local", "local"),

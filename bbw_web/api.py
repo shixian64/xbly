@@ -569,7 +569,12 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
     if (
         identity is not None
         and request.method == "POST"
-        and path in {"/api/match/online", "/api/match/local"}
+        and path
+        in {
+            "/api/match/online",
+            "/api/match/local",
+            "/api/match/voice/start",
+        }
     ):
         match_history_request_id = uuid.uuid4().hex
 
@@ -687,23 +692,6 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
                     },
                     status_code=503,
                 )
-
-    if (
-        identity is not None
-        and request.method == "POST"
-        and path == "/api/match/voice/start"
-    ):
-        try:
-            persistence.remember_match_history_response(
-                identity=identity,
-                method=request.method,
-                path=path,
-                response_data=response_data,
-                status=status,
-                request_id=uuid.uuid4().hex,
-            )
-        except Exception:
-            LOGGER.exception("match history persistence failed")
 
     is_login_path = path in {"/api/auth/login", "/api/auth/sms-login"}
     if is_login_path and not response_data.get("ok"):

@@ -6,7 +6,7 @@ import threading
 import unittest
 import uuid
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,9 +19,12 @@ if str(ROOT) not in sys.path:
 from bbw_web import bff_server as BFF  # noqa: E402
 from bbw_protocol.client import ApiResult  # noqa: E402
 from bbw_web.match_history import (  # noqa: E402
+    MATCH_HISTORY_PROVIDER,
+    MATCH_HISTORY_RETENTION_DAYS,
     load_match_history,
     record_match_history_response,
 )
+from bbw_web.jobs import _purge_expired_match_history  # noqa: E402
 
 
 class MatchHistoryBffContractTests(unittest.TestCase):
@@ -229,6 +232,74 @@ class MatchHistoryBffContractTests(unittest.TestCase):
         self.assertFalse(payload["history_saved"])
         self.assertIn("匹配成功", payload["history_warning"])
 
+    def test_voice_match_records_memory_history_and_reports_durable_failure(self) -> None:
+        result = ApiResult(
+            True,
+            200,
+            '{"id":"9","nickname":"语音用户"}',
+            data={"id": "9", "nickname": "语音用户", "city": "厦门"},
+        )
+        match = SimpleNamespace(
+            start_voice=lambda **_kwargs: result,
+            normalize_voice_result=lambda value: {
+                "outcome": "matched",
+                "target": value.data,
+            },
+        )
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(session=SimpleNamespace(uid="42"), match=match),
+            native=SimpleNamespace(),
+            lock=threading.RLock(),
+            match_history=[],
+            match_message_peers=set(),
+            voice_rong_credentials={
+                "app_key": "app-key",
+                "user_id": "42",
+                "token": "rong-token",
+                "nickname": "Me",
+                "portrait": "",
+            },
+            voice_rong_credentials_at=BFF.time.time(),
+            voice_match_state={},
+        )
+
+        class Harness:
+            path = "/api/match/voice/start"
+
+            def __init__(self):
+                self.response = None
+                self._request_match_history_recorder = self.failed_recorder
+
+            @staticmethod
+            def failed_recorder(_path, _payload):
+                raise RuntimeError("database unavailable")
+
+            def _check_api_origin(self):
+                return True
+
+            def body(self):
+                return {}
+
+            def sid(self):
+                return "sid-match-history"
+
+            def user(self, _sid):
+                return web_user
+
+            def ok(self, obj, status=200, **_kwargs):
+                self.response = (status, obj)
+                return self.response
+
+        harness = Harness()
+        BFF.Handler.do_POST(harness)
+        status, payload = harness.response
+
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["history_saved"])
+        self.assertIn("匹配成功", payload["history_warning"])
+        self.assertEqual(web_user.match_history[0]["id"], "9")
+        self.assertEqual(web_user.match_history[0]["match_mode"], "voice")
+
 
 class MatchHistoryPersistenceContractTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -337,6 +408,38 @@ class MatchHistoryPersistenceContractTests(unittest.TestCase):
         self.assertEqual(payload["items"][0]["match_mode"], "voice")
         self.assertEqual(payload["items"][0]["matched_at"], "2026-07-17T12:30:00+00:00")
 
+    def test_cleanup_purges_only_expired_match_history_in_bounded_batches(self) -> None:
+        ids = [uuid.uuid4(), uuid.uuid4()]
+
+        class FakeDb:
+            def __init__(self):
+                self.select_statement = None
+                self.delete_statement = None
+
+            def scalars(self, statement):
+                self.select_statement = statement
+                return ids
+
+            def execute(self, statement):
+                self.delete_statement = statement
+                return SimpleNamespace(rowcount=len(ids))
+
+        now = datetime(2026, 7, 17, 12, 30, tzinfo=UTC)
+        db = FakeDb()
+
+        deleted = _purge_expired_match_history(db, at=now, limit=5000)
+
+        self.assertEqual(deleted, 2)
+        self.assertIsNotNone(db.select_statement)
+        self.assertIsNotNone(db.delete_statement)
+        params = db.select_statement.compile().params
+        self.assertIn(MATCH_HISTORY_PROVIDER, params.values())
+        self.assertIn(
+            now - timedelta(days=MATCH_HISTORY_RETENTION_DAYS),
+            params.values(),
+        )
+        self.assertIn("activity_events", str(db.delete_statement))
+
 
 class MatchHistoryFrontendContractTests(unittest.TestCase):
     def test_production_wiring_uses_owner_scoped_activity_events(self) -> None:
@@ -364,12 +467,14 @@ class MatchHistoryFrontendContractTests(unittest.TestCase):
         self.assertIn("return load_match_history(", persistence)
         self.assertIn("persistence.remember_match_history_response(", api)
         self.assertIn("persistence.match_history(", api)
+        self.assertIn('"/api/match/voice/start",', api)
         self.assertIn("_remember_web_match_history(u, path, payload)", bff)
         self.assertIn('payload["history_saved"] = False', bff)
 
     def test_matching_page_loads_and_updates_durable_history(self) -> None:
         app_js = (ROOT / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8-sig")
         app_css = (ROOT / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8-sig")
+        index_html = (ROOT / "bbw_web" / "static" / "index.html").read_text(encoding="utf-8-sig")
 
         matching = app_js.split("async function pageMatching", 1)[1].split(
             "async function pageVoiceMatch", 1
@@ -385,6 +490,10 @@ class MatchHistoryFrontendContractTests(unittest.TestCase):
         self.assertIn("匹配结果已保留在当前页面", app_js)
         self.assertIn(".match-history-card", app_css)
         self.assertIn(".match-history-mode", app_css)
+        css_version = index_html.split('/static/app.css?v=', 1)[1].split('"', 1)[0]
+        js_version = index_html.split('/static/app.js?v=', 1)[1].split('"', 1)[0]
+        self.assertEqual(css_version, js_version)
+        self.assertTrue(css_version.endswith("-match-history"))
 
 
 if __name__ == "__main__":

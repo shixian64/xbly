@@ -3037,17 +3037,28 @@ class Handler(BaseHTTPRequestHandler):
                             match_peers = set()
                             setattr(u, "match_message_peers", match_peers)
                         match_peers.add(target_id)
-                    return self.ok(
-                        {
-                            "ok": True,
-                            "outcome": outcome,
-                            "message": "已匹配到用户，正在发起语音通话",
-                            "target": target,
-                            "items": [target],
-                            "count": 1,
-                            **state,
-                        }
-                    )
+                    payload = {
+                        "ok": True,
+                        "outcome": outcome,
+                        "message": "已匹配到用户，正在发起语音通话",
+                        "target": target,
+                        "items": [target],
+                        "count": 1,
+                        **state,
+                    }
+                    recorded_peers = _remember_web_match_history(u, path, payload)
+                    if recorded_peers:
+                        payload["history_saved"] = True
+                        recorder = getattr(self, "_request_match_history_recorder", None)
+                        if callable(recorder):
+                            try:
+                                recorder(path, payload)
+                            except Exception:
+                                payload["history_saved"] = False
+                                payload["history_warning"] = (
+                                    "匹配成功，但历史记录暂时没有保存，请保留当前匹配结果"
+                                )
+                    return self.ok(payload)
                 with u.lock:
                     _set_voice_match_state(u, "idle")
                 return self.ok(
@@ -3512,10 +3523,15 @@ def _message_peer_ids(payload: Any) -> Set[str]:
 def _remember_web_match_history(user: Any, path: str, payload: Mapping[str, Any]) -> List[str]:
     """Keep a bounded session history for the documented memory-only BFF."""
 
-    if path not in {"/api/match/online", "/api/match/local"}:
+    modes = {
+        "/api/match/online": "online",
+        "/api/match/local": "local",
+        "/api/match/voice/start": "voice",
+    }
+    mode = modes.get(path)
+    if mode is None:
         return []
     current_uid = str(getattr(getattr(user.app, "session", None), "uid", "") or "").strip()
-    mode = "local" if path == "/api/match/local" else "online"
     matched_at = int(time.time() * 1000)
     profiles = N.normalize_users(payload.get("items") or payload.get("list") or [])
     entries: List[Dict[str, Any]] = []

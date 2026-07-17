@@ -28,6 +28,7 @@ from bbw_prod.config import Settings, get_settings
 from bbw_prod.crypto import CredentialCipher, redact_raw_payload
 from bbw_prod.db import session_scope
 from bbw_prod.models import (
+    ActivityEvent,
     ExternalAccount,
     MediaObject,
     Message,
@@ -60,6 +61,7 @@ from bbw_protocol.app import BeibeiwuApp
 from bbw_protocol.client import ApiResult
 from bbw_protocol.session import Session as ProtocolSession
 from bbw_web.media_archive import MediaArchiveError, PreparedMedia, download_and_prepare
+from bbw_web.match_history import MATCH_HISTORY_PROVIDER, MATCH_HISTORY_RETENTION_DAYS
 from bbw_web.normalize import normalize_conversations, normalize_messages
 from bbw_web.r2 import R2Storage
 
@@ -105,6 +107,30 @@ def _uuid(value: Any, *, field: str) -> uuid.UUID:
 
 def _bounded(value: Any, limit: int) -> str:
     return str(value or "").strip()[:limit]
+
+
+def _purge_expired_match_history(
+    db: Any,
+    *,
+    at: datetime,
+    limit: int = 5000,
+) -> int:
+    cutoff = at - timedelta(days=MATCH_HISTORY_RETENTION_DAYS)
+    ids = list(
+        db.scalars(
+            select(ActivityEvent.id)
+            .where(
+                ActivityEvent.provider == MATCH_HISTORY_PROVIDER,
+                ActivityEvent.occurred_at <= cutoff,
+            )
+            .order_by(ActivityEvent.occurred_at, ActivityEvent.id)
+            .limit(max(1, min(int(limit), 5000)))
+        )
+    )
+    if not ids:
+        return 0
+    result = db.execute(delete(ActivityEvent).where(ActivityEvent.id.in_(ids)))
+    return int(result.rowcount or 0)
 
 
 def _as_bool(value: Any) -> bool:
@@ -1933,6 +1959,7 @@ def cleanup_expired_data() -> dict[str, Any]:
         audit_deleted = retention.purge_expired_audit_logs(at=now)
         web_sessions_deleted, admin_sessions_deleted = retention.purge_stale_sessions(at=now)
         messages_deleted = retention.purge_expired_messages(at=now, limit=5000)
+        match_history_deleted = _purge_expired_match_history(db, at=now, limit=5000)
         media_result = db.execute(
             delete(MediaObject).where(
                 MediaObject.deleted_at.is_not(None),
@@ -1961,6 +1988,7 @@ def cleanup_expired_data() -> dict[str, Any]:
         "web_sessions_deleted": web_sessions_deleted,
         "admin_sessions_deleted": admin_sessions_deleted,
         "messages_deleted": messages_deleted,
+        "match_history_deleted": match_history_deleted,
         "outboxes_deleted": outboxes_deleted,
         "r2_available": storage is not None,
     }
