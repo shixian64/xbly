@@ -726,6 +726,26 @@ def _is_false_response(r: Any, *accepted: str) -> bool:
     return (data is False and "false" in values) or raw in values
 
 
+def empty_list_envelope(
+    result: Any,
+    payload: Dict[str, Any],
+    message: str = "列表为空",
+) -> Dict[str, Any]:
+    """Treat an explicit HTTP-200 false as an empty collection for list APIs."""
+    if _is_false_response(result, "false"):
+        payload.update(
+            ok=True,
+            code="",
+            message=message,
+            error=None,
+            items=[],
+            list=[],
+            count=0,
+            availability="empty",
+        )
+    return payload
+
+
 def room_top_envelope(r: Any) -> Dict[str, Any]:
     """Mirror the APK: getRoomTop=false means no recommendation, not a page error."""
     payload = RE(r, "room")
@@ -1313,18 +1333,25 @@ class Handler(BaseHTTPRequestHandler):
                 None if summary else app,
                 getattr(u, "profile_cache", None),
             )
+            payload = empty_list_envelope(primary, payload, "关注列表为空")
+            if payload.get("availability") == "empty":
+                return self.ok(
+                    {"ok": True, "count": 0} if summary else payload
+                )
             if payload.get("items"):
                 return self.ok(
                     {"ok": payload.get("ok", True), "count": payload.get("count", 0)}
                     if summary
                     else payload
                 )
+            fallback = app.social.follow_list(q("uid") or None)
             payload = RS(
-                app.social.follow_list(q("uid") or None),
+                fallback,
                 str(app.session.uid or ""),
                 None if summary else app,
                 getattr(u, "profile_cache", None),
             )
+            payload = empty_list_envelope(fallback, payload, "关注列表为空")
             return self.ok(
                 {"ok": payload.get("ok", True), "count": payload.get("count", 0)}
                 if summary
@@ -1332,21 +1359,32 @@ class Handler(BaseHTTPRequestHandler):
             )
         if path == "/api/social/fans":
             summary = q("summary", "0") == "1"
+            result = app.social.fans_users(q("uid") or None, page=q("page", "1"))
             payload = RS(
-                app.social.fans_users(q("uid") or None, page=q("page", "1")),
+                result,
                 str(app.session.uid or ""),
                 None if summary else app,
                 getattr(u, "profile_cache", None),
             )
+            payload = empty_list_envelope(result, payload, "粉丝列表为空")
             return self.ok(
                 {"ok": payload.get("ok", True), "count": payload.get("count", 0)}
                 if summary
                 else payload
             )
         if path == "/api/social/follow-list":
-            return self.ok(RL(app.social.follow_list(q("uid") or q("id") or None)))
+            result = app.social.follow_list(q("uid") or q("id") or None)
+            return self.ok(empty_list_envelope(result, RL(result), "关注列表为空"))
         if path == "/api/social/friend-apply":
             result = app.social.friend_apply_list(q("page", "1"))
+            if _is_false_response(result, "false"):
+                payload = empty_list_envelope(
+                    result,
+                    N.envelope(result, items=[]),
+                    "好友申请列表为空",
+                )
+                payload["status"] = result.status
+                return self.ok({"ok": True, "count": 0} if q("summary", "0") == "1" else payload)
             if q("summary", "0") == "1":
                 items = N.normalize_friend_applications(
                     result.data, str(app.session.uid or "")
@@ -1360,11 +1398,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/social/friends":
             result = app.social.friends()
             items = N.normalize_friends(result.data, str(app.session.uid or ""))
-            if q("summary", "0") == "1":
-                return self.ok({"ok": bool(result.ok), "count": len(items)})
             payload = N.envelope(result, items=items)
             payload["list"] = items
             payload["status"] = result.status
+            payload = empty_list_envelope(result, payload, "通讯录为空")
+            if q("summary", "0") == "1":
+                return self.ok(
+                    {"ok": bool(payload.get("ok")), "count": int(payload.get("count") or 0)}
+                )
             return self.ok(payload)
         if path == "/api/social/visitors":
             visit_type = q("type", "seen_me")
@@ -1379,15 +1420,18 @@ class Handler(BaseHTTPRequestHandler):
                     400,
                 )
             payload = RL(result)
+            payload = empty_list_envelope(result, payload, "访客列表为空")
             if q("summary", "0") == "1":
                 return self.ok(
                     {"ok": payload.get("ok", True), "count": payload.get("count", 0)}
                 )
             return self.ok(payload)
         if path == "/api/social/blacklist":
-            return self.ok(RL(app.social.my_blacklist()))
+            result = app.social.my_blacklist()
+            return self.ok(empty_list_envelope(result, RL(result), "黑名单为空"))
         if path == "/api/social/blacklist-me":
-            return self.ok(RL(app.social.blacklist_me()))
+            result = app.social.blacklist_me()
+            return self.ok(empty_list_envelope(result, RL(result), "黑名单为空"))
 
         # ---- match ----
         if path == "/api/match/status":

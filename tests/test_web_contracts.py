@@ -17,6 +17,7 @@ from bbw_web.bff_server import (
     RE,
     RM,
     conversation_envelope,
+    empty_list_envelope,
     room_create_envelope,
     roomkit_list_envelope,
     room_top_envelope,
@@ -161,6 +162,39 @@ class BffEnvelopeTests(unittest.TestCase):
         self.assertEqual(payload["list"], [])
         self.assertEqual(payload["count"], 0)
         self.assertEqual(payload["availability"], "empty")
+
+    def test_social_list_false_is_an_empty_list(self) -> None:
+        result = ApiResult(
+            False,
+            200,
+            "false",
+            data=False,
+            code="FALSE_RESPONSE",
+            message="service returned false",
+            kind="json_other",
+        )
+
+        payload = empty_list_envelope(result, R(result), "关注列表为空")
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["items"], [])
+        self.assertEqual(payload["count"], 0)
+        self.assertEqual(payload["availability"], "empty")
+
+    def test_social_list_transport_failure_is_not_hidden(self) -> None:
+        result = ApiResult(
+            False,
+            502,
+            "false",
+            data=False,
+            code="FALSE_RESPONSE",
+            message="service returned false",
+            kind="json_other",
+        )
+
+        payload = empty_list_envelope(result, R(result), "关注列表为空")
+
+        self.assertFalse(payload["ok"])
 
     def test_room_top_transport_error_is_not_hidden_as_empty(self) -> None:
         result = ApiResult(
@@ -632,8 +666,19 @@ class SocialBffRoutingTests(unittest.TestCase):
     def tearDown(self) -> None:
         bff_server.STORE = self.old_store
 
-    def _run_get(self, path: str):
+    def _run_get(self, path: str, *, false_social: set[str] | None = None):
         result = ApiResult(True, 200, "[]", data=[])
+        false_result = ApiResult(
+            False,
+            200,
+            "false",
+            data=False,
+            code="FALSE_RESPONSE",
+            message="service returned false",
+            kind="json_other",
+        )
+        false_actions = false_social or set()
+        social_result = lambda action, fallback: false_result if action in false_actions else fallback
         calls = []
         app = SimpleNamespace(
             session=SimpleNamespace(uid="42"),
@@ -647,25 +692,39 @@ class SocialBffRoutingTests(unittest.TestCase):
                 )
             ),
             social=SimpleNamespace(
-                friends=lambda: calls.append(("friends", None)) or result,
-                friend_apply_list=lambda page: calls.append(("friend_apply", page)) or result,
+                friends=lambda: calls.append(("friends", None)) or social_result("friends", result),
+                friend_apply_list=lambda page: calls.append(("friend_apply", page))
+                or social_result("friend_apply", result),
                 follow_users=lambda _uid, page: calls.append(("follow_users", page))
-                or ApiResult(
-                    True,
-                    200,
-                    "[]",
-                    data=[{"you": "9", "yournickname": "关注用户"}],
+                or social_result(
+                    "follow_users",
+                    ApiResult(
+                        True,
+                        200,
+                        "[]",
+                        data=[{"you": "9", "yournickname": "关注用户"}],
+                    ),
                 ),
-                follow_list=lambda _uid: calls.append(("follow_list", None)) or result,
+                follow_list=lambda _uid: calls.append(("follow_list", None))
+                or social_result("follow_list", result),
                 fans_users=lambda _uid, page: calls.append(("fans_users", page))
-                or ApiResult(
-                    True,
-                    200,
-                    "[]",
-                    data=[{"fansid": "10", "fansnickname": "粉丝用户"}],
+                or social_result(
+                    "fans_users",
+                    ApiResult(
+                        True,
+                        200,
+                        "[]",
+                        data=[{"fansid": "10", "fansnickname": "粉丝用户"}],
+                    ),
                 ),
-                viewed_me=lambda page: calls.append(("seen_me", page)) or result,
-                i_viewed=lambda page: calls.append(("seen_by_me", page)) or result,
+                viewed_me=lambda page: calls.append(("seen_me", page))
+                or social_result("seen_me", result),
+                i_viewed=lambda page: calls.append(("seen_by_me", page))
+                or social_result("seen_by_me", result),
+                my_blacklist=lambda: calls.append(("blacklist", None))
+                or social_result("blacklist", result),
+                blacklist_me=lambda: calls.append(("blacklist_me", None))
+                or social_result("blacklist_me", result),
             ),
             im=SimpleNamespace(
                 history_conversations=lambda page: calls.append(("conversations", page))
@@ -861,6 +920,28 @@ class SocialBffRoutingTests(unittest.TestCase):
         self.assertEqual(response[1]["items"][0]["source"], "web")
         self.assertEqual(response[1]["items"][1]["status"], "unknown")
         self.assertEqual(response[1]["retry_after"], 480)
+
+    def test_false_social_lists_render_as_empty_instead_of_errors(self) -> None:
+        calls, response = self._run_get(
+            "/api/social/follows", false_social={"follow_users"}
+        )
+        self.assertEqual(calls, [("follow_users", "1")])
+        self.assertTrue(response[1]["ok"])
+        self.assertEqual(response[1]["items"], [])
+
+        calls, response = self._run_get(
+            "/api/social/fans", false_social={"fans_users"}
+        )
+        self.assertEqual(calls, [("fans_users", "1")])
+        self.assertTrue(response[1]["ok"])
+        self.assertEqual(response[1]["items"], [])
+
+        calls, response = self._run_get(
+            "/api/social/blacklist", false_social={"blacklist"}
+        )
+        self.assertEqual(calls, [("blacklist", None)])
+        self.assertTrue(response[1]["ok"])
+        self.assertEqual(response[1]["items"], [])
 
     def test_social_summary_routes_skip_profile_enrichment_and_duplicate_friend_reads(self) -> None:
         calls, response = self._run_get("/api/social/follows?summary=1")
