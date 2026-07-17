@@ -215,6 +215,60 @@ class CapturingTimRestClient(TimRestClient):
 
 
 class TimRestMediaContractTests(unittest.TestCase):
+    def test_recent_contacts_and_roaming_history_use_documented_request_shapes(self) -> None:
+        client = CapturingTimRestClient()
+
+        contacts = client.recent_contacts(
+            "42",
+            timestamp=10,
+            start_index=2,
+            top_timestamp=8,
+            top_start_index=1,
+        )
+        self.assertTrue(contacts.ok)
+        self.assertEqual(client.calls[-1][0], "recentcontact/get_list")
+        self.assertEqual(
+            client.calls[-1][1],
+            {
+                "From_Account": "42",
+                "TimeStamp": 10,
+                "StartIndex": 2,
+                "TopTimeStamp": 8,
+                "TopStartIndex": 1,
+                "AssistFlags": 7,
+            },
+        )
+
+        roaming = client.roaming_messages(
+            "42",
+            "9",
+            min_time=100,
+            max_time=200,
+            max_count=500,
+            last_msg_key="last-key",
+        )
+        self.assertTrue(roaming.ok)
+        self.assertEqual(client.calls[-1][0], "openim/admin_getroammsg")
+        self.assertEqual(
+            client.calls[-1][1],
+            {
+                "From_Account": "42",
+                "To_Account": "9",
+                "MaxCnt": 100,
+                "MinTime": 100,
+                "MaxTime": 200,
+                "LastMsgKey": "last-key",
+            },
+        )
+
+    def test_recent_contacts_and_roaming_history_reject_invalid_accounts(self) -> None:
+        client = CapturingTimRestClient()
+
+        self.assertFalse(client.recent_contacts("").ok)
+        self.assertFalse(client.roaming_messages("42", "42").ok)
+        self.assertFalse(client.roaming_messages("", "9").ok)
+        self.assertEqual(client.calls, [])
+
     def test_c2c_revoke_uses_authenticated_sender_and_msg_key_shape(self) -> None:
         client = CapturingTimRestClient()
 

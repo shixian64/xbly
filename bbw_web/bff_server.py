@@ -1042,7 +1042,17 @@ def conversation_envelope(
     """Attach cached peer display data without delaying the conversation summary."""
     payload = RE(result, "conversation")
     cache = profile_cache if profile_cache is not None else {}
-    for item in payload["items"]:
+    _attach_cached_conversation_profiles(app, payload["items"], cache)
+    payload["list"] = payload["items"]
+    return payload
+
+
+def _attach_cached_conversation_profiles(
+    app: Any,
+    items: List[Dict[str, Any]],
+    cache: Dict[str, tuple[float, Optional[Dict[str, Any]]]],
+) -> None:
+    for item in items:
         peer = str(item.get("peer_id") or item.get("conversation_user") or "").strip()
         if not peer or item.get("avatar"):
             continue
@@ -1059,8 +1069,172 @@ def conversation_envelope(
             )
         existing_user = item.get("user") if isinstance(item.get("user"), dict) else {}
         item["user"] = {**profile, **existing_user}
-    payload["list"] = payload["items"]
-    return payload
+
+
+def _tim_epoch_sort_value(value: Any) -> float:
+    raw = str(value or "").strip()
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    absolute = abs(parsed)
+    if absolute >= 10**15:
+        parsed /= 1_000_000
+    elif absolute >= 10**12:
+        parsed /= 1_000
+    return parsed
+
+
+def _tim_recent_conversation_envelope(
+    app: Any,
+    client: Any,
+    account_uid: str,
+    profile_cache: Optional[
+        Dict[str, tuple[float, Optional[Dict[str, Any]]]]
+    ] = None,
+    *,
+    max_pages: int = 5,
+) -> Dict[str, Any]:
+    timestamp = 0
+    start_index = 0
+    top_timestamp = 0
+    top_start_index = 0
+    rows: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    previous_cursor: Optional[Tuple[int, int, int, int]] = None
+    for _page in range(max(1, min(int(max_pages), 10))):
+        result = client.recent_contacts(
+            account_uid,
+            timestamp=timestamp,
+            start_index=start_index,
+            top_timestamp=top_timestamp,
+            top_start_index=top_start_index,
+        )
+        if not getattr(result, "ok", False):
+            raise RuntimeError("TIM recent contacts unavailable")
+        data = getattr(result, "data", None)
+        data = data if isinstance(data, Mapping) else {}
+        session_items = data.get("SessionItem")
+        session_items = session_items if isinstance(session_items, list) else []
+        for raw in session_items:
+            if not isinstance(raw, Mapping):
+                continue
+            if str(raw.get("Type") or "").strip().lower() not in {"1", "c2c"}:
+                continue
+            peer = str(raw.get("To_Account") or "").strip()
+            if (
+                not peer
+                or peer == account_uid
+                or peer in seen
+                or len(peer) > 128
+                or any(ord(char) < 33 for char in peer)
+            ):
+                continue
+            seen.add(peer)
+            rows.append(
+                {
+                    "id": f"C2C{peer}",
+                    "peer_id": peer,
+                    "conversation_user": peer,
+                    "timestamp": raw.get("MsgTime"),
+                    "unread_count": raw.get("UnreadMsgNum") or 0,
+                    "source": "tim_rest",
+                }
+            )
+        if int(data.get("CompleteFlag") or 0) == 1:
+            break
+        cursor = (
+            max(0, int(data.get("TimeStamp") or timestamp)),
+            max(0, int(data.get("StartIndex") or start_index)),
+            max(0, int(data.get("TopTimeStamp") or top_timestamp)),
+            max(0, int(data.get("TopStartIndex") or top_start_index)),
+        )
+        if not session_items or cursor == previous_cursor:
+            break
+        previous_cursor = cursor
+        timestamp, start_index, top_timestamp, top_start_index = cursor
+
+    rows.sort(
+        key=lambda item: _tim_epoch_sort_value(item.get("timestamp")),
+        reverse=True,
+    )
+    items = N.normalize_conversations(rows)
+    for item in items:
+        item["source"] = "tim_rest"
+    cache = profile_cache if profile_cache is not None else {}
+    _attach_cached_conversation_profiles(app, items, cache)
+    return {
+        "ok": True,
+        "items": items,
+        "list": items,
+        "count": len(items),
+        "entity": "conversation",
+        "status": 200,
+        "source": "tim_rest",
+    }
+
+
+def _tim_message_sort_key(item: Mapping[str, Any]) -> float:
+    return _tim_epoch_sort_value(item.get("timestamp") or item.get("time"))
+
+
+def _tim_roaming_message_envelope(
+    client: Any,
+    account_uid: str,
+    peer_uid: str,
+    *,
+    max_messages: int = 200,
+    retention_days: int = 180,
+) -> Dict[str, Any]:
+    now_epoch = int(time.time())
+    min_time = now_epoch - max(1, int(retention_days)) * 86400
+    page_limit = max(1, (max(1, int(max_messages)) + 99) // 100)
+    raw_items: List[Dict[str, Any]] = []
+    for sender, recipient in ((peer_uid, account_uid), (account_uid, peer_uid)):
+        last_msg_key = ""
+        for _page in range(page_limit):
+            result = client.roaming_messages(
+                sender,
+                recipient,
+                min_time=min_time,
+                max_time=now_epoch + 60,
+                max_count=min(100, max(1, int(max_messages))),
+                last_msg_key=last_msg_key,
+            )
+            if not getattr(result, "ok", False):
+                raise RuntimeError("TIM roaming messages unavailable")
+            data = getattr(result, "data", None)
+            data = data if isinstance(data, Mapping) else {}
+            page_items = data.get("MsgList")
+            page_items = page_items if isinstance(page_items, list) else []
+            raw_items.extend(dict(item) for item in page_items if isinstance(item, Mapping))
+            next_key = str(data.get("LastMsgKey") or "").strip()[:256]
+            if int(data.get("Complete") or 0) == 1 or not page_items or not next_key:
+                break
+            if next_key == last_msg_key:
+                break
+            last_msg_key = next_key
+
+    by_identity: Dict[str, Dict[str, Any]] = {}
+    for item in N.normalize_messages(raw_items):
+        identity = str(item.get("msg_key") or item.get("id") or "").strip()
+        if not identity:
+            identity = hashlib.sha256(
+                json.dumps(item, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+        by_identity[identity] = item
+    items = sorted(by_identity.values(), key=_tim_message_sort_key)[
+        -max(1, int(max_messages)):
+    ]
+    return {
+        "ok": True,
+        "items": items,
+        "list": items,
+        "count": len(items),
+        "entity": "message",
+        "status": 200,
+        "source": "tim_rest",
+    }
 
 
 def _batch_cached_profiles(
@@ -1472,7 +1646,11 @@ class Handler(BaseHTTPRequestHandler):
             return False
         if Handler.web_user_capabilities(self, user).get("proactive_private_message"):
             return True
-        for attribute in ("match_message_peers", "conversation_message_peers"):
+        for attribute in (
+            "friend_message_peers",
+            "match_message_peers",
+            "conversation_message_peers",
+        ):
             if target in set(getattr(user, attribute, set()) or set()):
                 return True
         authorizer = getattr(self, "_request_message_peer_authorizer", None)
@@ -1488,7 +1666,7 @@ class Handler(BaseHTTPRequestHandler):
             {
                 "ok": False,
                 "code": "PRIVATE_MESSAGE_PERMISSION_REQUIRED",
-                "error": "该私信入口仅向管理员授权的用户开放；匹配成功的用户和已有会话不受影响",
+                "error": "该私信入口仅向管理员授权的用户开放；好友、匹配成功的用户和已有会话不受影响",
                 "capabilities": capabilities,
             },
             403,
@@ -1855,6 +2033,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/social/friends":
             result = app.social.friends()
             items = N.normalize_friends(result.data, str(app.session.uid or ""))
+            friend_message_peers = {
+                peer
+                for peer in _message_peer_ids({"items": items})
+                if peer != str(app.session.uid or "")
+            }
+            setattr(u, "friend_message_peers", friend_message_peers)
             payload = N.envelope(result, items=items)
             payload["list"] = items
             payload["status"] = result.status
@@ -2113,7 +2297,8 @@ class Handler(BaseHTTPRequestHandler):
             match_peers = {
                 str(peer).strip()
                 for peer in (
-                    list(getattr(u, "match_message_peers", set()) or set())
+                    list(getattr(u, "friend_message_peers", set()) or set())
+                    + list(getattr(u, "match_message_peers", set()) or set())
                     + list(
                         getattr(self, "_request_message_policy_match_peers", ())
                         or ()
@@ -2128,6 +2313,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True,
                     "capabilities": Handler.web_user_capabilities(self, u),
                     "match_peers": sorted(match_peers)[:5000],
+                    "allowed_peers": sorted(match_peers)[:5000],
                 }
             )
         if path == "/api/im/tim":
@@ -2229,11 +2415,28 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/im/stickers":
             return self.ok(RE(app.im.stickers(), "sticker"))
         if path == "/api/im/conversations":
-            payload = conversation_envelope(
-                app,
-                app.im.history_conversations(q("page", "1")),
-                u.profile_cache,
-            )
+            try:
+                payload = _tim_recent_conversation_envelope(
+                    app,
+                    u.native.tim_rest,
+                    str(app.session.uid or ""),
+                    u.profile_cache,
+                )
+            except Exception:
+                result = app.im.history_conversations(q("page", "1"))
+                if _is_html_protocol_result(result) or not getattr(result, "ok", False):
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "code": "UPSTREAM_CONVERSATIONS_UNAVAILABLE",
+                            "error": "聊天列表暂时不可用，请稍后重试",
+                            "items": [],
+                            "list": [],
+                            "count": 0,
+                        },
+                        502,
+                    )
+                payload = conversation_envelope(app, result, u.profile_cache)
             conversation_peers = getattr(u, "conversation_message_peers", None)
             if conversation_peers is None:
                 conversation_peers = set()
@@ -2248,8 +2451,20 @@ class Handler(BaseHTTPRequestHandler):
             peer = q("peer") or q("uid") or q("yourid")
             if not peer:
                 return self.ok({"ok": False, "error": "缺少聊天对象 UID"}, 400)
-            result = app.im.history_messages(peer)
-            if _is_html_protocol_result(result):
+            capabilities = Handler.web_user_capabilities(self, u)
+            if not Handler.can_message_peer(self, u, peer):
+                return Handler.deny_private_message(self, capabilities)
+            try:
+                return self.ok(
+                    _tim_roaming_message_envelope(
+                        u.native.tim_rest,
+                        str(app.session.uid or ""),
+                        str(peer),
+                    )
+                )
+            except Exception:
+                result = app.im.history_messages(peer)
+            if _is_html_protocol_result(result) or not getattr(result, "ok", False):
                 return self.ok(
                     {
                         "ok": False,

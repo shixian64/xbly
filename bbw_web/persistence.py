@@ -14,7 +14,7 @@ from typing import Any, Mapping, Optional
 from redis import Redis
 from rq import Queue
 from rq.exceptions import InvalidJobOperation
-from sqlalchemy import select, text
+from sqlalchemy import and_, or_, select, text
 
 from bbw_prod.config import Settings
 from bbw_prod.crypto import CredentialCipher, normalize_phone
@@ -78,6 +78,8 @@ class PendingLoginConflict(RuntimeError):
 MESSAGE_POLICY_PROVIDER = "web-policy"
 MESSAGE_POLICY_MATCH_KIND = "match"
 MESSAGE_POLICY_CONVERSATION_KIND = "message_peer"
+SOCIAL_RELATIONSHIP_PROVIDER = "beibeiwu"
+SOCIAL_FRIEND_KIND = "friend"
 
 
 def _message_peer_uid(value: Any) -> str:
@@ -1042,13 +1044,21 @@ class RuntimePersistence:
             grant = db.scalar(
                 select(Relationship.id).where(
                     Relationship.owner_user_id == identity.user_id,
-                    Relationship.provider == MESSAGE_POLICY_PROVIDER,
                     Relationship.subject_upstream_uid == target,
-                    Relationship.kind.in_(
-                        [
-                            MESSAGE_POLICY_MATCH_KIND,
-                            MESSAGE_POLICY_CONVERSATION_KIND,
-                        ]
+                    or_(
+                        and_(
+                            Relationship.provider == MESSAGE_POLICY_PROVIDER,
+                            Relationship.kind.in_(
+                                [
+                                    MESSAGE_POLICY_MATCH_KIND,
+                                    MESSAGE_POLICY_CONVERSATION_KIND,
+                                ]
+                            ),
+                        ),
+                        and_(
+                            Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                            Relationship.kind == SOCIAL_FRIEND_KIND,
+                        ),
                     ),
                     Relationship.status == "active",
                     Relationship.ended_at.is_(None),
@@ -1059,6 +1069,45 @@ class RuntimePersistence:
             return ConversationRepository(db).exists_for_peer(
                 identity.user_id,
                 target,
+            )
+
+    def message_policy_allowed_peers(
+        self, identity: UserIdentity, *, limit: int = 2000
+    ) -> list[str]:
+        """Return durable friends and messaging grants for browser restoration."""
+
+        with session_scope() as db:
+            values = db.scalars(
+                select(Relationship.subject_upstream_uid)
+                .where(
+                    Relationship.owner_user_id == identity.user_id,
+                    or_(
+                        and_(
+                            Relationship.provider == MESSAGE_POLICY_PROVIDER,
+                            Relationship.kind.in_(
+                                [
+                                    MESSAGE_POLICY_MATCH_KIND,
+                                    MESSAGE_POLICY_CONVERSATION_KIND,
+                                ]
+                            ),
+                        ),
+                        and_(
+                            Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                            Relationship.kind == SOCIAL_FRIEND_KIND,
+                        ),
+                    ),
+                    Relationship.status == "active",
+                    Relationship.ended_at.is_(None),
+                )
+                .order_by(Relationship.updated_at.desc())
+                .limit(max(1, min(int(limit), 5000)))
+            )
+            return list(
+                dict.fromkeys(
+                    peer
+                    for peer in (_message_peer_uid(value) for value in values)
+                    if peer and peer != _message_peer_uid(identity.upstream_uid)
+                )
             )
 
     def message_policy_match_peers(

@@ -707,6 +707,99 @@ class ProtocolRoutingTests(unittest.TestCase):
         )
 
 
+class TimRestHistoryEnvelopeTests(unittest.TestCase):
+    def test_recent_contacts_filter_non_c2c_self_and_duplicates(self) -> None:
+        calls = []
+
+        class Client:
+            def recent_contacts(self, account_uid, **kwargs):
+                calls.append((account_uid, kwargs))
+                return SimpleNamespace(
+                    ok=True,
+                    data={
+                        "SessionItem": [
+                            {"Type": 1, "To_Account": "9", "MsgTime": 20},
+                            {"Type": 1, "To_Account": "9", "MsgTime": 10},
+                            {"Type": 1, "To_Account": "10", "MsgTime": 30},
+                            {"Type": 1, "To_Account": "42", "MsgTime": 30},
+                            {"Type": 2, "To_Account": "group", "MsgTime": 40},
+                        ],
+                        "CompleteFlag": 1,
+                    },
+                )
+
+        payload = bff_server._tim_recent_conversation_envelope(
+            SimpleNamespace(), Client(), "42", {}
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(
+            [item["peer_id"] for item in payload["items"]],
+            ["10", "9"],
+        )
+        self.assertEqual(payload["items"][0]["source"], "tim_rest")
+
+    def test_roaming_history_merges_deduplicates_and_sorts_both_directions(self) -> None:
+        calls = []
+
+        class Client:
+            def roaming_messages(self, sender, recipient, **kwargs):
+                calls.append((sender, recipient, kwargs))
+                if sender == "9":
+                    rows = [
+                        {
+                            "From_Account": "9",
+                            "To_Account": "42",
+                            "MsgTimeStamp": 20,
+                            "MsgKey": "incoming",
+                            "MsgBody": [
+                                {
+                                    "MsgType": "TIMTextElem",
+                                    "MsgContent": {"Text": "incoming"},
+                                }
+                            ],
+                        }
+                    ]
+                else:
+                    rows = [
+                        {
+                            "From_Account": "42",
+                            "To_Account": "9",
+                            "MsgTimeStamp": 10,
+                            "MsgKey": "outgoing",
+                            "MsgBody": [
+                                {
+                                    "MsgType": "TIMTextElem",
+                                    "MsgContent": {"Text": "outgoing"},
+                                }
+                            ],
+                        },
+                        {
+                            "From_Account": "9",
+                            "To_Account": "42",
+                            "MsgTimeStamp": 20,
+                            "MsgKey": "incoming",
+                            "MsgBody": [
+                                {
+                                    "MsgType": "TIMTextElem",
+                                    "MsgContent": {"Text": "incoming"},
+                                }
+                            ],
+                        },
+                    ]
+                return SimpleNamespace(
+                    ok=True,
+                    data={"MsgList": rows, "Complete": 1},
+                )
+
+        payload = bff_server._tim_roaming_message_envelope(Client(), "42", "9")
+
+        self.assertEqual([(call[0], call[1]) for call in calls], [("9", "42"), ("42", "9")])
+        self.assertEqual([item["msg_key"] for item in payload["items"]], ["outgoing", "incoming"])
+        self.assertEqual(payload["count"], 2)
+
+
 class SocialBffRoutingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.old_store = bff_server.STORE
@@ -721,6 +814,7 @@ class SocialBffRoutingTests(unittest.TestCase):
         *,
         false_social: set[str] | None = None,
         im_result: ApiResult | None = None,
+        authorized_peer: bool = True,
     ):
         result = im_result if im_result is not None else ApiResult(True, 200, "[]", data=[])
         false_result = ApiResult(
@@ -790,8 +884,23 @@ class SocialBffRoutingTests(unittest.TestCase):
         web_user = SimpleNamespace(
             app=app,
             profile_cache={},
+            conversation_message_peers={"9"} if authorized_peer else set(),
             native=SimpleNamespace(
                 tim_rest=SimpleNamespace(
+                    recent_contacts=lambda user_id, **_kwargs: calls.append(
+                        ("recent_contacts", user_id)
+                    )
+                    or SimpleNamespace(
+                        ok=True,
+                        data={"SessionItem": [], "CompleteFlag": 1},
+                    ),
+                    roaming_messages=lambda from_id, to_id, **_kwargs: calls.append(
+                        ("roaming", from_id, to_id)
+                    )
+                    or SimpleNamespace(
+                        ok=im_result is None,
+                        data={"MsgList": [], "Complete": 1},
+                    ),
                     query_online=lambda user_ids: calls.append(("presence", user_ids))
                     or SimpleNamespace(
                         ok=True,
@@ -934,11 +1043,14 @@ class SocialBffRoutingTests(unittest.TestCase):
         self.assertEqual(calls, [("seen_by_me", "2")])
 
         calls, response = self._run_get("/api/im/conversations?page=3")
-        self.assertEqual(calls, [("conversations", "3")])
+        self.assertEqual(calls, [("recent_contacts", "42")])
         self.assertEqual(response[1]["entity"], "conversation")
 
         calls, response = self._run_get("/api/im/messages?peer=9")
-        self.assertEqual(calls, [("messages", "9")])
+        self.assertEqual(
+            calls,
+            [("roaming", "9", "42"), ("roaming", "42", "9")],
+        )
         self.assertEqual(response[1]["entity"], "message")
 
         calls, response = self._run_get("/api/im/presence?uids=9,10")
@@ -1026,11 +1138,21 @@ class SocialBffRoutingTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(calls, [("messages", "9")])
+        self.assertEqual(calls, [("roaming", "9", "42"), ("messages", "9")])
         self.assertEqual(response[0], 502)
         self.assertEqual(response[1]["code"], "UPSTREAM_HISTORY_UNAVAILABLE")
         self.assertEqual(response[1]["items"], [])
         self.assertNotIn("DOCTYPE", json.dumps(response[1]))
+
+    def test_message_history_rejects_peer_without_friend_match_or_conversation(self) -> None:
+        calls, response = self._run_get(
+            "/api/im/messages?peer=9",
+            authorized_peer=False,
+        )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(response[0], 403)
+        self.assertEqual(response[1]["code"], "PRIVATE_MESSAGE_PERMISSION_REQUIRED")
 
     def test_presence_prefers_web_ttl_and_skips_blocked_tim_rest(self) -> None:
         backend = SimpleNamespace(
@@ -1798,7 +1920,15 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
     def tearDown(self) -> None:
         bff_server.STORE = self.old_store
 
-    def _run_rest_send(self, *, enabled=False, match_peers=(), conversation_peers=(), authorizer=None):
+    def _run_rest_send(
+        self,
+        *,
+        enabled=False,
+        friend_peers=(),
+        match_peers=(),
+        conversation_peers=(),
+        authorizer=None,
+    ):
         calls = []
         result = SimpleNamespace(
             ok=True,
@@ -1820,6 +1950,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                 )
             ),
             match_pool_online_list_enabled=enabled,
+            friend_message_peers=set(friend_peers),
             match_message_peers=set(match_peers),
             conversation_message_peers=set(conversation_peers),
         )
@@ -1862,6 +1993,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
     def test_match_existing_conversation_and_live_authorizer_are_allowed(self) -> None:
         for kwargs in (
             {"enabled": True},
+            {"friend_peers": {"9"}},
             {"match_peers": {"9"}},
             {"conversation_peers": {"9"}},
             {"authorizer": lambda peer: peer == "9"},
@@ -1952,6 +2084,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
 
         self.assertEqual(harness.response[0], 200)
         self.assertEqual(harness.response[1]["match_peers"], ["10", "9"])
+        self.assertEqual(harness.response[1]["allowed_peers"], ["10", "9"])
         self.assertFalse(
             harness.response[1]["capabilities"]["proactive_private_message"]
         )
@@ -2259,7 +2392,10 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("hasExistingConversation(target)", can_start_private_chat)
         self.assertIn("function rememberMatchMessagePeers(data)", app_js)
         self.assertIn("function rememberMessagePolicyMatchPeers(values)", app_js)
-        self.assertIn("rememberMessagePolicyMatchPeers(data.match_peers)", app_js)
+        self.assertIn(
+            "rememberMessagePolicyMatchPeers(data.allowed_peers || data.match_peers)",
+            app_js,
+        )
         self.assertIn('chatOrigin: "match"', app_js)
         self.assertIn("const chatAllowed = canStartPrivateChat(id)", user_card)
         self.assertIn('aria-disabled="${String(!chatAllowed)}"', user_card)
@@ -2280,6 +2416,7 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("identity.match_pool_online_list_enabled", api_py)
         self.assertIn('if path == "/api/im/message-policy"', bff_server_py)
         self.assertIn('"match_peers": sorted(match_peers)[:5000]', bff_server_py)
+        self.assertIn('"allowed_peers": sorted(match_peers)[:5000]', bff_server_py)
         self.assertIn("app.bootstrap(include_im=False)", bff_server_py)
         self.assertIn("Handler.can_message_peer(self, u, to_uid)", bff_server_py)
         self.assertIn("Handler.can_message_peer(self, u, target_id)", bff_server_py)

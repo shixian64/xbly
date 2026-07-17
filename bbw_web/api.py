@@ -551,10 +551,10 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
     if identity is not None and path == "/api/im/message-policy":
         try:
             message_policy_match_peers = tuple(
-                persistence.message_policy_match_peers(identity)
+                persistence.message_policy_allowed_peers(identity)
             )
         except Exception:
-            LOGGER.exception("message policy match grant lookup failed")
+            LOGGER.exception("message policy allowed peer lookup failed")
 
     match_history_loader: Optional[Callable[[int], dict[str, Any]]] = None
     if identity is not None and path == "/api/match/history":

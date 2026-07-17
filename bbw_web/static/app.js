@@ -1415,7 +1415,7 @@ function refreshMessagePolicy() {
   return api("/api/im/message-policy", { timeout: 6000 })
     .then(({ data }) => {
       applyCapabilities(data.capabilities);
-      rememberMessagePolicyMatchPeers(data.match_peers);
+      rememberMessagePolicyMatchPeers(data.allowed_peers || data.match_peers);
       syncPrivateMessageControls({ refreshChat: false });
       return data.capabilities || {};
     })
@@ -5309,7 +5309,7 @@ function chatPaneHtml() {
   if (!S.activePeer) {
     const startHint = S.proactivePrivateMessageEnabled
       ? "也可以从通讯录、访客或资料页主动发起私信。"
-      : "也可以先完成一次在线或同城匹配。";
+      : "也可以从好友列表打开聊天，或先完成一次在线或同城匹配。";
     const startAction = S.proactivePrivateMessageEnabled
       ? '<button type="button" class="btn primary small" data-action="social-open-tab" data-tab="friends">打开通讯录</button>'
       : '<button type="button" class="btn primary small" data-route="match">开始匹配</button>';
@@ -5334,7 +5334,7 @@ function chatPaneHtml() {
         ? '<div class="chat-readonly-notice">系统客服消息无需回复</div>'
         : canSendPrivateMessage
           ? chatComposerHtml()
-          : '<div class="chat-readonly-notice">该私信入口需要管理员授权；匹配成功后可以继续聊天</div>'
+          : '<div class="chat-readonly-notice">该私信入口需要管理员授权；成为好友或匹配成功后可以继续聊天</div>'
     }`;
 }
 
@@ -7890,6 +7890,10 @@ async function loadSocialTab(tab, signal) {
     ]);
     if (friendResult.status !== "fulfilled") throw friendResult.reason;
     const friends = itemsOf(friendResult.value.data);
+    rememberMessagePolicyMatchPeers(
+      friends.map((item) => item?.user_id || item?.uid || item?.id)
+    );
+    syncPrivateMessageControls({ refreshChat: false });
     applyCount = applyResult.status === "fulfilled" ? Number(applyResult.value.data?.count || 0) : 0;
     applyHasMore = applyResult.status === "fulfilled" && applyResult.value.data?.has_more === true;
     body = `<section class="section contact-surface"><div class="contact-search"><label class="sr-only" for="friend-filter">搜索好友</label><input id="friend-filter" type="search" placeholder="搜索昵称或 UID" autocomplete="off" /></div>${friendListHtml(

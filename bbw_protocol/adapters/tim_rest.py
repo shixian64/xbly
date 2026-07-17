@@ -151,6 +151,71 @@ class TimRestClient:
             {"To_Account": [str(u) for u in user_ids if str(u).strip()]},
         )
 
+    def recent_contacts(
+        self,
+        user_id: str,
+        *,
+        timestamp: int = 0,
+        start_index: int = 0,
+        top_timestamp: int = 0,
+        top_start_index: int = 0,
+        assist_flags: int = 7,
+    ) -> RestResult:
+        """Return the server-owned recent C2C conversation list for one user."""
+
+        account = str(user_id or "").strip()
+        if not account:
+            return RestResult(
+                ok=False,
+                action="recentcontact/get_list",
+                error_code=-2,
+                error_info="missing user account",
+            )
+        return self.call(
+            "recentcontact/get_list",
+            {
+                "From_Account": account,
+                "TimeStamp": max(0, int(timestamp)),
+                "StartIndex": max(0, int(start_index)),
+                "TopTimeStamp": max(0, int(top_timestamp)),
+                "TopStartIndex": max(0, int(top_start_index)),
+                "AssistFlags": max(0, int(assist_flags)),
+            },
+        )
+
+    def roaming_messages(
+        self,
+        from_account: str,
+        to_account: str,
+        *,
+        min_time: int = 0,
+        max_time: int = 0,
+        max_count: int = 100,
+        last_msg_key: str = "",
+    ) -> RestResult:
+        """Read one direction of C2C roaming history through the administrator API."""
+
+        sender = str(from_account or "").strip()
+        recipient = str(to_account or "").strip()
+        if not sender or not recipient or sender == recipient:
+            return RestResult(
+                ok=False,
+                action="openim/admin_getroammsg",
+                error_code=-2,
+                error_info="invalid from/to account",
+            )
+        return self.call(
+            "openim/admin_getroammsg",
+            {
+                "From_Account": sender,
+                "To_Account": recipient,
+                "MaxCnt": max(1, min(int(max_count), 100)),
+                "MinTime": max(0, int(min_time)),
+                "MaxTime": max(0, int(max_time)),
+                "LastMsgKey": str(last_msg_key or "")[:256],
+            },
+        )
+
     def revoke_c2c(self, from_account: str, to_account: str, msg_key: str) -> RestResult:
         """Recall one C2C message previously sent by ``from_account``.
 

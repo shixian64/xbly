@@ -25,10 +25,11 @@ from rq import Queue
 from sqlalchemy import and_, delete, or_, select
 
 from bbw_prod.config import Settings, get_settings
-from bbw_prod.crypto import CredentialCipher, redact_raw_payload
+from bbw_prod.crypto import CredentialCipher
 from bbw_prod.db import session_scope
 from bbw_prod.models import (
     ActivityEvent,
+    Conversation,
     ExternalAccount,
     MediaObject,
     Message,
@@ -54,12 +55,9 @@ from bbw_prod.services import (
     MediaQuotaService,
     NotFoundError,
     QuotaExceeded,
-    RawResponseService,
     RetentionService,
 )
-from bbw_protocol.app import BeibeiwuApp
-from bbw_protocol.client import ApiResult
-from bbw_protocol.session import Session as ProtocolSession
+from bbw_protocol.adapters.tim_rest import TimRestClient
 from bbw_web.media_archive import MediaArchiveError, PreparedMedia, download_and_prepare
 from bbw_web.match_history import MATCH_HISTORY_PROVIDER, MATCH_HISTORY_RETENTION_DAYS
 from bbw_web.normalize import normalize_conversations, normalize_messages
@@ -1257,118 +1255,6 @@ def schedule_due_syncs() -> dict[str, Any]:
     }
 
 
-def _decrypt_account_credentials(
-    cipher: CredentialCipher, account: ExternalAccount
-) -> tuple[str, str, str]:
-    context = lambda field: f"external-account:{account.id}:{field}"  # noqa: E731
-    login = cipher.decrypt_text(
-        account.login_account_encrypted,
-        purpose="external-account.login",
-        context=context("login"),
-    )
-    password = (
-        cipher.decrypt_text(
-            account.password_encrypted,
-            purpose="external-account.password",
-            context=context("password"),
-        )
-        if account.password_encrypted
-        else ""
-    )
-    token = (
-        cipher.decrypt_text(
-            account.token_encrypted,
-            purpose="external-account.token",
-            context=context("token"),
-        )
-        if account.token_encrypted
-        else "0"
-    )
-    return login, password, token
-
-
-def _protocol_session(account: ExternalAccount, user: User, *, login: str, token: str) -> ProtocolSession:
-    device = dict(account.device_data or {})
-    profile = dict(user.profile or {})
-    session = ProtocolSession(
-        uid=str(account.upstream_uid or "0"),
-        token=token or "0",
-        phone=login,
-        password="",
-        nickname=str(user.display_name or profile.get("nickname") or ""),
-        user_role=str(device.get("user_role") or profile.get("user_role") or ""),
-        rp_verify_time=str(device.get("rp_verify_time") or profile.get("rp_verify_time") or "0"),
-        vip=str(device.get("vip") or profile.get("vip") or "0"),
-        svip=str(device.get("svip") or profile.get("svip") or "0"),
-        portrait=str(device.get("portrait") or profile.get("portrait") or ""),
-        user_sign="",
-        login_id="",
-        raw_user=profile,
-    )
-    session.apply_device(device)
-    return session
-
-
-def _safe_raw_result(result: ApiResult) -> Any:
-    raw = str(result.raw or "")
-    if len(raw.encode("utf-8", errors="ignore")) > 1024 * 1024:
-        raw = raw[:1024 * 1024]
-    try:
-        return json.loads(raw)
-    except Exception:
-        return raw
-
-
-def _capture_worker_response(
-    *, owner_user_id: uuid.UUID, settings: Settings, cipher: CredentialCipher, meta: Mapping[str, Any], result: ApiResult
-) -> None:
-    with session_scope() as db:
-        RawResponseService(db, settings, cipher).store(
-            owner_user_id=owner_user_id,
-            endpoint=_bounded(meta.get("url"), 512),
-            payload={
-                "request": _json_safe(redact_raw_payload(meta)),
-                "response": _safe_raw_result(result),
-                "code": result.code,
-                "message": result.message,
-                "kind": result.kind,
-            },
-            http_status=int(result.status or 0),
-        )
-
-
-def _persist_refreshed_protocol_session(
-    *, owner_user_id: uuid.UUID, external_account_id: uuid.UUID, cipher: CredentialCipher, session: ProtocolSession
-) -> None:
-    if not session.logged_in:
-        return
-    with session_scope() as db:
-        account = ExternalAccountRepository(db).get_for_user(owner_user_id, for_update=True)
-        if account is None or account.id != external_account_id:
-            raise NotFoundError("user/account binding was not found")
-        context = f"external-account:{account.id}:token"
-        account.token_encrypted = cipher.encrypt_text(
-            str(session.token), purpose="external-account.token", context=context
-        )
-        account.upstream_uid = str(session.uid)
-        account.device_data = {
-            **dict(account.device_data or {}),
-            **session.device_dict(),
-            "user_role": session.user_role,
-            "rp_verify_time": session.rp_verify_time,
-            "vip": session.vip,
-            "svip": session.svip,
-            "portrait": session.portrait,
-        }
-        account.last_authenticated_at = utcnow()
-
-
-def _result_usable(result: ApiResult, items: Sequence[Mapping[str, Any]]) -> bool:
-    return bool(items) or bool(result.ok) or (
-        200 <= int(result.status or 0) < 300 and result.kind in {"json_info", "json_other"}
-    )
-
-
 def _save_sync_result(
     *,
     owner_user_id: uuid.UUID,
@@ -1411,8 +1297,202 @@ def _save_sync_result(
             account.last_sync_at = now
 
 
+def _tim_recent_conversations(
+    client: TimRestClient,
+    account_uid: str,
+    *,
+    max_pages: int,
+    max_conversations: int = 500,
+) -> list[dict[str, Any]]:
+    timestamp = 0
+    start_index = 0
+    top_timestamp = 0
+    top_start_index = 0
+    conversations: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    previous_cursor: tuple[int, int, int, int] | None = None
+    for _page in range(max(1, min(int(max_pages), 10))):
+        result = client.recent_contacts(
+            account_uid,
+            timestamp=timestamp,
+            start_index=start_index,
+            top_timestamp=top_timestamp,
+            top_start_index=top_start_index,
+        )
+        if not result.ok:
+            raise RuntimeError(
+                f"TIM recent contacts failed: {result.error_code or result.error_info}"
+            )
+        data = result.data if isinstance(result.data, Mapping) else {}
+        items = data.get("SessionItem")
+        if not isinstance(items, list):
+            items = []
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            session_type = str(item.get("Type") or "").strip().lower()
+            if session_type not in {"1", "c2c"}:
+                continue
+            peer = _bounded(item.get("To_Account"), 128)
+            if not peer or peer == account_uid or peer in seen:
+                continue
+            seen.add(peer)
+            conversations.append(
+                {
+                    "id": _canonical_conversation_id(peer),
+                    "peer_id": peer,
+                    "conversation_user": peer,
+                    "timestamp": item.get("MsgTime"),
+                    "unread_count": _as_int(item.get("UnreadMsgNum"), 0),
+                    "source": "tim_rest",
+                }
+            )
+            if len(conversations) >= max(1, min(int(max_conversations), 500)):
+                return conversations
+        if _as_int(data.get("CompleteFlag"), 0) == 1:
+            break
+        cursor = (
+            _as_int(data.get("TimeStamp"), timestamp, minimum=0),
+            _as_int(data.get("StartIndex"), start_index, minimum=0),
+            _as_int(data.get("TopTimeStamp"), top_timestamp, minimum=0),
+            _as_int(data.get("TopStartIndex"), top_start_index, minimum=0),
+        )
+        if cursor == previous_cursor or not items:
+            break
+        previous_cursor = cursor
+        timestamp, start_index, top_timestamp, top_start_index = cursor
+    return sorted(
+        conversations,
+        key=lambda item: _as_int(
+            item.get("timestamp"),
+            0,
+            minimum=0,
+            maximum=10**18,
+        ),
+        reverse=True,
+    )
+
+
+def _durable_message_conversations(
+    db: Any,
+    *,
+    owner_user_id: uuid.UUID,
+    account_uid: str,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    rows: list[tuple[Any, Any]] = []
+    rows.extend(
+        db.execute(
+            select(Conversation.peer_upstream_uid, Conversation.last_message_at)
+            .where(
+                Conversation.owner_user_id == owner_user_id,
+                Conversation.kind == "direct",
+                Conversation.peer_upstream_uid.is_not(None),
+            )
+            .order_by(Conversation.last_message_at.desc().nullslast(), Conversation.updated_at.desc())
+            .limit(max(1, min(int(limit), 500)))
+        )
+    )
+    rows.extend(
+        db.execute(
+            select(Relationship.subject_upstream_uid, Relationship.updated_at)
+            .where(
+                Relationship.owner_user_id == owner_user_id,
+                Relationship.status == "active",
+                Relationship.ended_at.is_(None),
+                or_(
+                    and_(
+                        Relationship.provider == SYNC_SOURCE,
+                        Relationship.kind == "friend",
+                    ),
+                    and_(
+                        Relationship.provider == "web-policy",
+                        Relationship.kind.in_(("match", "message_peer")),
+                    ),
+                ),
+            )
+            .order_by(Relationship.updated_at.desc())
+            .limit(max(1, min(int(limit), 500)))
+        )
+    )
+    conversations: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for peer_value, observed_at in rows:
+        peer = _bounded(peer_value, 128)
+        if not peer or peer == account_uid or peer in seen:
+            continue
+        seen.add(peer)
+        conversations.append(
+            {
+                "id": _canonical_conversation_id(peer),
+                "peer_id": peer,
+                "conversation_user": peer,
+                "timestamp": observed_at,
+                "unread_count": 0,
+                "source": "durable",
+            }
+        )
+        if len(conversations) >= max(1, min(int(limit), 500)):
+            break
+    return conversations
+
+
+def _tim_roaming_history(
+    client: TimRestClient,
+    *,
+    account_uid: str,
+    peer_uid: str,
+    min_time: int,
+    max_time: int,
+    max_messages: int,
+) -> tuple[list[dict[str, Any]], int]:
+    raw_items: list[dict[str, Any]] = []
+    request_count = 0
+    page_limit = max(1, (max(1, int(max_messages)) + 99) // 100)
+    for sender, recipient in ((peer_uid, account_uid), (account_uid, peer_uid)):
+        last_msg_key = ""
+        for _page in range(page_limit):
+            result = client.roaming_messages(
+                sender,
+                recipient,
+                min_time=min_time,
+                max_time=max_time,
+                max_count=min(100, max(1, int(max_messages))),
+                last_msg_key=last_msg_key,
+            )
+            request_count += 1
+            if not result.ok:
+                raise RuntimeError(
+                    f"TIM roaming history failed: {result.error_code or result.error_info}"
+                )
+            data = result.data if isinstance(result.data, Mapping) else {}
+            items = data.get("MsgList")
+            if not isinstance(items, list):
+                items = []
+            raw_items.extend(dict(item) for item in items if isinstance(item, Mapping))
+            next_key = _bounded(data.get("LastMsgKey"), 256)
+            if _as_int(data.get("Complete"), 0) == 1 or not items or not next_key:
+                break
+            if next_key == last_msg_key:
+                break
+            last_msg_key = next_key
+
+    normalized = normalize_messages(raw_items)
+    by_identity: dict[str, dict[str, Any]] = {}
+    for item in normalized:
+        identity = _bounded(item.get("msg_key") or item.get("id"), 512)
+        if not identity:
+            identity = _stable_json_digest(item)
+        by_identity[identity] = item
+    ordered = sorted(
+        by_identity.values(),
+        key=lambda item: _parse_time(item.get("timestamp") or item.get("time")),
+    )
+    return ordered[-max(1, int(max_messages)) :], request_count
+
+
 def sync_account_history(owner_user_id: str, external_account_id: str) -> dict[str, Any]:
-    """Reconcile recent server-side conversations/messages for one account."""
+    """Reconcile C2C conversations/messages through server-owned TIM REST APIs."""
 
     owner_id = _uuid(owner_user_id, field="owner_user_id")
     account_id = _uuid(external_account_id, field="external_account_id")
@@ -1421,17 +1501,42 @@ def sync_account_history(owner_user_id: str, external_account_id: str) -> dict[s
     inactive_seconds = _setting_seconds(
         settings, "inactive_sync_seconds", "BBW_INACTIVE_SYNC_SECONDS", 3600
     )
-    max_pages = max(1, min(10, _as_int(os.getenv("BBW_SYNC_MAX_PAGES"), 5, minimum=1, maximum=10)))
+    max_pages = max(
+        1,
+        min(10, _as_int(os.getenv("BBW_SYNC_MAX_PAGES"), 5, minimum=1, maximum=10)),
+    )
     max_conversations = max(
-        1, min(100, _as_int(os.getenv("BBW_SYNC_MAX_CONVERSATIONS"), 20, minimum=1, maximum=100))
+        1,
+        min(
+            100,
+            _as_int(
+                os.getenv("BBW_SYNC_MAX_CONVERSATIONS"),
+                20,
+                minimum=1,
+                maximum=100,
+            ),
+        ),
     )
     max_messages = max(
-        1, min(2000, _as_int(os.getenv("BBW_SYNC_MAX_MESSAGES_PER_PEER"), 500, minimum=1, maximum=2000))
+        1,
+        min(
+            2000,
+            _as_int(
+                os.getenv("BBW_SYNC_MAX_MESSAGES_PER_PEER"),
+                500,
+                minimum=1,
+                maximum=2000,
+            ),
+        ),
     )
+    now = utcnow()
     with session_scope() as db:
-        user, account = _load_owner_binding(db, owner_id, account_id)
+        _user, account = _load_owner_binding(db, owner_id, account_id)
         if not account.sync_enabled:
             return {"ok": True, "ignored": True, "reason": "account synchronization is disabled"}
+        account_uid = _bounded(account.upstream_uid, 128)
+        if not account_uid:
+            raise RuntimeError("upstream account UID is missing")
         cursor_row = SyncCursorRepository(db).get(owner_id, SYNC_SOURCE, SYNC_STREAM)
         try:
             previous_cursor = json.loads(cursor_row.cursor) if cursor_row and cursor_row.cursor else {}
@@ -1443,94 +1548,81 @@ def sync_account_history(owner_user_id: str, external_account_id: str) -> dict[s
             minimum=0,
             maximum=1_000_000,
         )
+        stored_peer_watermarks = (
+            previous_cursor.get("peer_watermarks")
+            if isinstance(previous_cursor, Mapping)
+            and isinstance(previous_cursor.get("peer_watermarks"), Mapping)
+            else {}
+        )
+        peer_watermarks = {
+            _bounded(peer, 128): _as_int(value, 0, minimum=0)
+            for peer, value in dict(stored_peer_watermarks).items()
+            if _bounded(peer, 128)
+        }
         previous_watermark = (
             _as_utc(cursor_row.watermark_at)
             if cursor_row and cursor_row.watermark_at
             else None
         )
         owner_is_active = owner_id in _active_owner_ids(
-            db, now=utcnow(), active_seconds=active_seconds
+            db, now=now, active_seconds=active_seconds
         )
-        detached_user = user
-        detached_account = account
-
-    cipher = CredentialCipher.from_settings(settings)
-    login, password, token = _decrypt_account_credentials(cipher, detached_account)
-
-    app = BeibeiwuApp(_protocol_session(detached_account, detached_user, login=login, token=token))
-    app.client.response_hook = lambda meta, result: _capture_worker_response(
-        owner_user_id=owner_id, settings=settings, cipher=cipher, meta=meta, result=result
-    )
-
-    def reauthenticate() -> bool:
-        if not password:
-            return False
-        # A login request itself must not recursively trigger the generic
-        # expired-session callback when the upstream rejects credentials.
-        callback = app.client.reauth_callback
-        app.client.reauth_callback = None
-        try:
-            result = app.auth.login_password(login, password)
-        finally:
-            app.client.reauth_callback = callback
-        app.session.password = ""
-        if not result.ok or not app.session.logged_in:
-            return False
-        _persist_refreshed_protocol_session(
+        durable_conversations = _durable_message_conversations(
+            db,
             owner_user_id=owner_id,
-            external_account_id=account_id,
-            cipher=cipher,
-            session=app.session,
+            account_uid=account_uid,
         )
-        return True
 
-    app.client.reauth_callback = reauthenticate
     watermark: datetime | None = previous_watermark
+    client = TimRestClient()
     try:
-        if not app.session.logged_in and not reauthenticate():
-            raise RuntimeError("upstream authentication failed")
+        contact_fallback = False
+        try:
+            recent_conversations = _tim_recent_conversations(
+                client,
+                account_uid,
+                max_pages=max_pages,
+            )
+        except Exception:
+            recent_conversations = []
+            contact_fallback = True
 
         conversations: list[dict[str, Any]] = []
         seen_peers: set[str] = set()
-        for page in range(1, max_pages + 1):
-            result = app.im.history_conversations(str(page))
-            page_items = normalize_conversations(result.data)
-            if not _result_usable(result, page_items):
-                raise RuntimeError(
-                    f"conversation history failed: {result.code or result.message or result.status}"
-                )
-            new_items = []
-            for item in page_items:
-                peer = _bounded(item.get("peer_id") or item.get("conversation_user"), 128)
-                if not peer or peer in seen_peers:
-                    continue
-                seen_peers.add(peer)
-                new_items.append(item)
-                if len(conversations) + len(new_items) >= 500:
-                    break
-            conversations.extend(new_items)
-            if not page_items or not new_items or len(conversations) >= 500:
+        for item in recent_conversations + durable_conversations:
+            peer = _bounded(item.get("peer_id") or item.get("conversation_user"), 128)
+            if not peer or peer == account_uid or peer in seen_peers:
+                continue
+            seen_peers.add(peer)
+            conversations.append(item)
+            if len(conversations) >= 500:
                 break
+        if not conversations and contact_fallback:
+            raise RuntimeError("TIM recent contacts failed and no durable peers are available")
 
         if conversations:
             start = peer_offset % len(conversations)
             rotated = conversations[start:] + conversations[:start]
-            changed: list[dict[str, Any]] = []
             if previous_watermark is None:
                 changed = list(conversations)
             else:
                 changed_cutoff = previous_watermark - timedelta(minutes=5)
+                changed = []
                 for item in conversations:
                     stamp = _optional_time(item.get("timestamp") or item.get("time"))
-                    unread = _as_int(item.get("unread_count"), 0)
-                    if unread > 0 or (stamp is not None and stamp >= changed_cutoff):
+                    if _as_int(item.get("unread_count"), 0) > 0 or (
+                        stamp is not None and stamp >= changed_cutoff
+                    ):
                         changed.append(item)
             selected_conversations = changed[:max_conversations]
             selected_peers = {
                 _bounded(item.get("peer_id") or item.get("conversation_user"), 128)
                 for item in selected_conversations
             }
-            fallback_target = min(max_conversations, 5 if owner_is_active else max_conversations)
+            fallback_target = min(
+                max(0, max_conversations - len(selected_conversations)),
+                5 if owner_is_active else max_conversations,
+            )
             fallback_added = 0
             for item in rotated:
                 if len(selected_conversations) >= max_conversations or fallback_added >= fallback_target:
@@ -1551,33 +1643,45 @@ def sync_account_history(owner_user_id: str, external_account_id: str) -> dict[s
             str(owner_id),
             str(account_id),
             "/api/im/conversations",
-            {"page": "sync"},
+            {"page": "tim-rest"},
             {"ok": True, "items": conversations},
         )
         messages_created = 0
         messages_existing = 0
+        roaming_requests = 0
         peer_errors: list[str] = []
-        for conversation in selected_conversations:
+        now_epoch = int(now.timestamp())
+        retention_floor = now_epoch - max(1, int(settings.message_retention_days)) * 86400
+        for index, conversation in enumerate(selected_conversations, 1):
             peer = _bounded(
                 conversation.get("peer_id") or conversation.get("conversation_user"), 128
             )
             if not peer:
                 continue
-            result = app.im.history_messages(peer)
-            items = normalize_messages(result.data)
-            if not _result_usable(result, items):
-                peer_errors.append(f"{peer}:{result.code or result.message or result.status}")
+            previous_peer_time = _as_int(peer_watermarks.get(peer), 0, minimum=0)
+            min_time = max(retention_floor, previous_peer_time - 300) if previous_peer_time else retention_floor
+            try:
+                items, request_count = _tim_roaming_history(
+                    client,
+                    account_uid=account_uid,
+                    peer_uid=peer,
+                    min_time=min_time,
+                    max_time=now_epoch + 60,
+                    max_messages=max_messages,
+                )
+                roaming_requests += request_count
+            except Exception as exc:
+                peer_errors.append(f"peer-{index}:{str(exc)[:300]}")
                 continue
-            if len(items) > max_messages:
-                items = sorted(
-                    items,
-                    key=lambda item: _parse_time(item.get("timestamp") or item.get("time")),
-                    reverse=True,
-                )[:max_messages]
+
+            peer_watermark = previous_peer_time
             for item in items:
                 stamp = _optional_time(item.get("timestamp") or item.get("time"))
-                if stamp and (watermark is None or stamp > watermark):
-                    watermark = stamp
+                if stamp:
+                    peer_watermark = max(peer_watermark, int(stamp.timestamp()))
+                    if watermark is None or stamp > watermark:
+                        watermark = stamp
+            peer_watermarks[peer] = max(peer_watermark, now_epoch if not items else 0)
             result_summary = ingest_history_response(
                 str(owner_id),
                 str(account_id),
@@ -1589,21 +1693,28 @@ def sync_account_history(owner_user_id: str, external_account_id: str) -> dict[s
             messages_existing += int(result_summary.get("messages_existing") or 0)
 
         if selected_conversations and len(peer_errors) >= len(selected_conversations):
-            raise RuntimeError("message history reconciliation failed for every conversation")
+            raise RuntimeError("TIM roaming reconciliation failed for every selected conversation")
+
+        peer_watermarks = dict(
+            sorted(peer_watermarks.items(), key=lambda item: item[1], reverse=True)[:500]
+        )
         summary = {
             "conversations": int(conversation_result.get("conversations") or 0),
             "messages_created": messages_created,
             "messages_existing": messages_existing,
             "peer_errors": len(peer_errors),
             "next_peer_offset": next_peer_offset,
+            "roaming_requests": roaming_requests,
+            "contact_fallback": contact_fallback,
         }
+        cursor_state = {**summary, "peer_watermarks": peer_watermarks}
         _save_sync_result(
             owner_user_id=owner_id,
             external_account_id=account_id,
             active_seconds=active_seconds,
             inactive_seconds=inactive_seconds,
             succeeded=True,
-            summary=summary,
+            summary=cursor_state,
             watermark_at=watermark,
             error="; ".join(peer_errors[:10]) or None,
         )
@@ -1619,9 +1730,6 @@ def sync_account_history(owner_user_id: str, external_account_id: str) -> dict[s
             error=str(exc),
         )
         raise
-    finally:
-        app.session.password = ""
-        password = ""
 
 
 def _media_hosts(settings: Settings) -> tuple[str, ...]:

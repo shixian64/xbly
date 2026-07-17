@@ -180,8 +180,11 @@ class ProductionContractTests(unittest.TestCase):
             'MESSAGE_POLICY_PROVIDER = "web-policy"',
             'MESSAGE_POLICY_MATCH_KIND = "match"',
             'MESSAGE_POLICY_CONVERSATION_KIND = "message_peer"',
+            'SOCIAL_RELATIONSHIP_PROVIDER = "beibeiwu"',
+            'SOCIAL_FRIEND_KIND = "friend"',
             "def grant_message_peers(",
             "def can_message_peer(",
+            "def message_policy_allowed_peers(",
             "def message_policy_match_peers(",
             "def remember_message_policy_response(",
             '"/api/match/online"',
@@ -198,6 +201,7 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn("Conversation.peer_upstream_uid == peer_upstream_uid", repositories)
         self.assertIn('Conversation.kind == kind', repositories)
         self.assertIn("persistence.can_message_peer(", api)
+        self.assertIn("persistence.message_policy_allowed_peers(identity)", api)
         self.assertIn("MATCH_DM_GRANT_PERSISTENCE_FAILED", api)
         self.assertIn("persistence.remember_message_policy_response(", api)
 
@@ -234,6 +238,78 @@ class ProductionContractTests(unittest.TestCase):
                 with patch("bbw_web.persistence.session_scope", fake_session_scope):
                     self.assertIs(runtime.can_message_peer(identity, "9"), expected)
                 self.assertEqual(len(db.statements), 2)
+
+    def test_active_friend_relationship_authorizes_private_message_peer(self) -> None:
+        try:
+            from bbw_web.persistence import RuntimePersistence, UserIdentity
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        class FakeDb:
+            def __init__(self) -> None:
+                self.statements: list[object] = []
+
+            def scalar(self, statement: object) -> object:
+                self.statements.append(statement)
+                return object()
+
+        runtime = RuntimePersistence.__new__(RuntimePersistence)
+        identity = UserIdentity(
+            user_id=uuid.uuid4(),
+            external_account_id=uuid.uuid4(),
+            upstream_uid="42",
+        )
+        db = FakeDb()
+
+        @contextmanager
+        def fake_session_scope():
+            yield db
+
+        with patch("bbw_web.persistence.session_scope", fake_session_scope):
+            self.assertTrue(runtime.can_message_peer(identity, "9"))
+
+        self.assertEqual(len(db.statements), 1)
+        statement = str(db.statements[0])
+        self.assertIn("relationships.provider", statement)
+        self.assertIn("relationships.kind", statement)
+        params = {str(value) for value in db.statements[0].compile().params.values()}
+        self.assertIn("beibeiwu", params)
+        self.assertIn("friend", params)
+
+    def test_message_policy_allowed_peers_restores_friend_and_match_grants(self) -> None:
+        try:
+            from bbw_web.persistence import RuntimePersistence, UserIdentity
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        class FakeDb:
+            def __init__(self) -> None:
+                self.statement = None
+
+            def scalars(self, statement: object) -> list[str]:
+                self.statement = statement
+                return ["9", "10", "9", "42", ""]
+
+        runtime = RuntimePersistence.__new__(RuntimePersistence)
+        identity = UserIdentity(
+            user_id=uuid.uuid4(),
+            external_account_id=uuid.uuid4(),
+            upstream_uid="42",
+        )
+        db = FakeDb()
+
+        @contextmanager
+        def fake_session_scope():
+            yield db
+
+        with patch("bbw_web.persistence.session_scope", fake_session_scope):
+            peers = runtime.message_policy_allowed_peers(identity)
+
+        self.assertEqual(peers, ["9", "10"])
+        params = {str(value) for value in db.statement.compile().params.values()}
+        self.assertIn("beibeiwu", params)
+        self.assertIn("friend", params)
+        self.assertIn("web-policy", params)
 
     def test_archived_messages_are_returned_for_the_authenticated_owner(self) -> None:
         from datetime import UTC, datetime
