@@ -2181,6 +2181,37 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("imComposerDrafts: new Map()", app_js)
         self.assertIn("restoreChatComposerDraft(uid)", app_js)
 
+    def test_text_message_send_is_optimistic_without_button_spinner(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        send_text = app_js.split("async function sendTextMessage", 1)[1].split(
+            "function progressRatio", 1
+        )[0]
+        send_form = app_js.split('if (kind === "im-send")', 1)[1].split(
+            'if (kind === "lab-call")', 1
+        )[0]
+        submit_listener = app_js.split('document.addEventListener("submit"', 1)[1].split(
+            'document.addEventListener("keydown"', 1
+        )[0]
+
+        self.assertIn('delivery: "sending"', send_text)
+        self.assertIn("appendLocalMessage(pending)", send_text)
+        self.assertLess(
+            send_text.index("appendLocalMessage(pending)"),
+            send_text.index("await S.chat.sendMessage(message)"),
+        )
+        self.assertIn("updateLocalMessage(pendingID, replacement)", send_text)
+        self.assertIn('delivery: "failed"', send_text)
+        self.assertIn("consumeSubmittedChatDraft", send_form)
+        self.assertIn('if (form.dataset.form === "im-send")', submit_listener)
+        self.assertIn("handleProductForm(form, submitter).catch", submit_listener)
+        optimistic_branch = submit_listener.split('if (form.dataset.form === "im-send")', 1)[
+            1
+        ].split("return;", 1)[0]
+        self.assertNotIn("withPending", optimistic_branch)
+        self.assertIn('entry.delivery === "sending" && entry.kind !== "text"', app_js)
+        self.assertIn('if (entry.kind === "text") return Boolean', app_js)
+
     def test_conversation_list_defaults_expanded_and_supports_horizontal_collapse(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")

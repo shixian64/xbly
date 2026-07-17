@@ -852,6 +852,11 @@ async function withPending(button, task) {
   }
 }
 
+function reportAsyncError(error, timeout = 3600) {
+  if (!error || error.name === "AbortError" || error instanceof AuthExpiredError) return;
+  toast(error.message || String(error), "error", timeout);
+}
+
 function withLoginPending(button, task) {
   const form = $("login-form");
   if (!form || form.dataset.pending === "true") return Promise.resolve();
@@ -4079,6 +4084,7 @@ function chatMessageState(entry) {
 
 function canRetryFailedChatMessage(entry) {
   if (!entry || entry.type !== "mine" || entry.delivery !== "failed" || entry.revoked) return false;
+  if (entry.kind === "text") return Boolean(String(entry.text || "").trim());
   if (entry.kind === "face") return Boolean(entry.payload?.data);
   return Boolean(
     ["image", "audio", "video", "file", "flash"].includes(entry.kind) &&
@@ -4213,7 +4219,7 @@ function chatLogHtml() {
         canRetry
           ? `<button type="button" class="chat-message-action retry" data-action="retry-chat-message" data-message-id="${esc(
               entry.id
-            )}" aria-label="重试发送" title="重新发送这条媒体消息">重试</button>`
+            )}" aria-label="重试发送" title="重新发送这条消息">重试</button>`
           : ""
       }${
         revokeAction
@@ -4227,7 +4233,7 @@ function chatLogHtml() {
       return `<div class="chat-message-row${mineClass}"><div class="chat-message-main${mineClass}">${stateIndicator}<div class="chat-line${mineClass}${
         entry.revoked ? ` is-revoked${canEditRevoked ? " can-edit" : ""}` : ""
       } chat-kind-${esc(entry.kind || "text")}" data-message-id="${esc(entry.id)}">${chatMessageBodyHtml(entry)}${
-        entry.delivery === "sending"
+        entry.delivery === "sending" && entry.kind !== "text"
           ? `<progress class="chat-upload-track" max="100" value="${Math.min(
               100,
               Math.max(2, Math.round(Number(entry.progress || 0) * 100))
@@ -4887,6 +4893,34 @@ function setChatComposerDraft(value) {
   return next;
 }
 
+function consumeSubmittedChatDraft(peer, submittedDraft, submittedDraftRevision, submittedPeerDraftRevision) {
+  const input = $("im-text");
+  const draftUnchanged =
+    String(S.activePeer || "") === peer &&
+    S.imComposerDraftRevision === submittedDraftRevision &&
+    String(input?.value ?? S.imComposerDraft) === submittedDraft;
+  const storedPeerDraftUnchanged =
+    Number(S.imComposerDraftRevisions.get(peer) || 0) === submittedPeerDraftRevision &&
+    String(S.imComposerDrafts.get(peer) || "") === submittedDraft;
+  const visiblePeerDraftUnchanged =
+    storedPeerDraftUnchanged &&
+    String(S.activePeer || "") === peer &&
+    String(input?.value ?? S.imComposerDraft) === submittedDraft;
+  const clearVisibleDraft = draftUnchanged || visiblePeerDraftUnchanged;
+  if (clearVisibleDraft) {
+    setChatComposerDraft("");
+  } else if (storedPeerDraftUnchanged) {
+    S.imComposerDrafts.delete(peer);
+    S.imComposerDraftRevisions.set(peer, submittedPeerDraftRevision + 1);
+  }
+  if (input && clearVisibleDraft) {
+    input.value = "";
+    syncChatComposerInput(input);
+    input.focus({ preventScroll: true });
+  }
+  return clearVisibleDraft;
+}
+
 function restoreChatComposerDraft(peer) {
   const target = String(peer || "");
   const next = target ? String(S.imComposerDrafts.get(target) || "") : "";
@@ -5094,6 +5128,13 @@ function findChatMessage(id, peer = S.activePeer) {
 async function retryFailedChatMessage(id) {
   const entry = findChatMessage(id);
   if (!canRetryFailedChatMessage(entry)) throw new Error("这条消息没有可用的重试数据");
+  if (entry.kind === "text") {
+    const conversation = S.conversations.find((item) => conversationPeer(item) === entry.peer) || {};
+    return sendTextMessage(entry.peer, entry.text, {
+      retryMessageId: entry.id,
+      peerName: conversation.nickname || conversation.peer_name || conversation.user?.nickname || `用户 ${entry.peer}`,
+    });
+  }
   if (entry.kind === "flash") {
     return sendFlashPhoto(entry.retryFile, { retryMessageId: entry.id });
   }
@@ -5190,6 +5231,127 @@ function editRevokedMessage(id) {
 function localMessageID(prefix = "message") {
   if (window.crypto?.randomUUID) return `local-${prefix}-${window.crypto.randomUUID()}`;
   return `local-${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "" } = {}) {
+  const target = String(peer || "").trim();
+  const content = String(text || "").trim();
+  const previous = retryMessageId ? findChatMessage(retryMessageId, target) : null;
+  const pendingID = previous?.id || localMessageID("text");
+  const pending = {
+    ...(previous || {}),
+    id: pendingID,
+    msgKey: "",
+    text: content,
+    kind: "text",
+    objectName: "TIMTextElem",
+    payload: { text: content },
+    media: {},
+    type: "mine",
+    peer: target,
+    timestamp: previous?.timestamp || Date.now(),
+    source: "local",
+    rawMessage: null,
+    peerRead: false,
+    delivery: "sending",
+    progress: 0,
+    retryError: "",
+    preview: content,
+  };
+  if (previous) updateLocalMessage(pendingID, pending);
+  else appendLocalMessage(pending);
+  updateConversationActivity(target, {
+    name: peerName || S.activePeerName || `用户 ${target}`,
+    lastMessage: content,
+    unreadCount: 0,
+  });
+  refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
+
+  try {
+    let sentEntry;
+    if (S.imConnected && S.imMode === "sdk" && S.chat && resolveTimApi()) {
+      const TIM = resolveTimApi();
+      const message = S.chat.createTextMessage({
+        to: target,
+        conversationType: TIM.TYPES.CONV_C2C,
+        payload: { text: content },
+      });
+      const result = await S.chat.sendMessage(message);
+      const sentMessage = result?.data?.message || result?.message || message;
+      sentEntry = timMessageEntry(sentMessage, target);
+      sentEntry.text = content;
+      sentEntry.type = "mine";
+      sentEntry.peerRead = timPeerReadState(sentMessage) ?? false;
+      sentEntry.delivery = "sent";
+    } else if (S.imMode === "rest" || !S.imConnected) {
+      const wasDisconnected = !S.imConnected;
+      const { data } = await api("/api/im/rest/send", {
+        method: "POST",
+        body: JSON.stringify({ to: target, text: content }),
+        timeout: 15000,
+      });
+      if (!data.ok) {
+        const info = errorInfo(data, wasDisconnected ? "发送失败" : "文本备用通道发送失败");
+        throw new Error([info.title, info.detail || data.error_info].filter(Boolean).join(" · "));
+      }
+      if (wasDisconnected) {
+        S.imConnected = true;
+        S.imMode = "rest";
+        S.imLastError = "";
+        S.messageLastPeerSyncAt = 0;
+        updateImConnectionStatus();
+        toast("已通过文本备用通道发送");
+      }
+      sentEntry = {
+        id: String(data.message_id || data.msg_uid || ""),
+        msgKey: String(data.msg_key || data.message_id || data.msg_uid || ""),
+        text: content,
+        type: "mine",
+        peer: target,
+        timestamp: Date.now(),
+        source: "rest",
+        peerRead: false,
+        delivery: "sent",
+      };
+    } else {
+      throw new Error("消息通道尚未连接");
+    }
+
+    const replacement = {
+      ...pending,
+      ...(sentEntry || {}),
+      id: sentEntry?.id || pendingID,
+      text: content,
+      kind: "text",
+      objectName: "TIMTextElem",
+      payload: { text: content },
+      media: {},
+      type: "mine",
+      peer: target,
+      peerRead: sentEntry?.peerRead ?? false,
+      delivery: "sent",
+      progress: 1,
+      retryError: "",
+      preview: content,
+    };
+    updateLocalMessage(pendingID, replacement);
+    updateConversationActivity(target, {
+      name: peerName || S.activePeerName || `用户 ${target}`,
+      lastMessage: content,
+      unreadCount: 0,
+    });
+    refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
+    archiveMessageBestEffort(replacement, "outgoing");
+    return replacement;
+  } catch (error) {
+    updateLocalMessage(pendingID, {
+      ...pending,
+      delivery: "failed",
+      progress: 0,
+      retryError: String(error?.message || error || "消息发送失败"),
+    });
+    throw error;
+  }
 }
 
 function progressRatio(event) {
@@ -9205,110 +9367,9 @@ async function handleProductForm(form, submitter) {
       `用户 ${peer}`;
     if (!canStartPrivateChat(peer)) throw new Error("该私信入口仅向管理员授权的用户开放");
 
-    let sentEntry = null;
-    if (S.imConnected && S.imMode === "sdk" && S.chat && resolveTimApi()) {
-      const TIM = resolveTimApi();
-      const message = S.chat.createTextMessage({
-        to: peer,
-        conversationType: TIM.TYPES.CONV_C2C,
-        payload: { text },
-      });
-      const result = await S.chat.sendMessage(message);
-      const sentMessage = result?.data?.message || result?.message || message;
-      sentEntry = timMessageEntry(sentMessage, peer);
-      sentEntry.text = text;
-      sentEntry.type = "mine";
-      sentEntry.peerRead = timPeerReadState(sentMessage) ?? false;
-      sentEntry.delivery = "sent";
-    } else if (S.imConnected && S.imMode === "rest") {
-      const { data } = await api("/api/im/rest/send", {
-        method: "POST",
-        body: JSON.stringify({ to: peer, text }),
-        timeout: 15000,
-      });
-      if (!data.ok) {
-        const info = errorInfo(data, "文本备用通道发送失败");
-        throw new Error([info.title, info.detail || data.error_info].filter(Boolean).join(" · "));
-      }
-      sentEntry = {
-        id: String(data.message_id || data.msg_uid || ""),
-        msgKey: String(data.msg_key || data.message_id || data.msg_uid || ""),
-        text,
-        type: "mine",
-        peer,
-        timestamp: Date.now(),
-        source: "rest",
-        peerRead: false,
-        delivery: "sent",
-      };
-    } else if (!S.imConnected) {
-      // One-shot: try REST without prior connect.
-      const { data } = await api("/api/im/rest/send", {
-        method: "POST",
-        body: JSON.stringify({ to: peer, text }),
-        timeout: 15000,
-      });
-      if (!data.ok) throw new Error(errorInfo(data, "发送失败").title);
-      S.imConnected = true;
-      S.imMode = "rest";
-      S.imLastError = "";
-      S.messageLastPeerSyncAt = 0;
-      updateImConnectionStatus();
-      toast("已通过文本备用通道发送");
-      sentEntry = {
-        id: String(data.message_id || data.msg_uid || ""),
-        msgKey: String(data.msg_key || data.message_id || data.msg_uid || ""),
-        text,
-        type: "mine",
-        peer,
-        timestamp: Date.now(),
-        source: "rest",
-        peerRead: false,
-        delivery: "sent",
-      };
-    } else {
-      throw new Error("消息通道尚未连接");
-    }
-
-    const archived = addImMessage(text, "mine", peer, sentEntry || { peerRead: false, delivery: "sent" });
-    archiveMessageBestEffort(archived, "outgoing");
-    updateConversationActivity(peer, {
-      name: submittedPeerName,
-      lastMessage: text,
-      unreadCount: 0,
-    });
-    const input = $("im-text");
-    const draftUnchanged =
-      String(S.activePeer || "") === peer &&
-      S.imComposerDraftRevision === submittedDraftRevision &&
-      String(input?.value ?? S.imComposerDraft) === submittedDraft;
-    const storedPeerDraftUnchanged =
-      Number(S.imComposerDraftRevisions.get(peer) || 0) === submittedPeerDraftRevision &&
-      String(S.imComposerDrafts.get(peer) || "") === submittedDraft;
-    const visiblePeerDraftUnchanged =
-      storedPeerDraftUnchanged &&
-      String(S.activePeer || "") === peer &&
-      String(input?.value ?? S.imComposerDraft) === submittedDraft;
-    const clearVisibleDraft = draftUnchanged || visiblePeerDraftUnchanged;
-    if (clearVisibleDraft) {
-      setChatComposerDraft("");
-    } else if (storedPeerDraftUnchanged) {
-      S.imComposerDrafts.delete(peer);
-      S.imComposerDraftRevisions.set(peer, submittedPeerDraftRevision + 1);
-    }
-    if (input && clearVisibleDraft) {
-      input.value = "";
-      syncChatComposerInput(input);
-    }
-    if (S.route === "msg") {
-      const log = $("im-log");
-      if (log) {
-        log.innerHTML = chatLogHtml();
-        scrollChatLogToBottom(log);
-      }
-      refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
-    }
-    return;
+    const sendTask = sendTextMessage(peer, text, { peerName: submittedPeerName });
+    consumeSubmittedChatDraft(peer, submittedDraft, submittedDraftRevision, submittedPeerDraftRevision);
+    return sendTask;
   }
   if (kind === "lab-call") {
     if (!S.labEnabled) throw new Error("协议台未启用");
@@ -9689,6 +9750,10 @@ document.addEventListener("submit", (event) => {
   if (!form) return;
   event.preventDefault();
   const submitter = event.submitter || form.querySelector('button[type="submit"]');
+  if (form.dataset.form === "im-send") {
+    void handleProductForm(form, submitter).catch((error) => reportAsyncError(error));
+    return;
+  }
   void withPending(submitter, () => handleProductForm(form, submitter));
 });
 
