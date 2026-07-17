@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -94,6 +95,42 @@ def _message_preview(message: Any) -> str:
     }.get(str(message.message_type or "").lower(), "消息")
 
 
+def _archived_message_item(message: Any) -> dict[str, Any]:
+    metadata = dict(message.extra_data) if isinstance(message.extra_data, dict) else {}
+    media = metadata.get("media_report")
+    if not isinstance(media, dict):
+        media = {}
+    message_id = str(message.upstream_message_id or message.id)
+    message_key = str(
+        metadata.get("message_key")
+        or metadata.get("client_message_key")
+        or ""
+    )
+    return {
+        "id": message_id,
+        "message_id": message_id,
+        "message_key": message_key,
+        "msg_key": message_key,
+        "text": str(message.body or ""),
+        "body": str(message.body or ""),
+        "kind": str(message.message_type or "text"),
+        "message_type": str(message.message_type or "text"),
+        "object_name": str(metadata.get("object_name") or ""),
+        "from": str(message.sender_upstream_uid or ""),
+        "to": str(message.recipient_upstream_uid or ""),
+        "flow": "out" if str(message.direction or "") == "outgoing" else "in",
+        "status": str(message.status or ""),
+        "time": message.occurred_at.isoformat(),
+        "timestamp": message.occurred_at.isoformat(),
+        "source": "archive",
+        "revoked": bool(metadata.get("revoked")),
+        "is_peer_read": metadata.get("is_peer_read"),
+        "read_at": str(metadata.get("read_at") or ""),
+        "flash_id": str(metadata.get("flash_id") or ""),
+        "media": media,
+    }
+
+
 @router.get("/conversations")
 def archived_conversations(request: Request, limit: int = 100) -> dict[str, Any]:
     persistence = request.app.state.persistence
@@ -155,6 +192,56 @@ def archived_conversations(request: Request, limit: int = 100) -> dict[str, Any]
                 }
             )
     return {"ok": True, "items": items, "list": items, "count": len(items)}
+
+
+@router.get("/messages")
+def archived_messages(
+    request: Request,
+    peer: str,
+    limit: int = 200,
+    before: datetime | None = None,
+) -> dict[str, Any]:
+    persistence = request.app.state.persistence
+    identity = persistence.require_identity(_sid(request))
+    if identity is None:
+        raise HTTPException(status_code=401, detail="请先登录")
+    target = str(peer or "").strip()
+    if (
+        not target
+        or len(target) > 128
+        or any(ord(char) < 33 for char in target)
+        or target == str(identity.upstream_uid or "").strip()
+    ):
+        raise HTTPException(status_code=400, detail="聊天对象 UID 不合法")
+    if not persistence.rate_limit(
+        f"archive-messages:{identity.user_id}", limit=120, window_seconds=60
+    ):
+        raise HTTPException(status_code=429, detail="聊天缓存读取过于频繁")
+
+    bounded_limit = min(max(1, int(limit)), 200)
+    with session_scope() as db:
+        conversation = ConversationRepository(db).get_by_peer(
+            identity.user_id,
+            target,
+        )
+        if conversation is None:
+            return {"ok": True, "items": [], "list": [], "count": 0}
+        rows = MessageRepository(db).list_for_conversation(
+            identity.user_id,
+            conversation.id,
+            before=before,
+            limit=bounded_limit,
+        )
+        items = [_archived_message_item(message) for message in reversed(rows)]
+    next_before = rows[-1].occurred_at.isoformat() if len(rows) == bounded_limit else ""
+    return {
+        "ok": True,
+        "items": items,
+        "list": items,
+        "count": len(items),
+        "has_more": bool(next_before),
+        "next_before": next_before,
+    }
 
 
 @router.post("/messages", status_code=status.HTTP_202_ACCEPTED)

@@ -3789,7 +3789,7 @@ function timMessageEntry(message, peer = "", me = String(S.user?.uid || S.user?.
     peer: target,
     timestamp: timMessageTimestamp(message),
     source: message?.source || "tim",
-    rawMessage: message?.source === "http" ? null : message,
+    rawMessage: ["http", "archive"].includes(String(message?.source || "")) ? null : message,
     recalledText: revoked && kind === "text" ? displayText : "",
     revoked,
     peerRead: timPeerReadState(message),
@@ -4160,7 +4160,21 @@ async function loadConversationMessages(peer, { force = false } = {}) {
   S.imMessageLoadingPeers.add(target);
   refreshChatLog();
   const me = String(S.user?.uid || S.user?.id || "");
+  const archiveTask = api(
+    `/api/archive/messages?peer=${encodeURIComponent(target)}&limit=200`,
+    { timeout: 6000 }
+  ).then(({ data }) => {
+    const entries = itemsOf(data).map((item) =>
+      timMessageEntry({ ...item, source: "archive" }, target, me)
+    );
+    if (entries.length) {
+      mergePeerMessages(target, entries);
+      if (S.activePeer === target) refreshChatLog();
+    }
+    return entries;
+  });
   const tasks = [
+    archiveTask,
     api(`/api/im/messages?peer=${encodeURIComponent(target)}`, { timeout: 10000 }).then(({ data }) =>
       itemsOf(data).map((item) => timMessageEntry({ ...item, source: "http" }, target, me))
     ),
@@ -4183,6 +4197,7 @@ async function loadConversationMessages(peer, { force = false } = {}) {
     mergePeerMessages(target, incoming);
     const archiveCandidates = new Map();
     incoming.forEach((entry) => {
+      if (entry.source === "archive") return;
       const identity = String(entry.id || entry.msgKey || `${entry.type}|${entry.kind}|${entry.timestamp}|${entry.text}`);
       const remoteMedia = archiveRemoteUrl(entry.media?.url) || archiveRemoteUrl(entry.media?.thumbnail);
       const score = (remoteMedia ? 4 : 0) + (entry.rawMessage ? 2 : 0) + (entry.text ? 1 : 0);

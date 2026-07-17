@@ -594,6 +594,17 @@ def RE(r: Any, entity: str) -> Dict[str, Any]:
     return d
 
 
+def _is_html_protocol_result(result: Any) -> bool:
+    headers = getattr(result, "headers", None)
+    content_type = ""
+    if isinstance(headers, dict):
+        content_type = str(
+            headers.get("content-type") or headers.get("Content-Type") or ""
+        ).lower()
+    prefix = str(getattr(result, "raw", "") or "").lstrip()[:256].lower()
+    return "text/html" in content_type or prefix.startswith(("<!doctype html", "<html"))
+
+
 def _cached_profile(
     app: Any,
     uid: str,
@@ -1723,7 +1734,23 @@ class Handler(BaseHTTPRequestHandler):
             peer = q("peer") or q("uid") or q("yourid")
             if not peer:
                 return self.ok({"ok": False, "error": "缺少聊天对象 UID"}, 400)
-            return self.ok(RE(app.im.history_messages(peer), "message"))
+            result = app.im.history_messages(peer)
+            if _is_html_protocol_result(result):
+                return self.ok(
+                    {
+                        "ok": False,
+                        "code": "UPSTREAM_HISTORY_UNAVAILABLE",
+                        "error": {
+                            "title": "上游聊天记录暂时不可用",
+                            "detail": "已改用服务器归档的聊天记录",
+                        },
+                        "items": [],
+                        "list": [],
+                        "count": 0,
+                    },
+                    502,
+                )
+            return self.ok(RE(result, "message"))
 
         if path == "/api/heartbeat":
             return self.ok(u.heartbeat.status() if u.heartbeat else {"running": False})

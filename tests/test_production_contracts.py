@@ -230,6 +230,106 @@ class ProductionContractTests(unittest.TestCase):
                     self.assertIs(runtime.can_message_peer(identity, "9"), expected)
                 self.assertEqual(len(db.statements), 2)
 
+    def test_archived_messages_are_returned_for_the_authenticated_owner(self) -> None:
+        from datetime import UTC, datetime
+
+        try:
+            from bbw_web import archive_api
+            from bbw_web.persistence import UserIdentity
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        owner_id = uuid.uuid4()
+        conversation_id = uuid.uuid4()
+        identity = UserIdentity(
+            user_id=owner_id,
+            external_account_id=uuid.uuid4(),
+            upstream_uid="42",
+        )
+        conversation = types.SimpleNamespace(id=conversation_id)
+        newer = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            upstream_message_id="newer-message",
+            extra_data={"message_key": "newer-key", "is_peer_read": True},
+            body="较新的消息",
+            message_type="text",
+            sender_upstream_uid="9",
+            recipient_upstream_uid="42",
+            direction="incoming",
+            status="sent",
+            occurred_at=datetime(2026, 7, 17, 15, 31, tzinfo=UTC),
+        )
+        older = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            upstream_message_id="older-message",
+            extra_data={"object_name": "TIMTextElem"},
+            body="较早的消息",
+            message_type="text",
+            sender_upstream_uid="42",
+            recipient_upstream_uid="9",
+            direction="outgoing",
+            status="sent",
+            occurred_at=datetime(2026, 7, 17, 15, 30, tzinfo=UTC),
+        )
+        conversation_calls: list[tuple[object, str]] = []
+        message_calls: list[tuple[object, object, object, int]] = []
+        persistence = types.SimpleNamespace(
+            require_identity=lambda sid: identity if sid == "sid" else None,
+            rate_limit=lambda *_args, **_kwargs: True,
+        )
+        request = types.SimpleNamespace(
+            cookies={archive_api.legacy.COOKIE_NAME: "sid"},
+            app=types.SimpleNamespace(
+                state=types.SimpleNamespace(persistence=persistence)
+            ),
+        )
+
+        @contextmanager
+        def fake_session_scope():
+            yield object()
+
+        conversation_repo = types.SimpleNamespace(
+            get_by_peer=lambda user_id, peer: conversation_calls.append((user_id, peer))
+            or conversation
+        )
+
+        def list_for_conversation(user_id, target_conversation_id, *, before, limit):
+            message_calls.append((user_id, target_conversation_id, before, limit))
+            return [newer, older]
+
+        message_repo = types.SimpleNamespace(
+            list_for_conversation=list_for_conversation
+        )
+        with (
+            patch("bbw_web.archive_api.session_scope", fake_session_scope),
+            patch(
+                "bbw_web.archive_api.ConversationRepository",
+                return_value=conversation_repo,
+            ),
+            patch(
+                "bbw_web.archive_api.MessageRepository",
+                return_value=message_repo,
+            ),
+        ):
+            payload = archive_api.archived_messages(
+                request,
+                peer="9",
+                limit=200,
+                before=None,
+            )
+
+        self.assertEqual(conversation_calls, [(owner_id, "9")])
+        self.assertEqual(message_calls, [(owner_id, conversation_id, None, 200)])
+        self.assertEqual(
+            [item["id"] for item in payload["items"]],
+            ["older-message", "newer-message"],
+        )
+        self.assertEqual(payload["items"][0]["flow"], "out")
+        self.assertEqual(payload["items"][0]["source"], "archive")
+        self.assertEqual(payload["items"][1]["text"], "较新的消息")
+        self.assertTrue(payload["items"][1]["is_peer_read"])
+        self.assertFalse(payload["has_more"])
+
     def test_admin_user_detail_race_and_sensitive_field_contracts(self) -> None:
         js = self.read("bbw_web/static/admin.js")
 

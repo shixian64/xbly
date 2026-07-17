@@ -695,8 +695,14 @@ class SocialBffRoutingTests(unittest.TestCase):
     def tearDown(self) -> None:
         bff_server.STORE = self.old_store
 
-    def _run_get(self, path: str, *, false_social: set[str] | None = None):
-        result = ApiResult(True, 200, "[]", data=[])
+    def _run_get(
+        self,
+        path: str,
+        *,
+        false_social: set[str] | None = None,
+        im_result: ApiResult | None = None,
+    ):
+        result = im_result if im_result is not None else ApiResult(True, 200, "[]", data=[])
         false_result = ApiResult(
             False,
             200,
@@ -930,6 +936,27 @@ class SocialBffRoutingTests(unittest.TestCase):
         calls, response = self._run_get("/api/social/friend-apply?page=1")
         self.assertEqual(calls, [("friend_apply", "1"), ("friends", None)])
         self.assertEqual(response[1]["items"], [])
+
+    def test_message_history_rejects_unexpected_html_response(self) -> None:
+        html = "<!DOCTYPE html><html><body>not message json</body></html>"
+        calls, response = self._run_get(
+            "/api/im/messages?peer=9",
+            im_result=ApiResult(
+                True,
+                200,
+                html,
+                data=html,
+                message=html[:200],
+                kind="text",
+                headers={"content-type": "text/html; charset=utf-8"},
+            ),
+        )
+
+        self.assertEqual(calls, [("messages", "9")])
+        self.assertEqual(response[0], 502)
+        self.assertEqual(response[1]["code"], "UPSTREAM_HISTORY_UNAVAILABLE")
+        self.assertEqual(response[1]["items"], [])
+        self.assertNotIn("DOCTYPE", json.dumps(response[1]))
 
     def test_presence_prefers_web_ttl_and_skips_blocked_tim_rest(self) -> None:
         backend = SimpleNamespace(
@@ -2092,6 +2119,11 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("S.conversationNextRefreshAt = Date.now() + CONVERSATION_REFRESH_ERROR_MS", summary_refresh)
         self.assertIn("applyConversationSummaries(itemsOf(data), { broadcast: true })", summary_refresh)
         self.assertIn("/api/archive/conversations?limit=100", app_js)
+        self.assertIn(
+            "/api/archive/messages?peer=${encodeURIComponent(target)}&limit=200",
+            app_js,
+        )
+        self.assertIn('if (entry.source === "archive") return;', app_js)
         self.assertIn("BroadcastChannel(\"bbw-message-summary\")", app_js)
         self.assertIn("navigator.locks.request", app_js)
         self.assertIn("updateUnreadBadges();", unread_recalculation)
