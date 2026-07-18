@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import unittest
 
 from bbw_protocol.adapters.tim_rest import RestResult
@@ -7,6 +10,22 @@ from bbw_web.jobs import _tim_recent_conversations, _tim_roaming_history
 
 
 class TimHistorySyncContractTests(unittest.TestCase):
+    def test_worker_can_import_sync_jobs_without_roomkit_secret(self) -> None:
+        environment = dict(os.environ)
+        environment["BBW_ROOMKIT_BUSINESS_TOKEN_FILE"] = ""
+
+        result = subprocess.run(
+            [sys.executable, "-c", "import bbw_web.jobs"],
+            cwd=os.getcwd(),
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_recent_conversations_paginate_filter_and_deduplicate(self) -> None:
         class Client:
             def __init__(self) -> None:

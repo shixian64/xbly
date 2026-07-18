@@ -14,10 +14,10 @@ Usage:
     print(native.im.tim_login_payload())
 """
 
-from .bundle import NativeBundle
-from .face import FaceAdapter, FaceSession
-from .im import ImAdapter, RongCredentials, TimCredentials
-from .roomkit import RoomKitAdapter, RoomKitCredentials
+from __future__ import annotations
+
+from importlib import import_module
+from typing import Any
 
 __all__ = [
     "NativeBundle",
@@ -29,3 +29,25 @@ __all__ = [
     "RoomKitAdapter",
     "RoomKitCredentials",
 ]
+
+_EXPORT_MODULES = {
+    "NativeBundle": ".bundle",
+    "FaceAdapter": ".face",
+    "FaceSession": ".face",
+    "ImAdapter": ".im",
+    "RongCredentials": ".im",
+    "TimCredentials": ".im",
+    "RoomKitAdapter": ".roomkit",
+    "RoomKitCredentials": ".roomkit",
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Load optional capability modules only when their exports are requested."""
+
+    module_name = _EXPORT_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(name)
+    value = getattr(import_module(module_name, __name__), name)
+    globals()[name] = value
+    return value
