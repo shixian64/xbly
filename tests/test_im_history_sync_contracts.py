@@ -60,11 +60,27 @@ class TimHistorySyncContractTests(unittest.TestCase):
                     },
                 )
 
+            def c2c_unread_counts(self, _account_uid, peers):
+                return RestResult(
+                    ok=True,
+                    action="openim/get_c2c_unread_msg_num",
+                    data={
+                        "C2CUnreadMsgNumList": [
+                            {
+                                "Peer_Account": peer,
+                                "C2CUnreadMsgNum": 2 if peer == "9" else 0,
+                            }
+                            for peer in peers
+                        ]
+                    },
+                )
+
         client = Client()
         rows = _tim_recent_conversations(client, "42", max_pages=5)
 
         self.assertEqual(client.calls, 2)
         self.assertEqual([row["peer_id"] for row in rows], ["9", "10"])
+        self.assertEqual([row["unread_count"] for row in rows], [2, 0])
 
     def test_roaming_history_merges_both_directions_and_deduplicates(self) -> None:
         class Client:
@@ -109,6 +125,18 @@ class TimHistorySyncContractTests(unittest.TestCase):
                     },
                 )
 
+            def c2c_unread_counts(self, _account_uid, peers):
+                return RestResult(
+                    ok=True,
+                    action="openim/get_c2c_unread_msg_num",
+                    data={
+                        "C2CUnreadMsgNumList": [
+                            {"Peer_Account": peer, "C2CUnreadMsgNum": 0}
+                            for peer in peers
+                        ]
+                    },
+                )
+
         client = Client()
         rows, request_count = _tim_roaming_history(
             client,
@@ -120,8 +148,9 @@ class TimHistorySyncContractTests(unittest.TestCase):
         )
 
         self.assertEqual(client.calls, [("9", "42"), ("42", "9")])
-        self.assertEqual(request_count, 2)
+        self.assertEqual(request_count, 3)
         self.assertEqual([row["msg_key"] for row in rows], ["outgoing", "incoming"])
+        self.assertTrue(rows[0]["is_peer_read"])
 
 
 if __name__ == "__main__":

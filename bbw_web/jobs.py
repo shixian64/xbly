@@ -479,7 +479,19 @@ def _ingest_message(
         row.status = _prefer_message_status(str(row.status or "unknown"), incoming_status)
         if not row.body and report.get("text"):
             row.body = str(report.get("text"))[:100_000]
-        row.extra_data = _merge_dict(row.extra_data, metadata)
+        previous_metadata = dict(row.extra_data or {})
+        merged_metadata = _merge_dict(previous_metadata, metadata)
+        previous_read = previous_metadata.get("is_peer_read")
+        incoming_read = metadata.get("is_peer_read")
+        if previous_read is True:
+            merged_metadata["is_peer_read"] = True
+        elif isinstance(incoming_read, bool):
+            merged_metadata["is_peer_read"] = incoming_read
+        elif "is_peer_read" in previous_metadata:
+            merged_metadata["is_peer_read"] = previous_read
+        if not metadata.get("read_at") and previous_metadata.get("read_at"):
+            merged_metadata["read_at"] = previous_metadata["read_at"]
+        row.extra_data = merged_metadata
         db.flush()
 
     outbox_id: uuid.UUID | None = None
@@ -1297,6 +1309,62 @@ def _save_sync_result(
             account.last_sync_at = now
 
 
+def _tim_c2c_unread_counts(
+    client: TimRestClient,
+    account_uid: str,
+    peers: Sequence[str],
+) -> tuple[dict[str, int], int]:
+    normalized = list(
+        dict.fromkeys(
+            _bounded(peer, 128)
+            for peer in peers
+            if _bounded(peer, 128) and _bounded(peer, 128) != account_uid
+        )
+    )[:500]
+    counts: dict[str, int] = {}
+    request_count = 0
+    for offset in range(0, len(normalized), 100):
+        result = client.c2c_unread_counts(
+            account_uid,
+            normalized[offset : offset + 100],
+        )
+        request_count += 1
+        if not result.ok:
+            continue
+        data = result.data if isinstance(result.data, Mapping) else {}
+        rows = data.get("C2CUnreadMsgNumList")
+        rows = rows if isinstance(rows, list) else []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            peer = _bounded(row.get("Peer_Account"), 128)
+            if peer:
+                counts[peer] = _as_int(row.get("C2CUnreadMsgNum"), 0, minimum=0)
+    return counts, request_count
+
+
+def _tim_apply_outgoing_read_state(
+    items: list[dict[str, Any]],
+    *,
+    account_uid: str,
+    peer_uid: str,
+    unread_count: int | None,
+) -> None:
+    if unread_count is None:
+        return
+    outgoing = [
+        item
+        for item in items
+        if _bounded(item.get("from") or item.get("from_user_id"), 128) == account_uid
+        and _bounded(item.get("to") or item.get("to_user_id"), 128) == peer_uid
+    ]
+    read_count = max(0, len(outgoing) - max(0, int(unread_count)))
+    for index, item in enumerate(outgoing):
+        is_read = index < read_count
+        item["is_peer_read"] = is_read
+        item["read_state"] = "read" if is_read else "unread"
+
+
 def _tim_recent_conversations(
     client: TimRestClient,
     account_uid: str,
@@ -1343,12 +1411,16 @@ def _tim_recent_conversations(
                     "peer_id": peer,
                     "conversation_user": peer,
                     "timestamp": item.get("MsgTime"),
-                    "unread_count": _as_int(item.get("UnreadMsgNum"), 0),
+                    "unread_count": _as_int(
+                        item.get("UnreadMsgCount") or item.get("UnreadMsgNum"), 0
+                    ),
                     "source": "tim_rest",
                 }
             )
             if len(conversations) >= max(1, min(int(max_conversations), 500)):
-                return conversations
+                break
+        if len(conversations) >= max(1, min(int(max_conversations), 500)):
+            break
         if _as_int(data.get("CompleteFlag"), 0) == 1:
             break
         cursor = (
@@ -1361,7 +1433,7 @@ def _tim_recent_conversations(
             break
         previous_cursor = cursor
         timestamp, start_index, top_timestamp, top_start_index = cursor
-    return sorted(
+    conversations = sorted(
         conversations,
         key=lambda item: _as_int(
             item.get("timestamp"),
@@ -1371,6 +1443,16 @@ def _tim_recent_conversations(
         ),
         reverse=True,
     )
+    unread_counts, _requests = _tim_c2c_unread_counts(
+        client,
+        account_uid,
+        [str(item.get("peer_id") or "") for item in conversations],
+    )
+    for item in conversations:
+        peer = str(item.get("peer_id") or "")
+        if peer in unread_counts:
+            item["unread_count"] = unread_counts[peer]
+    return conversations
 
 
 def _durable_message_conversations(
@@ -1488,7 +1570,20 @@ def _tim_roaming_history(
         by_identity.values(),
         key=lambda item: _parse_time(item.get("timestamp") or item.get("time")),
     )
-    return ordered[-max(1, int(max_messages)) :], request_count
+    ordered = ordered[-max(1, int(max_messages)) :]
+    unread_counts, unread_requests = _tim_c2c_unread_counts(
+        client,
+        peer_uid,
+        [account_uid],
+    )
+    request_count += unread_requests
+    _tim_apply_outgoing_read_state(
+        ordered,
+        account_uid=account_uid,
+        peer_uid=peer_uid,
+        unread_count=unread_counts.get(account_uid),
+    )
+    return ordered, request_count
 
 
 def sync_account_history(owner_user_id: str, external_account_id: str) -> dict[str, Any]:

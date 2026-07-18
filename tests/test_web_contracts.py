@@ -728,6 +728,20 @@ class TimRestHistoryEnvelopeTests(unittest.TestCase):
                     },
                 )
 
+            def c2c_unread_counts(self, _account_uid, peers):
+                return SimpleNamespace(
+                    ok=True,
+                    data={
+                        "C2CUnreadMsgNumList": [
+                            {
+                                "Peer_Account": peer,
+                                "C2CUnreadMsgNum": 2 if peer == "10" else 0,
+                            }
+                            for peer in peers
+                        ]
+                    },
+                )
+
         payload = bff_server._tim_recent_conversation_envelope(
             SimpleNamespace(), Client(), "42", {}
         )
@@ -737,6 +751,10 @@ class TimRestHistoryEnvelopeTests(unittest.TestCase):
         self.assertEqual(
             [item["peer_id"] for item in payload["items"]],
             ["10", "9"],
+        )
+        self.assertEqual(
+            [item["unread_count"] for item in payload["items"]],
+            [2, 0],
         )
         self.assertEqual(payload["items"][0]["source"], "tim_rest")
 
@@ -787,17 +805,45 @@ class TimRestHistoryEnvelopeTests(unittest.TestCase):
                                 }
                             ],
                         },
+                        {
+                            "From_Account": "42",
+                            "To_Account": "9",
+                            "MsgTimeStamp": 30,
+                            "MsgKey": "outgoing-new",
+                            "MsgBody": [
+                                {
+                                    "MsgType": "TIMTextElem",
+                                    "MsgContent": {"Text": "outgoing-new"},
+                                }
+                            ],
+                        },
                     ]
                 return SimpleNamespace(
                     ok=True,
                     data={"MsgList": rows, "Complete": 1},
                 )
 
+            def c2c_unread_counts(self, _account_uid, peers):
+                return SimpleNamespace(
+                    ok=True,
+                    data={
+                        "C2CUnreadMsgNumList": [
+                            {"Peer_Account": peer, "C2CUnreadMsgNum": 1}
+                            for peer in peers
+                        ]
+                    },
+                )
+
         payload = bff_server._tim_roaming_message_envelope(Client(), "42", "9")
 
         self.assertEqual([(call[0], call[1]) for call in calls], [("9", "42"), ("42", "9")])
-        self.assertEqual([item["msg_key"] for item in payload["items"]], ["outgoing", "incoming"])
-        self.assertEqual(payload["count"], 2)
+        self.assertEqual(
+            [item["msg_key"] for item in payload["items"]],
+            ["outgoing", "incoming", "outgoing-new"],
+        )
+        self.assertTrue(payload["items"][0]["is_peer_read"])
+        self.assertFalse(payload["items"][2]["is_peer_read"])
+        self.assertEqual(payload["count"], 3)
 
 
 class SocialBffRoutingTests(unittest.TestCase):
@@ -900,6 +946,15 @@ class SocialBffRoutingTests(unittest.TestCase):
                     or SimpleNamespace(
                         ok=im_result is None,
                         data={"MsgList": [], "Complete": 1},
+                    ),
+                    c2c_unread_counts=lambda _account_uid, peers: SimpleNamespace(
+                        ok=True,
+                        data={
+                            "C2CUnreadMsgNumList": [
+                                {"Peer_Account": peer, "C2CUnreadMsgNum": 0}
+                                for peer in peers
+                            ]
+                        },
                     ),
                     query_online=lambda user_ids: calls.append(("presence", user_ids))
                     or SimpleNamespace(
@@ -1983,12 +2038,67 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         bff_server.Handler.do_POST(harness)
         return calls, harness.response
 
+    def _run_mark_read(self, *, authorized=True):
+        calls = []
+        result = SimpleNamespace(ok=True)
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(session=SimpleNamespace(uid="42")),
+            native=SimpleNamespace(
+                tim_rest=SimpleNamespace(
+                    mark_c2c_read=lambda account, peer: calls.append((account, peer))
+                    or result
+                )
+            ),
+            match_pool_online_list_enabled=False,
+            friend_message_peers={"9"} if authorized else set(),
+            match_message_peers=set(),
+            conversation_message_peers=set(),
+        )
+
+        class Harness:
+            path = "/api/im/read"
+
+            def __init__(self):
+                self.response = None
+                self._request_match_pool_online_list_enabled = False
+
+            def _check_api_origin(self):
+                return True
+
+            def body(self):
+                return {"peer": "9"}
+
+            def sid(self):
+                return "sid"
+
+            def user(self, _sid):
+                return web_user
+
+            def ok(self, obj, status=200, **_kwargs):
+                self.response = (status, obj)
+                return self.response
+
+        harness = Harness()
+        bff_server.Handler.do_POST(harness)
+        return calls, harness.response
+
     def test_non_match_new_private_message_is_denied_before_rest_send(self) -> None:
         calls, response = self._run_rest_send()
 
         self.assertEqual(calls, [])
         self.assertEqual(response[0], 403)
         self.assertEqual(response[1]["code"], "PRIVATE_MESSAGE_PERMISSION_REQUIRED")
+
+    def test_rest_mode_read_report_uses_authenticated_account(self) -> None:
+        calls, response = self._run_mark_read()
+
+        self.assertEqual(calls, [("42", "9")])
+        self.assertEqual(response[0], 200)
+        self.assertTrue(response[1]["read"])
+
+        calls, response = self._run_mark_read(authorized=False)
+        self.assertEqual(calls, [])
+        self.assertEqual(response[0], 403)
 
     def test_match_existing_conversation_and_live_authorizer_are_allowed(self) -> None:
         for kwargs in (
@@ -2775,6 +2885,10 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("消息已读时间", app_js)
         self.assertIn("info.timestamp < sentAt - 60_000", app_js)
         self.assertIn("function chatMessageReadTimeInfo", app_js)
+        self.assertIn('return { label: "已发送", className: "is-sent", indicator: false };', app_js)
+        self.assertIn('api("/api/im/read"', app_js)
+        self.assertIn("function reportConversationRead(peer)", app_js)
+        self.assertIn("unreadPeers.slice(offset, offset + 5)", app_js)
         self.assertIn("width: fit-content", app_css)
         self.assertIn("conversation-read-state", app_css)
         self.assertIn("presence-badge", app_css)

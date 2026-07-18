@@ -1085,6 +1085,65 @@ def _tim_epoch_sort_value(value: Any) -> float:
     return parsed
 
 
+def _tim_c2c_unread_counts(
+    client: Any,
+    account_uid: str,
+    peers: List[str],
+) -> Dict[str, int]:
+    method = getattr(client, "c2c_unread_counts", None)
+    normalized = list(
+        dict.fromkeys(
+            str(peer or "").strip()
+            for peer in peers
+            if str(peer or "").strip()
+            and str(peer or "").strip() != account_uid
+        )
+    )[:500]
+    if not callable(method) or not account_uid or not normalized:
+        return {}
+    counts: Dict[str, int] = {}
+    for offset in range(0, len(normalized), 100):
+        result = method(account_uid, normalized[offset : offset + 100])
+        if not getattr(result, "ok", False):
+            continue
+        data = getattr(result, "data", None)
+        data = data if isinstance(data, Mapping) else {}
+        rows = data.get("C2CUnreadMsgNumList")
+        rows = rows if isinstance(rows, list) else []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            peer = str(row.get("Peer_Account") or "").strip()
+            if peer:
+                try:
+                    counts[peer] = max(0, int(row.get("C2CUnreadMsgNum") or 0))
+                except (TypeError, ValueError, OverflowError):
+                    counts[peer] = 0
+    return counts
+
+
+def _tim_apply_outgoing_read_state(
+    items: List[Dict[str, Any]],
+    *,
+    account_uid: str,
+    peer_uid: str,
+    unread_count: Optional[int],
+) -> None:
+    if unread_count is None:
+        return
+    outgoing = [
+        item
+        for item in items
+        if str(item.get("from") or item.get("from_user_id") or "") == account_uid
+        and str(item.get("to") or item.get("to_user_id") or "") == peer_uid
+    ]
+    read_count = max(0, len(outgoing) - max(0, int(unread_count)))
+    for index, item in enumerate(outgoing):
+        is_read = index < read_count
+        item["is_peer_read"] = is_read
+        item["read_state"] = "read" if is_read else "unread"
+
+
 def _tim_recent_conversation_envelope(
     app: Any,
     client: Any,
@@ -1159,8 +1218,16 @@ def _tim_recent_conversation_envelope(
         reverse=True,
     )
     items = N.normalize_conversations(rows)
+    unread_counts = _tim_c2c_unread_counts(
+        client,
+        account_uid,
+        [str(item.get("peer_id") or "") for item in items],
+    )
     for item in items:
         item["source"] = "tim_rest"
+        peer = str(item.get("peer_id") or "")
+        if peer in unread_counts:
+            item["unread_count"] = unread_counts[peer]
     cache = profile_cache if profile_cache is not None else {}
     _attach_cached_conversation_profiles(app, items, cache)
     return {
@@ -1226,6 +1293,13 @@ def _tim_roaming_message_envelope(
     items = sorted(by_identity.values(), key=_tim_message_sort_key)[
         -max(1, int(max_messages)):
     ]
+    unread_counts = _tim_c2c_unread_counts(client, peer_uid, [account_uid])
+    _tim_apply_outgoing_read_state(
+        items,
+        account_uid=account_uid,
+        peer_uid=peer_uid,
+        unread_count=unread_counts.get(account_uid),
+    )
     return {
         "ok": True,
         "items": items,
@@ -2770,6 +2844,28 @@ class Handler(BaseHTTPRequestHandler):
                 return self.ok(R(app.social.record_profile_view(target_uid)))
 
             # TIM REST fallback (when browser TIM.login hangs)
+            if path == "/api/im/read":
+                peer_uid = str(
+                    data.get("peer") or data.get("uid") or data.get("to") or ""
+                ).strip()
+                account_uid = str(app.session.uid or "").strip()
+                if not peer_uid or not account_uid:
+                    return self.ok({"ok": False, "error": "缺少聊天对象 UID"}, 400)
+                capabilities = Handler.web_user_capabilities(self, u)
+                if not Handler.can_message_peer(self, u, peer_uid):
+                    return Handler.deny_private_message(self, capabilities)
+                result = u.native.tim_rest.mark_c2c_read(account_uid, peer_uid)
+                if not result.ok:
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "code": "IM_READ_REPORT_FAILED",
+                            "error": "消息已读状态暂时无法同步",
+                        },
+                        502,
+                    )
+                return self.ok({"ok": True, "read": True})
+
             if path == "/api/im/rest/send":
                 message_type = str(
                     data.get("message_type") or data.get("type") or "text"

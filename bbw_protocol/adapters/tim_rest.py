@@ -216,6 +216,57 @@ class TimRestClient:
             },
         )
 
+    def c2c_unread_counts(
+        self,
+        to_account: str,
+        peer_accounts: List[str],
+    ) -> RestResult:
+        """Return per-peer C2C unread counts for one account."""
+
+        account = str(to_account or "").strip()
+        peers = list(
+            dict.fromkeys(
+                str(peer or "").strip()
+                for peer in peer_accounts
+                if str(peer or "").strip()
+                and str(peer or "").strip() != account
+            )
+        )[:100]
+        if not account or not peers:
+            return RestResult(
+                ok=False,
+                action="openim/get_c2c_unread_msg_num",
+                error_code=-2,
+                error_info="missing target account or peer accounts",
+            )
+        return self.call(
+            "openim/get_c2c_unread_msg_num",
+            {
+                "To_Account": account,
+                "Peer_Account": peers,
+            },
+        )
+
+    def mark_c2c_read(self, report_account: str, peer_account: str) -> RestResult:
+        """Mark one C2C conversation as read for ``report_account``."""
+
+        account = str(report_account or "").strip()
+        peer = str(peer_account or "").strip()
+        if not account or not peer or account == peer:
+            return RestResult(
+                ok=False,
+                action="openim/admin_set_msg_read",
+                error_code=-2,
+                error_info="invalid report/peer account",
+            )
+        return self.call(
+            "openim/admin_set_msg_read",
+            {
+                "Report_Account": account,
+                "Peer_Account": peer,
+            },
+        )
+
     def revoke_c2c(self, from_account: str, to_account: str, msg_key: str) -> RestResult:
         """Recall one C2C message previously sent by ``from_account``.
 

@@ -239,6 +239,28 @@ class TimRestMediaContractTests(unittest.TestCase):
             },
         )
 
+        unread = client.c2c_unread_counts("42", ["9", "10", "9"])
+        self.assertTrue(unread.ok)
+        self.assertEqual(client.calls[-1][0], "openim/get_c2c_unread_msg_num")
+        self.assertEqual(
+            client.calls[-1][1],
+            {
+                "To_Account": "42",
+                "Peer_Account": ["9", "10"],
+            },
+        )
+
+        marked = client.mark_c2c_read("42", "9")
+        self.assertTrue(marked.ok)
+        self.assertEqual(client.calls[-1][0], "openim/admin_set_msg_read")
+        self.assertEqual(
+            client.calls[-1][1],
+            {
+                "Report_Account": "42",
+                "Peer_Account": "9",
+            },
+        )
+
         roaming = client.roaming_messages(
             "42",
             "9",
@@ -267,6 +289,8 @@ class TimRestMediaContractTests(unittest.TestCase):
         self.assertFalse(client.recent_contacts("").ok)
         self.assertFalse(client.roaming_messages("42", "42").ok)
         self.assertFalse(client.roaming_messages("", "9").ok)
+        self.assertFalse(client.c2c_unread_counts("42", []).ok)
+        self.assertFalse(client.mark_c2c_read("42", "42").ok)
         self.assertEqual(client.calls, [])
 
     def test_c2c_revoke_uses_authenticated_sender_and_msg_key_shape(self) -> None:

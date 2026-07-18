@@ -4482,9 +4482,10 @@ function chatMessageState(entry) {
       persistent: true,
     };
   }
-  return chatMessageReadState(entry) === true
-    ? { label: "已读", className: "is-read", indicator: true }
-    : { label: "未读", className: "is-unread", indicator: true };
+  const readState = chatMessageReadState(entry);
+  if (readState === true) return { label: "已读", className: "is-read", indicator: true };
+  if (readState === false) return { label: "未读", className: "is-unread", indicator: true };
+  return { label: "已发送", className: "is-sent", indicator: false };
 }
 
 function canRetryFailedChatMessage(entry) {
@@ -5472,6 +5473,16 @@ function restoreChatComposerDraft(peer) {
   return next;
 }
 
+function reportConversationRead(peer) {
+  const target = String(peer || "").trim();
+  if (!target) return Promise.resolve(false);
+  return api("/api/im/read", {
+    method: "POST",
+    body: JSON.stringify({ peer: target }),
+    timeout: 8000,
+  }).then(({ data }) => data?.ok === true);
+}
+
 function markConversationRead(peer) {
   const target = String(peer || "").trim();
   if (!target) return;
@@ -5484,6 +5495,8 @@ function markConversationRead(peer) {
   if (S.imMode === "sdk" && S.chat && typeof S.chat.setMessageRead === "function") {
     const conversationID = current?.conversation_id || `C2C${target}`;
     void Promise.resolve(S.chat.setMessageRead({ conversationID })).catch(() => {});
+  } else {
+    void reportConversationRead(target).catch(() => false);
   }
 }
 
@@ -10435,8 +10448,9 @@ async function handleAction(action, button) {
     return switchSocialTab(normalizeSocialTab(button.dataset.tab));
   }
   if (action === "mark-all-read") {
-    const canSyncRead = S.imMode === "sdk" && S.chat && typeof S.chat.setMessageRead === "function";
-    if (canSyncRead) {
+    const sdkCanSyncRead = S.imMode === "sdk" && S.chat && typeof S.chat.setMessageRead === "function";
+    let syncedRead = sdkCanSyncRead;
+    if (sdkCanSyncRead) {
       await Promise.all(
         S.conversations.map((item) => {
           const peer = conversationPeer(item);
@@ -10444,6 +10458,21 @@ async function handleAction(action, button) {
           return S.chat.setMessageRead({ conversationID: item.conversation_id || `C2C${peer}` }).catch(() => {});
         })
       );
+    } else {
+      const unreadPeers = S.conversations
+        .filter((item) => Number(item.unread_count || item.unread || 0) > 0)
+        .map(conversationPeer)
+        .filter(Boolean);
+      let failed = 0;
+      for (let offset = 0; offset < unreadPeers.length; offset += 5) {
+        const results = await Promise.allSettled(
+          unreadPeers.slice(offset, offset + 5).map((peer) => reportConversationRead(peer))
+        );
+        failed += results.filter(
+          (result) => result.status !== "fulfilled" || result.value !== true
+        ).length;
+      }
+      syncedRead = unreadPeers.length === 0 || failed === 0;
     }
     S.conversations = S.conversations.map((item) => ({ ...item, unread_count: 0, unread: 0 }));
     S.conversations.forEach((item) => {
@@ -10452,7 +10481,7 @@ async function handleAction(action, button) {
     });
     S.unreadTotal = 0;
     updateUnreadBadges();
-    toast(canSyncRead ? "全部消息已标为已读" : "已清除当前未读提示");
+    toast(syncedRead ? "全部消息已标为已读" : "部分消息已读状态同步失败，请稍后重试");
     refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
     return;
   }
