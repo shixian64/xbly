@@ -2960,6 +2960,29 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn(".conversation-layout.is-list-collapsed .conversation-list-pane", app_css)
         self.assertIn("display: none", app_css)
 
+    def test_conversation_list_supports_batch_selection_select_all_and_delete(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
+
+        self.assertIn("conversationBatchMode: false", app_js)
+        self.assertIn("selectedConversationPeers: new Set()", app_js)
+        self.assertIn('data-action="start-conversation-batch"', app_js)
+        self.assertIn('data-action="finish-conversation-batch"', app_js)
+        self.assertIn('type="checkbox" data-action="toggle-conversation-selection"', app_js)
+        self.assertIn('data-action="toggle-conversation-select-all"', app_js)
+        self.assertIn('data-action="delete-selected-conversations"', app_js)
+        self.assertIn("function toggleAllConversationSelections()", app_js)
+        self.assertIn("function startConversationBatchDeleteConfirmation(button)", app_js)
+        self.assertIn("function removeSelectedConversationListItems()", app_js)
+        self.assertIn("removeConversationListItems(selected)", app_js)
+        self.assertIn("已从列表移除 ${result.count} 个聊天，消息仍然保留", app_js)
+        self.assertIn("S.conversationBatchMode ||", app_js)
+        self.assertIn("CONVERSATION_DISMISS_LIMIT = 500", app_js)
+        self.assertIn(".conversation-batch-toolbar", app_css)
+        self.assertIn(".conversation-select-control input", app_css)
+        self.assertIn(".conversation-item.is-batch-selecting.is-selected .conversation-card", app_css)
+
     def test_message_page_uses_compact_chat_surface_and_list_read_action(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
@@ -2968,10 +2991,10 @@ class SocialFrontendContractTests(unittest.TestCase):
         page_messages = app_js.split("async function pageMessages", 1)[1].split("async function pageMatching", 1)[0]
 
         self.assertNotIn('id="mark-all-read-top"', index_html)
-        self.assertIn('class="pane-head-actions"', page_messages)
-        self.assertIn('id="mark-all-read-list" data-action="mark-all-read"', page_messages)
+        self.assertIn('class="pane-head-actions"', app_js)
+        self.assertIn('id="mark-all-read-list" data-action="mark-all-read"', app_js)
         self.assertLess(
-            page_messages.index('id="mark-all-read-list"'),
+            page_messages.index("conversationListControlsHtml()"),
             page_messages.index('id="conversation-list"'),
         )
         self.assertIn("function syncMessageReadAction", app_js)

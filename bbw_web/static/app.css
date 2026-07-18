@@ -2515,6 +2515,19 @@ summary:focus-visible {
   gap: 0.45rem;
 }
 
+.conversation-batch-toolbar {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 0.5rem;
+  border-bottom: 1px solid var(--line);
+  background: #fff;
+  padding: 0.55rem 0.75rem;
+}
+
+.conversation-batch-toolbar .btn {
+  flex: 1 1 0;
+}
+
 .chat-head {
   min-height: 56px;
   padding-block: 0.5rem;
@@ -2561,6 +2574,27 @@ summary:focus-visible {
   touch-action: pan-y;
 }
 
+.conversation-select-control {
+  position: absolute;
+  z-index: 3;
+  top: 50%;
+  left: 0.72rem;
+  display: inline-flex;
+  width: 1.25rem;
+  height: 1.25rem;
+  align-items: center;
+  justify-content: center;
+  transform: translateY(-50%);
+}
+
+.conversation-select-control input {
+  width: 1.05rem;
+  height: 1.05rem;
+  margin: 0;
+  accent-color: var(--brand);
+  cursor: pointer;
+}
+
 .conversation-card {
   position: relative;
   z-index: 1;
@@ -2583,6 +2617,15 @@ summary:focus-visible {
 }
 
 .conversation-card.on {
+  box-shadow: inset 3px 0 var(--brand);
+}
+
+.conversation-item.is-batch-selecting .conversation-card {
+  padding-left: 2.65rem;
+}
+
+.conversation-item.is-batch-selecting.is-selected .conversation-card {
+  background: var(--brand-soft);
   box-shadow: inset 3px 0 var(--brand);
 }
 

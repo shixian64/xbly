@@ -49,6 +49,7 @@ const CONVERSATION_PROFILE_ERROR_TTL_MS = 60 * 1000;
 const CONVERSATION_SWIPE_THRESHOLD_PX = 42;
 const CONVERSATION_SWIPE_LOCK_PX = 8;
 const CONVERSATION_DELETE_CONFIRM_DELAY_MS = 500;
+const CONVERSATION_DISMISS_LIMIT = 500;
 const MESSAGE_ARCHIVE_RETRY_DELAYS_MS = [1500, 5000];
 const MESSAGE_ARCHIVE_MAX_IN_FLIGHT = 2;
 const PAGE_CACHE_TTL_MS = 2 * 60 * 1000;
@@ -131,6 +132,10 @@ const S = {
   dismissedConversationAccount: "",
   conversationDeleteTimers: new Map(),
   conversationSwipeGesture: null,
+  conversationBatchMode: false,
+  selectedConversationPeers: new Set(),
+  conversationBatchDeleteTimer: null,
+  conversationBatchDeleteStage: "idle",
   readConversationPeers: new Map(),
   unreadTotal: 0,
   profileSeq: 0,
@@ -1437,7 +1442,7 @@ function persistDismissedConversationPeers() {
   try {
     localStorage.setItem(
       key,
-      JSON.stringify([...S.dismissedConversationPeers.entries()].slice(-300))
+      JSON.stringify([...S.dismissedConversationPeers.entries()].slice(-CONVERSATION_DISMISS_LIMIT))
     );
   } catch {
     // Private browsing can disable localStorage; the in-memory dismissal still works.
@@ -1450,6 +1455,9 @@ function syncDismissedConversationAccount() {
   S.conversationDeleteTimers.forEach((timer) => clearTimeout(timer));
   S.conversationDeleteTimers.clear();
   S.conversationSwipeGesture = null;
+  clearConversationBatchDeleteConfirmation();
+  S.conversationBatchMode = false;
+  S.selectedConversationPeers.clear();
   S.dismissedConversationPeers.clear();
   S.dismissedConversationAccount = account;
   const key = dismissedConversationStorageKey(account);
@@ -1457,7 +1465,7 @@ function syncDismissedConversationAccount() {
   try {
     const stored = JSON.parse(localStorage.getItem(key) || "[]");
     if (!Array.isArray(stored)) return;
-    stored.slice(-300).forEach((entry) => {
+    stored.slice(-CONVERSATION_DISMISS_LIMIT).forEach((entry) => {
       if (!Array.isArray(entry) || entry.length < 2) return;
       const peer = String(entry[0] || "").trim();
       const hiddenThrough = Number(entry[1]);
@@ -1470,12 +1478,17 @@ function syncDismissedConversationAccount() {
   }
 }
 
-function dismissConversationPeer(peer, item) {
-  const target = String(peer || "").trim();
-  if (!target) return;
-  const latest = conversationTimestamp(item);
-  S.dismissedConversationPeers.set(target, latest > 0 ? latest : Date.now());
-  persistDismissedConversationPeers();
+function dismissConversationPeers(items) {
+  let changed = false;
+  (Array.isArray(items) ? items : []).forEach((item) => {
+    const peer = conversationPeer(item);
+    if (!peer) return;
+    const latest = conversationTimestamp(item);
+    S.dismissedConversationPeers.set(peer, latest > 0 ? latest : Date.now());
+    changed = true;
+  });
+  if (changed) persistDismissedConversationPeers();
+  return changed;
 }
 
 function restoreDismissedConversationPeer(peer) {
@@ -1676,8 +1689,14 @@ function buildNav() {
 
 function syncMessageReadAction() {
   const markAllRead = $("mark-all-read-list");
-  if (!markAllRead) return;
-  markAllRead.disabled = !S.conversations.length;
+  if (markAllRead) markAllRead.disabled = !S.conversations.length;
+  const batchManage = document.querySelector('[data-action="start-conversation-batch"]');
+  if (batchManage) batchManage.disabled = !S.conversations.length;
+  const batchDelete = document.querySelector('[data-action="delete-selected-conversations"]');
+  if (batchDelete) {
+    const selected = selectedConversationCount();
+    batchDelete.disabled = !selected || S.conversationBatchDeleteStage === "waiting";
+  }
 }
 
 function syncNav() {
@@ -2777,11 +2796,33 @@ function conversationCard(item) {
   );
   const unread = Number(conversation.unread_count || conversation.unread || 0);
   const active = peer && peer === S.activePeer;
+  const batchSelected = S.conversationBatchMode && S.selectedConversationPeers.has(peer);
+  const selectionLabel = `${batchSelected ? "取消选择" : "选择"}与 ${name} 的聊天`;
+  const cardLabel = S.conversationBatchMode
+    ? selectionLabel
+    : `打开与 ${name} 的聊天`;
   const presence = peer ? presenceBadgeHtml(peer, { ...nestedUser, ...conversation }, "presence-compact") : "";
-  return `<div class="conversation-item" data-conversation-item data-uid="${esc(peer)}">
+  const selectionControl = S.conversationBatchMode
+    ? `<label class="conversation-select-control"><input type="checkbox" data-action="toggle-conversation-selection" data-uid="${esc(
+        peer
+      )}" aria-label="${esc(selectionLabel)}" ${batchSelected ? "checked" : ""} /></label>`
+    : "";
+  const deleteAction = S.conversationBatchMode
+    ? ""
+    : `<button type="button" class="btn danger small conversation-delete-action" data-action="delete-conversation" data-uid="${esc(
+        peer
+      )}" data-name="${esc(name)}" aria-label="从聊天列表删除与 ${esc(
+        name
+      )} 的聊天" aria-hidden="true" tabindex="-1">删除</button>`;
+  return `<div class="conversation-item${S.conversationBatchMode ? " is-batch-selecting" : ""}${
+    batchSelected ? " is-selected" : ""
+  }" data-conversation-item data-uid="${esc(peer)}">
+    ${selectionControl}
     <button type="button" class="conversation-card${active ? " on" : ""}" data-action="select-conversation" data-uid="${esc(
       peer
-    )}" data-name="${esc(name)}" data-avatar="${esc(avatar || "")}" aria-label="打开与 ${esc(name)} 的聊天" title="${esc(name)}">
+    )}" data-name="${esc(name)}" data-avatar="${esc(avatar || "")}" aria-label="${esc(cardLabel)}" ${
+      S.conversationBatchMode ? `aria-pressed="${String(batchSelected)}"` : ""
+    } title="${esc(name)}">
       ${avatarHtml(avatar)}
       <span class="conversation-copy"><span class="conversation-title-line"><strong>${esc(name)}</strong>${presence}</span><span class="conversation-preview">${esc(
         preview
@@ -2790,11 +2831,7 @@ function conversationCard(item) {
       unread > 0 ? `<span class="unread-badge" aria-label="${esc(unread)} 条未读">${esc(unread > 99 ? "99+" : unread)}</span>` : ""
     }</span>
     </button>
-    <button type="button" class="btn danger small conversation-delete-action" data-action="delete-conversation" data-uid="${esc(
-      peer
-    )}" data-name="${esc(name)}" aria-label="从聊天列表删除与 ${esc(
-      name
-    )} 的聊天" aria-hidden="true" tabindex="-1">删除</button>
+    ${deleteAction}
   </div>`;
 }
 
@@ -4911,6 +4948,146 @@ function conversationListHtml() {
     : `<div class="empty-state"><div><strong>还没有聊天记录</strong><span>可以从通讯录或身边的人开始一段对话</span><button type="button" class="btn soft small" data-action="social-open-tab" data-tab="friends">打开通讯录</button></div></div>`;
 }
 
+function conversationSelectionPeers() {
+  return S.conversations.map(conversationPeer).filter(Boolean);
+}
+
+function pruneConversationSelection() {
+  const available = new Set(conversationSelectionPeers());
+  let changed = false;
+  S.selectedConversationPeers.forEach((peer) => {
+    if (available.has(peer)) return;
+    S.selectedConversationPeers.delete(peer);
+    changed = true;
+  });
+  return changed;
+}
+
+function selectedConversationCount() {
+  pruneConversationSelection();
+  return S.selectedConversationPeers.size;
+}
+
+function conversationCollapseButtonHtml() {
+  return `<button type="button" class="utility-btn conversation-collapse-toggle" data-action="toggle-conversation-list" aria-controls="conversation-list" aria-expanded="${String(
+    !S.conversationListCollapsed
+  )}" aria-label="${S.conversationListCollapsed ? "横向展开聊天列表" : "横向收起聊天列表"}" title="${
+    S.conversationListCollapsed ? "横向展开聊天列表" : "横向收起聊天列表"
+  }">${S.conversationListCollapsed ? "展开" : "收起"}</button>`;
+}
+
+function conversationListControlsHtml() {
+  const total = S.conversations.length;
+  const selected = selectedConversationCount();
+  const allSelected = total > 0 && selected === total;
+  const summary = S.conversationBatchMode
+    ? total
+      ? `已选择 ${selected} 项，共 ${total} 项`
+      : "当前没有可选择的会话"
+    : total
+      ? `${total} 个最近会话`
+      : "最近联系的人会显示在这里";
+  const actions = S.conversationBatchMode
+    ? `<button type="button" class="btn secondary small" data-action="finish-conversation-batch">完成</button>${conversationCollapseButtonHtml()}`
+    : `<button type="button" class="btn secondary small" id="mark-all-read-list" data-action="mark-all-read" aria-label="将所有会话标记为已读" ${
+        total ? "" : "disabled"
+      }>全部已读</button><button type="button" class="btn secondary small" data-action="start-conversation-batch" ${
+        total ? "" : "disabled"
+      }>批量管理</button>${conversationCollapseButtonHtml()}`;
+  const batchDeleteLabel =
+    S.conversationBatchDeleteStage === "confirm"
+      ? `确认删除 ${selected} 项`
+      : S.conversationBatchDeleteStage === "waiting"
+        ? "请稍候"
+        : selected
+          ? `删除已选 (${selected})`
+          : "删除已选";
+  const batchToolbar = S.conversationBatchMode
+    ? `<div class="conversation-batch-toolbar" role="toolbar" aria-label="批量管理聊天列表"><button type="button" class="btn secondary small" data-action="toggle-conversation-select-all" ${
+        total ? "" : "disabled"
+      }>${allSelected ? "取消全选" : "全选"}</button><button type="button" class="btn danger small" data-action="delete-selected-conversations" data-delete-stage="${esc(
+        S.conversationBatchDeleteStage
+      )}" ${selected && S.conversationBatchDeleteStage !== "waiting" ? "" : "disabled"}>${esc(
+        batchDeleteLabel
+      )}</button></div>`
+    : "";
+  return `<div class="pane-head"><div class="pane-head-copy"><h2>${
+    S.conversationBatchMode ? "批量管理" : "聊天列表"
+  }</h2><p data-conversation-count aria-live="polite">${esc(
+    summary
+  )}</p></div><div class="pane-head-actions">${actions}</div></div>${batchToolbar}`;
+}
+
+function clearConversationBatchDeleteConfirmation() {
+  if (S.conversationBatchDeleteTimer) clearTimeout(S.conversationBatchDeleteTimer);
+  S.conversationBatchDeleteTimer = null;
+  S.conversationBatchDeleteStage = "idle";
+  const button = document.querySelector('[data-action="delete-selected-conversations"]');
+  if (!button) return;
+  const selected = selectedConversationCount();
+  button.dataset.deleteStage = "idle";
+  button.dataset.locked = "false";
+  button.disabled = selected === 0;
+  button.textContent = selected ? `删除已选 (${selected})` : "删除已选";
+}
+
+function setConversationBatchMode(enabled) {
+  const next = Boolean(enabled) && S.conversations.length > 0;
+  clearConversationBatchDeleteConfirmation();
+  S.conversationBatchMode = next;
+  S.selectedConversationPeers.clear();
+  S.conversationSwipeGesture = null;
+  document.querySelectorAll("[data-conversation-item].is-delete-revealed").forEach((item) =>
+    setConversationDeleteRevealed(item, false)
+  );
+  refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
+}
+
+function toggleConversationSelection(peer) {
+  const target = String(peer || "").trim();
+  if (!S.conversationBatchMode || !target || !S.conversations.some((item) => conversationPeer(item) === target)) {
+    return;
+  }
+  clearConversationBatchDeleteConfirmation();
+  if (S.selectedConversationPeers.has(target)) S.selectedConversationPeers.delete(target);
+  else S.selectedConversationPeers.add(target);
+  refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
+}
+
+function toggleAllConversationSelections() {
+  if (!S.conversationBatchMode) return;
+  clearConversationBatchDeleteConfirmation();
+  const peers = conversationSelectionPeers();
+  const allSelected = peers.length > 0 && peers.every((peer) => S.selectedConversationPeers.has(peer));
+  S.selectedConversationPeers.clear();
+  if (!allSelected) peers.forEach((peer) => S.selectedConversationPeers.add(peer));
+  refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
+}
+
+function startConversationBatchDeleteConfirmation(button) {
+  const selected = selectedConversationCount();
+  if (!S.conversationBatchMode || !selected) return;
+  clearConversationBatchDeleteConfirmation();
+  S.conversationBatchDeleteStage = "waiting";
+  button.dataset.deleteStage = "waiting";
+  button.dataset.locked = "true";
+  button.disabled = true;
+  button.textContent = "请稍候";
+  S.conversationBatchDeleteTimer = setTimeout(() => {
+    S.conversationBatchDeleteTimer = null;
+    const currentSelected = selectedConversationCount();
+    if (!button.isConnected || !S.conversationBatchMode || !currentSelected) {
+      clearConversationBatchDeleteConfirmation();
+      return;
+    }
+    S.conversationBatchDeleteStage = "confirm";
+    button.dataset.deleteStage = "confirm";
+    button.dataset.locked = "false";
+    button.disabled = false;
+    button.textContent = `确认删除 ${currentSelected} 项`;
+  }, CONVERSATION_DELETE_CONFIRM_DELAY_MS);
+}
+
 function clearConversationDeleteTimer(peer) {
   const target = String(peer || "").trim();
   const timer = S.conversationDeleteTimers.get(target);
@@ -4951,6 +5128,7 @@ function setConversationDeleteRevealed(item, revealed) {
 function beginConversationSwipe(event) {
   const item = event.target.closest && event.target.closest("[data-conversation-item]");
   if (
+    S.conversationBatchMode ||
     !item ||
     event.target.closest('[data-action="delete-conversation"]') ||
     (event.pointerType === "mouse" && event.button !== 0)
@@ -5022,28 +5200,52 @@ function startConversationDeleteConfirmation(button) {
   S.conversationDeleteTimers.set(peer, timer);
 }
 
-function removeConversationListItem(peer) {
-  const target = String(peer || "").trim();
-  const conversation = S.conversations.find((item) => conversationPeer(item) === target);
-  if (!target || !conversation) return;
-  dismissConversationPeer(target, conversation);
-  clearConversationDeleteTimer(target);
-  const wasActive = target === String(S.activePeer || "");
+function closeActiveConversationForRemoval() {
+  if (!S.activePeer) return;
+  finishVoiceRecording(null, true);
+  closeFlashViewer();
+  closeChatMediaViewer();
+  S.imComposerPanel = "";
+  setChatComposerDraft($("im-text")?.value ?? S.imComposerDraft);
+  S.imVoiceMode = false;
+  S.activePeer = "";
+  restoreChatComposerDraft("");
+  S.activePeerName = "";
+}
+
+function removeConversationListItems(peers) {
+  const targets = new Set(
+    (Array.isArray(peers) ? peers : []).map((peer) => String(peer || "").trim()).filter(Boolean)
+  );
+  const conversations = S.conversations.filter((item) => targets.has(conversationPeer(item)));
+  if (!conversations.length) return { count: 0, wasActive: false };
+  dismissConversationPeers(conversations);
+  targets.forEach(clearConversationDeleteTimer);
+  const wasActive = targets.has(String(S.activePeer || ""));
   if (wasActive) {
-    finishVoiceRecording(null, true);
-    closeFlashViewer();
-    closeChatMediaViewer();
-    S.imComposerPanel = "";
-    setChatComposerDraft($("im-text")?.value ?? S.imComposerDraft);
-    S.imVoiceMode = false;
-    S.activePeer = "";
-    restoreChatComposerDraft("");
-    S.activePeerName = "";
+    closeActiveConversationForRemoval();
   }
-  S.conversations = S.conversations.filter((item) => conversationPeer(item) !== target);
+  S.conversations = S.conversations.filter((item) => !targets.has(conversationPeer(item)));
   recalculateUnreadTotal();
-  refreshMessageConversationRegion({ refreshList: true, refreshPane: wasActive });
+  return { count: conversations.length, wasActive };
+}
+
+function removeConversationListItem(peer) {
+  const result = removeConversationListItems([peer]);
+  if (!result.count) return;
+  refreshMessageConversationRegion({ refreshList: true, refreshPane: result.wasActive });
   toast("聊天已从列表移除，消息仍然保留");
+}
+
+function removeSelectedConversationListItems() {
+  if (!S.conversationBatchMode || S.conversationBatchDeleteStage !== "confirm") return;
+  const selected = [...S.selectedConversationPeers];
+  const result = removeConversationListItems(selected);
+  clearConversationBatchDeleteConfirmation();
+  S.conversationBatchMode = false;
+  S.selectedConversationPeers.clear();
+  refreshMessageConversationRegion({ refreshList: true, refreshPane: result.wasActive });
+  if (result.count) toast(`已从列表移除 ${result.count} 个聊天，消息仍然保留`);
 }
 
 function stickerGroupsFromEnvelope(envelope) {
@@ -5347,9 +5549,10 @@ function refreshMessageConversationRegion({
   if (S.route !== "msg") return false;
   const page = document.querySelector(".message-page");
   const layout = document.querySelector(".conversation-layout");
+  const controls = document.querySelector("[data-conversation-list-controls]");
   const list = document.querySelector(".conversation-list");
   const pane = document.querySelector(".chat-pane");
-  if (!page || !layout || !list || !pane) return false;
+  if (!page || !layout || !controls || !list || !pane) return false;
   const previousInput = refreshPane ? pane.querySelector("#im-text") : null;
   const previousPeer = String(previousInput?.closest('form[data-form="im-send"]')?.elements?.peer?.value || "");
   const preserveComposer = Boolean(previousInput && previousPeer === String(S.activePeer || ""));
@@ -5366,6 +5569,7 @@ function refreshMessageConversationRegion({
   layout.classList.toggle("is-list-collapsed", S.conversationListCollapsed);
   document.body.classList.toggle("chat-conversation-open", Boolean(S.activePeer));
   if (refreshList) {
+    controls.innerHTML = conversationListControlsHtml();
     list.innerHTML = conversationListHtml();
   } else {
     list.querySelectorAll(".conversation-card").forEach((card) => {
@@ -5388,7 +5592,16 @@ function refreshMessageConversationRegion({
     scrollChatLogToBottom(pane.querySelector("#im-log"));
   }
   const count = document.querySelector("[data-conversation-count]");
-  if (count) count.textContent = S.conversations.length ? `${S.conversations.length} 个最近会话` : "最近联系的人会显示在这里";
+  if (count) {
+    const total = S.conversations.length;
+    count.textContent = S.conversationBatchMode
+      ? total
+        ? `已选择 ${selectedConversationCount()} 项，共 ${total} 项`
+        : "当前没有可选择的会话"
+      : total
+        ? `${total} 个最近会话`
+        : "最近联系的人会显示在这里";
+  }
   const collapseToggle = document.querySelector('[data-action="toggle-conversation-list"]');
   if (collapseToggle) {
     const expanded = !S.conversationListCollapsed;
@@ -7552,7 +7765,7 @@ async function pageMessages(signal) {
   if (S.activePeer) void loadConversationMessages(S.activePeer);
   return `<div class="message-page${S.activePeer ? " conversation-open" : ""}"><section class="conversation-layout${S.activePeer ? " has-active" : ""}${S.conversationListCollapsed ? " is-list-collapsed" : ""}">
       <aside class="conversation-list-pane" aria-label="聊天列表">
-        <div class="pane-head"><div class="pane-head-copy"><h2>聊天列表</h2><p data-conversation-count>${S.conversations.length ? `${S.conversations.length} 个最近会话` : "最近联系的人会显示在这里"}</p></div><div class="pane-head-actions"><button type="button" class="btn secondary small" id="mark-all-read-list" data-action="mark-all-read" aria-label="将所有会话标记为已读" ${S.conversations.length ? "" : "disabled"}>全部已读</button><button type="button" class="utility-btn conversation-collapse-toggle" data-action="toggle-conversation-list" aria-controls="conversation-list" aria-expanded="${String(!S.conversationListCollapsed)}" aria-label="${S.conversationListCollapsed ? "横向展开聊天列表" : "横向收起聊天列表"}" title="${S.conversationListCollapsed ? "横向展开聊天列表" : "横向收起聊天列表"}">${S.conversationListCollapsed ? "展开" : "收起"}</button></div></div>
+        <div data-conversation-list-controls>${conversationListControlsHtml()}</div>
         <div class="conversation-list ui-scrollbar" id="conversation-list">${conversationListHtml()}</div>
       </aside>
       <div class="chat-pane">${chatPaneHtml()}</div>
@@ -10272,6 +10485,30 @@ async function handleAction(action, button) {
     return;
   }
   if (action === "record-voice" || action === "flash-hold") return;
+  if (action === "start-conversation-batch") {
+    setConversationBatchMode(true);
+    return;
+  }
+  if (action === "finish-conversation-batch") {
+    setConversationBatchMode(false);
+    return;
+  }
+  if (action === "toggle-conversation-selection") {
+    toggleConversationSelection(button.dataset.uid);
+    return;
+  }
+  if (action === "toggle-conversation-select-all") {
+    toggleAllConversationSelections();
+    return;
+  }
+  if (action === "delete-selected-conversations") {
+    if (button.dataset.deleteStage === "confirm") {
+      removeSelectedConversationListItems();
+    } else {
+      startConversationBatchDeleteConfirmation(button);
+    }
+    return;
+  }
   if (action === "delete-conversation") {
     if (button.dataset.deleteStage === "confirm") {
       removeConversationListItem(button.dataset.uid);
@@ -10288,6 +10525,10 @@ async function handleAction(action, button) {
   if (action === "open-chat" || action === "select-conversation") {
     const uid = String(button.dataset.uid || "").trim();
     if (!uid) throw new Error("缺少对方 UID");
+    if (action === "select-conversation" && S.conversationBatchMode) {
+      toggleConversationSelection(uid);
+      return;
+    }
     if (action === "open-chat" && !canStartPrivateChat(uid)) {
       toast("该私信入口仅向管理员授权的用户开放", "error", 4200);
       return;
