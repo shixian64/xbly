@@ -1542,18 +1542,48 @@ function closeMessageSyncChannel() {
   S.messageSyncChannel = null;
 }
 
+function conversationMessageRevision(item) {
+  if (!item) return "";
+  return [
+    conversationTimestamp(item),
+    item.activity_sequence ?? item.activitySequence ?? item.msg_sequence ?? item.msgSeq ?? item.MsgSeq,
+    item.preview_sequence ?? item.previewSequence ?? item.last_message_sequence,
+  ]
+    .map((value) => String(value ?? ""))
+    .join("\u001f");
+}
+
 function applyConversationSummaries(
   items,
   { broadcast = false, authority = "live", observedAt = Date.now() } = {}
 ) {
+  const activePeer = S.route === "msg" ? String(S.activePeer || "").trim() : "";
+  const previousActive = activePeer
+    ? S.conversations.find((item) => conversationPeer(item) === activePeer)
+    : null;
+  const previousRevision = conversationMessageRevision(previousActive);
   const prepared = (Array.isArray(items) ? items : []).map((item) =>
     normalizeConversationSummary(item, { authority, observedAt })
   );
   S.conversations = mergeConversationSources(prepared, S.conversations);
+  const nextActive = activePeer
+    ? S.conversations.find((item) => conversationPeer(item) === activePeer)
+    : null;
+  const nextRevision = conversationMessageRevision(nextActive);
   recalculateUnreadTotal();
   refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
   void hydrateConversationProfiles();
   if (authority === "live") void hydrateStaleConversationPreviews();
+  if (
+    authority === "live" &&
+    activePeer &&
+    nextRevision &&
+    nextRevision !== previousRevision
+  ) {
+    S.messageLastPeerSyncAt = Date.now();
+    S.messageLastPeerSyncPeer = activePeer;
+    void loadConversationMessages(activePeer, { force: true });
+  }
   if (broadcast) {
     const channel = ensureMessageSyncChannel();
     try {
@@ -1745,6 +1775,22 @@ function syncMessagesInBackground({ force = false } = {}) {
   if (!S.authenticated || document.hidden) return Promise.resolve([]);
   const now = Date.now();
   const tasks = [];
+  if (S.imConnected && S.imMode === "sdk" && S.chat && typeof S.chat.isReady === "function") {
+    try {
+      if (!S.chat.isReady()) {
+        S.imConnected = false;
+        S.imLastError = "实时连接状态异常，已启用定时消息同步";
+        S.imNextReconnectAt = 0;
+        S.messageLastPeerSyncAt = 0;
+        updateImConnectionStatus();
+      }
+    } catch {
+      S.imConnected = false;
+      S.imNextReconnectAt = 0;
+      S.messageLastPeerSyncAt = 0;
+      updateImConnectionStatus();
+    }
+  }
   if (force || now - S.messageLastPolicySyncAt >= MESSAGE_POLICY_SYNC_MS) {
     S.messageLastPolicySyncAt = now;
     tasks.push(refreshMessagePolicy());
@@ -12120,6 +12166,14 @@ window.addEventListener("resize", () => scheduleMomentViewScan(), { passive: tru
 window.addEventListener("scroll", () => scheduleMomentViewScan(), { passive: true });
 window.visualViewport?.addEventListener("resize", syncVisualViewport, { passive: true });
 window.visualViewport?.addEventListener("scroll", syncVisualViewport, { passive: true });
+
+window.addEventListener("online", () => {
+  if (!S.authenticated || document.hidden) return;
+  S.imNextReconnectAt = 0;
+  S.messageLastPeerSyncAt = 0;
+  startMessageSyncTimer();
+  void runMessageSyncCycle({ force: true });
+});
 
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
