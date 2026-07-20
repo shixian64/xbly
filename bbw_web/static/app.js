@@ -71,6 +71,8 @@ const PANEL_DOM_CACHE_LIMIT = 80;
 const MESSAGE_REVOKE_DEFAULT_WINDOW_MS = 2 * 60 * 1000;
 const MEDIA_RECONCILE_DELAYS_MS = [1200, 3500, 8000];
 const CHAT_MEDIA_RETRY_DELAYS_MS = [700, 1800, 4000];
+const VOICE_TRANSCRIPT_STORAGE_KEY = "bbw:im:voice-transcripts";
+const VOICE_TRANSCRIPT_STORAGE_LIMIT = 300;
 const MOMENT_VIDEO_FRAME_CHECK_MS = 2500;
 const MOMENT_VIDEO_INITIAL_FRAME_WAIT_MS = 15000;
 const MOMENT_VIDEO_COMPAT_TIMEOUT_MS = 32 * 60 * 1000;
@@ -209,6 +211,7 @@ const S = {
   imLocalObjectUrls: new Set(),
   imMediaReconcileTimers: new Map(),
   imMediaRetryState: new Map(),
+  imVoiceTranscriptLoading: new Set(),
   presenceByUid: new Map(),
   presenceLoadingUids: new Set(),
   subscribedPresenceUids: new Set(),
@@ -447,14 +450,15 @@ function validAvatarValue(...values) {
 }
 
 function resolveTimApi() {
-  if (window.TIM && typeof window.TIM.create === "function") return window.TIM;
   if (window.TencentCloudChat && typeof window.TencentCloudChat.create === "function") {
     return window.TencentCloudChat;
   }
+  if (window.TIM && typeof window.TIM.create === "function") return window.TIM;
   return null;
 }
 
-const TIM_SDK_SRC = "/static/vendor/tim-js.js";
+const TIM_SDK_SRC = "/static/vendor/tencent-cloud-chat-3.6.6.js";
+const TIM_SDK_VERSION = "3.6.6";
 const TIM_UPLOAD_PLUGIN_SRC = "/static/vendor/tim-upload-plugin.js";
 let _timSdkLoading = null;
 let _timUploadPluginLoading = null;
@@ -521,7 +525,7 @@ function withTimeout(promise, ms, label = "操作") {
 }
 
 /**
- * Ensure the vendored TIM Web SDK is on window.TIM.
+ * Ensure the vendored Tencent Cloud Chat Web SDK is available.
  * Handles: slow network, script tag race, or index.html without the vendor tag.
  */
 function ensureTimSdkLoaded() {
@@ -534,7 +538,9 @@ function ensureTimSdkLoaded() {
       if (api) resolve(api);
       else reject(err || new Error("实时消息组件已请求但未正确加载"));
     };
-    const existing = document.querySelector("script[data-bbw-tim],script[src*='tim-js.js']");
+    const existing = document.querySelector(
+      "script[data-bbw-tim],script[src*='tencent-cloud-chat-3.6.6.js'],script[src*='tim-js.js']"
+    );
     if (existing) {
       // Script tag present but not ready yet — poll briefly, then hard-reload once.
       let n = 0;
@@ -547,7 +553,7 @@ function ensureTimSdkLoaded() {
           clearInterval(timer);
           // Force a fresh inject (handles failed first load / wrong path).
           const script = document.createElement("script");
-          script.src = `${TIM_SDK_SRC}?v=2.27.6`;
+          script.src = `${TIM_SDK_SRC}?v=${TIM_SDK_VERSION}`;
           script.dataset.bbwTim = "1";
           script.onload = () => finish();
           script.onerror = () => finish(new Error("实时消息组件加载失败"));
@@ -557,7 +563,7 @@ function ensureTimSdkLoaded() {
       return;
     }
     const script = document.createElement("script");
-    script.src = `${TIM_SDK_SRC}?v=2.27.6`;
+    script.src = `${TIM_SDK_SRC}?v=${TIM_SDK_VERSION}`;
     script.async = false;
     script.dataset.bbwTim = "1";
     script.onload = () => finish();
@@ -5679,6 +5685,184 @@ function rememberAudioPlayed(id) {
   }
 }
 
+function voiceTranscriptStorage() {
+  try {
+    const value = JSON.parse(localStorage.getItem(VOICE_TRANSCRIPT_STORAGE_KEY) || "{}");
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+function voiceTranscriptEntryKey(entry) {
+  const account = String(S.user?.uid || S.user?.id || "anonymous");
+  return `${account}|${messageIdentityKey(entry)}`;
+}
+
+function storedVoiceTranscript(entry) {
+  const key = voiceTranscriptEntryKey(entry);
+  const stored = voiceTranscriptStorage()[key];
+  if (!stored || typeof stored !== "object") return { text: "", status: 0 };
+  const text = String(stored.text || "").trim().slice(0, 5000);
+  const status = Number(stored.status) === 1 ? 1 : text ? 3 : 0;
+  return { text, status };
+}
+
+function persistVoiceTranscript(entry, text, status) {
+  const normalizedText = String(text || "").trim().slice(0, 5000);
+  if (!normalizedText) return;
+  try {
+    const stored = voiceTranscriptStorage();
+    stored[voiceTranscriptEntryKey(entry)] = {
+      text: normalizedText,
+      status: Number(status) === 1 ? 1 : 3,
+      at: Date.now(),
+    };
+    const limited = Object.fromEntries(
+      Object.entries(stored)
+        .sort((a, b) => Number(b[1]?.at || 0) - Number(a[1]?.at || 0))
+        .slice(0, VOICE_TRANSCRIPT_STORAGE_LIMIT)
+    );
+    localStorage.setItem(VOICE_TRANSCRIPT_STORAGE_KEY, JSON.stringify(limited));
+  } catch {
+    /* Voice text remains available for the current page when storage is unavailable. */
+  }
+}
+
+function messageVoiceTranscript(message, payload = messagePayload(message)) {
+  const localCustomRaw = firstMessageValue(
+    [message, payload],
+    ["localCustomData", "local_custom_data", "LocalCustomData"],
+    ""
+  );
+  const localCustom = parseJsonValue(localCustomRaw) || {};
+  const text = String(
+    firstMessageValue(
+      [localCustom, message, payload],
+      ["voice_to_text", "voiceToText", "convertedText", "speechText", "recognitionText"],
+      ""
+    ) || ""
+  )
+    .trim()
+    .slice(0, 5000);
+  const rawStatus = Number(
+    firstMessageValue(
+      [localCustom, message, payload],
+      ["voice_to_text_view_status", "voiceToTextViewStatus", "voiceTextStatus"],
+      0
+    )
+  );
+  return {
+    text,
+    status: rawStatus === 1 ? 1 : text ? 3 : rawStatus === 2 ? 2 : 0,
+  };
+}
+
+function hydrateVoiceTranscript(entry, message, payload) {
+  if (entry?.kind !== "audio") return entry;
+  const embedded = messageVoiceTranscript(message, payload);
+  const stored = storedVoiceTranscript(entry);
+  entry.voiceText = embedded.text || stored.text;
+  entry.voiceTextStatus = embedded.text ? embedded.status : stored.status;
+  if (S.imVoiceTranscriptLoading.has(voiceTranscriptEntryKey(entry))) entry.voiceTextStatus = 2;
+  return entry;
+}
+
+function voiceTranscriptActionInfo(entry) {
+  if (!entry || entry.kind !== "audio" || entry.revoked || entry.delivery === "sending" || entry.delivery === "failed") {
+    return null;
+  }
+  const text = String(entry.voiceText || "").trim();
+  const status = Number(entry.voiceTextStatus || 0);
+  if (status === 2 || S.imVoiceTranscriptLoading.has(voiceTranscriptEntryKey(entry))) {
+    return { label: "转换中", title: "正在将语音转换为文字", disabled: true };
+  }
+  if (text) {
+    return status === 1
+      ? { label: "显示文字", title: "显示这条语音的文字内容", disabled: false }
+      : { label: "收起文字", title: "收起这条语音的文字内容", disabled: false };
+  }
+  if (entry.rawMessage && S.imMode === "sdk" && typeof S.chat?.convertVoiceToText === "function") {
+    return { label: "转文字", title: "将这条语音转换为文字", disabled: false };
+  }
+  return null;
+}
+
+function updateVoiceTranscriptEntry(entry, text, status, { persist = true } = {}) {
+  const key = messageIdentityKey(entry);
+  const index = S.imMessages.findIndex((item) => messageIdentityKey(item) === key);
+  if (index < 0) return null;
+  const next = {
+    ...S.imMessages[index],
+    voiceText: String(text || "").trim().slice(0, 5000),
+    voiceTextStatus: Number(status) || 0,
+  };
+  S.imMessages[index] = next;
+  if (persist && next.voiceText) persistVoiceTranscript(next, next.voiceText, next.voiceTextStatus);
+  refreshChatLog();
+  return next;
+}
+
+function voiceTranscriptResultText(result) {
+  const candidates = [
+    result?.data?.result,
+    result?.result,
+    result?.data?.text,
+    result?.text,
+    result?.data?.voiceText,
+  ];
+  return String(candidates.find((value) => typeof value === "string" && value.trim()) || "")
+    .trim()
+    .slice(0, 5000);
+}
+
+async function convertChatVoiceToText(id, messageRandom = "") {
+  let entry = findChatMessageByIdentity(id, messageRandom);
+  if (!entry || entry.kind !== "audio" || entry.revoked) throw new Error("这条语音当前无法转文字");
+  const existingText = String(entry.voiceText || "").trim();
+  if (existingText) {
+    const nextStatus = Number(entry.voiceTextStatus) === 1 ? 3 : 1;
+    updateVoiceTranscriptEntry(entry, existingText, nextStatus);
+    return;
+  }
+  if (!entry.rawMessage || S.imMode !== "sdk" || typeof S.chat?.convertVoiceToText !== "function") {
+    throw new Error("当前消息通道暂不支持语音转文字");
+  }
+  const storageKey = voiceTranscriptEntryKey(entry);
+  if (S.imVoiceTranscriptLoading.has(storageKey)) return;
+  S.imVoiceTranscriptLoading.add(storageKey);
+  updateVoiceTranscriptEntry(entry, "", 2, { persist: false });
+  try {
+    const result = await withTimeout(
+      Promise.resolve(
+        S.chat.convertVoiceToText({
+          message: entry.rawMessage,
+          language: "zh (cmn-Hans-CN)",
+        })
+      ),
+      30000,
+      "语音转文字"
+    );
+    const text = voiceTranscriptResultText(result);
+    if (!text) throw new Error("没有识别到可显示的文字");
+    S.imVoiceTranscriptLoading.delete(storageKey);
+    entry = findChatMessageByIdentity(id, messageRandom) || entry;
+    updateVoiceTranscriptEntry(entry, text, 3);
+    toast("语音已转换为文字");
+  } catch (error) {
+    S.imVoiceTranscriptLoading.delete(storageKey);
+    entry = findChatMessageByIdentity(id, messageRandom) || entry;
+    updateVoiceTranscriptEntry(entry, "", 0, { persist: false });
+    const detail = String(error?.message || error || "语音转文字失败");
+    if (/unsupported|voice format|format/i.test(detail)) {
+      throw new Error("这条语音的格式暂不支持转文字");
+    }
+    throw error;
+  } finally {
+    S.imVoiceTranscriptLoading.delete(storageKey);
+  }
+}
+
 function optionalReadState(value) {
   if (value === true || value === 1) return true;
   if (value === false || value === 0) return false;
@@ -5858,6 +6042,7 @@ function timMessageEntry(message, peer = "", me = String(S.user?.uid || S.user?.
     delivery: status.includes("fail") ? "failed" : status.includes("sending") || status.includes("unsend") ? "sending" : "sent",
     progress: numericMessageValue(message?.progress, status.includes("sending") ? 0 : 1),
   };
+  hydrateVoiceTranscript(entry, message, payload);
   entry.preview = String(message?.preview || messagePreview(entry));
   return entry;
 }
@@ -5965,6 +6150,21 @@ function chatMessageQuoteHtml(entry) {
   )}</strong><span>${esc(messageQuoteDisplayText(quote))}</span></button>`;
 }
 
+function voiceBubbleWidth(duration) {
+  const seconds = Math.max(1, Math.min(60, Math.round(Number(duration) || 1)));
+  return Math.round((9.5 + (seconds / 60) * 8.5) * 10) / 10;
+}
+
+function chatVoiceTranscriptHtml(entry) {
+  const text = String(entry?.voiceText || "").trim();
+  const status = Number(entry?.voiceTextStatus || 0);
+  if (status === 2) {
+    return '<div class="chat-voice-transcript is-loading" role="status">正在转换为文字，请稍候</div>';
+  }
+  if (!text || status === 1) return "";
+  return `<div class="chat-voice-transcript"><span>${esc(text)}</span></div>`;
+}
+
 function chatMessageBodyHtml(entry) {
   if (entry.revoked) {
     if (canEditRevokedMessage(entry)) {
@@ -5990,15 +6190,24 @@ function chatMessageBodyHtml(entry) {
   if (entry.kind === "audio") {
     const played = entry.type === "mine" || isAudioPlayed(entry.id);
     if (!media.url) {
-      return `<span class="chat-message-text">语音消息 · ${esc(formatMediaDuration(media.duration))}</span>`;
+      return `<span class="chat-message-text">语音消息 · ${esc(
+        Math.max(1, Math.round(Number(media.duration) || 1))
+      )} 秒</span>${chatVoiceTranscriptHtml(entry)}`;
     }
-    return `<div class="chat-audio${played ? " is-played" : ""}" data-playback-wrap><div class="chat-audio-head"><strong>语音消息</strong><span>${esc(
-      formatMediaDuration(media.duration)
-    )}</span>${played ? "" : '<span class="chat-audio-unplayed">未播放</span>'}</div><audio controls preload="metadata" data-audio-message-id="${esc(
+    const duration = Math.max(1, Math.round(Number(media.duration) || 1));
+    return `<div class="chat-audio${played ? " is-played" : ""}" data-playback-wrap style="--chat-audio-width:${voiceBubbleWidth(
+      duration
+    )}rem"><button type="button" class="chat-audio-button" data-action="toggle-chat-audio" aria-label="播放语音，${esc(
+      duration
+    )} 秒" aria-pressed="false"><span class="chat-audio-status" data-audio-status>播放语音</span><span class="chat-audio-duration" data-audio-duration>${esc(
+      duration
+    )} 秒</span>${played ? "" : '<span class="chat-audio-unplayed">未听</span>'}<span class="chat-audio-progress" aria-hidden="true"><span data-audio-progress></span></span></button><audio preload="metadata" data-audio-message-id="${esc(
       entry.id
     )}" data-media-playback data-media-source="${esc(media.url)}" src="${esc(
       media.url
-    )}"></audio><div class="chat-playback-fallback" data-playback-fallback hidden><span>语音加载失败</span><button type="button" data-action="retry-chat-playback">重试</button></div></div>`;
+    )}"></audio><div class="chat-playback-fallback" data-playback-fallback hidden><span>语音加载失败</span><button type="button" data-action="retry-chat-playback">重试</button></div>${chatVoiceTranscriptHtml(
+      entry
+    )}</div>`;
   }
   if (entry.kind === "video") {
     if (!media.url) return `<span class="chat-message-text">视频暂不可用</span>`;
@@ -6082,6 +6291,7 @@ function chatLogHtml() {
       const canRetry = canRetryFailedChatMessage(entry);
       const canEditRevoked = canEditRevokedMessage(entry);
       const canQuote = canQuoteChatMessage(entry);
+      const voiceTranscriptAction = voiceTranscriptActionInfo(entry);
       const sentTime = chatMessageTimeInfo(entry.timestamp);
       const readTime = chatMessageReadTimeInfo(entry, sentTime);
       const stateIndicator =
@@ -6090,6 +6300,33 @@ function chatLogHtml() {
               state.label
             )}" title="${esc(state.label)}"></span>`
           : "";
+      const contextualActionsHtml = `${
+        voiceTranscriptAction
+          ? `<button type="button" class="chat-message-action voice-text" data-action="voice-to-text" data-message-id="${esc(
+              entry.id
+            )}" data-message-random="${esc(
+              entry.messageRandom || timMessageRandom(entry)
+            )}" aria-label="${esc(voiceTranscriptAction.title)}" title="${esc(voiceTranscriptAction.title)}" ${
+              voiceTranscriptAction.disabled ? "disabled" : ""
+            }>${esc(voiceTranscriptAction.label)}</button>`
+          : ""
+      }${
+        canQuote
+          ? `<button type="button" class="chat-message-action quote" data-action="quote-chat-message" data-message-id="${esc(
+              entry.id
+            )}" data-message-random="${esc(
+              entry.messageRandom || timMessageRandom(entry)
+            )}" aria-label="引用消息" title="引用这条消息">引用</button>`
+          : ""
+      }${
+        revokeAction
+          ? `<button type="button" class="chat-message-action${
+              revokeAction.outsideDefaultWindow ? " is-outside-default-window" : ""
+            }" data-action="revoke-chat-message" data-message-id="${esc(entry.id)}" aria-label="${esc(
+              revokeAction.title
+            )}" title="${esc(revokeAction.title)}">${esc(revokeAction.label)}</button>`
+          : ""
+      }`;
       const metaHtml = `${
         sentTime
           ? `<time class="chat-message-time"${sentTime.datetime ? ` datetime="${esc(sentTime.datetime)}"` : ""} title="${esc(
@@ -6111,23 +6348,11 @@ function chatLogHtml() {
             )}" aria-label="重试发送" title="重新发送这条消息">重试</button>`
           : ""
       }${
-        canQuote
-          ? `<button type="button" class="chat-message-action quote contextual" data-action="quote-chat-message" data-message-id="${esc(
-              entry.id
-            )}" data-message-random="${esc(
-              entry.messageRandom || timMessageRandom(entry)
-            )}" aria-label="引用消息" title="引用这条消息">引用</button>`
-          : ""
-      }${
-        revokeAction
-          ? `<button type="button" class="chat-message-action contextual${
-              revokeAction.outsideDefaultWindow ? " is-outside-default-window" : ""
-            }" data-action="revoke-chat-message" data-message-id="${esc(entry.id)}" aria-label="${esc(
-              revokeAction.title
-            )}" title="${esc(revokeAction.title)}">${esc(revokeAction.label)}</button>`
+        contextualActionsHtml
+          ? `<span class="chat-message-actions contextual" role="group" aria-label="消息操作">${contextualActionsHtml}</span>`
           : ""
       }`;
-      const hasContextActions = Boolean(canQuote || revokeAction);
+      const hasContextActions = Boolean(contextualActionsHtml);
       return `<div class="chat-message-row${mineClass}${hasContextActions ? " has-context-actions" : ""}" data-message-id="${esc(entry.id)}" data-message-random="${esc(
         entry.messageRandom || timMessageRandom(entry)
       )}" data-message-sequence="${esc(entry.sequence || timMessageSequence(entry))}"><div class="chat-message-main${mineClass}">${stateIndicator}<div class="chat-line${mineClass}${
@@ -6285,6 +6510,8 @@ function peerMessageRevision(peer) {
         entry.peerRead,
         entry.readAt,
         entry.flashId,
+        entry.voiceText,
+        entry.voiceTextStatus,
         JSON.stringify(normalizeMessageQuote(entry.quote) || null),
         entry.media?.url,
         entry.media?.thumbnail,
@@ -6326,6 +6553,11 @@ function mergePeerMessages(peer, incoming) {
             retryMeta: entry.delivery === "sent" ? null : entry.retryMeta ?? previous.retryMeta ?? null,
             retryError: entry.delivery === "sent" ? "" : entry.retryError ?? previous.retryError ?? "",
             quote: normalizeMessageQuote(entry.quote) || normalizeMessageQuote(previous.quote),
+            voiceText: entry.voiceText || previous.voiceText || "",
+            voiceTextStatus:
+              entry.voiceText || Number(entry.voiceTextStatus)
+                ? Number(entry.voiceTextStatus || 0)
+                : Number(previous.voiceTextStatus || 0),
           }
         : entry
     );
@@ -8806,6 +9038,42 @@ function finishVoiceRecording(pointer, cancel = false) {
   state.cancel = state.cancel || cancel;
   if (state.recorder && state.recorder.state !== "inactive") state.recorder.stop();
   else if (state.stream) state.stream.getTracks().forEach((track) => track.stop());
+}
+
+function syncChatAudioPlaybackUi(audio) {
+  const wrap = audio?.closest?.(".chat-audio");
+  const button = wrap?.querySelector("[data-audio-control], .chat-audio-button");
+  if (!wrap || !button) return;
+  const duration = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
+  const current = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
+  const ratio = duration > 0 ? Math.max(0, Math.min(1, current / duration)) : 0;
+  const playing = !audio.paused && !audio.ended;
+  const completed = Boolean(audio.ended || (duration > 0 && ratio >= 0.999));
+  wrap.classList.toggle("is-playing", playing);
+  wrap.classList.toggle("is-complete", completed);
+  button.setAttribute("aria-pressed", playing ? "true" : "false");
+  const status = button.querySelector("[data-audio-status]");
+  if (status) status.textContent = playing ? "暂停语音" : completed ? "重新播放" : current > 0 ? "继续播放" : "播放语音";
+  const durationLabel = button.querySelector("[data-audio-duration]");
+  if (durationLabel && duration > 0) durationLabel.textContent = `${Math.max(1, Math.round(duration))} 秒`;
+  const progress = button.querySelector("[data-audio-progress]");
+  if (progress) progress.style.transform = `scaleX(${ratio})`;
+}
+
+async function toggleChatAudioPlayback(button) {
+  const audio = button?.closest("[data-playback-wrap]")?.querySelector("audio[data-audio-message-id]");
+  if (!audio) throw new Error("语音播放控件不可用");
+  if (audio.dataset.mediaFailed === "1") {
+    reloadChatPlayback(audio, { manual: true });
+    return;
+  }
+  if (!audio.paused) {
+    audio.pause();
+    syncChatAudioPlaybackUi(audio);
+    return;
+  }
+  await audio.play();
+  syncChatAudioPlaybackUi(audio);
 }
 
 function ensureChatMediaViewer() {
@@ -12304,6 +12572,7 @@ async function logout() {
     S.imStickersLoaded = false;
     S.imRecordingState = null;
     S.imMediaRetryState.clear();
+    S.imVoiceTranscriptLoading.clear();
     S.imConnecting = false;
     S._imConnecting = null;
     S.imConnectingGeneration = -1;
@@ -12568,6 +12837,10 @@ async function handleAction(action, button) {
     quoteChatMessage(button.dataset.messageId, button.dataset.messageRandom);
     return;
   }
+  if (action === "voice-to-text") {
+    await convertChatVoiceToText(button.dataset.messageId, button.dataset.messageRandom);
+    return;
+  }
   if (action === "cancel-chat-quote") {
     clearChatMessageQuote();
     refreshChatComposerQuote({ focus: true });
@@ -12675,6 +12948,10 @@ async function handleAction(action, button) {
       return;
     }
     openChatMediaViewer(button.dataset.mediaKind || "image", button.dataset.url);
+    return;
+  }
+  if (action === "toggle-chat-audio") {
+    await toggleChatAudioPlayback(button);
     return;
   }
   if (action === "close-chat-media") {
@@ -13321,6 +13598,7 @@ function completeBrowserLogin(data) {
   S.imArchiveLoadedPeers.clear();
   S.imMessageOlderLoadingPeers.clear();
   S.imMessageHistoryExhaustedPeers.clear();
+  S.imVoiceTranscriptLoading.clear();
   S.conversations = [];
   S.conversationRefreshPromise = null;
   S.conversationLastRefreshAt = 0;
@@ -13531,9 +13809,21 @@ document.addEventListener(
     const wrap = audio.closest(".chat-audio");
     wrap?.classList.add("is-played");
     wrap?.querySelector(".chat-audio-unplayed")?.remove();
+    syncChatAudioPlaybackUi(audio);
   },
   true
 );
+
+for (const eventName of ["pause", "ended", "timeupdate", "durationchange"]) {
+  document.addEventListener(
+    eventName,
+    (event) => {
+      const audio = event.target.closest && event.target.closest("audio[data-audio-message-id]");
+      if (audio) syncChatAudioPlaybackUi(audio);
+    },
+    true
+  );
+}
 
 document.addEventListener("pointerdown", (event) => {
   beginConversationSwipe(event);
@@ -13868,6 +14158,7 @@ window.addEventListener("pagehide", (event) => {
     closeMessageSyncChannel();
     revokeAllChatObjectUrls();
     S.imMediaRetryState.clear();
+    S.imVoiceTranscriptLoading.clear();
     if (S.loginStage === "invite") {
       void fetch("/api/auth/invite/cancel", {
         method: "POST",

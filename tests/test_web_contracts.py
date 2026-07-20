@@ -4162,6 +4162,25 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("尝试启用文本备用通道", app_js)
         self.assertIn("当前仅可发送文本", app_js)
 
+    def test_voice_messages_use_compact_bubbles_and_web_voice_to_text(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
+        vendor = root / "bbw_web" / "static" / "vendor" / "tencent-cloud-chat-3.6.6.js"
+
+        self.assertTrue(vendor.is_file())
+        self.assertIn("convertVoiceToText", vendor.read_text(encoding="utf-8"))
+        self.assertIn('TIM_SDK_SRC = "/static/vendor/tencent-cloud-chat-3.6.6.js"', app_js)
+        self.assertIn('data-action="toggle-chat-audio"', app_js)
+        self.assertIn('data-action="voice-to-text"', app_js)
+        self.assertIn("function convertChatVoiceToText", app_js)
+        self.assertIn("voice_to_text_view_status", app_js)
+        self.assertIn('class="chat-message-actions contextual"', app_js)
+        self.assertIn(".chat-audio-button", app_css)
+        self.assertIn(".chat-audio-progress", app_css)
+        self.assertIn(".chat-voice-transcript", app_css)
+        self.assertIn(".chat-message-actions", app_css)
+
     def test_profile_and_structured_fields_use_chinese_display_labels(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")

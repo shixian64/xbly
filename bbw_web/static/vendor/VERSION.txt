@@ -1,9 +1,15 @@
+@tencentcloud/chat@3.6.6
+Source: https://registry.npmjs.org/@tencentcloud/chat/-/chat-3.6.6.tgz (package/index.js)
+Global: window.TencentCloudChat (UMD)
+Purpose: pinned product Web IM SDK with voice-to-text support.
+
+Legacy fallback retained:
 tim-js-sdk@2.27.6
 Source: https://cdn.jsdelivr.net/npm/tim-js-sdk@2.27.6/tim-js.js
 Global: window.TIM (UMD)
-Purpose: fixed-version vendor for product Web IM; do not replace with unpinned "latest".
+Purpose: retained as the previous fixed-version vendor for rollback and comparison.
 
 tim-upload-plugin@1.4.3
 Source: npm package tim-upload-plugin@1.4.3 (UMD index.js)
 Global: window.TIMUploadPlugin
-Purpose: required by TIM Web SDK 2.27.6 for image/audio/video/file upload.
+Purpose: required for image/audio/video/file upload.
