@@ -12134,8 +12134,11 @@ async function handleAction(action, button) {
       return;
     }
     if (action === "open-chat" && !canStartPrivateChat(uid)) {
-      toast("该私信入口仅向管理员授权的用户开放", "error", 4200);
-      return;
+      await refreshMessagePolicy();
+      if (!canStartPrivateChat(uid)) {
+        toast("该私信入口仅向管理员授权的用户开放", "error", 4200);
+        return;
+      }
     }
     if (uid !== S.activePeer) {
       S.imComposerPanel = "";

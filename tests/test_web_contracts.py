@@ -3198,6 +3198,15 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('${chatAllowed ? "" : " hidden"}>聊天</button>', user_card)
         self.assertIn("button.hidden = !allowed", app_js)
         self.assertIn('action === "open-chat" && !canStartPrivateChat(uid)', app_js)
+        self.assertIn("await refreshMessagePolicy();", app_js)
+        policy_recheck = app_js.split(
+            'if (action === "open-chat" && !canStartPrivateChat(uid))', 1
+        )[1].split("if (uid !== S.activePeer)", 1)[0]
+        self.assertLess(
+            policy_recheck.index("await refreshMessagePolicy();"),
+            policy_recheck.index('toast("该私信入口仅向管理员授权的用户开放"'),
+        )
+        self.assertIn("if (!canStartPrivateChat(uid)) {", policy_recheck)
         self.assertIn("const chatAllowed = !isSelf && canStartPrivateChat(profileUid)", open_profile)
         self.assertIn('${chatAllowed ? "" : " hidden"}>聊天</button>', open_profile)
         self.assertIn('data-action="add-friend"', open_profile)
@@ -4298,6 +4307,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("session-bootstrap-retry", css_version)
         self.assertIn("route-dom-cache", css_version)
         self.assertIn("panel-dom-cache", css_version)
+        self.assertIn("private-message-policy-recheck", css_version)
 
 
 class FlashPhotoBffContractTests(unittest.TestCase):
