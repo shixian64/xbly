@@ -351,7 +351,7 @@ python -m bbw_protocol.cli withdraw --alipay ... --name ... --amount ...
 
 ### 6.4 任务进度校验：本地还是服务器？能否伪造完成？
 
-#### 客户端只有 3 个任务相关 HTTP
+#### 任务页只有 3 个直接相关 HTTP
 
 | 接口 | 参数 | 作用 |
 |---|---|---|
@@ -359,7 +359,7 @@ python -m bbw_protocol.cli withdraw --alipay ... --name ... --amount ...
 | `createHotActivityList` | `uid` | **拉取任务列表**（含服务端算好的 `progress` / `num` / `available`） |
 | `receiveHotActivityList` | **仅 `id`** | 领取奖励 |
 
-客户端 **没有**「上报进度」接口。`HotActivity` UI 逻辑：
+客户端没有直接提交或修改 `progress` 的任务接口。`HotActivity` UI 逻辑：
 
 ```text
 if progress == num → 按钮可点「领取」→ receiveHotActivityList(id)
@@ -371,8 +371,10 @@ else → 按钮不可点
 #### 进度从哪来
 
 - `progress` 由 **`createHotActivityList` 服务端返回**。
-- 客户端不做聊天句数/刷动态次数的本地累加再提交。
-- 推断：进度在服务端由业务行为旁路累加（发消息、看动态、匹配等），**不是客户端自报**。
+- 客户端不在本地累加任务进度，也不会把 `progress` 直接提交给任务接口。
+- 动态页会额外调用 `luntanStatistic`：`uid=<当前用户>`、`type=pv`、`postId=<进入可见区域的动态 ID>`。
+- `luntanStatistic` 固定使用 `i=99999`，与动态列表来自 `Luntan0` 还是 `luntannewnewnew` 无关。
+- 因此进度仍由服务端维护，但服务端依据的是客户端上报的业务行为事件，而不是单纯拉取列表。
 
 #### 伪造探测（本号 YOUR_UID）
 
@@ -381,8 +383,10 @@ else → 按钮不可点
 | `receive` 只传 id（进度仍 0） | 空 body，**卡不增加** |
 | `receive` 附带 `progress=num` / `complete=1` 等 | 空 body，**无效** |
 | 猜测接口 `updateHotActivityList` / `taskProgress` / `completeHotActivity`… | empty/false，**不存在或无效** |
-| `playOnce` 等试图刷「观看动态」 | 列表里 progress 仍 0 |
-| 重拉 `createHotActivityList` | progress 仍服务端原值 |
+| 只调用 `playOnce` | 列表里 progress 仍 0；该接口是视频播放次数，不是动态曝光 |
+| 只请求 `Luntan0` / `luntannewnewnew` | 只返回列表，不产生 `pv` 行为 |
+| APK 动态卡片进入可见区域 | 调用 `luntanStatistic(type=pv, postId=...)` |
+| 重拉 `createHotActivityList` | 只读取服务端最新值，不会因刷新动作自行增长 |
 
 本号列表曾出现 **`available=已领取` 但 `progress=0`**（状态不一致展示），重复领取仍无回包、**不能再刷卡**。
 
@@ -392,7 +396,7 @@ else → 按钮不可点
 |---|---|
 | 任务完成校验在哪？ | **服务器**（进度与是否可领以服务端状态为准） |
 | 客户端校验？ | 仅 **UI**（progress==num 才可点领取） |
-| 能否直接伪造完成？ | **目前不能**；无进度上报接口，领取不接受客户端伪造 progress |
+| 能否直接伪造完成？ | **目前不能**；无直接进度上报接口，领取不接受客户端伪造 progress |
 | 正规完成方式 | 真实触发对应行为 → 服务端加 progress → `receiveHotActivityList` |
 
 ```

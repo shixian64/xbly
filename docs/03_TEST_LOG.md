@@ -341,7 +341,7 @@ HTTP 主路径已协议化；通用 `call` 覆盖全部枚举 action。原生 SD
 |---|---|
 | receive + 伪造 progress/complete 字段 | 空响应，卡不增加 |
 | 猜测 update/complete 类 action | empty/false |
-| playOnce 等 | 未抬高「观看动态」progress |
+| 只调用 `playOnce` | 未抬高「观看动态」progress；APK 实际另行上报 `luntanStatistic(type=pv, postId=...)` |
 | 重拉任务列表 | progress 仍为服务端值 |
 
 ### 结论

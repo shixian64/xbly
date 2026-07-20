@@ -38,9 +38,9 @@ const SYSTEM_CUSTOMER_SERVICE_UID = "1";
 const MESSAGE_SYNC_TICK_MS = 3000;
 const MESSAGE_SUMMARY_CHAT_MS = 25 * 1000;
 const MESSAGE_SUMMARY_BACKGROUND_MS = 60 * 1000;
-const MESSAGE_POLICY_SYNC_MS = 5000;
-const MESSAGE_PEER_SYNC_REALTIME_MS = 10 * 1000;
-const MESSAGE_PEER_SYNC_FALLBACK_MS = 8 * 1000;
+const MESSAGE_POLICY_SYNC_MS = 60 * 1000;
+const MESSAGE_PEER_SYNC_REALTIME_MS = 90 * 1000;
+const MESSAGE_PEER_SYNC_FALLBACK_MS = 12 * 1000;
 const CONVERSATION_REFRESH_MIN_MS = 8 * 1000;
 const CONVERSATION_REFRESH_ERROR_MS = 30 * 1000;
 const ARCHIVED_CONVERSATION_TTL_MS = 30 * 1000;
@@ -115,6 +115,9 @@ const S = {
   momentsTab: "推荐",
   momentsSearch: "",
   momentsFeedSeq: 0,
+  momentViewObserver: null,
+  momentViewRetryTimers: new Set(),
+  momentViewScanScheduled: false,
   socialTab: "friends",
   visitorTab: "seen_me",
   activePeer: "",
@@ -165,6 +168,7 @@ const S = {
   imMessages: [],
   imMessageLoadingPeers: new Set(),
   imMessageLoadedPeers: new Set(),
+  imArchiveLoadedPeers: new Set(),
   imComposerPanel: "",
   imComposerDraft: "",
   imComposerDraftRevision: 0,
@@ -700,6 +704,7 @@ async function api(path, options = {}) {
       stopPresenceTimer();
       stopMessageSyncTimer();
       closeMessageSyncChannel();
+      disconnectMomentViewTracking();
       clearPeerMediaReconcile();
       clearMessageArchiveDeliveryState();
       S._imConnecting = null;
@@ -2092,6 +2097,7 @@ function hydrateRenderedRoute(route, signal, seq) {
       }
     });
   }
+  if (route === "moments") observeMomentCards();
   if (S.authenticatedServicesPending) scheduleAuthenticatedServices(1000);
 }
 
@@ -2127,6 +2133,7 @@ async function activateRoute(id, { force = false } = {}) {
     }
     S.matchTab = normalizeMatchTab(params.get("tab"));
   }
+  disconnectMomentViewTracking();
   if (S.routeController) S.routeController.abort();
   const controller = new AbortController();
   const seq = ++S.routeSeq;
@@ -2241,7 +2248,7 @@ function avatarHtml(url) {
   // not collapse every row and then expand it again as images decode.
   return `<span class="avatar avatar-loading" aria-hidden="true"><img src="${esc(
     src
-  )}" alt="" loading="eager" decoding="async" referrerpolicy="no-referrer" data-avatar-image /></span>`;
+  )}" alt="" loading="lazy" decoding="async" fetchpriority="low" referrerpolicy="no-referrer" data-avatar-image /></span>`;
 }
 
 function revealLoadedAvatar(image) {
@@ -3403,6 +3410,106 @@ function clearMomentCache() {
     if (String(key).startsWith("moments")) S.pageCache.delete(key);
   });
   S.pageCache.delete("me");
+}
+
+function disconnectMomentViewTracking() {
+  if (S.momentViewObserver) S.momentViewObserver.disconnect();
+  S.momentViewObserver = null;
+  S.momentViewRetryTimers.forEach((timer) => clearTimeout(timer));
+  S.momentViewRetryTimers.clear();
+}
+
+function momentCardIsVisible(card) {
+  if (
+    !card?.isConnected ||
+    document.hidden ||
+    S.route !== "moments" ||
+    S.momentsTab === "我的" ||
+    !card.closest("#moment-feed")
+  ) {
+    return false;
+  }
+  const rect = card.getBoundingClientRect();
+  const viewportHeight = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
+  const viewportWidth = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+  return rect.bottom > 0 && rect.top < viewportHeight && rect.right > 0 && rect.left < viewportWidth;
+}
+
+function retryMomentViewReport(card) {
+  const attempts = Number(card?.dataset.momentViewAttempts || 0);
+  if (!card?.isConnected || attempts >= 2) return;
+  card.dataset.momentViewAttempts = String(attempts + 1);
+  const timer = setTimeout(() => {
+    S.momentViewRetryTimers.delete(timer);
+    if (momentCardIsVisible(card)) void reportMomentView(card);
+  }, 1500 * (attempts + 1));
+  S.momentViewRetryTimers.add(timer);
+}
+
+async function reportMomentView(card) {
+  const postId = String(card?.dataset.postId || "").trim();
+  if (!/^\d{1,32}$/.test(postId) || postId === "0" || !momentCardIsVisible(card)) return;
+  if (card.dataset.momentViewState === "pending" || card.dataset.momentViewState === "reported") return;
+  card.dataset.momentViewState = "pending";
+  const generation = S.sessionGeneration;
+  try {
+    const result = await api("/api/moments/view", {
+      method: "POST",
+      body: JSON.stringify({ post_id: postId }),
+      timeout: 12000,
+    });
+    if (generation !== S.sessionGeneration) return;
+    if (!result.ok || !result.data?.ok) throw new Error("动态观看记录未提交");
+    S.pageCache.delete("tasks");
+    if (!card.isConnected) return;
+    card.dataset.momentViewState = "reported";
+    card.dataset.momentViewAttempts = "0";
+  } catch (error) {
+    if (card.isConnected && generation === S.sessionGeneration) {
+      delete card.dataset.momentViewState;
+      retryMomentViewReport(card);
+    }
+    if (error?.name !== "AbortError") console.info("[moment-view]", error?.message || error);
+  }
+}
+
+function scanVisibleMomentCards(container = root()) {
+  if (document.hidden || S.route !== "moments" || S.momentsTab === "我的") return;
+  const feed = container?.matches?.("#moment-feed") ? container : container?.querySelector?.("#moment-feed");
+  feed?.querySelectorAll?.("[data-post-card][data-post-id]").forEach((card) => {
+    if (momentCardIsVisible(card)) void reportMomentView(card);
+  });
+}
+
+function scheduleMomentViewScan(container = root()) {
+  if (S.momentViewScanScheduled) return;
+  S.momentViewScanScheduled = true;
+  requestAnimationFrame(() => {
+    S.momentViewScanScheduled = false;
+    scanVisibleMomentCards(container);
+  });
+}
+
+function observeMomentCards(container = root()) {
+  if (S.route !== "moments" || S.momentsTab === "我的") {
+    disconnectMomentViewTracking();
+    return;
+  }
+  if (!S.momentViewObserver && typeof IntersectionObserver !== "undefined") {
+    S.momentViewObserver = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) void reportMomentView(entry.target);
+        });
+      },
+      { threshold: 0.01 }
+    );
+  }
+  const feed = container?.matches?.("#moment-feed") ? container : container?.querySelector?.("#moment-feed");
+  feed?.querySelectorAll?.("[data-post-card][data-post-id]").forEach((card) => {
+    S.momentViewObserver?.observe(card);
+  });
+  scheduleMomentViewScan(container);
 }
 
 function clearRelationshipCache(tabs = SOCIAL_TABS) {
@@ -5042,6 +5149,11 @@ function scrollChatLogToBottom(log = $("im-log")) {
   });
 }
 
+function chatLogIsNearBottom(log = $("im-log"), threshold = 96) {
+  if (!log) return true;
+  return log.scrollHeight - log.scrollTop - log.clientHeight <= threshold;
+}
+
 function addImMessage(text, type = "system", peer = "", meta = {}) {
   if (type === "system") {
     console.info("[TIM]", String(text));
@@ -5065,8 +5177,9 @@ function addImMessage(text, type = "system", peer = "", meta = {}) {
   trimChatMessages(100);
   const log = $("im-log");
   if (log) {
+    const shouldStickToBottom = type === "mine" || chatLogIsNearBottom(log);
     log.innerHTML = chatLogHtml();
-    scrollChatLogToBottom(log);
+    if (shouldStickToBottom) scrollChatLogToBottom(log);
   }
   return entry;
 }
@@ -5085,11 +5198,12 @@ function trimChatMessages(limit = 500) {
   });
 }
 
-function refreshChatLog() {
+function refreshChatLog({ forceBottom = false } = {}) {
   const log = $("im-log");
   if (!log) return;
+  const shouldStickToBottom = forceBottom || chatLogIsNearBottom(log);
   log.innerHTML = chatLogHtml();
-  scrollChatLogToBottom(log);
+  if (shouldStickToBottom) scrollChatLogToBottom(log);
 }
 
 function clearPeerMediaReconcile(peer = "") {
@@ -5117,8 +5231,39 @@ function schedulePeerMediaReconcile(peer) {
   S.imMediaReconcileTimers.set(target, timers);
 }
 
+function peerMessageRevision(peer) {
+  const target = String(peer || "");
+  return S.imMessages
+    .filter((entry) => entry.peer === target)
+    .map((entry) =>
+      [
+        entry.id,
+        entry.msgKey,
+        entry.sequence,
+        entry.timestamp,
+        entry.type,
+        entry.kind,
+        entry.text,
+        entry.delivery,
+        entry.progress,
+        entry.revoked,
+        entry.peerRead,
+        entry.readAt,
+        entry.flashId,
+        entry.media?.url,
+        entry.media?.thumbnail,
+        entry.media?.uuid,
+      ]
+        .map((value) => String(value ?? ""))
+        .join("\u001f")
+    )
+    .sort()
+    .join("\u001e");
+}
+
 function mergePeerMessages(peer, incoming) {
   const target = String(peer || "");
+  const previousRevision = peerMessageRevision(target);
   const previousBlobUrls = new Set();
   S.imMessages
     .filter((entry) => entry.peer === target)
@@ -5155,34 +5300,35 @@ function mergePeerMessages(peer, incoming) {
   previousBlobUrls.forEach((url) => {
     if (!retainedBlobUrls.has(url)) revokeChatObjectUrl(url);
   });
+  return previousRevision !== peerMessageRevision(target);
 }
 
 async function loadConversationMessages(peer, { force = false } = {}) {
   const target = String(peer || "").trim();
   if (!target || S.imMessageLoadingPeers.has(target)) return;
   if (!force && S.imMessageLoadedPeers.has(target)) return;
+  const wasLoaded = S.imMessageLoadedPeers.has(target);
+  const shouldLoadArchive = !S.imArchiveLoadedPeers.has(target);
   S.imMessageLoadingPeers.add(target);
-  refreshChatLog();
+  if (!wasLoaded && S.activePeer === target) refreshChatLog();
   const me = String(S.user?.uid || S.user?.id || "");
-  const archiveTask = api(
-    `/api/archive/messages?peer=${encodeURIComponent(target)}&limit=200`,
-    { timeout: 6000 }
-  ).then(({ data }) => {
-    const entries = itemsOf(data).map((item) =>
-      timMessageEntry({ ...item, source: "archive" }, target, me)
-    );
-    if (entries.length) {
-      mergePeerMessages(target, entries);
-      if (S.activePeer === target) refreshChatLog();
-    }
-    return entries;
-  });
   const tasks = [
-    archiveTask,
     api(`/api/im/messages?peer=${encodeURIComponent(target)}`, { timeout: 10000 }).then(({ data }) =>
       itemsOf(data).map((item) => timMessageEntry({ ...item, source: "http" }, target, me))
     ),
   ];
+  if (shouldLoadArchive) {
+    tasks.push(
+      api(`/api/archive/messages?peer=${encodeURIComponent(target)}&limit=200`, { timeout: 6000 }).then(
+        ({ data, ok }) => {
+          if (ok && data?.ok !== false) S.imArchiveLoadedPeers.add(target);
+          return itemsOf(data).map((item) =>
+            timMessageEntry({ ...item, source: "archive" }, target, me)
+          );
+        }
+      )
+    );
+  }
   if (S.imMode === "sdk" && S.chat && typeof S.chat.getMessageList === "function") {
     tasks.push(
       withTimeout(
@@ -5198,7 +5344,7 @@ async function loadConversationMessages(peer, { force = false } = {}) {
   try {
     const results = await Promise.allSettled(tasks);
     const incoming = results.flatMap((result) => (result.status === "fulfilled" ? result.value : []));
-    mergePeerMessages(target, incoming);
+    const changed = mergePeerMessages(target, incoming);
     const archiveCandidates = new Map();
     incoming.forEach((entry) => {
       if (["archive", "http", "history"].includes(String(entry.source || "").toLowerCase())) return;
@@ -5212,9 +5358,12 @@ async function loadConversationMessages(peer, { force = false } = {}) {
       archiveMessageBestEffort(entry, entry.type === "mine" ? "outgoing" : "incoming")
     );
     S.imMessageLoadedPeers.add(target);
+    if (changed && S.activePeer === target) refreshChatLog();
   } finally {
     S.imMessageLoadingPeers.delete(target);
-    if (S.activePeer === target) refreshChatLog();
+    if (!wasLoaded && S.activePeer === target && !S.imMessages.some((entry) => entry.peer === target)) {
+      refreshChatLog();
+    }
   }
 }
 
@@ -8391,8 +8540,18 @@ async function loadMomentsTab(tab, signal) {
   if (S.momentsSearch && activeTab !== "我的") params.set("search", S.momentsSearch);
   const { data } = await api(`/api/moments/posts?${params.toString()}`, { signal });
   const posts = itemsOf(data);
-  const nextCursor = activeTab === "我的" ? String(data?.next_page || "") : String(posts.at(-1)?.id || "");
+  const nextCursor = nextMomentsCursor(activeTab, "1", posts, data);
   return { tab: activeTab, data, posts, nextCursor };
+}
+
+function nextMomentsCursor(tab, currentCursor, posts, data = null) {
+  if (tab === "我的") return String(data?.next_page || "");
+  const serverCursor = String(data?.next_cursor || "").trim();
+  if (serverCursor) return serverCursor;
+  if (!posts.length) return "";
+  if (tab === "推荐") return String(posts.at(-1)?.id || "");
+  const page = Number.parseInt(String(currentCursor || ""), 10);
+  return Number.isSafeInteger(page) && page > 0 ? String(page + 1) : "";
 }
 
 function momentsTabPanelHtml({ tab, data, posts, nextCursor }) {
@@ -8473,6 +8632,7 @@ async function switchMomentsTab(tab, { force = false } = {}) {
 
   const previousTab = S.momentsTab;
   const seq = ++S.momentsFeedSeq;
+  disconnectMomentViewTracking();
   S.momentsTab = activeTab;
   syncMomentsTabUI(activeTab);
   S.pageCache.delete(routeCacheKey("moments"));
@@ -8484,11 +8644,13 @@ async function switchMomentsTab(tab, { force = false } = {}) {
     if (seq !== S.momentsFeedSeq || S.route !== "moments" || S.momentsTab !== activeTab) return;
     panel.innerHTML = momentsTabPanelHtml(view);
     syncMomentsTabUI(activeTab, view.data);
+    observeMomentCards(panel);
   } catch (error) {
     if (seq !== S.momentsFeedSeq || S.route !== "moments") return;
     if (error instanceof AuthExpiredError) return;
     S.momentsTab = previousTab;
     syncMomentsTabUI(previousTab);
+    observeMomentCards(panel);
     toast(error?.message || "动态加载失败，请稍后重试", "error", 4200);
   } finally {
     if (seq === S.momentsFeedSeq && S.route === "moments") {
@@ -10506,6 +10668,7 @@ async function logout() {
     S.imMessages = [];
     S.imMessageLoadingPeers.clear();
     S.imMessageLoadedPeers.clear();
+    S.imArchiveLoadedPeers.clear();
     S.imComposerPanel = "";
     setChatComposerDraft("");
     S.imComposerDrafts.clear();
@@ -10551,6 +10714,7 @@ async function logout() {
     S.activePeerName = "";
     S.conversationListCollapsed = false;
     S.serverHeartbeat = false;
+    disconnectMomentViewTracking();
     closeProfileDialog();
     scrubAuthenticatedDom();
     applyUser(null);
@@ -10638,15 +10802,25 @@ async function handleAction(action, button) {
     const params = new URLSearchParams(tab === "我的" ? { tab, page: cursor } : { tab, cursor });
     if (S.momentsSearch && tab !== "我的") params.set("search", S.momentsSearch);
     const { data } = await api(`/api/moments/posts?${params.toString()}`);
-    const posts = itemsOf(data);
+    const fetchedPosts = itemsOf(data);
     const feed = $("moment-feed");
-    if (!posts.length) {
+    if (!fetchedPosts.length) {
       button.textContent = "没有更多动态";
       button.dataset.locked = "true";
       return;
     }
+    const existingIds = new Set(
+      [...(feed?.querySelectorAll("[data-post-card][data-post-id]") || [])].map((card) => String(card.dataset.postId || ""))
+    );
+    const posts = fetchedPosts.filter((post) => {
+      const id = String(post?.id || "");
+      if (!id || existingIds.has(id)) return false;
+      existingIds.add(id);
+      return true;
+    });
     feed?.insertAdjacentHTML("beforeend", posts.map(momentCard).join(""));
-    button.dataset.cursor = tab === "我的" ? String(data?.next_page || "") : String(posts.at(-1)?.id || "");
+    observeMomentCards(feed);
+    button.dataset.cursor = nextMomentsCursor(tab, cursor, fetchedPosts, data);
     if (!button.dataset.cursor) {
       button.textContent = "没有更多动态";
       button.dataset.locked = "true";
@@ -11485,6 +11659,10 @@ function completeBrowserLogin(data) {
   S.sessionGeneration += 1;
   S.authenticated = true;
   closeMessageSyncChannel();
+  S.imMessages = [];
+  S.imMessageLoadingPeers.clear();
+  S.imMessageLoadedPeers.clear();
+  S.imArchiveLoadedPeers.clear();
   S.conversations = [];
   S.conversationRefreshPromise = null;
   S.conversationLastRefreshAt = 0;
@@ -11938,6 +12116,8 @@ window.addEventListener("hashchange", () => {
 
 window.addEventListener("resize", syncVisualViewport, { passive: true });
 window.addEventListener("resize", syncNavigationMode, { passive: true });
+window.addEventListener("resize", () => scheduleMomentViewScan(), { passive: true });
+window.addEventListener("scroll", () => scheduleMomentViewScan(), { passive: true });
 window.visualViewport?.addEventListener("resize", syncVisualViewport, { passive: true });
 window.visualViewport?.addEventListener("scroll", syncVisualViewport, { passive: true });
 
@@ -11951,6 +12131,7 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
     startMessageSyncTimer();
     void runMessageSyncCycle({ force: true });
+    scanVisibleMomentCards();
   } else {
     stopMessageSyncTimer();
   }

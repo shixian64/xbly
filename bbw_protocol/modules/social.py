@@ -220,6 +220,24 @@ class SocialAPI:
             },
         )
 
+    def record_post_view(self, postid: str) -> ApiResult:
+        """Report the APK ``pv`` event for a visible Dynamic card.
+
+        Loading ``Luntan0``/``luntannewnewnew`` only returns feed data. APK
+        v154 separately posts each visible post id to the legacy ``i=99999``
+        statistic route; that event is what the server can use to advance the
+        "观看动态" task.
+        """
+
+        return self.c.request(
+            self.c.url("luntanStatistic", i="99999"),
+            {
+                "uid": self.c.session.uid,
+                "type": "pv",
+                "postId": str(postid),
+            },
+        )
+
     def luntan_like(self, postid: str) -> ApiResult:
         return self.c.call("luntanlike", postid=postid)
 

@@ -794,6 +794,23 @@ summary:focus-visible {
   animation: page-in 0.22s ease both;
 }
 
+.moment-card,
+.user-card,
+.conversation-card,
+.bottle-card {
+  content-visibility: auto;
+}
+
+.moment-card {
+  contain-intrinsic-size: auto 420px;
+}
+
+.user-card,
+.conversation-card,
+.bottle-card {
+  contain-intrinsic-size: auto 96px;
+}
+
 @keyframes page-in {
   from { opacity: 0; }
   to { opacity: 1; }
@@ -1836,7 +1853,7 @@ summary:focus-visible {
 }
 
 .avatar.avatar-loading {
-  visibility: hidden;
+  opacity: 0;
 }
 
 .avatar-sm {
@@ -5008,6 +5025,14 @@ html.flash-viewing body {
 @media (max-width: 960px) {
   .app-shell {
     grid-template-columns: 1fr;
+  }
+
+  .sidebar,
+  .topbar,
+  .bottom-nav,
+  .drawer-mask,
+  body.chat-conversation-open .chat-head {
+    backdrop-filter: none;
   }
 
   .mobile-only {

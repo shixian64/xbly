@@ -2037,6 +2037,13 @@ class Handler(BaseHTTPRequestHandler):
                 allowed_tabs = {"推荐", "附近", "最新", "招募令", "关注"}
                 if tab not in allowed_tabs:
                     return self.ok({"ok": False, "error": "不支持的动态分类"}, 400)
+                if (
+                    not cursor.isdigit()
+                    or cursor == "0"
+                    or len(cursor) > 32
+                    or (tab != "推荐" and int(cursor) > 100000)
+                ):
+                    return self.ok({"ok": False, "error": "动态游标无效"}, 400)
                 region = "不限"
                 if tab == "附近":
                     raw_user = getattr(app.session, "raw_user", {}) or {}
@@ -2056,6 +2063,15 @@ class Handler(BaseHTTPRequestHandler):
                     filter_region=region,
                 )
             payload = RM(result, "post", current_uid)
+            payload["cursor"] = cursor
+            feed_items = payload.get("items") if isinstance(payload.get("items"), list) else []
+            if feed_items:
+                if tab == "推荐":
+                    payload["next_cursor"] = str(feed_items[-1].get("id") or "")
+                else:
+                    payload["next_cursor"] = str(int(cursor) + 1)
+            else:
+                payload["next_cursor"] = ""
             if tab == "附近":
                 payload["location_region"] = region
             return self.ok(payload)
@@ -3245,6 +3261,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self.ok(R(app.social.add_blacklist(**_params(data))))
             if path == "/api/social/blacklist-del":
                 return self.ok(R(app.social.delete_blacklist(**_params(data))))
+            if path == "/api/moments/view":
+                postid = str(
+                    data.get("postid") or data.get("post_id") or data.get("id") or ""
+                ).strip()
+                if (
+                    not postid
+                    or postid == "0"
+                    or not postid.isdigit()
+                    or len(postid) > 32
+                ):
+                    return self.ok({"ok": False, "error": "动态编号无效"}, 400)
+                payload = R(app.social.record_post_view(postid), empty_ok=True)
+                payload["post_id"] = postid
+                return self.ok(payload)
             if path == "/api/social/like-post":
                 return self.ok(
                     R(
@@ -3937,13 +3967,14 @@ class Handler(BaseHTTPRequestHandler):
                 ".webp": "image/webp",
                 ".svg": "image/svg+xml",
             }[path.suffix]
-        # Vendor SDK is large and immutable by version pin.  First-party HTML/JS
-        # must be revalidated on every load: an older cached IM connector can keep
-        # throwing before login even after the server-side file has been fixed.
-        if "vendor" in rel.parts:
-            cache = "public, max-age=86400"
+        # Query-versioned first-party assets and version-pinned vendor SDK files
+        # are immutable.  Keep unversioned entry points revalidated so a direct
+        # /static/app.js request cannot retain stale application code.
+        has_version = bool(parse_qs(urlparse(self.path).query).get("v"))
+        if has_version or "vendor" in rel.parts:
+            cache = "public, max-age=31536000, immutable"
         elif path.suffix in {".html", ".js"}:
-            cache = "no-store"
+            cache = "no-cache"
         else:
             cache = "public, max-age=300"
         self._send(200, data, ct, cache_control=cache)

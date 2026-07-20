@@ -712,6 +712,13 @@ class ProtocolRoutingTests(unittest.TestCase):
             {"myid": "42", "authid": "9", "pageindex": "3"},
         )
 
+        SocialAPI(FakeClient()).record_post_view("123")
+        self.assertEqual(calls[6][0], "99999:luntanStatistic")
+        self.assertEqual(
+            calls[6][1],
+            {"uid": "42", "type": "pv", "postId": "123"},
+        )
+
 
 class TimRestHistoryEnvelopeTests(unittest.TestCase):
     def test_recent_contacts_filter_non_c2c_self_and_duplicates(self) -> None:
@@ -1120,6 +1127,42 @@ class SocialBffRoutingTests(unittest.TestCase):
         bff_server.Handler.do_POST(harness)
         return calls, harness.response
 
+    def _run_moment_view_post(self, payload: dict):
+        result = ApiResult(True, 200, "", data=None, kind="empty")
+        calls = []
+        app = SimpleNamespace(
+            social=SimpleNamespace(
+                record_post_view=lambda postid: calls.append(("view", postid)) or result,
+            )
+        )
+        web_user = SimpleNamespace(app=app)
+
+        class Harness:
+            path = "/api/moments/view"
+
+            def __init__(self):
+                self.response = None
+
+            def _check_api_origin(self):
+                return True
+
+            def body(self):
+                return payload
+
+            def sid(self):
+                return "sid"
+
+            def user(self, _sid):
+                return web_user
+
+            def ok(self, obj, status=200, **_kwargs):
+                self.response = (status, obj)
+                return self.response
+
+        harness = Harness()
+        bff_server.Handler.do_POST(harness)
+        return calls, harness.response
+
     def _run_agree_post(self, payload: dict):
         calls = []
         accepted = set()
@@ -1215,6 +1258,18 @@ class SocialBffRoutingTests(unittest.TestCase):
         calls, response = self._run_get("/api/social/friend-apply?page=1")
         self.assertEqual(calls, [("friend_apply", "1")])
         self.assertEqual(response[1]["items"], [])
+
+    def test_moment_view_route_only_accepts_numeric_post_ids(self) -> None:
+        calls, response = self._run_moment_view_post({"post_id": "123"})
+        self.assertEqual(calls, [("view", "123")])
+        self.assertEqual(response[0], 200)
+        self.assertTrue(response[1]["ok"])
+        self.assertEqual(response[1]["post_id"], "123")
+
+        calls, response = self._run_moment_view_post({"post_id": "abc"})
+        self.assertEqual(calls, [])
+        self.assertEqual(response[0], 400)
+        self.assertFalse(response[1]["ok"])
 
     def test_friend_applications_scan_past_accepted_first_page(self) -> None:
         calls = []
@@ -1417,7 +1472,12 @@ class SocialBffRoutingTests(unittest.TestCase):
     def test_nearby_moments_use_profile_region_and_report_missing_location(self) -> None:
         def run(raw_user, profile_data=None):
             calls = []
-            result = ApiResult(True, 200, "[]", data=[])
+            result = ApiResult(
+                True,
+                200,
+                "[]",
+                data=[{"id": "101", "authid": "9", "posttext": "nearby"}],
+            )
             session = SimpleNamespace(uid="42", raw_user=raw_user, nickname="N", portrait="")
             app = SimpleNamespace(
                 session=session,
@@ -1463,6 +1523,8 @@ class SocialBffRoutingTests(unittest.TestCase):
         calls, response = run({"id": "42", "region": "上海-上海"})
         self.assertEqual(calls[0][2]["filter_region"], "上海-上海")
         self.assertEqual(response[1]["location_region"], "上海-上海")
+        self.assertEqual(response[1]["cursor"], "1")
+        self.assertEqual(response[1]["next_cursor"], "2")
 
         calls, response = run({}, {"id": "42", "region": "浙江-杭州"})
         self.assertEqual(calls[0][2]["filter_region"], "浙江-杭州")
@@ -1472,6 +1534,52 @@ class SocialBffRoutingTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(response[1]["code"], "PROFILE_LOCATION_MISSING")
         self.assertTrue(response[1]["location_required"])
+
+    def test_recommended_moments_continue_from_last_post_id(self) -> None:
+        calls = []
+        result = ApiResult(
+            True,
+            200,
+            "[]",
+            data=[
+                {"id": "99", "authid": "8", "posttext": "first"},
+                {"id": "100", "authid": "9", "posttext": "last"},
+            ],
+        )
+        session = SimpleNamespace(uid="42", raw_user={}, nickname="N", portrait="")
+        app = SimpleNamespace(
+            session=session,
+            social=SimpleNamespace(
+                posts=lambda tab, cursor, **kwargs: calls.append((tab, cursor, kwargs)) or result,
+            ),
+        )
+        web_user = SimpleNamespace(app=app)
+
+        class Harness:
+            path = "/api/moments/posts?tab=%E6%8E%A8%E8%8D%90&cursor=1"
+
+            def __init__(self):
+                self.response = None
+
+            def _check_api_origin(self):
+                return True
+
+            def sid(self):
+                return "sid"
+
+            def user(self, _sid):
+                return web_user
+
+            def ok(self, obj, status=200, **_kwargs):
+                self.response = (status, obj)
+                return self.response
+
+        harness = Harness()
+        bff_server.Handler.do_GET(harness)
+
+        self.assertEqual(calls[0][0:2], ("推荐", "1"))
+        self.assertEqual(harness.response[1]["cursor"], "1")
+        self.assertEqual(harness.response[1]["next_cursor"], "100")
 
     def test_user_moments_target_uid_and_numbered_pages(self) -> None:
         def run(path):
@@ -2426,6 +2534,27 @@ class ImRevokeBffContractTests(unittest.TestCase):
 
 
 class SocialFrontendContractTests(unittest.TestCase):
+    def test_moment_cards_report_apk_pv_when_they_enter_the_viewport(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        server_py = (root / "bbw_web" / "bff_server.py").read_text(encoding="utf-8")
+
+        for marker in (
+            "function observeMomentCards",
+            "new IntersectionObserver",
+            '{ threshold: 0.01 }',
+            "function reportMomentView",
+            'api("/api/moments/view"',
+            "body: JSON.stringify({ post_id: postId })",
+            "if (!result.ok || !result.data?.ok)",
+            'S.pageCache.delete("tasks")',
+            "observeMomentCards(feed)",
+            "disconnectMomentViewTracking()",
+        ):
+            self.assertIn(marker, app_js)
+        self.assertIn('if path == "/api/moments/view":', server_py)
+        self.assertIn("app.social.record_post_view(postid)", server_py)
+
     def test_me_page_renders_profile_before_loading_relationship_counts(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
@@ -2658,8 +2787,19 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("seq !== S.momentsFeedSeq", moments_switch)
         self.assertNotIn('start: "1"', moments_loader)
         self.assertIn('activeTab === "我的" ? { tab: activeTab, page: "1" }', moments_loader)
+        self.assertIn('nextMomentsCursor(activeTab, "1", posts, data)', moments_loader)
+        self.assertIn("function nextMomentsCursor", moments_loader)
+        self.assertIn("data?.next_cursor", moments_loader)
         self.assertIn('String(data?.next_page || "")', moments_loader)
+        self.assertIn('tab === "推荐"', moments_loader)
         self.assertIn('String(posts.at(-1)?.id || "")', moments_loader)
+        self.assertIn("String(page + 1)", moments_loader)
+        load_more = app_js.split('if (action === "moment-load-more")', 1)[1].split(
+            'if (action === "moment-delete")', 1
+        )[0]
+        self.assertIn("existingIds", load_more)
+        self.assertIn("fetchedPosts.filter", load_more)
+        self.assertIn("nextMomentsCursor(tab, cursor, fetchedPosts, data)", load_more)
         self.assertIn(".moments-tab-panel.is-loading", app_css)
 
     def test_moment_comment_avatar_opens_profile_dialog(self) -> None:
@@ -2758,10 +2898,11 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('aria-hidden="true"', avatar_renderer)
         self.assertIn('avatar.classList.remove("avatar-loading")', avatar_renderer)
         self.assertIn(".avatar.avatar-loading", app_css)
-        self.assertIn("visibility: hidden", app_css)
+        self.assertIn("opacity: 0", app_css)
         self.assertIn("data-avatar-image", avatar_renderer)
-        self.assertIn('loading="eager"', avatar_renderer)
-        self.assertNotIn('loading="lazy"', avatar_renderer)
+        self.assertIn('loading="lazy"', avatar_renderer)
+        self.assertIn('fetchpriority="low"', avatar_renderer)
+        self.assertNotIn('loading="eager"', avatar_renderer)
         self.assertNotIn("onload=", avatar_renderer)
         self.assertNotIn("onerror=", avatar_renderer)
         self.assertIn("function revealLoadedAvatar(image)", app_js)
@@ -2955,6 +3096,12 @@ class SocialFrontendContractTests(unittest.TestCase):
             "/api/archive/messages?peer=${encodeURIComponent(target)}&limit=200",
             app_js,
         )
+        self.assertIn("imArchiveLoadedPeers: new Set()", app_js)
+        self.assertIn("const shouldLoadArchive = !S.imArchiveLoadedPeers.has(target)", app_js)
+        self.assertIn("if (shouldLoadArchive)", app_js)
+        self.assertIn("S.imArchiveLoadedPeers.add(target)", app_js)
+        self.assertIn("function chatLogIsNearBottom", app_js)
+        self.assertIn("const shouldStickToBottom = forceBottom || chatLogIsNearBottom(log)", app_js)
         self.assertIn('["archive", "http", "history"]', app_js)
         self.assertIn("function mergeConversationPair", app_js)
         self.assertIn("preview_timestamp", app_js)
@@ -3301,7 +3448,9 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn('img[data-media-source]', app_js)
         self.assertIn("MESSAGE_MODIFIED", app_js)
         self.assertIn("NET_STATE_CHANGE", app_js)
-        self.assertIn("MESSAGE_PEER_SYNC_FALLBACK_MS = 8 * 1000", app_js)
+        self.assertIn("MESSAGE_PEER_SYNC_FALLBACK_MS = 12 * 1000", app_js)
+        self.assertIn("MESSAGE_PEER_SYNC_REALTIME_MS = 90 * 1000", app_js)
+        self.assertIn("MESSAGE_POLICY_SYNC_MS = 60 * 1000", app_js)
         self.assertIn("图片加载失败，点击重试", app_js)
         self.assertIn("function handleChatPlaybackError(media)", app_js)
         self.assertIn('data-action="retry-chat-playback"', app_js)
