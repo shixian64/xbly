@@ -2308,6 +2308,17 @@ function avatarHtml(url) {
   )}" alt="" loading="lazy" decoding="async" fetchpriority="low" referrerpolicy="no-referrer" data-avatar-image /></span>`;
 }
 
+function conversationAvatarHtml(url) {
+  const src = mediaUrl(validAvatarValue(url));
+  if (!src) return "";
+  // Conversation avatars are visible immediately and load eagerly. A full
+  // browser refresh has no previous DOM node to reuse, so hiding these images
+  // until a lazy-load event would make the entire list blink into view.
+  return `<span class="avatar" aria-hidden="true"><img src="${esc(
+    src
+  )}" alt="" loading="eager" decoding="async" fetchpriority="high" referrerpolicy="no-referrer" data-avatar-image /></span>`;
+}
+
 function revealLoadedAvatar(image) {
   const avatar = image?.closest?.(".avatar");
   if (avatar) avatar.classList.remove("avatar-loading");
@@ -3214,7 +3225,7 @@ function conversationCard(item) {
     )}" data-name="${esc(name)}" data-avatar="${esc(avatar || "")}" aria-label="${esc(cardLabel)}" ${
       S.conversationBatchMode ? `aria-pressed="${String(batchSelected)}"` : ""
     } title="${esc(name)}">
-      ${avatarHtml(avatar)}
+      ${conversationAvatarHtml(avatar)}
       <span class="conversation-copy"><span class="conversation-title-line"><strong>${esc(name)}</strong>${presence}</span><span class="conversation-preview">${esc(
         preview
       )}</span></span>
@@ -6117,6 +6128,7 @@ function chatPaneHtml() {
 
 function renderConversationList(list) {
   const previousAvatars = new Map();
+  const pendingAvatarSwaps = [];
   list.querySelectorAll("[data-conversation-item][data-uid]").forEach((item) => {
     const peer = String(item.dataset.uid || "");
     const avatar = item.querySelector(".conversation-card > .avatar");
@@ -6134,10 +6146,64 @@ function renderConversationList(list) {
     const previous = previousAvatars.get(String(item.dataset.uid || ""));
     const nextAvatar = item.querySelector(".conversation-card > .avatar");
     const nextImage = nextAvatar?.querySelector("img[data-avatar-image]");
-    if (!previous || !nextAvatar || previous.src !== (nextImage?.getAttribute("src") || "")) return;
+    const nextSrc = nextImage?.getAttribute("src") || "";
+    if (!previous || !nextAvatar || !nextSrc) return;
+    if (previous.src === nextSrc) {
+      delete previous.avatar.dataset.pendingAvatarSrc;
+      nextAvatar.replaceWith(previous.avatar);
+      return;
+    }
+    previous.avatar.dataset.pendingAvatarSrc = nextSrc;
     nextAvatar.replaceWith(previous.avatar);
+    pendingAvatarSwaps.push({ currentAvatar: previous.avatar, nextAvatar, nextImage, nextSrc });
   });
   list.replaceChildren(template.content);
+  pendingAvatarSwaps.forEach(scheduleConversationAvatarSwap);
+}
+
+function scheduleConversationAvatarSwap({ currentAvatar, nextAvatar, nextImage, nextSrc }) {
+  const loader = new Image();
+  let settled = false;
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    const reveal = () => {
+      if (
+        !currentAvatar.isConnected ||
+        currentAvatar.dataset.pendingAvatarSrc !== nextSrc
+      ) {
+        return;
+      }
+      loader.dataset.avatarImage = "";
+      nextImage.replaceWith(loader);
+      delete currentAvatar.dataset.pendingAvatarSrc;
+      currentAvatar.replaceWith(nextAvatar);
+    };
+    if (typeof loader.decode === "function") {
+      void loader.decode().catch(() => {}).then(reveal);
+    } else {
+      reveal();
+    }
+  };
+  const fail = () => {
+    if (settled) return;
+    settled = true;
+    if (currentAvatar.dataset.pendingAvatarSrc === nextSrc) {
+      delete currentAvatar.dataset.pendingAvatarSrc;
+    }
+  };
+  loader.alt = "";
+  loader.loading = "eager";
+  loader.decoding = "async";
+  loader.fetchPriority = "high";
+  loader.referrerPolicy = "no-referrer";
+  loader.addEventListener("load", finish, { once: true });
+  loader.addEventListener("error", fail, { once: true });
+  loader.src = nextSrc;
+  if (loader.complete) {
+    if (loader.naturalWidth > 0) finish();
+    else fail();
+  }
 }
 
 function refreshMessageConversationRegion({

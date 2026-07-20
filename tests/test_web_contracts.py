@@ -2912,7 +2912,10 @@ class SocialFrontendContractTests(unittest.TestCase):
         index_html = (root / "bbw_web" / "static" / "index.html").read_text(encoding="utf-8")
         agents_md = (root / "AGENTS.md").read_text(encoding="utf-8")
         avatar_renderer = app_js.split("function avatarHtml(url)", 1)[1].split(
-            "const PEER_PRESENCE_TTL_MS", 1
+            "function conversationAvatarHtml(url)", 1
+        )[0]
+        conversation_avatar_renderer = app_js.split("function conversationAvatarHtml(url)", 1)[1].split(
+            "function revealLoadedAvatar", 1
         )[0]
         conversation_list_renderer = app_js.split("function renderConversationList(list)", 1)[1].split(
             "function refreshMessageConversationRegion", 1
@@ -2929,13 +2932,16 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('if (!src) return "";', avatar_renderer)
         self.assertIn('class="avatar avatar-loading"', avatar_renderer)
         self.assertIn('aria-hidden="true"', avatar_renderer)
-        self.assertIn('avatar.classList.remove("avatar-loading")', avatar_renderer)
+        self.assertIn('avatar.classList.remove("avatar-loading")', app_js)
         self.assertIn(".avatar.avatar-loading", app_css)
         self.assertIn("opacity: 0", app_css)
         self.assertIn("data-avatar-image", avatar_renderer)
         self.assertIn('loading="lazy"', avatar_renderer)
         self.assertIn('fetchpriority="low"', avatar_renderer)
         self.assertNotIn('loading="eager"', avatar_renderer)
+        self.assertNotIn("avatar-loading", conversation_avatar_renderer)
+        self.assertIn('loading="eager"', conversation_avatar_renderer)
+        self.assertIn('fetchpriority="high"', conversation_avatar_renderer)
         self.assertNotIn("onload=", avatar_renderer)
         self.assertNotIn("onerror=", avatar_renderer)
         self.assertIn("function revealLoadedAvatar(image)", app_js)
@@ -2946,6 +2952,9 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('document.createElement("template")', conversation_list_renderer)
         self.assertIn("nextAvatar.replaceWith(previous.avatar);", conversation_list_renderer)
         self.assertIn("list.replaceChildren(template.content);", conversation_list_renderer)
+        self.assertIn("pendingAvatarSwaps.forEach(scheduleConversationAvatarSwap);", conversation_list_renderer)
+        self.assertIn("function scheduleConversationAvatarSwap", app_js)
+        self.assertIn('currentAvatar.dataset.pendingAvatarSrc !== nextSrc', app_js)
         self.assertIn("renderConversationList(list);", conversation_region_refresh)
         self.assertNotIn("list.innerHTML = conversationListHtml();", conversation_region_refresh)
         self.assertIn('id="side-avatar" aria-hidden="true" hidden></div>', index_html)
@@ -3069,7 +3078,7 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("messageSyncTimer: null", app_js)
         self.assertIn("ensureConversationForPeer(uid", app_js)
         self.assertIn("updateConversationActivity(peer", app_js)
-        self.assertIn("avatarHtml(avatar)", conversation_card)
+        self.assertIn("conversationAvatarHtml(avatar)", conversation_card)
         self.assertIn("conversationProfilesByUid: new Map()", app_js)
         self.assertIn("function conversationAvatar(item)", app_js)
         self.assertIn("function preserveConversationAvatar(preferred, fallback)", app_js)
@@ -3824,6 +3833,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertEqual(css_version, js_version)
         self.assertIn("mobile-media-retry-secure-viewport", css_version)
         self.assertIn("conversation-avatar-stable", css_version)
+        self.assertIn("conversation-avatar-stable-reload", css_version)
 
 
 class FlashPhotoBffContractTests(unittest.TestCase):
