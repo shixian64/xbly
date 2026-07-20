@@ -2603,12 +2603,19 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                 self.assertEqual(response[0], 200)
                 self.assertTrue(response[1]["ok"])
 
-    def test_broad_im_credentials_are_disabled_for_all_product_users(self) -> None:
+    def test_tim_credentials_are_enabled_for_all_product_users(self) -> None:
+        tim_calls = []
         web_user = SimpleNamespace(
             app=SimpleNamespace(session=SimpleNamespace(uid="42")),
             native=SimpleNamespace(
                 im=SimpleNamespace(
-                    tim_login_payload=lambda **_kwargs: self.fail("credential mint must not run"),
+                    tim_login_payload=lambda **kwargs: tim_calls.append(kwargs)
+                    or {
+                        "SDKAppID": 1600039823,
+                        "userID": "42",
+                        "userSig": "server-user-signature",
+                        "source": "server",
+                    },
                     rong_register=lambda: self.fail("credential mint must not run"),
                     bootstrap=lambda **_kwargs: self.fail("credential mint must not run"),
                 )
@@ -2636,7 +2643,21 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                 return self.response
 
         for enabled in (False, True):
-            for path in ("/api/im/tim", "/api/im/rong", "/api/im/bootstrap"):
+            harness = Harness("/api/im/tim", enabled)
+            bff_server.Handler.do_GET(harness)
+
+            self.assertEqual(harness.response[0], 200)
+            self.assertTrue(harness.response[1]["ok"])
+            self.assertEqual(harness.response[1]["userID"], "42")
+            self.assertEqual(harness.response[1]["userSig"], "server-user-signature")
+            self.assertTrue(harness.response[1]["sig_len"])
+            self.assertTrue(
+                bff_server.Handler.web_user_capabilities(harness, web_user)[
+                    "direct_im_credentials"
+                ]
+            )
+
+            for path in ("/api/im/rong", "/api/im/bootstrap"):
                 with self.subTest(enabled=enabled, path=path):
                     harness = Harness(path, enabled)
                     bff_server.Handler.do_GET(harness)
@@ -2646,9 +2667,17 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                         harness.response[1]["code"],
                         "IM_DIRECT_CREDENTIALS_DISABLED",
                     )
-                    self.assertFalse(
+                    self.assertTrue(
                         harness.response[1]["capabilities"]["direct_im_credentials"]
                     )
+
+        self.assertEqual(
+            tim_calls,
+            [
+                {"prefer": "server", "allow_local_fallback": False},
+                {"prefer": "server", "allow_local_fallback": False},
+            ],
+        )
 
     def test_message_policy_restores_durable_match_peers(self) -> None:
         web_user = SimpleNamespace(
@@ -2688,7 +2717,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
             harness.response[1]["capabilities"]["proactive_private_message"]
         )
 
-    def test_app_bootstrap_never_requests_or_leaks_tim_credential(self) -> None:
+    def test_app_bootstrap_returns_server_tim_credential_for_direct_media(self) -> None:
         bootstrap_calls = []
         credential_calls = []
         ok = ApiResult(True, 200, "true", data=True)
@@ -2725,8 +2754,13 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                     app=app,
                     native=SimpleNamespace(
                         im=SimpleNamespace(
-                            tim_login_payload=lambda **_kwargs: credential_calls.append(True)
-                            or {"userSig": "must-not-leak"}
+                            tim_login_payload=lambda **kwargs: credential_calls.append(kwargs)
+                            or {
+                                "SDKAppID": 1600039823,
+                                "userID": "42",
+                                "userSig": "server-user-signature",
+                                "source": "server",
+                            }
                         )
                     ),
                     match_pool_online_list_enabled=enabled,
@@ -2736,18 +2770,25 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                 bff_server.Handler.do_GET(harness)
 
                 self.assertEqual(harness.response[0], 200)
+                self.assertTrue(harness.response[1]["tim"]["ok"])
+                self.assertEqual(harness.response[1]["tim"]["userID"], "42")
                 self.assertEqual(
-                    harness.response[1]["tim"]["code"],
-                    "IM_DIRECT_CREDENTIALS_DISABLED",
+                    harness.response[1]["tim"]["userSig"],
+                    "server-user-signature",
                 )
-                self.assertFalse(
+                self.assertTrue(
                     harness.response[1]["capabilities"]["direct_im_credentials"]
                 )
-                self.assertNotIn("must-not-leak", json.dumps(harness.response[1]))
                 self.assertNotIn("txim", harness.response[1]["batch"])
 
         self.assertEqual(bootstrap_calls, [False, False])
-        self.assertEqual(credential_calls, [])
+        self.assertEqual(
+            credential_calls,
+            [
+                {"prefer": "server", "allow_local_fallback": False},
+                {"prefer": "server", "allow_local_fallback": False},
+            ],
+        )
 
 
 class ImRevokeBffContractTests(unittest.TestCase):
@@ -3077,7 +3118,7 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn(".discovery-filter-form", app_css)
         self.assertNotIn("MATCH_POOL_ONLINE_LIST_FORBIDDEN", bff_server_py)
 
-    def test_unprivileged_non_match_users_cannot_display_or_trigger_private_chat(self) -> None:
+    def test_unprivileged_non_match_users_remain_hidden_in_ui_and_rest_path(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
         bff_server_py = (root / "bbw_web" / "bff_server.py").read_text(encoding="utf-8")
@@ -3129,7 +3170,17 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("Handler.can_message_peer(self, u, to_uid)", bff_server_py)
         self.assertIn("Handler.can_message_peer(self, u, target_id)", bff_server_py)
         self.assertIn("IM_DIRECT_CREDENTIALS_DISABLED", bff_server_py)
-        self.assertIn('"direct_im_credentials": False', bff_server_py)
+        self.assertIn('"direct_im_credentials": True', bff_server_py)
+        self.assertIn('if path == "/api/im/tim"', bff_server_py)
+        self.assertIn('prefer="server"', bff_server_py)
+        self.assertIn("allow_local_fallback=False", bff_server_py)
+        tim_connect = app_js.split("async function ensureTimConnected", 1)[1].split(
+            "async function cleanupIM", 1
+        )[0]
+        self.assertNotIn(
+            "if (!S.proactivePrivateMessageEnabled) return false;",
+            tim_connect,
+        )
         self.assertIn("persistence.can_message_peer(", api_py)
 
     def test_moments_and_social_tabs_update_only_their_content_panels(self) -> None:

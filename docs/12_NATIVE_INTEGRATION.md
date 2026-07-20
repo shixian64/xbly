@@ -93,8 +93,8 @@ python -m bbw_web --port 8765
 ### IM
 
 - 本地 UserSig：`sign.gen_user_sig`，仅 CLI / 显式 Lab 研究使用；产品 Web 不隐式回退到本地签名。
-- 服务端：`tximsign.php`；登录响应 `userSign`；产品 Web 的文本发送统一经过 BFF 权限检查。
-- 实时收发：由受信任宿主提供固定版本 TIM 或融云 SDK。
+- 服务端：`tximsign.php` 或登录响应提供 `userSign`；产品 Web 会把服务端 UserSig 下发给已登录浏览器。
+- 实时收发：浏览器使用固定版本 TIM SDK 和上传插件发送文字及富媒体；该直连通道不经过 BFF 的逐对象私信鉴权。SDK 不可用时仅回退到经过 BFF 权限检查的 REST 文本发送。
 
 ### 刷脸
 

@@ -11166,13 +11166,11 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
       let lastErr = "";
       for (const prefer of order) {
         if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
-        if (!S.proactivePrivateMessageEnabled) return false;
         try {
           setImConnectingUi(true, "正在验证消息登录凭证…");
           addImMessage(`获取 TIM 凭证（${prefer}）…`, "system");
           const cred = await fetchTimCredential(prefer);
           if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
-          if (!S.proactivePrivateMessageEnabled) return false;
           addImMessage(
             `凭证就绪 source=${cred.source || prefer} uid=${cred.userID} sig_len=${cred.sig_len || String(cred.userSig).length}`,
             "system"
@@ -11180,10 +11178,6 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
           const ok = await connectTIM(cred, sessionGeneration);
           if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
           if (ok) {
-            if (!S.proactivePrivateMessageEnabled) {
-              await cleanupIM();
-              return false;
-            }
             void uploadPluginReady.then((ready) => {
               if (!ready || !S.chat || typeof S.chat.registerPlugin !== "function" || !window.TIMUploadPlugin) return;
               try {

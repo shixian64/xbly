@@ -2316,7 +2316,19 @@ class Handler(BaseHTTPRequestHandler):
                 k: {"ok": v.ok, "code": v.code, "message": v.message}
                 for k, v in app.bootstrap(include_im=False).items()
             }
-            tim = Handler.broad_im_credentials_disabled_payload(self, capabilities)
+            try:
+                tim = {
+                    "ok": True,
+                    **u.native.im.tim_login_payload(
+                        prefer="server",
+                        allow_local_fallback=False,
+                    ),
+                }
+            except Exception as exc:
+                tim = {
+                    "ok": False,
+                    "error": _safe_error(exc, "消息登录凭证获取失败"),
+                }
             u.persist()
             return self.ok(
                 {
@@ -2834,8 +2846,34 @@ class Handler(BaseHTTPRequestHandler):
                 }
             )
         if path == "/api/im/tim":
-            capabilities = Handler.web_user_capabilities(self, u)
-            return Handler.deny_broad_im_credentials(self, capabilities)
+            try:
+                payload = u.native.im.tim_login_payload(
+                    prefer="server",
+                    allow_local_fallback=False,
+                )
+                if not payload.get("userSig") or not payload.get("userID"):
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "error": {
+                                "title": "消息登录凭证不完整",
+                                "detail": "缺少用户标识或登录签名，请重新登录后再试",
+                            },
+                        },
+                        400,
+                    )
+                return self.ok(
+                    {
+                        "ok": True,
+                        **payload,
+                        "sig_len": len(str(payload.get("userSig") or "")),
+                    }
+                )
+            except Exception as exc:
+                return self.ok(
+                    {"ok": False, "error": _safe_error(exc, "消息登录凭证获取失败")},
+                    400,
+                )
         if path == "/api/im/rong":
             capabilities = Handler.web_user_capabilities(self, u)
             return Handler.deny_broad_im_credentials(self, capabilities)
@@ -4498,7 +4536,9 @@ def _web_user_capabilities(
         "match_pool_online_list": True,
         "voice_match": True,
         "proactive_private_message": enabled,
-        "direct_im_credentials": False,
+        # Direct TIM credentials intentionally restore browser SDK media send.
+        # SDK calls do not pass through Handler.can_message_peer().
+        "direct_im_credentials": True,
         "nearby_custom_city": (
             bool(getattr(user, "nearby_custom_city_enabled", False))
             if nearby_custom_city_enabled is None

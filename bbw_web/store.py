@@ -219,7 +219,7 @@ class WebUser:
         return {
             "match_pool_online_list": True,
             "proactive_private_message": enabled,
-            "direct_im_credentials": False,
+            "direct_im_credentials": True,
             "nearby_custom_city": bool(self.nearby_custom_city_enabled),
         }
 
