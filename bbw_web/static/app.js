@@ -5106,10 +5106,72 @@ function parseJsonValue(value) {
   }
 }
 
+const NATIVE_QUOTE_KIND_BY_TYPE = Object.freeze({
+  1: "text",
+  2: "custom",
+  3: "image",
+  4: "audio",
+  5: "video",
+  6: "file",
+  7: "location",
+  8: "face",
+  10: "relay",
+});
+
+const NATIVE_QUOTE_TYPE_BY_KIND = Object.freeze({
+  text: 1,
+  custom: 2,
+  flash: 2,
+  image: 3,
+  audio: 4,
+  video: 5,
+  file: 6,
+  location: 7,
+  face: 8,
+  relay: 10,
+});
+
+function nativeMessageQuoteKind(value) {
+  const raw = String(value ?? "").trim().toLowerCase();
+  const numeric = Number(raw);
+  if (Number.isInteger(numeric) && numeric > 0) return NATIVE_QUOTE_KIND_BY_TYPE[numeric] || "custom";
+  if (["sound", "voice"].includes(raw)) return "audio";
+  if (["merge", "merger"].includes(raw)) return "relay";
+  if (raw === "emoji") return "face";
+  return raw || "text";
+}
+
+function nativeMessageQuoteInteger(value) {
+  const numeric = Number(value);
+  return Number.isSafeInteger(numeric) && numeric > 0 ? numeric : 0;
+}
+
+function nativeMessageQuoteTimestamp(value) {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return Math.trunc(numeric >= 10_000_000_000 ? numeric / 1000 : numeric);
+  }
+  const parsed = Date.parse(String(value || ""));
+  return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed / 1000)) : 0;
+}
+
+function nativeMessageQuoteAbstract(quote) {
+  const kind = String(quote?.kind || "");
+  if (["image", "audio", "video", "location", "face"].includes(kind)) return "";
+  const text = String(quote?.text || "");
+  if (kind === "file") return text.replace(/^\[文件\]\s*/, "");
+  if (kind === "relay") return text.replace(/^\[聊天记录\]\s*/, "");
+  return text;
+}
+
 function normalizeMessageQuote(value) {
   let payload = value && typeof value === "object" && !Array.isArray(value) ? value : parseJsonValue(value);
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
-  if (payload.bbw_message && typeof payload.bbw_message === "object") {
+  if (payload.messageReply && typeof payload.messageReply === "object") {
+    if (String(payload.messageReply.messageRootID || "").trim()) return null;
+    if (nativeMessageQuoteInteger(payload.messageReply.version) > 1) return null;
+    payload = payload.messageReply;
+  } else if (payload.bbw_message && typeof payload.bbw_message === "object") {
     payload = payload.bbw_message.quote;
   } else if (payload.quote && typeof payload.quote === "object") {
     payload = payload.quote;
@@ -5117,13 +5179,17 @@ function normalizeMessageQuote(value) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
   const bounded = (candidate, limit) => String(candidate ?? "").trim().slice(0, limit);
   const quote = {
-    message_id: bounded(payload.message_id ?? payload.messageId ?? payload.id, 512),
+    message_id: bounded(payload.message_id ?? payload.messageId ?? payload.messageID ?? payload.id, 512),
     message_random: bounded(payload.message_random ?? payload.messageRandom ?? payload.msg_random, 80),
+    message_sequence: bounded(
+      payload.message_sequence ?? payload.messageSequence ?? payload.sequence ?? payload.msg_sequence,
+      80
+    ),
     sender_uid: bounded(payload.sender_uid ?? payload.senderUid ?? payload.from, 128),
-    sender_name: bounded(payload.sender_name ?? payload.senderName ?? payload.author, 120),
-    text: bounded(payload.text ?? payload.preview ?? payload.content, 500),
-    kind: bounded(payload.kind ?? payload.message_type ?? payload.type, 40) || "text",
-    sent_at: bounded(payload.sent_at ?? payload.sentAt ?? payload.timestamp ?? payload.time, 80),
+    sender_name: bounded(payload.sender_name ?? payload.senderName ?? payload.messageSender ?? payload.author, 120),
+    text: bounded(payload.text ?? payload.preview ?? payload.webAbstract ?? payload.messageAbstract ?? payload.content, 500),
+    kind: bounded(nativeMessageQuoteKind(payload.kind ?? payload.message_type ?? payload.messageType ?? payload.type), 40),
+    sent_at: bounded(payload.sent_at ?? payload.sentAt ?? payload.messageTime ?? payload.timestamp ?? payload.time, 80),
   };
   return [quote.message_id, quote.message_random, quote.sender_uid, quote.text].some(Boolean) ? quote : null;
 }
@@ -5131,7 +5197,21 @@ function normalizeMessageQuote(value) {
 function messageQuoteCloudCustomData(quote) {
   const normalized = normalizeMessageQuote(quote);
   if (!normalized) return "";
-  return JSON.stringify({ bbw_message: { version: 1, quote: normalized } });
+  const messageReply = {
+    messageAbstract: nativeMessageQuoteAbstract(normalized),
+    messageID: normalized.message_id,
+    messageSender: normalized.sender_name || normalized.sender_uid,
+    messageSequence: nativeMessageQuoteInteger(normalized.message_sequence),
+    messageTime: nativeMessageQuoteTimestamp(normalized.sent_at),
+    messageType: NATIVE_QUOTE_TYPE_BY_KIND[normalized.kind] || 2,
+    version: 1,
+  };
+  if (normalized.message_random) messageReply.messageRandom = normalized.message_random;
+  if (normalized.sender_uid) messageReply.senderUid = normalized.sender_uid;
+  if (normalized.kind) messageReply.kind = normalized.kind;
+  return JSON.stringify({
+    messageReply,
+  });
 }
 
 function messageQuoteFrom(message, payload, cloud) {
@@ -5144,8 +5224,26 @@ function messageQuoteFrom(message, payload, cloud) {
 }
 
 function messageQuotePreviewText(entry) {
-  if (!entry) return "[消息]";
-  return String(messagePreview(entry) || "[消息]").trim().slice(0, 500);
+  if (!entry) return "";
+  const kind = String(entry.kind || "text");
+  if (kind === "text") return String(entry.text || "").trim().slice(0, 500);
+  if (kind === "file") {
+    return String(
+      entry.media?.name ||
+        firstMessageValue([entry.payload, entry], ["fileName", "file_name", "name"], "")
+    )
+      .trim()
+      .slice(0, 500);
+  }
+  if (kind === "relay") {
+    return String(firstMessageValue([entry.payload, entry], ["title", "Title", "text", "content"], ""))
+      .trim()
+      .slice(0, 500);
+  }
+  if (["custom", "flash"].includes(kind)) {
+    return String(entry.text || customMessageText(entry.payload || {}) || "").trim().slice(0, 500);
+  }
+  return "";
 }
 
 function messageQuoteSnapshot(entry) {
@@ -5170,6 +5268,7 @@ function messageQuoteSnapshot(entry) {
   return normalizeMessageQuote({
     message_id: entry.id,
     message_random: entry.messageRandom || timMessageRandom(entry),
+    message_sequence: entry.sequence || timMessageSequence(entry),
     sender_uid: senderUid,
     sender_name: senderName,
     text: messageQuotePreviewText(entry),
@@ -5188,6 +5287,28 @@ function messageQuoteAuthorLabel(quote) {
     return S.activePeerName || `用户 ${normalized.sender_uid}`;
   }
   return normalized.sender_uid ? `用户 ${normalized.sender_uid}` : "未知用户";
+}
+
+function messageQuoteDisplayText(quote) {
+  const normalized = normalizeMessageQuote(quote);
+  if (!normalized) return "[消息]";
+  if (normalized.kind === "file") {
+    const name = normalized.text.replace(/^\[文件\]\s*/, "");
+    return name ? `[文件] ${name}` : "[文件]";
+  }
+  if (normalized.kind === "text" && normalized.text) return tuiEmojiPreviewText(normalized.text);
+  if (normalized.text) return normalized.text;
+  const labels = {
+    image: "[图片]",
+    audio: "[语音]",
+    video: "[视频]",
+    file: "[文件]",
+    face: "[动画表情]",
+    location: "[地理位置]",
+    relay: "[聊天记录]",
+    custom: "[自定义消息]",
+  };
+  return labels[normalized.kind] || "[消息]";
 }
 
 function decodeMessageData(value) {
@@ -5837,9 +5958,11 @@ function chatMessageQuoteHtml(entry) {
   if (!quote || entry?.revoked) return "";
   return `<button type="button" class="chat-message-quote" data-action="jump-to-quoted-message" data-quote-message-id="${esc(
     quote.message_id
-  )}" data-quote-message-random="${esc(quote.message_random)}" aria-label="跳转到被引用的消息"><strong>${esc(
+  )}" data-quote-message-random="${esc(quote.message_random)}" data-quote-message-sequence="${esc(
+    quote.message_sequence
+  )}" aria-label="跳转到被引用的消息"><strong>${esc(
     messageQuoteAuthorLabel(quote)
-  )}</strong><span>${esc(quote.text || "[消息]")}</span></button>`;
+  )}</strong><span>${esc(messageQuoteDisplayText(quote))}</span></button>`;
 }
 
 function chatMessageBodyHtml(entry) {
@@ -6007,7 +6130,7 @@ function chatLogHtml() {
       const hasContextActions = Boolean(canQuote || revokeAction);
       return `<div class="chat-message-row${mineClass}${hasContextActions ? " has-context-actions" : ""}" data-message-id="${esc(entry.id)}" data-message-random="${esc(
         entry.messageRandom || timMessageRandom(entry)
-      )}"><div class="chat-message-main${mineClass}">${stateIndicator}<div class="chat-line${mineClass}${
+      )}" data-message-sequence="${esc(entry.sequence || timMessageSequence(entry))}"><div class="chat-message-main${mineClass}">${stateIndicator}<div class="chat-line${mineClass}${
         entry.revoked ? ` is-revoked${canEditRevoked ? " can-edit" : ""}` : ""
       } chat-kind-${esc(entry.kind || "text")}" data-message-id="${esc(entry.id)}" data-chat-message-bubble${
         hasContextActions ? ' tabindex="0" aria-label="显示消息操作" aria-expanded="false"' : ""
@@ -7006,7 +7129,7 @@ function chatComposerQuoteHtml() {
   if (!quote) return "";
   return `<div class="chat-compose-quote"><div class="chat-compose-quote-content"><strong>正在引用 ${esc(
     messageQuoteAuthorLabel(quote)
-  )}</strong><span>${esc(quote.text || "[消息]")}</span></div><button type="button" data-action="cancel-chat-quote">取消引用</button></div>`;
+  )}</strong><span>${esc(messageQuoteDisplayText(quote))}</span></div><button type="button" data-action="cancel-chat-quote">取消引用</button></div>`;
 }
 
 function chatComposerHtml() {
@@ -7612,15 +7735,17 @@ function findChatMessage(id, peer = S.activePeer) {
   );
 }
 
-function findChatMessageByIdentity(id, messageRandom, peer = S.activePeer) {
+function findChatMessageByIdentity(id, messageRandom, messageSequence = "", peer = S.activePeer) {
   const messageID = String(id || "").trim();
   const random = String(messageRandom || "").trim();
+  const sequence = String(messageSequence || "").trim();
   const target = String(peer || "");
   return (
     S.imMessages.find((entry) => {
       if (String(entry.peer || "") !== target) return false;
       if (messageID && String(entry.id || "") === messageID) return true;
-      return Boolean(random && String(entry.messageRandom || timMessageRandom(entry) || "") === random);
+      if (random && String(entry.messageRandom || timMessageRandom(entry) || "") === random) return true;
+      return Boolean(sequence && String(entry.sequence || timMessageSequence(entry) || "") === sequence);
     }) || null
   );
 }
@@ -7653,7 +7778,12 @@ function quoteChatMessage(id, messageRandom = "") {
 function findQuotedMessage(quote, peer = S.activePeer) {
   const normalized = normalizeMessageQuote(quote);
   if (!normalized) return null;
-  return findChatMessageByIdentity(normalized.message_id, normalized.message_random, peer);
+  return findChatMessageByIdentity(
+    normalized.message_id,
+    normalized.message_random,
+    normalized.message_sequence,
+    peer
+  );
 }
 
 async function jumpToQuotedMessage(quote) {
@@ -7671,7 +7801,8 @@ async function jumpToQuotedMessage(quote) {
   const rows = [...document.querySelectorAll("#im-log .chat-message-row")];
   const target = rows.find((row) => {
     if (normalized.message_id && row.dataset.messageId === normalized.message_id) return true;
-    return Boolean(normalized.message_random && row.dataset.messageRandom === normalized.message_random);
+    if (normalized.message_random && row.dataset.messageRandom === normalized.message_random) return true;
+    return Boolean(normalized.message_sequence && row.dataset.messageSequence === normalized.message_sequence);
   });
   if (!target) return false;
   target.classList.remove("is-quote-target");
@@ -12446,6 +12577,7 @@ async function handleAction(action, button) {
     await jumpToQuotedMessage({
       message_id: button.dataset.quoteMessageId,
       message_random: button.dataset.quoteMessageRandom,
+      message_sequence: button.dataset.quoteMessageSequence,
     });
     return;
   }

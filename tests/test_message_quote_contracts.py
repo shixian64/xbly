@@ -18,10 +18,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class MessageQuoteNormalizerTests(unittest.TestCase):
-    def test_nested_cloud_custom_data_round_trips(self) -> None:
+    def test_android_tuikit_cloud_custom_data_round_trips(self) -> None:
         quote = {
             "message_id": "message-1",
             "message_random": "778899",
+            "message_sequence": "12345",
             "sender_uid": "42",
             "sender_name": "测试用户",
             "text": "被引用的消息",
@@ -32,9 +33,129 @@ class MessageQuoteNormalizerTests(unittest.TestCase):
         encoded = encode_message_quote(quote)
         payload = json.loads(encoded)
 
-        self.assertEqual(payload["bbw_message"]["version"], 1)
+        native_quote = payload["messageReply"]
+        self.assertEqual(native_quote["version"], 1)
+        self.assertEqual(native_quote["messageID"], "message-1")
+        self.assertEqual(native_quote["messageAbstract"], "被引用的消息")
+        self.assertEqual(native_quote["messageSender"], "测试用户")
+        self.assertEqual(native_quote["messageSequence"], 12345)
+        self.assertEqual(native_quote["messageTime"], 1784550000)
+        self.assertEqual(native_quote["messageType"], 1)
+        self.assertEqual(native_quote["messageRandom"], "778899")
+        self.assertEqual(native_quote["senderUid"], "42")
+        self.assertEqual(native_quote["kind"], "text")
+        self.assertNotIn("webAbstract", native_quote)
+        self.assertNotIn("sentAt", native_quote)
+        self.assertNotIn("messageRootID", native_quote)
         self.assertEqual(extract_message_quote(encoded), quote)
         self.assertEqual(normalize_message_quote(payload), quote)
+
+    def test_legacy_bbw_quote_payload_remains_readable(self) -> None:
+        quote = normalize_message_quote(
+            {
+                "bbw_message": {
+                    "version": 1,
+                    "quote": {
+                        "message_id": "legacy-message",
+                        "sender_name": "旧版网页",
+                        "text": "旧版引用摘要",
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(quote["message_id"], "legacy-message")
+        self.assertEqual(quote["sender_name"], "旧版网页")
+        self.assertEqual(quote["text"], "旧版引用摘要")
+
+    def test_native_apk_quote_payload_is_normalized(self) -> None:
+        quote = normalize_message_quote(
+            {
+                "messageReply": {
+                    "messageID": "android-message",
+                    "messageAbstract": "APK 引用摘要",
+                    "messageSender": "APK 用户",
+                    "messageSequence": 7788,
+                    "messageTime": 1784550000,
+                    "messageType": 3,
+                    "version": 1,
+                }
+            }
+        )
+
+        self.assertEqual(quote["message_id"], "android-message")
+        self.assertEqual(quote["message_sequence"], "7788")
+        self.assertEqual(quote["sender_name"], "APK 用户")
+        self.assertEqual(quote["text"], "APK 引用摘要")
+        self.assertEqual(quote["kind"], "image")
+        self.assertEqual(quote["sent_at"], "1784550000")
+
+    def test_native_rich_media_abstract_matches_tuikit(self) -> None:
+        payload = json.loads(
+            encode_message_quote(
+                {
+                    "message_id": "image-message",
+                    "message_sequence": "9",
+                    "sender_name": "图片发送者",
+                    "text": "[图片]",
+                    "kind": "image",
+                    "sent_at": "1784550000",
+                }
+            )
+        )["messageReply"]
+
+        self.assertEqual(payload["messageType"], 3)
+        self.assertEqual(payload["messageAbstract"], "")
+        self.assertNotIn("webAbstract", payload)
+
+    def test_native_file_abstract_uses_filename_without_web_prefix(self) -> None:
+        payload = json.loads(
+            encode_message_quote(
+                {
+                    "message_id": "file-message",
+                    "message_sequence": "10",
+                    "sender_name": "文件发送者",
+                    "text": "[文件] report.pdf",
+                    "kind": "file",
+                    "sent_at": "1784550000",
+                }
+            )
+        )["messageReply"]
+
+        self.assertEqual(payload["messageType"], 6)
+        self.assertEqual(payload["messageAbstract"], "report.pdf")
+
+    def test_native_apk_thread_reply_is_not_treated_as_quote(self) -> None:
+        self.assertEqual(
+            normalize_message_quote(
+                {
+                    "messageReply": {
+                        "messageID": "reply-message",
+                        "messageRootID": "root-message",
+                        "messageAbstract": "这是回复，不是引用",
+                        "messageSender": "APK 用户",
+                        "messageType": 1,
+                        "version": 1,
+                    }
+                }
+            ),
+            {},
+        )
+
+    def test_future_native_quote_version_is_ignored(self) -> None:
+        self.assertEqual(
+            normalize_message_quote(
+                {
+                    "messageReply": {
+                        "messageID": "future-message",
+                        "messageAbstract": "未来版本引用",
+                        "messageType": 1,
+                        "version": 2,
+                    }
+                }
+            ),
+            {},
+        )
 
     def test_aliases_and_length_limits_are_normalized(self) -> None:
         quote = normalize_message_quote(
@@ -42,6 +163,7 @@ class MessageQuoteNormalizerTests(unittest.TestCase):
                 "quote": {
                     "messageId": "m" * 600,
                     "messageRandom": "7" * 100,
+                    "messageSequence": "8" * 100,
                     "senderUid": "u" * 160,
                     "senderName": "n" * 160,
                     "preview": "t" * 700,
@@ -53,6 +175,7 @@ class MessageQuoteNormalizerTests(unittest.TestCase):
 
         self.assertEqual(len(quote["message_id"]), 512)
         self.assertEqual(len(quote["message_random"]), 80)
+        self.assertEqual(len(quote["message_sequence"]), 80)
         self.assertEqual(len(quote["sender_uid"]), 128)
         self.assertEqual(len(quote["sender_name"]), 120)
         self.assertEqual(len(quote["text"]), 500)
@@ -85,19 +208,20 @@ class MessageQuoteTransportTests(unittest.TestCase):
             }
         )
 
-        result = client.send_text("42", "9", "回复内容", cloud_custom_data=cloud_data)
+        result = client.send_text("42", "9", "引用后的消息", cloud_custom_data=cloud_data)
 
         self.assertTrue(result.ok)
         command, body, _ = client.calls[-1]
         self.assertEqual(command, "openim/sendmsg")
         self.assertEqual(body["CloudCustomData"], cloud_data)
-        self.assertEqual(body["MsgBody"][0]["MsgContent"]["Text"], "回复内容")
+        self.assertEqual(body["MsgBody"][0]["MsgContent"]["Text"], "引用后的消息")
 
     def test_history_ingestion_extracts_quote_snapshot(self) -> None:
         cloud_data = encode_message_quote(
             {
                 "message_id": "message-1",
                 "message_random": "778899",
+                "message_sequence": "12345",
                 "sender_uid": "9",
                 "sender_name": "对方",
                 "text": "原消息",
@@ -110,7 +234,7 @@ class MessageQuoteTransportTests(unittest.TestCase):
                 "from": "42",
                 "to": "9",
                 "type": "text",
-                "text": "回复内容",
+                "text": "引用后的消息",
                 "timestamp": 1784550000,
                 "cloud_custom_data": cloud_data,
             },
@@ -121,6 +245,7 @@ class MessageQuoteTransportTests(unittest.TestCase):
         self.assertIsNotNone(report)
         self.assertEqual(report["quote"]["message_id"], "message-1")
         self.assertEqual(report["quote"]["message_random"], "778899")
+        self.assertEqual(report["quote"]["message_sequence"], "12345")
 
     def test_archive_report_accepts_quote_snapshot(self) -> None:
         report = MessageReport.model_validate(
@@ -128,9 +253,10 @@ class MessageQuoteTransportTests(unittest.TestCase):
                 "idempotency_key": "quote-message-1",
                 "peer_uid": "9",
                 "direction": "outgoing",
-                "text": "回复内容",
+                "text": "引用后的消息",
                 "quote": {
                     "message_id": "message-1",
+                    "message_sequence": "12345",
                     "sender_uid": "9",
                     "sender_name": "对方",
                     "text": "原消息",
@@ -154,6 +280,11 @@ class FrontendMessageQuoteContracts(unittest.TestCase):
             'data-action="cancel-chat-quote"',
             'data-action="jump-to-quoted-message"',
             "function messageQuoteCloudCustomData(quote)",
+            "messageReply",
+            "messageID",
+            "messageAbstract",
+            "messageRootID",
+            "data-quote-message-sequence",
             "options.cloudCustomData = cloudCustomData",
             "quote: messageQuote",
             "restoreChatMessageQuote(uid)",

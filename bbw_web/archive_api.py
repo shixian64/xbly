@@ -44,6 +44,7 @@ class QuoteReport(BaseModel):
 
     message_id: str = Field(default="", max_length=512)
     message_random: str = Field(default="", max_length=80)
+    message_sequence: str = Field(default="", max_length=80)
     sender_uid: str = Field(default="", max_length=128)
     sender_name: str = Field(default="", max_length=120)
     text: str = Field(default="", max_length=500)
