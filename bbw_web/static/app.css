@@ -827,7 +827,6 @@ summary:focus-visible {
 
 .moment-card,
 .user-card,
-.conversation-card,
 .bottle-card {
   content-visibility: auto;
 }
@@ -837,7 +836,6 @@ summary:focus-visible {
 }
 
 .user-card,
-.conversation-card,
 .bottle-card {
   contain-intrinsic-size: auto 96px;
 }

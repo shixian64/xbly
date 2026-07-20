@@ -3267,6 +3267,12 @@ class SocialFrontendContractTests(unittest.TestCase):
         conversation_region_refresh = app_js.split(
             "function refreshMessageConversationRegion", 1
         )[1].split('document.addEventListener("keydown"', 1)[0]
+        content_visibility_selector = app_css.split(
+            "content-visibility: auto;", 1
+        )[0].rsplit("}", 1)[-1]
+        compact_intrinsic_selector = app_css.split(
+            "contain-intrinsic-size: auto 96px;", 1
+        )[0].rsplit("}", 1)[-1]
 
         self.assertNotIn("match-section-index", app_js)
         self.assertNotIn("match-section-index", app_css)
@@ -3301,6 +3307,8 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('currentAvatar.dataset.pendingAvatarSrc !== nextSrc', app_js)
         self.assertIn("renderConversationList(list);", conversation_region_refresh)
         self.assertNotIn("list.innerHTML = conversationListHtml();", conversation_region_refresh)
+        self.assertNotIn(".conversation-card", content_visibility_selector)
+        self.assertNotIn(".conversation-card", compact_intrinsic_selector)
         self.assertIn('id="side-avatar" aria-hidden="true" hidden></div>', index_html)
         self.assertIn("avatar.hidden = true", app_js)
         self.assertIn("禁止使用数字、字符串首个字符", agents_md)
@@ -4194,6 +4202,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("conversation-avatar-stable", css_version)
         self.assertIn("conversation-avatar-stable-reload", css_version)
         self.assertIn("conversation-profile-fast", css_version)
+        self.assertIn("conversation-list-stable-paint", css_version)
 
 
 class FlashPhotoBffContractTests(unittest.TestCase):
