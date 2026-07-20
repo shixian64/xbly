@@ -2914,6 +2914,12 @@ class SocialFrontendContractTests(unittest.TestCase):
         avatar_renderer = app_js.split("function avatarHtml(url)", 1)[1].split(
             "const PEER_PRESENCE_TTL_MS", 1
         )[0]
+        conversation_list_renderer = app_js.split("function renderConversationList(list)", 1)[1].split(
+            "function refreshMessageConversationRegion", 1
+        )[0]
+        conversation_region_refresh = app_js.split(
+            "function refreshMessageConversationRegion", 1
+        )[1].split('document.addEventListener("keydown"', 1)[0]
 
         self.assertNotIn("match-section-index", app_js)
         self.assertNotIn("match-section-index", app_css)
@@ -2935,6 +2941,13 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("function revealLoadedAvatar(image)", app_js)
         self.assertIn("function discardFailedAvatar(image)", app_js)
         self.assertIn('matches("img[data-avatar-image]")', app_js)
+        self.assertIn("const previousAvatars = new Map();", conversation_list_renderer)
+        self.assertIn('image?.getAttribute("src")', conversation_list_renderer)
+        self.assertIn('document.createElement("template")', conversation_list_renderer)
+        self.assertIn("nextAvatar.replaceWith(previous.avatar);", conversation_list_renderer)
+        self.assertIn("list.replaceChildren(template.content);", conversation_list_renderer)
+        self.assertIn("renderConversationList(list);", conversation_region_refresh)
+        self.assertNotIn("list.innerHTML = conversationListHtml();", conversation_region_refresh)
         self.assertIn('id="side-avatar" aria-hidden="true" hidden></div>', index_html)
         self.assertIn("avatar.hidden = true", app_js)
         self.assertIn("禁止使用数字、字符串首个字符", agents_md)
@@ -3099,6 +3112,9 @@ class SocialFrontendContractTests(unittest.TestCase):
         summary_refresh = app_js.split("function refreshConversationSummary", 1)[1].split(
             "function stopMessageSyncTimer", 1
         )[0]
+        preview_hydration = app_js.split("async function hydrateStaleConversationPreviews", 1)[1].split(
+            "function loadArchivedConversationSummary", 1
+        )[0]
         unread_recalculation = app_js.split("function recalculateUnreadTotal", 1)[1].split(
             "function markConversationRead", 1
         )[0]
@@ -3141,6 +3157,14 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("function hydrateStaleConversationPreviews", app_js)
         self.assertIn("conversationPreviewHydrationPromise", app_js)
         self.assertIn("generation === S.sessionGeneration", app_js)
+        self.assertIn("refreshList: false", preview_hydration)
+        self.assertIn('let changed = false;', preview_hydration)
+        self.assertEqual(
+            preview_hydration.count(
+                "refreshMessageConversationRegion({ refreshList: true, refreshPane: false });"
+            ),
+            1,
+        )
         self.assertIn(".sort(compareMessageOrder)", app_js)
         self.assertNotIn("previewTimestamp + 2000", app_js)
         self.assertIn("summary=1&at=", app_js)
@@ -3799,6 +3823,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         js_version = index_html.split('/static/app.js?v=', 1)[1].split('"', 1)[0]
         self.assertEqual(css_version, js_version)
         self.assertIn("mobile-media-retry-secure-viewport", css_version)
+        self.assertIn("conversation-avatar-stable", css_version)
 
 
 class FlashPhotoBffContractTests(unittest.TestCase):

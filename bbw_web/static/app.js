@@ -1600,7 +1600,7 @@ function applyConversationSummaries(
   return S.conversations;
 }
 
-async function loadConversationPreview(peer, activityTimestamp) {
+async function loadConversationPreview(peer, activityTimestamp, { refreshList = true } = {}) {
   const target = String(peer || "").trim();
   const activity = Math.max(0, Number(activityTimestamp || 0));
   const generation = S.sessionGeneration;
@@ -1645,7 +1645,9 @@ async function loadConversationPreview(peer, activityTimestamp) {
     };
     updated.preview_stale = conversationPreviewNeedsRefresh(updated, updated);
     S.conversations[index] = updated;
-    refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
+    if (refreshList) {
+      refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
+    }
     return true;
   } catch {
     if (generation === S.sessionGeneration) {
@@ -1665,6 +1667,7 @@ async function hydrateStaleConversationPreviews() {
   const generation = S.sessionGeneration;
   const task = (async () => {
     const results = [];
+    let changed = false;
     while (
       S.authenticated &&
       generation === S.sessionGeneration &&
@@ -1686,9 +1689,17 @@ async function hydrateStaleConversationPreviews() {
         .slice(0, available);
       if (!candidates.length) break;
       const batch = await Promise.allSettled(
-        candidates.map((item) => loadConversationPreview(conversationPeer(item), conversationTimestamp(item)))
+        candidates.map((item) =>
+          loadConversationPreview(conversationPeer(item), conversationTimestamp(item), {
+            refreshList: false,
+          })
+        )
       );
+      changed ||= batch.some((result) => result.status === "fulfilled" && result.value === true);
       results.push(...batch);
+    }
+    if (changed && S.route === "msg" && generation === S.sessionGeneration) {
+      refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
     }
     return results;
   })().finally(() => {
@@ -3063,10 +3074,14 @@ function rememberTimConversationProfiles(rows) {
 }
 
 function renderHydratedConversationProfiles() {
-  S.conversations = S.conversations.map(applyCachedConversationProfile);
-  if (S.route === "msg") {
+  const previous = S.conversations;
+  const next = previous.map(applyCachedConversationProfile);
+  const changed = next.some((item, index) => item !== previous[index]);
+  S.conversations = next;
+  if (changed && S.route === "msg") {
     refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
   }
+  return changed;
 }
 
 function conversationProfileForPeer(rows, peer) {
@@ -6100,6 +6115,31 @@ function chatPaneHtml() {
     }`;
 }
 
+function renderConversationList(list) {
+  const previousAvatars = new Map();
+  list.querySelectorAll("[data-conversation-item][data-uid]").forEach((item) => {
+    const peer = String(item.dataset.uid || "");
+    const avatar = item.querySelector(".conversation-card > .avatar");
+    const image = avatar?.querySelector("img[data-avatar-image]");
+    const src = image?.getAttribute("src") || "";
+    if (!peer || !avatar || !src) return;
+    if (image.complete && image.naturalWidth > 0) avatar.classList.remove("avatar-loading");
+    previousAvatars.set(peer, { avatar, src });
+  });
+
+  const template = document.createElement("template");
+  template.innerHTML = conversationListHtml();
+
+  template.content.querySelectorAll("[data-conversation-item][data-uid]").forEach((item) => {
+    const previous = previousAvatars.get(String(item.dataset.uid || ""));
+    const nextAvatar = item.querySelector(".conversation-card > .avatar");
+    const nextImage = nextAvatar?.querySelector("img[data-avatar-image]");
+    if (!previous || !nextAvatar || previous.src !== (nextImage?.getAttribute("src") || "")) return;
+    nextAvatar.replaceWith(previous.avatar);
+  });
+  list.replaceChildren(template.content);
+}
+
 function refreshMessageConversationRegion({
   focusComposer = false,
   refreshList = true,
@@ -6129,7 +6169,7 @@ function refreshMessageConversationRegion({
   document.body.classList.toggle("chat-conversation-open", Boolean(S.activePeer));
   if (refreshList) {
     controls.innerHTML = conversationListControlsHtml();
-    list.innerHTML = conversationListHtml();
+    renderConversationList(list);
   } else {
     list.querySelectorAll(".conversation-card").forEach((card) => {
       const active = String(card.dataset.uid || "") === String(S.activePeer || "");
