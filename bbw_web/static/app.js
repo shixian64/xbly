@@ -46,6 +46,9 @@ const CONVERSATION_REFRESH_ERROR_MS = 30 * 1000;
 const ARCHIVED_CONVERSATION_TTL_MS = 30 * 1000;
 const CONVERSATION_PROFILE_TTL_MS = 15 * 60 * 1000;
 const CONVERSATION_PROFILE_ERROR_TTL_MS = 60 * 1000;
+const CONVERSATION_PROFILE_SDK_WAIT_MS = 1200;
+const CONVERSATION_PROFILE_REST_BATCH_SIZE = 12;
+const CONVERSATION_PROFILE_CACHE_LIMIT = 200;
 const CONVERSATION_PREVIEW_REFRESH_MS = 10 * 1000;
 const CONVERSATION_SWIPE_THRESHOLD_PX = 42;
 const CONVERSATION_SWIPE_LOCK_PX = 8;
@@ -132,6 +135,7 @@ const S = {
   conversationProfilesByUid: new Map(),
   conversationProfileFetchedAt: new Map(),
   conversationProfileLoadingUids: new Set(),
+  conversationProfileCacheAccount: "",
   conversationPreviewFetchedAt: new Map(),
   conversationPreviewLoadingPeers: new Set(),
   conversationPreviewHydrationPromise: null,
@@ -1240,6 +1244,7 @@ function showLogin(show, clearSecrets = false) {
 function applyUser(user) {
   S.user = user || null;
   syncDismissedConversationAccount();
+  syncConversationProfileAccount();
   const avatar = $("side-avatar");
   avatar.replaceChildren();
   avatar.hidden = true;
@@ -1440,6 +1445,58 @@ function refreshMessagePolicy() {
 
 function messageSyncAccountId() {
   return String(S.user?.uid || S.user?.id || "").trim();
+}
+
+function conversationProfileStorageKey(account = messageSyncAccountId()) {
+  const normalized = String(account || "").trim();
+  return normalized ? `bbw:im:conversation-profiles:${normalized}` : "";
+}
+
+function persistConversationProfiles() {
+  const key = conversationProfileStorageKey(S.conversationProfileCacheAccount);
+  if (!key) return;
+  const items = [...S.conversationProfilesByUid.entries()]
+    .map(([peer, profile]) => ({
+      peer,
+      nickname: String(profile?.nickname || profile?.name || "").trim(),
+      avatar: validAvatarValue(profile?.avatar, profile?.portrait),
+      fetchedAt: Number(S.conversationProfileFetchedAt.get(peer) || 0),
+    }))
+    .filter((item) => item.peer && item.fetchedAt && conversationProfileResolved(item, item.peer))
+    .sort((left, right) => left.fetchedAt - right.fetchedAt)
+    .slice(-CONVERSATION_PROFILE_CACHE_LIMIT);
+  try {
+    sessionStorage.setItem(key, JSON.stringify({ version: 1, items }));
+  } catch {
+    // Private browsing can disable sessionStorage; memory caching still works.
+  }
+}
+
+function syncConversationProfileAccount() {
+  const account = messageSyncAccountId();
+  if (account === S.conversationProfileCacheAccount) return;
+  S.conversationProfilesByUid.clear();
+  S.conversationProfileFetchedAt.clear();
+  S.conversationProfileLoadingUids.clear();
+  S.conversationProfileCacheAccount = account;
+  const key = conversationProfileStorageKey(account);
+  if (!key) return;
+  try {
+    const payload = JSON.parse(sessionStorage.getItem(key) || "{}");
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    const now = Date.now();
+    items.slice(-CONVERSATION_PROFILE_CACHE_LIMIT).forEach((item) => {
+      const peer = String(item?.peer || "").trim();
+      const fetchedAt = Number(item?.fetchedAt || 0);
+      if (!peer || !fetchedAt || now - fetchedAt >= CONVERSATION_PROFILE_TTL_MS) return;
+      const profile = normalizedConversationProfile(item, peer);
+      if (!profile) return;
+      S.conversationProfilesByUid.set(peer, profile);
+      S.conversationProfileFetchedAt.set(peer, fetchedAt);
+    });
+  } catch {
+    // Ignore malformed or unavailable browser storage.
+  }
 }
 
 function dismissedConversationStorageKey(account = messageSyncAccountId()) {
@@ -2706,6 +2763,101 @@ function conversationAvatar(item) {
   );
 }
 
+function conversationDisplayName(item) {
+  const conversation = item && typeof item === "object" ? item : {};
+  const nestedUser =
+    conversation.user && typeof conversation.user === "object"
+      ? conversation.user
+      : conversation.user_info && typeof conversation.user_info === "object"
+        ? conversation.user_info
+        : {};
+  return String(
+    conversation.nickname || conversation.peer_name || nestedUser.nickname || nestedUser.name || ""
+  ).trim();
+}
+
+function conversationNameIsPlaceholder(name, peer) {
+  const value = String(name || "").trim();
+  const target = String(peer || "").trim();
+  return !value || value === "用户" || value === target || value === `用户 ${target}`;
+}
+
+function conversationProfileNeedsHydration(item) {
+  const peer = conversationPeer(item);
+  return Boolean(
+    peer &&
+      (!conversationAvatar(item) || conversationNameIsPlaceholder(conversationDisplayName(item), peer))
+  );
+}
+
+function conversationProfileResolved(profile, peer) {
+  if (!profile || typeof profile !== "object") return false;
+  if (profile._resolved === true) return true;
+  return Boolean(
+    validAvatarValue(profile.avatar, profile.portrait) ||
+      !conversationNameIsPlaceholder(profile.nickname || profile.name, peer)
+  );
+}
+
+function normalizedConversationProfile(profile, peer) {
+  const item = profile && typeof profile === "object" ? profile : {};
+  const target = String(peer || item.id || item.uid || item.userID || item.userId || "").trim();
+  if (!target) return null;
+  const rawName = String(item.nick || item.nickname || item.name || "").trim();
+  const nickname = conversationNameIsPlaceholder(rawName, target) ? "" : rawName;
+  const avatar = validAvatarValue(item.avatar, item.portrait, item.faceUrl, item.face_url);
+  if (!nickname && !avatar) return null;
+  return {
+    id: target,
+    nickname,
+    name: nickname,
+    avatar,
+    portrait: avatar,
+    _resolved: true,
+  };
+}
+
+function rememberConversationProfile(peer, profile) {
+  const target = String(peer || "").trim();
+  const incoming = normalizedConversationProfile(profile, target);
+  if (!target || !incoming) return false;
+  const previous = S.conversationProfilesByUid.get(target) || {};
+  const nickname = incoming.nickname || previous.nickname || previous.name || "";
+  const avatar = validAvatarValue(incoming.avatar, incoming.portrait, previous.avatar, previous.portrait);
+  S.conversationProfilesByUid.set(target, {
+    ...previous,
+    ...incoming,
+    nickname,
+    name: nickname,
+    avatar,
+    portrait: avatar,
+    _resolved: true,
+  });
+  S.conversationProfileFetchedAt.set(target, Date.now());
+  return true;
+}
+
+function preserveConversationDisplayName(preferred, fallback) {
+  const conversation = preferred && typeof preferred === "object" ? preferred : {};
+  const peer = conversationPeer(conversation) || conversationPeer(fallback);
+  const currentName = conversationDisplayName(conversation);
+  const fallbackName = conversationDisplayName(fallback);
+  if (
+    !peer ||
+    !conversationNameIsPlaceholder(currentName, peer) ||
+    conversationNameIsPlaceholder(fallbackName, peer)
+  ) {
+    return conversation;
+  }
+  const currentUser = conversation.user && typeof conversation.user === "object" ? conversation.user : {};
+  const fallbackUser = fallback?.user && typeof fallback.user === "object" ? fallback.user : {};
+  return {
+    ...conversation,
+    nickname: fallbackName,
+    user: { ...fallbackUser, ...currentUser, nickname: fallbackName },
+  };
+}
+
 function preserveConversationAvatar(preferred, fallback) {
   const conversation = preferred && typeof preferred === "object" ? preferred : {};
   const currentAvatar = conversationAvatar(conversation);
@@ -2965,8 +3117,9 @@ function mergeConversationPair(preferred, fallback) {
   const unreadWinner = [primary, secondary]
     .filter(conversationUnreadAuthoritative)
     .sort((a, b) => conversationUnreadObservedAt(b) - conversationUnreadObservedAt(a))[0];
-  let merged = preserveConversationAvatar(
-    {
+  let merged = preserveConversationDisplayName(
+    preserveConversationAvatar(
+      {
       ...activityFallback,
       ...activityWinner,
       timestamp: Math.max(primaryActivity, secondaryActivity),
@@ -2986,7 +3139,9 @@ function mergeConversationPair(preferred, fallback) {
         : 0,
       unread_observed_at: unreadWinner?.unread_observed_at || 0,
       unread_authoritative: Boolean(unreadWinner),
-    },
+      },
+      activityFallback
+    ),
     activityFallback
   );
   const peer = conversationPeer(merged);
@@ -3035,11 +3190,8 @@ function applyCachedConversationProfile(item) {
   const inherited = currentAvatar
     ? Boolean(conversation._avatar_from_fallback)
     : Boolean(profileAvatar);
-  const currentName = String(
-    conversation.nickname || conversation.peer_name || nestedUser.nickname || nestedUser.name || ""
-  ).trim();
-  const placeholderName = !currentName || currentName === peer || currentName === `用户 ${peer}` || currentName === "用户";
-  const name = placeholderName
+  const currentName = conversationDisplayName(conversation);
+  const name = conversationNameIsPlaceholder(currentName, peer)
     ? profile.nickname || profile.name || currentName || `用户 ${peer}`
     : currentName;
   if (
@@ -3069,19 +3221,13 @@ function timUserProfileRows(result) {
 }
 
 function rememberTimConversationProfiles(rows) {
+  let changed = false;
   (Array.isArray(rows) ? rows : []).forEach((item) => {
     if (!item || typeof item !== "object") return;
     const peer = String(item.userID || item.userId || item.uid || item.id || "").trim();
-    const avatar = validAvatarValue(item.avatar, item.portrait, item.faceUrl, item.face_url);
-    if (!peer || !avatar) return;
-    S.conversationProfilesByUid.set(peer, {
-      id: peer,
-      nickname: item.nick || item.nickname || item.name || peer,
-      avatar,
-      portrait: avatar,
-    });
-    S.conversationProfileFetchedAt.set(peer, Date.now());
+    if (rememberConversationProfile(peer, item)) changed = true;
   });
+  if (changed) persistConversationProfiles();
 }
 
 function renderHydratedConversationProfiles() {
@@ -3103,23 +3249,47 @@ function conversationProfileForPeer(rows, peer) {
   return profiles.length === 1 && idless.length === 1 ? idless[0] : null;
 }
 
+function conversationProfileSdkAvailable() {
+  return Boolean(
+    S.imConnected &&
+      S.imMode === "sdk" &&
+      S.chat &&
+      typeof S.chat.getUserProfile === "function"
+  );
+}
+
+async function waitForConversationProfileSdk() {
+  if (conversationProfileSdkAvailable()) return true;
+  if (!(S.directImCredentialsEnabled && S.proactivePrivateMessageEnabled)) return false;
+  const deadline = Date.now() + CONVERSATION_PROFILE_SDK_WAIT_MS;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    if (conversationProfileSdkAvailable()) return true;
+  }
+  return conversationProfileSdkAvailable();
+}
+
+function conversationPeerNeedsHydration(peer) {
+  return S.conversations.some(
+    (item) => conversationPeer(item) === peer && conversationProfileNeedsHydration(applyCachedConversationProfile(item))
+  );
+}
+
 async function hydrateConversationProfiles() {
   const now = Date.now();
   const peers = [...new Set(
     S.conversations
       .filter(isC2CConversation)
-      .filter((item) => !conversationAvatar(item))
+      .filter(conversationProfileNeedsHydration)
       .map(conversationPeer)
       .filter(
         (peer) => {
-          const profile = S.conversationProfilesByUid.get(peer);
           const fetchedAt = Number(S.conversationProfileFetchedAt.get(peer) || 0);
-          const ttl = validAvatarValue(profile?.avatar, profile?.portrait)
-            ? CONVERSATION_PROFILE_TTL_MS
-            : CONVERSATION_PROFILE_ERROR_TTL_MS;
+          const ttl = conversationPeerNeedsHydration(peer)
+            ? CONVERSATION_PROFILE_ERROR_TTL_MS
+            : CONVERSATION_PROFILE_TTL_MS;
           return (
             peer &&
-            !validAvatarValue(profile?.avatar, profile?.portrait) &&
             now - fetchedAt >= ttl &&
             !S.conversationProfileLoadingUids.has(peer)
           );
@@ -3129,7 +3299,7 @@ async function hydrateConversationProfiles() {
   if (!peers.length) return;
   peers.forEach((peer) => S.conversationProfileLoadingUids.add(peer));
   try {
-    if (S.imConnected && S.imMode === "sdk" && S.chat && typeof S.chat.getUserProfile === "function") {
+    if (await waitForConversationProfileSdk()) {
       const chunks = [];
       for (let index = 0; index < peers.length; index += 100) chunks.push(peers.slice(index, index + 100));
       const results = await Promise.allSettled(
@@ -3143,12 +3313,9 @@ async function hydrateConversationProfiles() {
       renderHydratedConversationProfiles();
     }
 
-    const unresolved = peers.filter((peer) => {
-      const profile = S.conversationProfilesByUid.get(peer);
-      return !validAvatarValue(profile?.avatar, profile?.portrait);
-    });
-    for (let index = 0; index < unresolved.length; index += 50) {
-      const batch = unresolved.slice(index, index + 50);
+    const unresolved = peers.filter(conversationPeerNeedsHydration);
+    for (let index = 0; index < unresolved.length; index += CONVERSATION_PROFILE_REST_BATCH_SIZE) {
+      const batch = unresolved.slice(index, index + CONVERSATION_PROFILE_REST_BATCH_SIZE);
       try {
         const { data } = await api(
           `/api/profile/users?uids=${encodeURIComponent(batch.join(","))}`,
@@ -3157,12 +3324,14 @@ async function hydrateConversationProfiles() {
         const profiles = itemsOf(data);
         batch.forEach((peer) => {
           const profile = conversationProfileForPeer(profiles, peer);
-          if (profile) S.conversationProfilesByUid.set(peer, profile);
-          S.conversationProfileFetchedAt.set(peer, Date.now());
+          if (!rememberConversationProfile(peer, profile)) {
+            S.conversationProfileFetchedAt.set(peer, Date.now());
+          }
         });
       } catch {
         batch.forEach((peer) => S.conversationProfileFetchedAt.set(peer, Date.now()));
       }
+      persistConversationProfiles();
       renderHydratedConversationProfiles();
     }
   } finally {

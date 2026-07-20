@@ -501,6 +501,67 @@ class BffEnvelopeTests(unittest.TestCase):
         self.assertEqual(item["nickname"], "头像用户")
         self.assertEqual(calls, [])
 
+    def test_conversation_list_uses_cached_nickname_when_avatar_already_exists(self) -> None:
+        app = SimpleNamespace(profile=SimpleNamespace(get_user=lambda uid: None))
+        item = {
+            "peer_id": "9",
+            "nickname": "9",
+            "avatar": "https://oss.banghua.xin/images/users/existing.jpg",
+        }
+        cache = {
+            "9": (
+                bff_server.time.monotonic(),
+                {
+                    "id": "9",
+                    "nickname": "真实昵称",
+                    "avatar": "https://oss.banghua.xin/images/users/cached.jpg",
+                },
+            )
+        }
+
+        bff_server._attach_cached_conversation_profiles(app, [item], cache)
+
+        self.assertEqual(item["avatar"], "https://oss.banghua.xin/images/users/existing.jpg")
+        self.assertEqual(item["nickname"], "真实昵称")
+
+    def test_archived_conversation_local_profiles_supply_public_name_and_avatar(self) -> None:
+        from bbw_web import archive_api
+
+        class Result:
+            @staticmethod
+            def all():
+                return [
+                    (
+                        "9",
+                        "9",
+                        {"nickname": "真实昵称"},
+                        {"portrait": "images/users/local.jpg"},
+                    ),
+                    ("10", "10", {}, {}),
+                ]
+
+        class Db:
+            statement = None
+
+            def execute(self, statement):
+                self.statement = statement
+                return Result()
+
+        db = Db()
+        profiles = archive_api._local_public_profile_map(db, ["9", "9", "10"])
+
+        self.assertEqual(
+            profiles["9"],
+            {
+                "id": "9",
+                "nickname": "真实昵称",
+                "avatar": "images/users/local.jpg",
+                "portrait": "images/users/local.jpg",
+            },
+        )
+        self.assertNotIn("10", profiles)
+        self.assertIn("beibeiwu", {str(value) for value in db.statement.compile().params.values()})
+
     def test_message_normalization_keeps_revoke_identity_and_state(self) -> None:
         messages = normalize_messages(
             [
@@ -3088,16 +3149,31 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("const avatar = currentAvatar || profileAvatar;", app_js)
         self.assertIn("async function hydrateConversationProfiles()", app_js)
         self.assertIn("function conversationProfileForPeer(rows, peer)", app_js)
-        self.assertIn(".filter((item) => !conversationAvatar(item))", app_js)
+        self.assertIn("function conversationProfileNeedsHydration(item)", app_js)
+        self.assertIn(".filter(conversationProfileNeedsHydration)", app_js)
+        self.assertIn("conversationNameIsPlaceholder(conversationDisplayName(item), peer)", app_js)
         self.assertIn(".map(applyCachedConversationProfile);", app_js)
         self.assertIn("return profiles.length === 1 && idless.length === 1 ? idless[0] : null;", app_js)
         self.assertNotIn("profiles[0] ||", app_js)
         self.assertIn("function timUserProfileRows(result)", app_js)
         self.assertIn("function rememberTimConversationProfiles(rows)", app_js)
+        self.assertIn("function normalizedConversationProfile(profile, peer)", app_js)
+        self.assertIn("_resolved: true", app_js)
         self.assertIn("S.chat.getUserProfile({ userIDList })", app_js)
+        self.assertIn("await waitForConversationProfileSdk()", app_js)
+        self.assertIn("CONVERSATION_PROFILE_SDK_WAIT_MS = 1200", app_js)
         self.assertIn("/api/profile/users?uids=", app_js)
+        self.assertIn("CONVERSATION_PROFILE_REST_BATCH_SIZE = 12", app_js)
         self.assertIn("conversationProfileFetchedAt: new Map()", app_js)
         self.assertIn("CONVERSATION_PROFILE_TTL_MS", app_js)
+        self.assertIn(
+            "const ttl = conversationPeerNeedsHydration(peer)",
+            app_js,
+        )
+        self.assertIn("function conversationProfileStorageKey", app_js)
+        self.assertIn("sessionStorage.setItem(key", app_js)
+        self.assertIn("syncConversationProfileAccount();", app_js)
+        self.assertIn("function preserveConversationDisplayName(preferred, fallback)", app_js)
         self.assertIn("void hydrateConversationProfiles();", app_js)
         self.assertNotIn('data-action="im-connect"', app_js)
         self.assertNotIn('id="reload-page"', index_html)
@@ -3834,6 +3910,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("mobile-media-retry-secure-viewport", css_version)
         self.assertIn("conversation-avatar-stable", css_version)
         self.assertIn("conversation-avatar-stable-reload", css_version)
+        self.assertIn("conversation-profile-fast", css_version)
 
 
 class FlashPhotoBffContractTests(unittest.TestCase):

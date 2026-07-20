@@ -1066,13 +1066,13 @@ def _attach_cached_conversation_profiles(
 ) -> None:
     for item in items:
         peer = str(item.get("peer_id") or item.get("conversation_user") or "").strip()
-        if not peer or item.get("avatar"):
+        if not peer:
             continue
         profile = _cached_profile(app, peer, cache, fetch_on_miss=False)
         if not profile:
             continue
         avatar = str(profile.get("avatar") or profile.get("portrait") or "")
-        if avatar:
+        if avatar and not item.get("avatar"):
             item["avatar"] = avatar
         current_name = str(item.get("nickname") or "").strip()
         if not current_name or current_name in {"用户", peer, f"用户 {peer}"}:

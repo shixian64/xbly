@@ -7,8 +7,10 @@ from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import select
 
 from bbw_prod.db import session_scope
+from bbw_prod.models import ExternalAccount, User
 from bbw_prod.repositories import ConversationRepository, MessageRepository
 from bbw_web import bff_server as legacy
 
@@ -114,6 +116,76 @@ def _metadata_time(value: Any) -> datetime | None:
         return None
 
 
+def _public_profile_value(data: Any, *keys: str) -> str:
+    if not isinstance(data, dict):
+        return ""
+    for key in keys:
+        value = str(data.get(key) or "").strip()
+        if value and value.lower() not in {"none", "null", "undefined"}:
+            return value
+    return ""
+
+
+def _conversation_name_is_placeholder(name: Any, peer: str) -> bool:
+    value = str(name or "").strip()
+    return not value or value in {"用户", peer, f"用户 {peer}"}
+
+
+def _local_public_profile_map(db: Any, peers: list[str]) -> dict[str, dict[str, str]]:
+    targets = list(dict.fromkeys(str(peer or "").strip() for peer in peers if str(peer or "").strip()))
+    if not targets:
+        return {}
+    rows = db.execute(
+        select(
+            ExternalAccount.upstream_uid,
+            User.display_name,
+            User.profile,
+            ExternalAccount.device_data,
+        )
+        .join(User, User.id == ExternalAccount.user_id)
+        .where(
+            ExternalAccount.provider == "beibeiwu",
+            ExternalAccount.upstream_uid.in_(targets),
+        )
+    ).all()
+    profiles: dict[str, dict[str, str]] = {}
+    for upstream_uid, display_name, profile_data, device_data in rows:
+        peer = str(upstream_uid or "").strip()
+        if not peer:
+            continue
+        nickname = next(
+            (
+                value
+                for value in (
+                    str(display_name or "").strip(),
+                    *(
+                        _public_profile_value(profile_data, key)
+                        for key in ("nickname", "nick", "name", "username")
+                    ),
+                )
+                if not _conversation_name_is_placeholder(value, peer)
+            ),
+            "",
+        )
+        avatar = _public_profile_value(device_data, "portrait", "avatar") or _public_profile_value(
+            profile_data,
+            "portrait",
+            "avatar",
+            "head",
+            "headimg",
+            "head_img",
+        )
+        public_profile: dict[str, str] = {"id": peer}
+        if nickname:
+            public_profile["nickname"] = nickname
+        if avatar:
+            public_profile["avatar"] = avatar
+            public_profile["portrait"] = avatar
+        if len(public_profile) > 1:
+            profiles[peer] = public_profile
+    return profiles
+
+
 def _archived_message_item(message: Any) -> dict[str, Any]:
     metadata = dict(message.extra_data) if isinstance(message.extra_data, dict) else {}
     media = metadata.get("media_report")
@@ -171,6 +243,10 @@ def archived_conversations(request: Request, limit: int = 100) -> dict[str, Any]
         latest = MessageRepository(db).latest_for_conversations(
             identity.user_id, [conversation.id for conversation in conversations]
         )
+        local_profiles = _local_public_profile_map(
+            db,
+            [str(conversation.peer_upstream_uid or "") for conversation in conversations],
+        )
         items: list[dict[str, Any]] = []
         for conversation in conversations:
             metadata = (
@@ -198,11 +274,28 @@ def archived_conversations(request: Request, limit: int = 100) -> dict[str, Any]
                 metadata.get("avatar")
                 or user.get("avatar")
                 or user.get("portrait")
+                or local_profiles.get(str(conversation.peer_upstream_uid or "").strip(), {}).get("avatar")
                 or ""
             )
             peer = str(conversation.peer_upstream_uid or "").strip()
             if not peer:
                 continue
+            local_profile = local_profiles.get(peer, {})
+            nickname = next(
+                (
+                    value
+                    for value in (
+                        str(conversation.title or "").strip(),
+                        str(user.get("nickname") or user.get("name") or "").strip(),
+                        str(local_profile.get("nickname") or "").strip(),
+                    )
+                    if not _conversation_name_is_placeholder(value, peer)
+                ),
+                peer,
+            )
+            public_user = {**local_profile, **user, "nickname": nickname}
+            if avatar:
+                public_user["avatar"] = avatar
             items.append(
                 {
                     "id": str(conversation.id),
@@ -211,14 +304,9 @@ def archived_conversations(request: Request, limit: int = 100) -> dict[str, Any]
                     "source": "archive",
                     "peer_id": peer,
                     "conversation_user": peer,
-                    "nickname": str(
-                        conversation.title
-                        or user.get("nickname")
-                        or user.get("name")
-                        or peer
-                    ),
+                    "nickname": nickname,
                     "avatar": avatar,
-                    "user": user,
+                    "user": public_user,
                     "last_message": preview,
                     "content": preview,
                     "timestamp": activity_at.isoformat() if activity_at is not None else "",
