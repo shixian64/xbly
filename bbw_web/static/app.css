@@ -821,30 +821,6 @@ summary:focus-visible {
   display: none;
 }
 
-.page-enter {
-  animation: page-in 0.22s ease both;
-}
-
-.moment-card,
-.user-card,
-.bottle-card {
-  content-visibility: auto;
-}
-
-.moment-card {
-  contain-intrinsic-size: auto 420px;
-}
-
-.user-card,
-.bottle-card {
-  contain-intrinsic-size: auto 96px;
-}
-
-@keyframes page-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-
 /* content */
 .welcome-strip,
 .relationship-toolbar {

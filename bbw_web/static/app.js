@@ -54,6 +54,7 @@ const CONVERSATION_SWIPE_THRESHOLD_PX = 42;
 const CONVERSATION_SWIPE_LOCK_PX = 8;
 const CONVERSATION_DELETE_CONFIRM_DELAY_MS = 500;
 const CONVERSATION_DISMISS_LIMIT = 500;
+const BOOT_SESSION_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 15000];
 const MESSAGE_ARCHIVE_RETRY_DELAYS_MS = [1500, 5000];
 const MESSAGE_ARCHIVE_MAX_IN_FLIGHT = 2;
 const PAGE_CACHE_TTL_MS = 2 * 60 * 1000;
@@ -62,6 +63,8 @@ const FAST_VIEW_CACHE_TTL_MS = 15 * 1000;
 const FEED_VIEW_CACHE_TTL_MS = 45 * 1000;
 const RELATION_VIEW_CACHE_TTL_MS = 60 * 1000;
 const ME_STATS_TTL_MS = 60 * 1000;
+const ROUTE_DOM_CACHE_LIMIT = 12;
+const PANEL_DOM_CACHE_LIMIT = 80;
 // Tencent Chat Web SDK defaults to a 2-minute client recall window. The
 // application console may extend it; the admin REST recall route has no fixed
 // time limit while the message is still inside its roaming-storage lifetime.
@@ -94,6 +97,9 @@ const S = {
   routeSeq: 0,
   pageCache: new Map(),
   panelCache: new Map(),
+  routeDomCache: new Map(),
+  panelDomCache: new Map(),
+  routeDomKey: "",
   meStats: null,
   meStatsAt: 0,
   matchTab: "match",
@@ -711,8 +717,7 @@ async function api(path, options = {}) {
       S.user = null;
       S.meStats = null;
       S.meStatsAt = 0;
-      S.pageCache.clear();
-      S.panelCache.clear();
+      clearAllViewCaches();
       clearTimeout(S.authenticatedServicesTimer);
       S.authenticatedServicesTimer = null;
       S.authenticatedServicesPending = false;
@@ -1257,9 +1262,9 @@ function applyUser(user) {
   syncDismissedConversationAccount();
   syncConversationProfileAccount();
   const avatar = $("side-avatar");
-  avatar.replaceChildren();
-  avatar.hidden = true;
   if (!user) {
+    avatar.replaceChildren();
+    avatar.hidden = true;
     S.proactivePrivateMessageEnabled = false;
     S.directImCredentialsEnabled = false;
     S.matchMessagePeers.clear();
@@ -1272,6 +1277,13 @@ function applyUser(user) {
   $("side-name").textContent = name;
   $("side-meta").textContent = `UID ${uid} · ${user.is_realname ? "已实名" : "未实名"}`;
   const src = mediaUrl(user.avatar || user.portrait);
+  const currentImage = avatar.querySelector("img");
+  if (src && currentImage?.getAttribute("src") === src) {
+    if (currentImage.complete && currentImage.naturalWidth > 0) avatar.hidden = false;
+    return;
+  }
+  avatar.replaceChildren();
+  avatar.hidden = true;
   if (src) {
     const image = document.createElement("img");
     image.alt = "";
@@ -1318,19 +1330,12 @@ function applyCapabilities(capabilities) {
   const nearbyCustomCityChanged = previousNearbyCustomCity !== S.nearbyCustomCityEnabled;
   if (!proactiveChanged && !directCredentialsChanged && !nearbyCustomCityChanged) return;
   if (proactiveChanged) {
-    S.pageCache.delete("nearby");
-    [...S.pageCache.keys()].forEach((key) => {
-      if (String(key).startsWith("match:")) S.pageCache.delete(key);
-    });
-    S.pageCache.clear();
-    S.panelCache.clear();
+    clearAllViewCaches();
     syncPrivateMessageControls();
   }
   if (nearbyCustomCityChanged) {
-    S.pageCache.delete("nearby");
-    [...S.panelCache.keys()].forEach((key) => {
-      if (String(key).startsWith("nearby:")) S.panelCache.delete(key);
-    });
+    clearViewCacheKey("nearby");
+    clearViewCachePrefix("nearby:");
   }
   if ((proactiveChanged || directCredentialsChanged) && S.authenticated && (S.imMode || S.chat || S.imConnecting)) {
     void cleanupIM().finally(() => {
@@ -2126,10 +2131,18 @@ async function switchMineTab(id, { force = false, replace = false } = {}) {
   }
   if (target === S.route && !force) return;
 
+  const previousRoute = S.route;
+  const previousRouteKey = routeCacheKey(previousRoute);
+  const previousPanelKey = minePanelCacheKey(previousRoute);
+  const previousPanelDom = {
+    nodes: [...panel.childNodes],
+    scrollTop: Number(panel.scrollTop || 0),
+  };
+  rememberPanelDomSnapshot(previousPanelKey, panel);
+  discardCurrentRouteDomSnapshot();
   if (S.routeController) S.routeController.abort();
   const controller = new AbortController();
   const seq = ++S.routeSeq;
-  const previousRoute = S.route;
   S.routeController = controller;
   S.route = target;
   root().classList.remove("message-route");
@@ -2143,14 +2156,22 @@ async function switchMineTab(id, { force = false, replace = false } = {}) {
   if (replace) history.replaceState(null, "", hash);
   else if (location.hash !== hash) history.pushState(null, "", hash);
 
-  const cacheKey = routeCacheKey(target);
-  const cached = reusableCacheEntry(S.panelCache, cacheKey);
+  const routeKey = routeCacheKey(target);
+  const panelKey = minePanelCacheKey(target);
+  const cached = reusableCacheEntry(S.panelCache, panelKey);
+  const panelDom = reusablePanelDomEntry(panelKey, cached);
+  const panelDomRestored = panelDom
+    ? previousPanelKey === panelKey
+      ? true
+      : restorePanelDomSnapshot(panel, panelDom)
+    : false;
   if (cached) {
-    panel.innerHTML = cached.html;
+    if (!panelDomRestored) panel.innerHTML = cached.html;
     hydrateRenderedRoute(target, controller.signal, seq);
     void refreshVisiblePeerPresence();
     if (!force && cached.fresh) {
-      rememberCurrentPageSnapshot(cacheKey);
+      rememberPanelDomSnapshot(panelKey, panel);
+      rememberCurrentPageSnapshot(routeKey);
       root().focus({ preventScroll: true });
       return;
     }
@@ -2165,19 +2186,25 @@ async function switchMineTab(id, { force = false, replace = false } = {}) {
     const page = PAGE_RENDERERS[target] || pageMe;
     const html = await page(controller.signal, { force });
     if (controller.signal.aborted || seq !== S.routeSeq || S.route !== target) return;
-    panel.innerHTML = html;
-    rememberPanelSnapshot(cacheKey, html);
-    rememberCurrentPageSnapshot(cacheKey);
+    if (!panelDomRestored || cached?.html !== html) panel.innerHTML = html;
+    rememberPanelSnapshot(panelKey, html);
+    rememberPanelDomSnapshot(panelKey, panel);
+    rememberCurrentPageSnapshot(routeKey);
     hydrateRenderedRoute(target, controller.signal, seq);
     void refreshVisiblePeerPresence();
   } catch (error) {
     if (error?.name === "AbortError" || seq !== S.routeSeq || S.route !== target) return;
     if (error instanceof AuthExpiredError) return;
     if (cached) {
+      rememberPanelDomSnapshot(panelKey, panel);
+      rememberCurrentPageSnapshot(routeKey);
       toast("页面已显示缓存内容，后台更新失败", "error", 3600);
       return;
     }
     S.route = previousRoute;
+    restorePanelDomSnapshot(panel, previousPanelDom);
+    rememberPanelDomSnapshot(previousPanelKey, panel);
+    rememberCurrentPageSnapshot(previousRouteKey);
     syncNav();
     syncMineTabUI(previousRoute);
     history.replaceState(null, "", routeHash(previousRoute));
@@ -2198,6 +2225,10 @@ function routeCacheKey(route) {
   }
   if (route === "moments") return `${route}:${S.momentsTab}:${S.momentsSearch}`;
   return route;
+}
+
+function minePanelCacheKey(route) {
+  return `mine:${routeCacheKey(route)}`;
 }
 
 function viewCacheTtl(key) {
@@ -2229,37 +2260,161 @@ function reusableCacheEntry(cache, key) {
   return { ...entry, age, fresh: age < viewCacheTtl(key) };
 }
 
+function trimDomCache(cache, limit) {
+  while (cache.size > limit) {
+    const oldest = cache.keys().next().value;
+    if (oldest == null) break;
+    cache.delete(oldest);
+  }
+}
+
+function rememberRouteDomSnapshot(key = S.routeDomKey) {
+  const page = root();
+  const target = String(key || "");
+  if (!page || !target || !page.childNodes.length) return;
+  S.routeDomCache.delete(target);
+  S.routeDomCache.set(target, {
+    nodes: [...page.childNodes],
+    time: Date.now(),
+    scrollY: window.scrollY,
+  });
+  S.routeDomKey = target;
+  trimDomCache(S.routeDomCache, ROUTE_DOM_CACHE_LIMIT);
+}
+
+function reusableRouteDomEntry(key, { allowWithoutPageCache = false, cacheEntry = null } = {}) {
+  const target = String(key || "");
+  const entry = S.routeDomCache.get(target);
+  if (!entry) return null;
+  const age = Date.now() - Number(entry.time || 0);
+  if (
+    !Array.isArray(entry.nodes) ||
+    !entry.nodes.length ||
+    !Number.isFinite(age) ||
+    age >= PAGE_CACHE_MAX_AGE_MS ||
+    (!allowWithoutPageCache && !cacheEntry)
+  ) {
+    S.routeDomCache.delete(target);
+    return null;
+  }
+  S.routeDomCache.delete(target);
+  S.routeDomCache.set(target, entry);
+  return {
+    ...entry,
+    age,
+    fresh: allowWithoutPageCache || Boolean(cacheEntry?.fresh),
+  };
+}
+
+function restoreRouteDomSnapshot(key, entry) {
+  if (!entry?.nodes?.length) return false;
+  root().replaceChildren(...entry.nodes);
+  S.routeDomKey = String(key || "");
+  requestAnimationFrame(() => {
+    window.scrollTo({ top: Math.max(0, Number(entry.scrollY || 0)), behavior: "auto" });
+  });
+  return true;
+}
+
+function rememberPanelDomSnapshot(key, panel) {
+  const target = String(key || "");
+  if (!target || !panel || !panel.childNodes.length) return;
+  S.panelDomCache.delete(target);
+  S.panelDomCache.set(target, {
+    nodes: [...panel.childNodes],
+    time: Date.now(),
+    scrollTop: Number(panel.scrollTop || 0),
+  });
+  trimDomCache(S.panelDomCache, PANEL_DOM_CACHE_LIMIT);
+}
+
+function reusablePanelDomEntry(key, cacheEntry = null) {
+  const target = String(key || "");
+  const entry = S.panelDomCache.get(target);
+  const age = Date.now() - Number(entry?.time || 0);
+  if (
+    !entry ||
+    !Array.isArray(entry.nodes) ||
+    !entry.nodes.length ||
+    !cacheEntry ||
+    !Number.isFinite(age) ||
+    age >= PAGE_CACHE_MAX_AGE_MS
+  ) {
+    S.panelDomCache.delete(target);
+    return null;
+  }
+  S.panelDomCache.delete(target);
+  S.panelDomCache.set(target, entry);
+  return { ...entry, age, fresh: Boolean(cacheEntry.fresh) };
+}
+
+function restorePanelDomSnapshot(panel, entry) {
+  if (!panel || !entry?.nodes?.length) return false;
+  panel.replaceChildren(...entry.nodes);
+  panel.scrollTop = Math.max(0, Number(entry.scrollTop || 0));
+  return true;
+}
+
+function discardCurrentRouteDomSnapshot() {
+  if (S.routeDomKey) S.routeDomCache.delete(S.routeDomKey);
+  S.routeDomKey = "";
+}
+
+function discardCurrentMinePanelDomSnapshot() {
+  if (!isMineRoute(S.route)) return;
+  S.panelDomCache.delete(minePanelCacheKey(S.route));
+}
+
 function rememberPanelSnapshot(key, html, metadata = {}) {
   S.panelCache.set(key, { html, metadata, time: Date.now() });
+  S.panelDomCache.delete(key);
   while (S.panelCache.size > 80) {
     const oldest = S.panelCache.keys().next().value;
     if (oldest == null) break;
     S.panelCache.delete(oldest);
+    S.panelDomCache.delete(oldest);
   }
 }
 
 function rememberCurrentPageSnapshot(key = routeCacheKey(S.route)) {
-  if (S.route === "msg" || !root()) return;
-  S.pageCache.set(key, { html: root().innerHTML, time: Date.now() });
+  if (!root()) return;
+  if (S.route !== "msg") S.pageCache.set(key, { html: root().innerHTML, time: Date.now() });
+  rememberRouteDomSnapshot(key);
 }
 
 function clearViewCacheKey(key) {
   S.pageCache.delete(key);
   S.panelCache.delete(key);
+  S.panelCache.delete(`mine:${key}`);
+  S.routeDomCache.delete(key);
+  S.panelDomCache.delete(key);
+  S.panelDomCache.delete(`mine:${key}`);
+  if (S.routeDomKey === key) S.routeDomKey = "";
 }
 
 function clearViewCachePrefix(prefix) {
-  [S.pageCache, S.panelCache].forEach((cache) => {
+  const prefixes = [String(prefix || ""), `mine:${String(prefix || "")}`];
+  [S.pageCache, S.panelCache, S.routeDomCache, S.panelDomCache].forEach((cache) => {
     [...cache.keys()].forEach((key) => {
-      if (String(key).startsWith(prefix)) cache.delete(key);
+      if (prefixes.some((value) => String(key).startsWith(value))) cache.delete(key);
     });
   });
+  if (prefixes.some((value) => S.routeDomKey.startsWith(value))) S.routeDomKey = "";
+}
+
+function clearAllViewCaches() {
+  S.pageCache.clear();
+  S.panelCache.clear();
+  S.routeDomCache.clear();
+  S.panelDomCache.clear();
+  S.routeDomKey = "";
 }
 
 function rememberPanelElementSnapshot(key, panel) {
   if (!panel) return;
   const previous = S.panelCache.get(key);
   rememberPanelSnapshot(key, panel.innerHTML, previous?.metadata || {});
+  rememberPanelDomSnapshot(key, panel);
 }
 
 function updateMeStatsDom() {
@@ -2347,6 +2502,9 @@ async function activateRoute(id, { force = false } = {}) {
     }
     S.matchTab = normalizeMatchTab(params.get("tab"));
   }
+  const cacheKey = routeCacheKey(target);
+  const previousDomKey = S.routeDomKey;
+  if (previousDomKey) rememberRouteDomSnapshot(previousDomKey);
   disconnectMomentViewTracking();
   if (S.routeController) S.routeController.abort();
   const controller = new AbortController();
@@ -2358,19 +2516,63 @@ async function activateRoute(id, { force = false } = {}) {
   document.body.classList.toggle("chat-conversation-open", target === "msg" && Boolean(S.activePeer));
   syncNav();
   closeDrawer();
-  const cacheKey = routeCacheKey(target);
   const cached = target === "msg" ? null : reusableCacheEntry(S.pageCache, cacheKey);
-  if (cached) {
-    root().innerHTML = cached.html;
+  const routeDom = reusableRouteDomEntry(cacheKey, {
+    allowWithoutPageCache: target === "msg",
+    cacheEntry: cached,
+  });
+  const routeDomRestored = routeDom
+    ? previousDomKey === cacheKey
+      ? true
+      : restoreRouteDomSnapshot(cacheKey, routeDom)
+    : false;
+  if (routeDomRestored) {
+    S.routeDomKey = cacheKey;
     root().focus({ preventScroll: true });
     centerActiveRelationshipTab();
     hydrateRenderedRoute(target, controller.signal, seq);
     void refreshVisiblePeerPresence();
-    if (!force && cached.fresh) return;
+    if (target === "msg") {
+      recalculateUnreadTotal();
+      const active = activeConversation();
+      if (active && !S.activePeerName) {
+        S.activePeerName = active.nickname || active.peer_name || active.user?.nickname || `用户 ${S.activePeer}`;
+      }
+      refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
+      if (S.activePeer) void loadConversationMessages(S.activePeer);
+      void loadArchivedConversationSummary();
+      void runMessageSyncCycle();
+      if (!S.imConnected) {
+        void ensureTimConnected().then((ok) => {
+          if (ok && S.route === "msg" && seq === S.routeSeq) {
+            refreshMessageConversationRegion({
+              refreshPane: document.activeElement?.matches?.("#im-text") !== true,
+            });
+          }
+        });
+      }
+      return;
+    }
+    if (!force && cached?.fresh) return;
     root().setAttribute("aria-busy", "true");
     root().classList.add("is-refreshing");
-  } else {
+  }
+  if (cached && !routeDomRestored) {
+    root().innerHTML = cached.html;
+    S.routeDomKey = cacheKey;
+    root().focus({ preventScroll: true });
+    centerActiveRelationshipTab();
+    hydrateRenderedRoute(target, controller.signal, seq);
+    void refreshVisiblePeerPresence();
+    if (!force && cached.fresh) {
+      rememberRouteDomSnapshot(cacheKey);
+      return;
+    }
+    root().setAttribute("aria-busy", "true");
+    root().classList.add("is-refreshing");
+  } else if (!routeDomRestored) {
     root().innerHTML = withMineSubnav(target, loadingState("正在准备页面…"));
+    S.routeDomKey = cacheKey;
     window.scrollTo({ top: 0, behavior: "auto" });
   }
   try {
@@ -2378,10 +2580,15 @@ async function activateRoute(id, { force = false } = {}) {
     const html = await page(controller.signal, { force });
     if (controller.signal.aborted || seq !== S.routeSeq) return;
     const rendered = `<div class="page-enter">${withMineSubnav(target, html)}</div>`;
-    root().innerHTML = rendered;
+    if (!routeDomRestored || cached?.html !== rendered) root().innerHTML = rendered;
+    S.routeDomKey = cacheKey;
     if (target !== "msg") {
       S.pageCache.set(cacheKey, { html: rendered, time: Date.now() });
-      if (isMineRoute(target)) rememberPanelSnapshot(cacheKey, html);
+      if (isMineRoute(target)) {
+        const panelKey = minePanelCacheKey(target);
+        rememberPanelSnapshot(panelKey, html);
+        rememberPanelDomSnapshot(panelKey, $("mine-tab-panel"));
+      }
     }
     root().focus({ preventScroll: true });
     centerActiveRelationshipTab();
@@ -2401,6 +2608,7 @@ async function activateRoute(id, { force = false } = {}) {
         }
       });
     }
+    rememberRouteDomSnapshot(cacheKey);
   } catch (error) {
     if (error && error.name === "AbortError") return;
     if (error instanceof AuthExpiredError) return;
@@ -2413,6 +2621,8 @@ async function activateRoute(id, { force = false } = {}) {
       target,
       errorState(error.message || String(error), target)
     );
+    S.routeDomKey = cacheKey;
+    rememberRouteDomSnapshot(cacheKey);
     if (S.authenticatedServicesPending) scheduleAuthenticatedServices(1000);
   } finally {
     if (seq === S.routeSeq) {
@@ -3754,14 +3964,8 @@ const MOMENT_TABS = ["推荐", "附近", "最新", "招募令", "关注"];
 const MOMENT_PAGE_CURSOR_TABS = new Set(["附近", "最新"]);
 
 function clearMomentCache() {
-  [...S.pageCache.keys()].forEach((key) => {
-    if (String(key).startsWith("moments")) S.pageCache.delete(key);
-  });
-  [...S.panelCache.keys()].forEach((key) => {
-    if (String(key).startsWith("moments")) S.panelCache.delete(key);
-  });
-  S.pageCache.delete("me");
-  S.panelCache.delete("me");
+  clearViewCachePrefix("moments");
+  clearViewCacheKey("me");
 }
 
 function resetMomentViewTaskAssist() {
@@ -3921,8 +4125,7 @@ async function reportMomentView(card) {
         toast("已完成浏览动态任务，可前往任务页领取奖励", "success", 4200);
       }
     }
-    S.pageCache.delete("tasks");
-    S.panelCache.delete("tasks");
+    clearViewCacheKey("tasks");
     if (ownsCardRequest()) {
       card.dataset.momentViewQueuedEntries = String(Math.max(0, queuedMomentViewEntries(card) - 1));
       delete card.dataset.momentViewState;
@@ -3994,19 +4197,23 @@ function observeMomentCards(container = root()) {
 
 function clearRelationshipCache(tabs = SOCIAL_TABS) {
   const selected = new Set(Array.isArray(tabs) ? tabs : [tabs]);
-  [S.pageCache, S.panelCache].forEach((cache) => {
+  const matchesSelectedRoute = (value) =>
+    (value.startsWith("social:") || value.startsWith("mine:social:")) &&
+    [...selected].some(
+      (tab) =>
+        value === `social:${tab}` ||
+        value.startsWith(`social:${tab}:`) ||
+        value === `mine:social:${tab}` ||
+        value.startsWith(`mine:social:${tab}:`)
+    );
+  [S.pageCache, S.panelCache, S.routeDomCache, S.panelDomCache].forEach((cache) => {
     [...cache.keys()].forEach((key) => {
       const value = String(key);
-      if (
-        value.startsWith("social:") &&
-        [...selected].some((tab) => value === `social:${tab}` || value.startsWith(`social:${tab}:`))
-      ) {
-        cache.delete(key);
-      }
+      if (matchesSelectedRoute(value)) cache.delete(key);
     });
   });
-  S.pageCache.delete("me");
-  S.panelCache.delete("me");
+  if (matchesSelectedRoute(S.routeDomKey)) S.routeDomKey = "";
+  clearViewCacheKey("me");
 }
 
 function momentMediaHtml(post) {
@@ -4218,8 +4425,7 @@ function taskCard(item) {
 }
 
 function applyTaskClaimSuccess(button, data) {
-  S.pageCache.delete("tasks");
-  S.panelCache.delete("tasks");
+  clearViewCacheKey("tasks");
   const card = button.closest(".task-card");
   const task = data && data.task && typeof data.task === "object" ? data.task : null;
   if (card && task) {
@@ -8830,6 +9036,11 @@ function discoveryPanelCacheKey(tab) {
 
 async function loadDiscoveryPanel(tab, { requestLocation = true, forceLocation = false, force = false } = {}) {
   const activeTab = normalizeDiscoveryTab(tab);
+  const previousCacheKey = discoveryPanelCacheKey(S.nearbyTab);
+  const panel = $("discovery-panel");
+  if (!panel || S.route !== "nearby") return;
+  rememberPanelDomSnapshot(previousCacheKey, panel);
+  discardCurrentRouteDomSnapshot();
   S.nearbyTab = activeTab;
   S.nearbyLoadSeq += 1;
   const seq = S.nearbyLoadSeq;
@@ -8837,13 +9048,18 @@ async function loadDiscoveryPanel(tab, { requestLocation = true, forceLocation =
   const controller = new AbortController();
   S.nearbyController = controller;
   syncDiscoveryTabs(activeTab);
-  const panel = $("discovery-panel");
-  if (!panel) return;
   let cacheKey = discoveryPanelCacheKey(activeTab);
   let cached = reusableCacheEntry(S.panelCache, cacheKey);
+  let panelDom = reusablePanelDomEntry(cacheKey, cached);
+  let panelDomRestored = panelDom
+    ? previousCacheKey === cacheKey
+      ? true
+      : restorePanelDomSnapshot(panel, panelDom)
+    : false;
   if (cached) {
-    panel.innerHTML = cached.html;
+    if (!panelDomRestored) panel.innerHTML = cached.html;
     if (!force && !forceLocation && cached.fresh) {
+      rememberPanelDomSnapshot(cacheKey, panel);
       rememberCurrentPageSnapshot(routeCacheKey("nearby"));
       if (S.nearbyController === controller) S.nearbyController = null;
       return;
@@ -8859,6 +9075,13 @@ async function loadDiscoveryPanel(tab, { requestLocation = true, forceLocation =
       S.nearbyLocation = await requestNearbyLocation();
       cacheKey = discoveryPanelCacheKey(activeTab);
       cached = reusableCacheEntry(S.panelCache, cacheKey);
+      panelDom = reusablePanelDomEntry(cacheKey, cached);
+      panelDomRestored = panelDom
+        ? previousCacheKey === cacheKey
+          ? true
+          : restorePanelDomSnapshot(panel, panelDom)
+        : false;
+      if (cached && !panelDomRestored) panel.innerHTML = cached.html;
     }
     let data = await fetchDiscoveryPeople(activeTab, { signal: controller.signal });
     if (activeTab === "nearby" && data?.location_required && requestLocation && !forceLocation) {
@@ -8871,18 +9094,23 @@ async function loadDiscoveryPanel(tab, { requestLocation = true, forceLocation =
         const html = discoveryPanelHtml(data, activeTab, { locationError: error.message || String(error) });
         panel.innerHTML = html;
         rememberPanelSnapshot(cacheKey, html);
+        rememberPanelDomSnapshot(cacheKey, panel);
         rememberCurrentPageSnapshot(routeCacheKey("nearby"));
         return;
       }
     }
     if (seq !== S.nearbyLoadSeq || controller.signal.aborted || S.route !== "nearby") return;
-    panel.innerHTML = discoveryPanelHtml(data, activeTab);
+    const nextHtml = discoveryPanelHtml(data, activeTab);
+    if (!panelDomRestored || cached?.html !== nextHtml) panel.innerHTML = nextHtml;
     const html = panel.innerHTML;
     rememberPanelSnapshot(cacheKey, html);
+    rememberPanelDomSnapshot(cacheKey, panel);
     rememberCurrentPageSnapshot(routeCacheKey("nearby"));
   } catch (error) {
     if (error?.name === "AbortError" || seq !== S.nearbyLoadSeq || S.route !== "nearby") return;
     if (cached) {
+      rememberPanelDomSnapshot(cacheKey, panel);
+      rememberCurrentPageSnapshot(routeCacheKey("nearby"));
       toast("已显示缓存列表，最新数据暂时无法更新", "error", 3600);
       return;
     }
@@ -9270,17 +9498,27 @@ async function switchMomentsTab(tab, { force = false } = {}) {
   if (S.momentsTab === activeTab && !force) return;
 
   const previousTab = S.momentsTab;
+  const previousCacheKey = routeCacheKey("moments");
+  rememberPanelDomSnapshot(previousCacheKey, panel);
+  discardCurrentRouteDomSnapshot();
   const seq = ++S.momentsFeedSeq;
   disconnectMomentViewTracking();
   S.momentsTab = activeTab;
   syncMomentsTabUI(activeTab);
   const cacheKey = routeCacheKey("moments");
   const cached = reusableCacheEntry(S.panelCache, cacheKey);
+  const panelDom = reusablePanelDomEntry(cacheKey, cached);
+  const panelDomRestored = panelDom
+    ? previousCacheKey === cacheKey
+      ? true
+      : restorePanelDomSnapshot(panel, panelDom)
+    : false;
   if (cached) {
-    panel.innerHTML = cached.html;
+    if (!panelDomRestored) panel.innerHTML = cached.html;
     syncMomentsTabUI(activeTab, cached.metadata?.view?.data);
     observeMomentCards(panel);
     if (!force && cached.fresh) {
+      rememberPanelDomSnapshot(cacheKey, panel);
       rememberCurrentPageSnapshot(cacheKey);
       return;
     }
@@ -9292,9 +9530,11 @@ async function switchMomentsTab(tab, { force = false } = {}) {
   try {
     const view = await loadMomentsTab(activeTab);
     if (seq !== S.momentsFeedSeq || S.route !== "moments" || S.momentsTab !== activeTab) return;
-    panel.innerHTML = momentsTabPanelHtml(view);
+    const nextHtml = momentsTabPanelHtml(view);
+    if (!panelDomRestored || cached?.html !== nextHtml) panel.innerHTML = nextHtml;
     const html = panel.innerHTML;
     rememberPanelSnapshot(cacheKey, html, { view });
+    rememberPanelDomSnapshot(cacheKey, panel);
     syncMomentsTabUI(activeTab, view.data);
     observeMomentCards(panel);
     rememberCurrentPageSnapshot(cacheKey);
@@ -9303,6 +9543,8 @@ async function switchMomentsTab(tab, { force = false } = {}) {
     if (error instanceof AuthExpiredError) return;
     if (cached) {
       observeMomentCards(panel);
+      rememberPanelDomSnapshot(cacheKey, panel);
+      rememberCurrentPageSnapshot(cacheKey);
       toast("已显示缓存动态，最新内容暂时无法更新", "error", 3600);
       return;
     }
@@ -9482,6 +9724,10 @@ async function switchSocialTab(tab, { visitorTab = S.visitorTab, force = false }
   }
   if (sameView && !force) return;
 
+  const previousCacheKey = routeCacheKey("social");
+  rememberPanelDomSnapshot(previousCacheKey, panel);
+  discardCurrentMinePanelDomSnapshot();
+  discardCurrentRouteDomSnapshot();
   if (S.routeController) S.routeController.abort();
   const controller = new AbortController();
   const seq = ++S.routeSeq;
@@ -9494,11 +9740,19 @@ async function switchSocialTab(tab, { visitorTab = S.visitorTab, force = false }
   }
   const cacheKey = routeCacheKey("social");
   const cached = reusableCacheEntry(S.panelCache, cacheKey);
+  const panelDom = reusablePanelDomEntry(cacheKey, cached);
+  const panelDomRestored = panelDom
+    ? previousCacheKey === cacheKey
+      ? true
+      : restorePanelDomSnapshot(panel, panelDom)
+    : false;
   if (cached) {
-    panel.innerHTML = cached.html;
+    if (!panelDomRestored) panel.innerHTML = cached.html;
     syncFriendApplicationCount(cached.metadata?.applyCount, cached.metadata?.applyHasMore);
     void refreshVisiblePeerPresence();
     if (!force && cached.fresh) {
+      rememberPanelDomSnapshot(cacheKey, panel);
+      rememberPanelElementSnapshot(minePanelCacheKey("social"), $("mine-tab-panel"));
       rememberCurrentPageSnapshot(cacheKey);
       return;
     }
@@ -9512,18 +9766,23 @@ async function switchSocialTab(tab, { visitorTab = S.visitorTab, force = false }
   try {
     const view = await loadSocialTab(activeTab, controller.signal);
     if (controller.signal.aborted || seq !== S.routeSeq || S.route !== "social" || S.socialTab !== activeTab) return;
-    panel.innerHTML = view.body;
+    if (!panelDomRestored || cached?.html !== view.body) panel.innerHTML = view.body;
     rememberPanelSnapshot(cacheKey, view.body, {
       applyCount: view.applyCount,
       applyHasMore: view.applyHasMore,
     });
+    rememberPanelDomSnapshot(cacheKey, panel);
     syncFriendApplicationCount(view.applyCount, view.applyHasMore);
+    rememberPanelElementSnapshot(minePanelCacheKey("social"), $("mine-tab-panel"));
     rememberCurrentPageSnapshot(cacheKey);
     void refreshVisiblePeerPresence();
   } catch (error) {
     if (error?.name === "AbortError" || seq !== S.routeSeq || S.route !== "social") return;
     if (error instanceof AuthExpiredError) return;
     if (cached) {
+      rememberPanelDomSnapshot(cacheKey, panel);
+      rememberPanelElementSnapshot(minePanelCacheKey("social"), $("mine-tab-panel"));
+      rememberCurrentPageSnapshot(cacheKey);
       toast("已显示缓存列表，最新数据暂时无法更新", "error", 3600);
       return;
     }
@@ -9592,6 +9851,9 @@ async function switchMatchHubTab(tab) {
   }
   if (S.matchTab === activeTab && !force) return;
 
+  const previousCacheKey = routeCacheKey("match");
+  rememberPanelDomSnapshot(previousCacheKey, panel);
+  discardCurrentRouteDomSnapshot();
   if (S.routeController) S.routeController.abort();
   const controller = new AbortController();
   const seq = ++S.routeSeq;
@@ -9603,10 +9865,17 @@ async function switchMatchHubTab(tab) {
   }
   const cacheKey = routeCacheKey("match");
   const cached = reusableCacheEntry(S.panelCache, cacheKey);
+  const panelDom = reusablePanelDomEntry(cacheKey, cached);
+  const panelDomRestored = panelDom
+    ? previousCacheKey === cacheKey
+      ? true
+      : restorePanelDomSnapshot(panel, panelDom)
+    : false;
   if (cached) {
-    panel.innerHTML = cached.html;
+    if (!panelDomRestored) panel.innerHTML = cached.html;
     if (activeTab === "voice") void hydrateVoiceMatchPanel();
     if (!force && cached.fresh) {
+      rememberPanelDomSnapshot(cacheKey, panel);
       rememberCurrentPageSnapshot(cacheKey);
       return;
     }
@@ -9620,14 +9889,17 @@ async function switchMatchHubTab(tab) {
   try {
     const content = await loadMatchHubTab(activeTab, controller.signal);
     if (controller.signal.aborted || seq !== S.routeSeq || S.route !== "match" || S.matchTab !== activeTab) return;
-    panel.innerHTML = content;
+    if (!panelDomRestored || cached?.html !== content) panel.innerHTML = content;
     rememberPanelSnapshot(cacheKey, content);
+    rememberPanelDomSnapshot(cacheKey, panel);
     rememberCurrentPageSnapshot(cacheKey);
     if (activeTab === "voice") void hydrateVoiceMatchPanel();
   } catch (error) {
     if (error?.name === "AbortError" || seq !== S.routeSeq || S.route !== "match") return;
     if (error instanceof AuthExpiredError) return;
     if (cached) {
+      rememberPanelDomSnapshot(cacheKey, panel);
+      rememberCurrentPageSnapshot(cacheKey);
       toast("已显示缓存状态，最新数据暂时无法更新", "error", 3600);
       return;
     }
@@ -11407,8 +11679,7 @@ async function logout() {
     resetMomentViewTaskAssist();
     S.socialTab = "friends";
     S.visitorTab = "seen_me";
-    S.pageCache.clear();
-    S.panelCache.clear();
+    clearAllViewCaches();
     S.meStats = null;
     S.meStatsAt = 0;
     S.imMessages = [];
@@ -12408,8 +12679,7 @@ function completeBrowserLogin(data) {
   resetTurnstileChallenge({ hide: true });
   S.sessionGeneration += 1;
   S.authenticated = true;
-  S.pageCache.clear();
-  S.panelCache.clear();
+  clearAllViewCaches();
   resetMomentViewTaskAssist();
   closeMessageSyncChannel();
   S.imMessages = [];
@@ -12988,27 +13258,45 @@ window.addEventListener("pagehide", (event) => {
 syncVisualViewport();
 syncNavigationMode();
 
+function setBootStatusText(text) {
+  const status = $("boot-status-text");
+  if (status) status.textContent = String(text || "正在恢复登录状态…");
+}
+
+async function restoreSessionAtBoot() {
+  let transientFailures = 0;
+  while (true) {
+    try {
+      const result = await api("/api/me", { authOptional: true, timeout: 8000 });
+      if (result.status === 200 || result.status === 401) return result;
+    } catch {
+      // A network error does not prove that the durable session is invalid.
+    }
+    setBootStatusText("服务暂时不可用，正在恢复登录状态…");
+    const delay = BOOT_SESSION_RETRY_DELAYS_MS[
+      Math.min(transientFailures, BOOT_SESSION_RETRY_DELAYS_MS.length - 1)
+    ];
+    transientFailures += 1;
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }
+}
+
 (async function boot() {
   setLoginMode("password");
-  try {
-    const [, { status, data }] = await Promise.all([
-      loadFeatures(),
-      api("/api/me", { authOptional: true, timeout: 8000 }),
-    ]);
-    if (status === 200 && data.ok && data.user?.logged_in) {
-      S.sessionGeneration += 1;
-      S.authenticated = true;
-      applyCapabilities(data.capabilities);
-      applyUser(data.user);
-      showLogin(false);
-      S.serverHeartbeat = Boolean(data.auto_heartbeat ?? S.serverHeartbeat);
-      S.authenticatedServicesPending = true;
-      const desired = hashRoute();
-      go(isRouteAllowed(desired) ? desired : "nearby", { replace: !isRouteAllowed(desired), force: true });
-      return;
-    }
-  } catch {
-    // Login screen remains available when the bootstrap request fails.
+  const featuresTask = Promise.resolve(loadFeatures()).catch(() => {});
+  const { status, data } = await restoreSessionAtBoot();
+  await Promise.allSettled([featuresTask]);
+  if (status === 200 && data.ok && data.user?.logged_in) {
+    S.sessionGeneration += 1;
+    S.authenticated = true;
+    applyCapabilities(data.capabilities);
+    applyUser(data.user);
+    showLogin(false);
+    S.serverHeartbeat = Boolean(data.auto_heartbeat ?? S.serverHeartbeat);
+    S.authenticatedServicesPending = true;
+    const desired = hashRoute();
+    go(isRouteAllowed(desired) ? desired : "nearby", { replace: !isRouteAllowed(desired), force: true });
+    return;
   }
   S.authenticated = false;
   applyUser(null);

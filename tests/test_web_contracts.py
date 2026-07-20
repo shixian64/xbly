@@ -398,7 +398,7 @@ class BffEnvelopeTests(unittest.TestCase):
         )
         self.assertIn("function applyTaskClaimSuccess(button, data)", app_js)
         self.assertIn('card.outerHTML = taskCard({', app_js)
-        self.assertIn('S.pageCache.delete("tasks")', app_js)
+        self.assertIn('clearViewCacheKey("tasks")', app_js)
         self.assertNotIn('if (toastEnv(data, "领取请求已提交")) go("tasks", { force: true });', app_js)
 
     def test_conversation_entity_has_stable_summary_fields(self) -> None:
@@ -2858,6 +2858,26 @@ class ImRevokeBffContractTests(unittest.TestCase):
 
 
 class SocialFrontendContractTests(unittest.TestCase):
+    def test_boot_retries_transient_session_restore_failures_before_showing_login(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        index_html = (root / "bbw_web" / "static" / "index.html").read_text(encoding="utf-8")
+        restore = app_js.split("async function restoreSessionAtBoot()", 1)[1].split(
+            "(async function boot()", 1
+        )[0]
+        boot = app_js.split("(async function boot()", 1)[1].split("})();", 1)[0]
+
+        self.assertIn("BOOT_SESSION_RETRY_DELAYS_MS", app_js)
+        self.assertIn("while (true)", restore)
+        self.assertIn('api("/api/me", { authOptional: true, timeout: 8000 })', restore)
+        self.assertIn("result.status === 200 || result.status === 401", restore)
+        self.assertIn('setBootStatusText("服务暂时不可用，正在恢复登录状态…")', restore)
+        self.assertIn("await new Promise((resolve) => setTimeout(resolve, delay))", restore)
+        self.assertIn("await restoreSessionAtBoot()", boot)
+        self.assertNotIn('api("/api/me"', boot)
+        self.assertNotIn("Login screen remains available when the bootstrap request fails.", boot)
+        self.assertIn('id="boot-status-text"', index_html)
+
     def test_moment_cards_report_apk_pv_when_they_enter_the_viewport(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
@@ -2886,7 +2906,7 @@ class SocialFrontendContractTests(unittest.TestCase):
             'S.momentViewTaskAssistState = "pending"',
             "taskAssist?.completed",
             "if (!result.ok || !result.data?.ok)",
-            'S.pageCache.delete("tasks")',
+            'clearViewCacheKey("tasks")',
             "observeMomentCards(feed)",
             "disconnectMomentViewTracking()",
         ):
@@ -2948,10 +2968,20 @@ class SocialFrontendContractTests(unittest.TestCase):
         switch_match = app_js.split("async function switchMatchHubTab", 1)[1].split(
             "async function pageWallet", 1
         )[0]
+        load_discovery = app_js.split("async function loadDiscoveryPanel", 1)[1].split(
+            "async function pageNearby", 1
+        )[0]
+        switch_moments = app_js.split("async function switchMomentsTab", 1)[1].split(
+            "function relationshipToolsHtml", 1
+        )[0]
 
         for marker in (
             "panelCache: new Map()",
+            "routeDomCache: new Map()",
+            "panelDomCache: new Map()",
             "function reusableCacheEntry",
+            "function reusableRouteDomEntry",
+            "function reusablePanelDomEntry",
             "function rememberPanelSnapshot",
             "PAGE_CACHE_MAX_AGE_MS",
             "FAST_VIEW_CACHE_TTL_MS",
@@ -2960,14 +2990,30 @@ class SocialFrontendContractTests(unittest.TestCase):
         ):
             self.assertIn(marker, app_js)
         self.assertIn("reusableCacheEntry(S.pageCache, cacheKey)", activate_route)
+        self.assertIn("reusableRouteDomEntry(cacheKey", activate_route)
+        self.assertIn("restoreRouteDomSnapshot(cacheKey, routeDom)", activate_route)
+        self.assertIn("allowWithoutPageCache: target === \"msg\"", activate_route)
+        self.assertIn("refreshMessageConversationRegion({ refreshList: true, refreshPane: false })", activate_route)
         self.assertIn('root().classList.add("is-refreshing")', activate_route)
         self.assertNotIn("permissionSensitiveRoute", activate_route)
-        self.assertIn("reusableCacheEntry(S.panelCache, cacheKey)", switch_mine)
-        self.assertIn("rememberCurrentPageSnapshot(cacheKey)", switch_mine)
+        self.assertIn("minePanelCacheKey(target)", switch_mine)
+        self.assertIn("reusableCacheEntry(S.panelCache, panelKey)", switch_mine)
+        self.assertIn("restorePanelDomSnapshot(panel, panelDom)", switch_mine)
+        self.assertIn("rememberCurrentPageSnapshot(routeKey)", switch_mine)
         self.assertIn("reusableCacheEntry(S.panelCache, cacheKey)", switch_social)
+        self.assertIn("rememberPanelDomSnapshot(cacheKey, panel)", switch_social)
+        self.assertIn("restorePanelDomSnapshot(panel, panelDom)", switch_social)
         self.assertIn("reusableCacheEntry(S.panelCache, cacheKey)", switch_match)
+        self.assertIn("rememberPanelDomSnapshot(cacheKey, panel)", switch_match)
+        self.assertIn("restorePanelDomSnapshot(panel, panelDom)", switch_match)
+        self.assertIn("rememberPanelDomSnapshot(cacheKey, panel)", load_discovery)
+        self.assertIn("restorePanelDomSnapshot(panel, panelDom)", load_discovery)
+        self.assertIn("rememberPanelDomSnapshot(cacheKey, panel)", switch_moments)
+        self.assertIn("restorePanelDomSnapshot(panel, panelDom)", switch_moments)
         self.assertIn(".page-root.is-refreshing::before", app_css)
         self.assertIn('content: "正在更新数据"', app_css)
+        self.assertNotIn("animation: page-in", app_css)
+        self.assertNotIn("content-visibility: auto", app_css)
 
     def test_nearby_panel_cache_hit_updates_the_full_page_snapshot(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -3099,7 +3145,8 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('"/api/match/online-users"', nearby)
         self.assertIn('"/api/match/nearby-users"', nearby)
         self.assertIn("async function loadDiscoveryPanel", nearby)
-        self.assertIn("panel.innerHTML = discoveryPanelHtml", nearby)
+        self.assertIn("const nextHtml = discoveryPanelHtml", nearby)
+        self.assertIn("panel.innerHTML = nextHtml", nearby)
         self.assertIn("navigator.geolocation.getCurrentPosition", nearby)
         self.assertNotIn('class="welcome-strip"', nearby_page)
         self.assertNotIn('class="quick-entry-grid"', nearby_page)
@@ -3159,7 +3206,7 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("direct_im_credentials", app_js)
         self.assertIn("if (!S.directImCredentialsEnabled)", app_js)
         self.assertNotIn("capabilities.match_pool_online_list === true", app_js)
-        self.assertIn('S.pageCache.delete("nearby")', app_js)
+        self.assertIn('clearViewCacheKey("nearby")', app_js)
         self.assertIn("Handler.web_user_capabilities(self, u)", bff_server_py)
         self.assertIn('"_request_match_pool_online_list_enabled"', bff_server_py)
         self.assertIn("identity.match_pool_online_list_enabled", api_py)
@@ -3197,7 +3244,8 @@ class SocialFrontendContractTests(unittest.TestCase):
             'return switchSocialTab("visitors"',
             "return switchSocialTab(normalizeSocialTab(button.dataset.tab))",
             'history.pushState(null, "", socialRouteHash(activeTab, S.visitorTab))',
-            'panel.innerHTML = momentsTabPanelHtml(view)',
+            'const nextHtml = momentsTabPanelHtml(view)',
+            'panel.innerHTML = nextHtml',
             'panel.innerHTML = view.body',
         ):
             self.assertIn(marker, app_js)
@@ -3318,13 +3366,6 @@ class SocialFrontendContractTests(unittest.TestCase):
         conversation_region_refresh = app_js.split(
             "function refreshMessageConversationRegion", 1
         )[1].split('document.addEventListener("keydown"', 1)[0]
-        content_visibility_selector = app_css.split(
-            "content-visibility: auto;", 1
-        )[0].rsplit("}", 1)[-1]
-        compact_intrinsic_selector = app_css.split(
-            "contain-intrinsic-size: auto 96px;", 1
-        )[0].rsplit("}", 1)[-1]
-
         self.assertNotIn("match-section-index", app_js)
         self.assertNotIn("match-section-index", app_css)
         self.assertNotIn("function firstChar", app_js)
@@ -3358,8 +3399,8 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('currentAvatar.dataset.pendingAvatarSrc !== nextSrc', app_js)
         self.assertIn("renderConversationList(list);", conversation_region_refresh)
         self.assertNotIn("list.innerHTML = conversationListHtml();", conversation_region_refresh)
-        self.assertNotIn(".conversation-card", content_visibility_selector)
-        self.assertNotIn(".conversation-card", compact_intrinsic_selector)
+        self.assertNotIn("content-visibility: auto;", app_css)
+        self.assertNotIn("contain-intrinsic-size: auto 96px;", app_css)
         self.assertIn('id="side-avatar" aria-hidden="true" hidden></div>', index_html)
         self.assertIn("avatar.hidden = true", app_js)
         self.assertIn("禁止使用数字、字符串首个字符", agents_md)
@@ -4254,6 +4295,9 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("conversation-avatar-stable-reload", css_version)
         self.assertIn("conversation-profile-fast", css_version)
         self.assertIn("conversation-list-stable-paint", css_version)
+        self.assertIn("session-bootstrap-retry", css_version)
+        self.assertIn("route-dom-cache", css_version)
+        self.assertIn("panel-dom-cache", css_version)
 
 
 class FlashPhotoBffContractTests(unittest.TestCase):
