@@ -59,6 +59,11 @@ FRIEND_APPLICATION_SCAN_PAGES = 5
 MOMENT_ID_CURSOR_TABS = frozenset({"推荐", "招募令", "关注"})
 MOMENT_PAGE_CURSOR_TABS = frozenset({"附近", "最新"})
 MOMENT_FEED_TABS = MOMENT_ID_CURSOR_TABS | MOMENT_PAGE_CURSOR_TABS
+MOMENT_VIEW_TASK_TITLE_MARKERS = ("观看动态", "浏览动态")
+MOMENT_VIEW_TASK_POLL_DELAYS_SEC = (0.0, 0.25, 0.75)
+MOMENT_VIEW_TASK_DEADLINE_SEC = 55.0
+MOMENT_VIEW_TASK_MAX_REPEAT_EVENTS = 200
+MOMENT_VIEW_TASK_BATCH_SIZE = 10
 RATE_LIMIT_LOCK = threading.Lock()
 RATE_LIMIT_BUCKETS: Dict[str, List[float]] = {}
 MUTATION_LOCK = threading.Lock()
@@ -565,6 +570,324 @@ def _load_tasks(app: Any) -> Tuple[List[Dict[str, Any]], Any, Any]:
     if not items:
         items = N.normalize_tasks(getattr(have, "data", None))
     return items, create, have
+
+
+def _moment_view_tasks(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    tasks = []
+    for item in items:
+        title = "".join(str(item.get("title") or "").split())
+        if any(marker in title for marker in MOMENT_VIEW_TASK_TITLE_MARKERS):
+            tasks.append(item)
+    return tasks
+
+
+def _moment_view_task_remaining(task: Dict[str, Any]) -> Optional[int]:
+    if task.get("is_claimed") or task.get("can_receive"):
+        return 0
+    try:
+        progress = max(0.0, float(task.get("progress") or 0))
+        total = max(0.0, float(task.get("total") or 0))
+    except (TypeError, ValueError):
+        return None
+    if total <= 0:
+        return None
+    return max(0, int(math.ceil(total - progress)))
+
+
+def _moment_view_task_snapshot(
+    tasks: List[Dict[str, Any]],
+) -> Optional[Dict[str, int]]:
+    snapshot: Dict[str, int] = {}
+    for task in tasks:
+        task_id = str(task.get("id") or "").strip()
+        remaining = _moment_view_task_remaining(task)
+        if not task_id or remaining is None or task_id in snapshot:
+            return None
+        snapshot[task_id] = remaining
+    return snapshot
+
+
+def _moment_view_task_max_remaining(snapshot: Dict[str, int]) -> int:
+    return max(snapshot.values(), default=0)
+
+
+def _moment_view_progress_change(
+    before: Optional[Dict[str, int]],
+    after: Optional[Dict[str, int]],
+    expected_events: int,
+) -> str:
+    if before is None or after is None:
+        return "unknown"
+    active_ids = [task_id for task_id, remaining in before.items() if remaining > 0]
+    if not active_ids:
+        return "complete"
+    deltas = []
+    for task_id in active_ids:
+        if task_id not in after:
+            return "unknown"
+        delta = before[task_id] - after[task_id]
+        if delta < 0 or delta > expected_events:
+            return "unknown"
+        deltas.append(delta)
+    return "advanced" if any(delta > 0 for delta in deltas) else "unchanged"
+
+
+def _moment_view_event_submitted(result: Any) -> bool:
+    if getattr(result, "ok", False):
+        return True
+    status = int(getattr(result, "status", 0) or 0)
+    return str(getattr(result, "kind", "") or "") == "empty" and 200 <= status < 300
+
+
+def _record_moment_view_events(
+    app: Any,
+    post_id: str,
+    count: int,
+    *,
+    deadline: float,
+) -> Tuple[int, int]:
+    total = max(0, int(count))
+    if total <= 0:
+        return 0, 0
+    attempted = 0
+    accepted = 0
+    for _index in range(total):
+        if time.monotonic() >= deadline:
+            break
+        attempted += 1
+        try:
+            submitted = _moment_view_event_submitted(
+                app.social.record_post_view(post_id)
+            )
+        except Exception:
+            submitted = False
+        if not submitted:
+            break
+        accepted += 1
+    return attempted, accepted
+
+
+def _moment_view_task_state(
+    app: Any,
+) -> Tuple[bool, List[Dict[str, Any]], Optional[Dict[str, int]]]:
+    items, create, have = _load_tasks(app)
+    available = bool(
+        items
+        or getattr(create, "ok", False)
+        or getattr(have, "ok", False)
+    )
+    tasks = _moment_view_tasks(items)
+    return available, tasks, _moment_view_task_snapshot(tasks)
+
+
+def _poll_moment_view_task_progress(
+    app: Any,
+    before: Dict[str, int],
+    expected_events: int,
+    deadline: float,
+) -> Tuple[
+    bool,
+    List[Dict[str, Any]],
+    Optional[Dict[str, int]],
+    str,
+]:
+    before_remaining = _moment_view_task_max_remaining(before)
+    last_available = False
+    last_tasks: List[Dict[str, Any]] = []
+    last_snapshot: Optional[Dict[str, int]] = None
+    last_change = "unknown"
+    for delay in MOMENT_VIEW_TASK_POLL_DELAYS_SEC:
+        if delay:
+            if time.monotonic() + delay >= deadline:
+                break
+            time.sleep(delay)
+        if time.monotonic() >= deadline:
+            break
+        try:
+            available, tasks, snapshot = _moment_view_task_state(app)
+        except Exception:
+            continue
+        if not available:
+            continue
+        candidate_change = _moment_view_progress_change(
+            before,
+            snapshot,
+            expected_events,
+        )
+        if last_change not in {"advanced", "complete"} or candidate_change in {
+            "advanced",
+            "complete",
+        }:
+            last_available = True
+            last_tasks = tasks
+            last_snapshot = snapshot
+            last_change = candidate_change
+        progressed = (
+            before_remaining - _moment_view_task_max_remaining(snapshot)
+            if snapshot is not None
+            else 0
+        )
+        if candidate_change == "complete" or (
+            candidate_change == "advanced" and progressed >= expected_events
+        ):
+            break
+    return last_available, last_tasks, last_snapshot, last_change
+
+
+def _assist_moment_view_task(
+    app: Any,
+    post_id: str,
+    *,
+    deadline: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Best-effort completion of active view tasks using the APK's real PV event.
+
+    The APK allows the same post to be reported again after it re-enters the
+    visible area.  Before sending the remaining events, verify against the
+    authoritative task list that repeated reports actually advance progress.
+    """
+
+    if deadline is None:
+        deadline = time.monotonic() + MOMENT_VIEW_TASK_DEADLINE_SEC
+    deadline_expired = time.monotonic() >= deadline
+    if deadline_expired:
+        state_available, tasks, snapshot = False, [], None
+    else:
+        try:
+            state_available, tasks, snapshot = _moment_view_task_state(app)
+        except Exception:
+            state_available, tasks, snapshot = False, [], None
+    payload: Dict[str, Any] = {
+        "checked": state_available,
+        "task_found": bool(tasks),
+        "completed": False,
+        "retryable": False,
+        "state": (
+            "deadline_reached"
+            if deadline_expired
+            else ("not_found" if state_available else "unavailable")
+        ),
+        "remaining_before": None,
+        "remaining_after": None,
+        "requested_repeat_views": 0,
+        "successful_repeat_views": 0,
+        "progress_delta": 0,
+        "capped": False,
+        "tasks": tasks,
+    }
+    if not state_available:
+        payload["retryable"] = True
+        return payload
+    if not tasks:
+        return payload
+
+    if snapshot is None:
+        payload.update(state="target_unknown", retryable=True)
+        return payload
+    remaining_before = _moment_view_task_max_remaining(snapshot)
+    payload["remaining_before"] = remaining_before
+    if remaining_before <= 0:
+        payload.update(completed=True, state="already_complete", remaining_after=0)
+        return payload
+
+    repeat_budget = min(remaining_before, MOMENT_VIEW_TASK_MAX_REPEAT_EVENTS)
+    payload["capped"] = remaining_before > repeat_budget
+    current_snapshot = snapshot
+    current_remaining = remaining_before
+    remaining_budget = repeat_budget
+    first_batch = True
+    while current_remaining > 0 and remaining_budget > 0:
+        if time.monotonic() >= deadline:
+            payload.update(state="deadline_reached", retryable=True)
+            break
+        chunk_count = min(
+            current_remaining,
+            remaining_budget,
+            1 if first_batch else MOMENT_VIEW_TASK_BATCH_SIZE,
+        )
+        attempted, successful = _record_moment_view_events(
+            app,
+            post_id,
+            chunk_count,
+            deadline=deadline,
+        )
+        payload["requested_repeat_views"] += attempted
+        payload["successful_repeat_views"] += successful
+        remaining_budget -= attempted
+        if successful <= 0:
+            payload.update(
+                state=(
+                    "deadline_reached"
+                    if time.monotonic() >= deadline
+                    else ("probe_failed" if first_batch else "partial")
+                ),
+                retryable=True,
+            )
+            break
+
+        available, next_tasks, next_snapshot, change = (
+            _poll_moment_view_task_progress(
+                app,
+                current_snapshot,
+                successful,
+                deadline,
+            )
+        )
+        payload["tasks"] = next_tasks
+        if not available or next_snapshot is None:
+            payload.update(
+                checked=False,
+                state=(
+                    "deadline_reached"
+                    if time.monotonic() >= deadline
+                    else "verification_unavailable"
+                ),
+                retryable=True,
+            )
+            break
+        next_remaining = _moment_view_task_max_remaining(next_snapshot)
+        payload["remaining_after"] = next_remaining
+        payload["progress_delta"] = max(
+            0,
+            remaining_before - next_remaining,
+        )
+        progressed = current_remaining - next_remaining
+        if change not in {"advanced", "complete"} or progressed <= 0:
+            payload.update(state="verification_pending", retryable=True)
+            break
+
+        current_snapshot = next_snapshot
+        current_remaining = next_remaining
+        first_batch = False
+        if current_remaining > 0 and progressed < successful:
+            payload.update(state="verification_pending", retryable=True)
+            break
+        if successful < attempted or attempted < chunk_count:
+            payload.update(state="partial", retryable=True)
+            break
+
+    if current_remaining <= 0:
+        payload.update(
+            completed=True,
+            retryable=False,
+            state="completed",
+            remaining_after=0,
+        )
+    elif payload["state"] not in {
+        "deadline_reached",
+        "probe_failed",
+        "partial",
+        "verification_pending",
+        "verification_unavailable",
+    }:
+        payload.update(
+            state="capped" if payload["capped"] else "partial",
+            retryable=True,
+            remaining_after=current_remaining,
+        )
+    elif payload["remaining_after"] is None:
+        payload["remaining_after"] = current_remaining
+    return payload
 
 
 def _attach_task_snapshot(
@@ -3274,8 +3597,47 @@ class Handler(BaseHTTPRequestHandler):
                     or len(postid) > 32
                 ):
                     return self.ok({"ok": False, "error": "动态编号无效"}, 400)
+                assist_task = str(data.get("assist_task") or "").strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+                assist_deadline = (
+                    time.monotonic() + MOMENT_VIEW_TASK_DEADLINE_SEC
+                    if assist_task
+                    else None
+                )
                 payload = R(app.social.record_post_view(postid), empty_ok=True)
                 payload["post_id"] = postid
+                if assist_task:
+                    if payload.get("ok"):
+                        try:
+                            payload["task_assist"] = _assist_moment_view_task(
+                                app,
+                                postid,
+                                deadline=assist_deadline,
+                            )
+                        except Exception:
+                            payload["task_assist"] = {
+                                "checked": False,
+                                "task_found": False,
+                                "completed": False,
+                                "retryable": True,
+                                "state": "unavailable",
+                                "requested_repeat_views": 0,
+                                "successful_repeat_views": 0,
+                            }
+                    else:
+                        payload["task_assist"] = {
+                            "checked": False,
+                            "task_found": False,
+                            "completed": False,
+                            "retryable": True,
+                            "state": "initial_view_failed",
+                            "requested_repeat_views": 0,
+                            "successful_repeat_views": 0,
+                        }
                 return self.ok(payload)
             if path == "/api/social/like-post":
                 return self.ok(

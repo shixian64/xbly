@@ -1201,14 +1201,15 @@ class SocialBffRoutingTests(unittest.TestCase):
         bff_server.Handler.do_POST(harness)
         return calls, harness.response
 
-    def _run_moment_view_post(self, payload: dict):
-        result = ApiResult(True, 200, "", data=None, kind="empty")
+    def _run_moment_view_post(self, payload: dict, app=None):
         calls = []
-        app = SimpleNamespace(
-            social=SimpleNamespace(
-                record_post_view=lambda postid: calls.append(("view", postid)) or result,
+        if app is None:
+            result = ApiResult(True, 200, "", data=None, kind="empty")
+            app = SimpleNamespace(
+                social=SimpleNamespace(
+                    record_post_view=lambda postid: calls.append(("view", postid)) or result,
+                )
             )
-        )
         web_user = SimpleNamespace(app=app)
 
         class Harness:
@@ -1344,6 +1345,200 @@ class SocialBffRoutingTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(response[0], 400)
         self.assertFalse(response[1]["ok"])
+
+    def test_moment_view_route_completes_an_active_view_task_after_probe(self) -> None:
+        progress = 94
+        lock = threading.Lock()
+        view_calls = []
+
+        def record_post_view(postid):
+            nonlocal progress
+            with lock:
+                progress = min(100, progress + 1)
+                view_calls.append(postid)
+            return ApiResult(False, 200, "", data=None, kind="empty")
+
+        def call(action, **_kwargs):
+            with lock:
+                current = progress
+            data = (
+                [
+                    {
+                        "id": "view-task",
+                        "name": "观看动态100条",
+                        "progress": current,
+                        "num": 100,
+                        "available": "可领取" if current >= 100 else "未完成",
+                    }
+                ]
+                if action == "createHotActivityList"
+                else []
+            )
+            return ApiResult(True, 200, "[]", data=data)
+
+        app = SimpleNamespace(
+            session=SimpleNamespace(uid="42"),
+            social=SimpleNamespace(record_post_view=record_post_view),
+            call=call,
+        )
+        _, response = self._run_moment_view_post(
+            {"post_id": "123", "assist_task": True},
+            app=app,
+        )
+
+        assist = response[1]["task_assist"]
+        self.assertEqual(response[0], 200)
+        self.assertEqual(view_calls, ["123"] * 6)
+        self.assertTrue(assist["task_found"])
+        self.assertTrue(assist["completed"])
+        self.assertEqual(assist["remaining_before"], 5)
+        self.assertEqual(assist["remaining_after"], 0)
+        self.assertEqual(assist["successful_repeat_views"], 5)
+
+    def test_moment_view_task_assist_retries_when_progress_verification_is_delayed(self) -> None:
+        view_calls = []
+
+        def record_post_view(postid):
+            view_calls.append(postid)
+            return ApiResult(False, 200, "", data=None, kind="empty")
+
+        task = {
+            "id": "view-task",
+            "name": "观看动态100条",
+            "progress": 10,
+            "num": 100,
+            "available": "未完成",
+        }
+
+        def call(action, **_kwargs):
+            return ApiResult(
+                True,
+                200,
+                "[]",
+                data=[task] if action == "createHotActivityList" else [],
+            )
+
+        app = SimpleNamespace(
+            session=SimpleNamespace(uid="42"),
+            social=SimpleNamespace(record_post_view=record_post_view),
+            call=call,
+        )
+        with patch.object(bff_server.time, "sleep", return_value=None):
+            _, response = self._run_moment_view_post(
+                {"post_id": "123", "assist_task": True},
+                app=app,
+            )
+
+        assist = response[1]["task_assist"]
+        self.assertEqual(view_calls, ["123", "123"])
+        self.assertFalse(assist["completed"])
+        self.assertTrue(assist["retryable"])
+        self.assertEqual(assist["state"], "verification_pending")
+        self.assertEqual(assist["remaining_after"], 90)
+
+    def test_moment_view_task_assist_does_not_batch_when_longest_task_stalls(self) -> None:
+        view_calls = []
+        short_progress = 0
+
+        def record_post_view(postid):
+            nonlocal short_progress
+            view_calls.append(postid)
+            if len(view_calls) >= 2:
+                short_progress = 1
+            return ApiResult(False, 200, "", data=None, kind="empty")
+
+        def call(action, **_kwargs):
+            data = []
+            if action == "createHotActivityList":
+                data = [
+                    {
+                        "id": "long-view-task",
+                        "name": "观看动态100条",
+                        "progress": 0,
+                        "num": 100,
+                        "available": "未完成",
+                    },
+                    {
+                        "id": "short-view-task",
+                        "name": "浏览动态1条",
+                        "progress": short_progress,
+                        "num": 1,
+                        "available": "可领取" if short_progress else "未完成",
+                    },
+                ]
+            return ApiResult(True, 200, "[]", data=data)
+
+        app = SimpleNamespace(
+            session=SimpleNamespace(uid="42"),
+            social=SimpleNamespace(record_post_view=record_post_view),
+            call=call,
+        )
+        with patch.object(bff_server.time, "sleep", return_value=None):
+            _, response = self._run_moment_view_post(
+                {"post_id": "123", "assist_task": True},
+                app=app,
+            )
+
+        assist = response[1]["task_assist"]
+        self.assertEqual(view_calls, ["123", "123"])
+        self.assertEqual(assist["successful_repeat_views"], 1)
+        self.assertEqual(assist["progress_delta"], 0)
+        self.assertEqual(assist["state"], "verification_pending")
+        self.assertTrue(assist["retryable"])
+
+    def test_moment_view_task_assist_failure_does_not_lose_the_initial_view(self) -> None:
+        with patch.object(
+            bff_server,
+            "_assist_moment_view_task",
+            side_effect=RuntimeError("assist unavailable"),
+        ):
+            calls, response = self._run_moment_view_post(
+                {"post_id": "123", "assist_task": True}
+            )
+
+        self.assertEqual(calls, [("view", "123")])
+        self.assertEqual(response[0], 200)
+        self.assertTrue(response[1]["ok"])
+        self.assertEqual(response[1]["task_assist"]["state"], "unavailable")
+        self.assertTrue(response[1]["task_assist"]["retryable"])
+
+    def test_moment_view_task_assist_does_not_start_after_its_deadline(self) -> None:
+        calls = []
+        app = SimpleNamespace(
+            session=SimpleNamespace(uid="42"),
+            call=lambda action, **_kwargs: calls.append(action),
+        )
+
+        assist = bff_server._assist_moment_view_task(app, "123", deadline=0.0)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(assist["state"], "deadline_reached")
+        self.assertTrue(assist["retryable"])
+
+    def test_moment_view_task_assist_accepts_successful_empty_fallback(self) -> None:
+        calls = []
+
+        def call(action, **_kwargs):
+            calls.append(action)
+            if action == "createHotActivityList":
+                return ApiResult(False, 503, "unavailable", data=None)
+            return ApiResult(True, 200, "[]", data=[])
+
+        app = SimpleNamespace(
+            session=SimpleNamespace(uid="42"),
+            call=call,
+        )
+
+        assist = bff_server._assist_moment_view_task(app, "123")
+
+        self.assertCountEqual(
+            calls,
+            ["createHotActivityList", "haveHotActivityList"],
+        )
+        self.assertTrue(assist["checked"])
+        self.assertFalse(assist["task_found"])
+        self.assertFalse(assist["retryable"])
+        self.assertEqual(assist["state"], "not_found")
 
     def test_friend_applications_scan_past_accepted_first_page(self) -> None:
         calls = []
@@ -2632,8 +2827,23 @@ class SocialFrontendContractTests(unittest.TestCase):
             "new IntersectionObserver",
             '{ threshold: 0.01 }',
             "function reportMomentView",
+            "function updateMomentCardVisibility",
+            "momentViewQueuedEntries",
+            "drainMomentViewReports",
+            "drainQueuedMomentViews",
+            "momentViewTaskAssistSeq",
+            "resetMomentViewTaskAssist",
+            "momentViewRequestSeq",
+            "retryMomentViewTaskAssist",
+            "momentViewTaskAssistRetries",
+            "MOMENT_VIEW_TASK_ASSIST_MAX_RETRIES",
+            'card.dataset.momentViewVisible = "0"',
+            "updateMomentCardVisibility(entry.target, momentCardIsVisible(entry.target))",
+            "scanVisibleMomentCards(root(), { force: true })",
             'api("/api/moments/view"',
-            "body: JSON.stringify({ post_id: postId })",
+            "body: JSON.stringify({ post_id: postId, assist_task: assistTask })",
+            'S.momentViewTaskAssistState = "pending"',
+            "taskAssist?.completed",
             "if (!result.ok || !result.data?.ok)",
             'S.pageCache.delete("tasks")',
             "observeMomentCards(feed)",
@@ -2642,6 +2852,28 @@ class SocialFrontendContractTests(unittest.TestCase):
             self.assertIn(marker, app_js)
         self.assertIn('if path == "/api/moments/view":', server_py)
         self.assertIn("app.social.record_post_view(postid)", server_py)
+        self.assertIn('payload["task_assist"] = _assist_moment_view_task(', server_py)
+        self.assertIn("deadline=assist_deadline", server_py)
+        self.assertIn("MOMENT_VIEW_TASK_BATCH_SIZE", server_py)
+
+    def test_moment_view_task_assist_does_not_block_other_pv_reports(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        drain_report = app_js.split("function drainMomentViewReports", 1)[1].split(
+            "function drainQueuedMomentViews", 1
+        )[0]
+        report_view = app_js.split("async function reportMomentView", 1)[1].split(
+            "function scanVisibleMomentCards", 1
+        )[0]
+
+        self.assertNotIn('S.momentViewTaskAssistState === "pending"', drain_report)
+        self.assertIn('if (card.dataset.momentViewState === "pending") return;', report_view)
+        self.assertNotIn(
+            'card.dataset.momentViewState === "pending" || S.momentViewTaskAssistState === "pending"',
+            report_view,
+        )
+        self.assertIn('const assistTask = S.momentViewTaskAssistState === "idle";', report_view)
+        self.assertIn("body: JSON.stringify({ post_id: postId, assist_task: assistTask })", report_view)
 
     def test_me_page_renders_profile_before_loading_relationship_counts(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -2658,6 +2890,57 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("?summary=1", hydrate)
         self.assertIn('data-me-stat="friends"', page_me)
         self.assertIn("PAGE_CACHE_TTL_MS = 2 * 60 * 1000", app_js)
+
+    def test_menu_navigation_reuses_cached_views_and_revalidates_in_background(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
+        activate_route = app_js.split("async function activateRoute", 1)[1].split(
+            "function loadingState", 1
+        )[0]
+        switch_mine = app_js.split("async function switchMineTab", 1)[1].split(
+            "function routeCacheKey", 1
+        )[0]
+        switch_social = app_js.split("async function switchSocialTab", 1)[1].split(
+            "async function loadMatchHubTab", 1
+        )[0]
+        switch_match = app_js.split("async function switchMatchHubTab", 1)[1].split(
+            "async function pageWallet", 1
+        )[0]
+
+        for marker in (
+            "panelCache: new Map()",
+            "function reusableCacheEntry",
+            "function rememberPanelSnapshot",
+            "PAGE_CACHE_MAX_AGE_MS",
+            "FAST_VIEW_CACHE_TTL_MS",
+            "FEED_VIEW_CACHE_TTL_MS",
+            "RELATION_VIEW_CACHE_TTL_MS",
+        ):
+            self.assertIn(marker, app_js)
+        self.assertIn("reusableCacheEntry(S.pageCache, cacheKey)", activate_route)
+        self.assertIn('root().classList.add("is-refreshing")', activate_route)
+        self.assertNotIn("permissionSensitiveRoute", activate_route)
+        self.assertIn("reusableCacheEntry(S.panelCache, cacheKey)", switch_mine)
+        self.assertIn("rememberCurrentPageSnapshot(cacheKey)", switch_mine)
+        self.assertIn("reusableCacheEntry(S.panelCache, cacheKey)", switch_social)
+        self.assertIn("reusableCacheEntry(S.panelCache, cacheKey)", switch_match)
+        self.assertIn(".page-root.is-refreshing::before", app_css)
+        self.assertIn('content: "正在更新数据"', app_css)
+
+    def test_nearby_panel_cache_hit_updates_the_full_page_snapshot(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        load_discovery = app_js.split("async function loadDiscoveryPanel", 1)[1].split(
+            "async function pageNearby", 1
+        )[0]
+        fresh_cache_branch = load_discovery.split(
+            "if (!force && !forceLocation && cached.fresh)", 1
+        )[1].split("  } else {", 1)[0]
+
+        snapshot = 'rememberCurrentPageSnapshot(routeCacheKey("nearby"));'
+        self.assertIn(snapshot, fresh_cache_branch)
+        self.assertLess(fresh_cache_branch.index(snapshot), fresh_cache_branch.index("return;"))
 
     def test_voice_room_ui_is_removed_but_voice_matching_is_first_class(self) -> None:
         root = Path(__file__).resolve().parents[1]

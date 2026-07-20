@@ -57,6 +57,10 @@ const CONVERSATION_DISMISS_LIMIT = 500;
 const MESSAGE_ARCHIVE_RETRY_DELAYS_MS = [1500, 5000];
 const MESSAGE_ARCHIVE_MAX_IN_FLIGHT = 2;
 const PAGE_CACHE_TTL_MS = 2 * 60 * 1000;
+const PAGE_CACHE_MAX_AGE_MS = 15 * 60 * 1000;
+const FAST_VIEW_CACHE_TTL_MS = 15 * 1000;
+const FEED_VIEW_CACHE_TTL_MS = 45 * 1000;
+const RELATION_VIEW_CACHE_TTL_MS = 60 * 1000;
 const ME_STATS_TTL_MS = 60 * 1000;
 // Tencent Chat Web SDK defaults to a 2-minute client recall window. The
 // application console may extend it; the admin REST recall route has no fixed
@@ -67,6 +71,7 @@ const CHAT_MEDIA_RETRY_DELAYS_MS = [700, 1800, 4000];
 const MOMENT_VIDEO_FRAME_CHECK_MS = 2500;
 const MOMENT_VIDEO_INITIAL_FRAME_WAIT_MS = 15000;
 const MOMENT_VIDEO_COMPAT_TIMEOUT_MS = 32 * 60 * 1000;
+const MOMENT_VIEW_TASK_ASSIST_MAX_RETRIES = 2;
 const MATCH_GENDERS = ["不限", "男", "女"];
 const MATCH_PROPERTIES = ["双", "Z", "B"];
 const DISCOVERY_TABS = ["online", "nearby"];
@@ -88,6 +93,7 @@ const S = {
   routeController: null,
   routeSeq: 0,
   pageCache: new Map(),
+  panelCache: new Map(),
   meStats: null,
   meStatsAt: 0,
   matchTab: "match",
@@ -121,6 +127,9 @@ const S = {
   momentViewObserver: null,
   momentViewRetryTimers: new Set(),
   momentViewScanScheduled: false,
+  momentViewTaskAssistState: "idle",
+  momentViewTaskAssistSeq: 0,
+  momentViewTaskAssistRetries: 0,
   socialTab: "friends",
   visitorTab: "seen_me",
   activePeer: "",
@@ -702,6 +711,8 @@ async function api(path, options = {}) {
       S.user = null;
       S.meStats = null;
       S.meStatsAt = 0;
+      S.pageCache.clear();
+      S.panelCache.clear();
       clearTimeout(S.authenticatedServicesTimer);
       S.authenticatedServicesTimer = null;
       S.authenticatedServicesPending = false;
@@ -1312,9 +1323,15 @@ function applyCapabilities(capabilities) {
       if (String(key).startsWith("match:")) S.pageCache.delete(key);
     });
     S.pageCache.clear();
+    S.panelCache.clear();
     syncPrivateMessageControls();
   }
-  if (nearbyCustomCityChanged) S.pageCache.delete("nearby");
+  if (nearbyCustomCityChanged) {
+    S.pageCache.delete("nearby");
+    [...S.panelCache.keys()].forEach((key) => {
+      if (String(key).startsWith("nearby:")) S.panelCache.delete(key);
+    });
+  }
   if ((proactiveChanged || directCredentialsChanged) && S.authenticated && (S.imMode || S.chat || S.imConnecting)) {
     void cleanupIM().finally(() => {
       if (!S.authenticated) return;
@@ -2126,20 +2143,40 @@ async function switchMineTab(id, { force = false, replace = false } = {}) {
   if (replace) history.replaceState(null, "", hash);
   else if (location.hash !== hash) history.pushState(null, "", hash);
 
-  S.pageCache.delete(routeCacheKey(target));
+  const cacheKey = routeCacheKey(target);
+  const cached = reusableCacheEntry(S.panelCache, cacheKey);
+  if (cached) {
+    panel.innerHTML = cached.html;
+    hydrateRenderedRoute(target, controller.signal, seq);
+    void refreshVisiblePeerPresence();
+    if (!force && cached.fresh) {
+      rememberCurrentPageSnapshot(cacheKey);
+      root().focus({ preventScroll: true });
+      return;
+    }
+  } else {
+    panel.innerHTML = loadingState("正在准备页面…");
+  }
   panel.setAttribute("aria-busy", "true");
-  panel.classList.add("is-loading");
+  if (cached) panel.classList.add("is-refreshing");
+  else panel.classList.add("is-loading");
 
   try {
     const page = PAGE_RENDERERS[target] || pageMe;
-    const html = await page(controller.signal);
+    const html = await page(controller.signal, { force });
     if (controller.signal.aborted || seq !== S.routeSeq || S.route !== target) return;
     panel.innerHTML = html;
+    rememberPanelSnapshot(cacheKey, html);
+    rememberCurrentPageSnapshot(cacheKey);
     hydrateRenderedRoute(target, controller.signal, seq);
     void refreshVisiblePeerPresence();
   } catch (error) {
     if (error?.name === "AbortError" || seq !== S.routeSeq || S.route !== target) return;
     if (error instanceof AuthExpiredError) return;
+    if (cached) {
+      toast("页面已显示缓存内容，后台更新失败", "error", 3600);
+      return;
+    }
     S.route = previousRoute;
     syncNav();
     syncMineTabUI(previousRoute);
@@ -2148,6 +2185,7 @@ async function switchMineTab(id, { force = false, replace = false } = {}) {
   } finally {
     if (seq === S.routeSeq) {
       panel.classList.remove("is-loading");
+      panel.classList.remove("is-refreshing");
       panel.removeAttribute("aria-busy");
     }
   }
@@ -2160,6 +2198,68 @@ function routeCacheKey(route) {
   }
   if (route === "moments") return `${route}:${S.momentsTab}:${S.momentsSearch}`;
   return route;
+}
+
+function viewCacheTtl(key) {
+  const normalized = String(key || "");
+  if (
+    normalized === "nearby" ||
+    normalized.startsWith("nearby:") ||
+    normalized.startsWith("match:") ||
+    normalized === "wallet"
+  ) {
+    return FAST_VIEW_CACHE_TTL_MS;
+  }
+  if (normalized.startsWith("moments:")) return FEED_VIEW_CACHE_TTL_MS;
+  if (normalized.startsWith("social:")) return RELATION_VIEW_CACHE_TTL_MS;
+  if (normalized === "tasks") return FEED_VIEW_CACHE_TTL_MS;
+  return PAGE_CACHE_TTL_MS;
+}
+
+function reusableCacheEntry(cache, key) {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  const age = Date.now() - Number(entry.time || 0);
+  if (!Number.isFinite(age) || age >= PAGE_CACHE_MAX_AGE_MS) {
+    cache.delete(key);
+    return null;
+  }
+  cache.delete(key);
+  cache.set(key, entry);
+  return { ...entry, age, fresh: age < viewCacheTtl(key) };
+}
+
+function rememberPanelSnapshot(key, html, metadata = {}) {
+  S.panelCache.set(key, { html, metadata, time: Date.now() });
+  while (S.panelCache.size > 80) {
+    const oldest = S.panelCache.keys().next().value;
+    if (oldest == null) break;
+    S.panelCache.delete(oldest);
+  }
+}
+
+function rememberCurrentPageSnapshot(key = routeCacheKey(S.route)) {
+  if (S.route === "msg" || !root()) return;
+  S.pageCache.set(key, { html: root().innerHTML, time: Date.now() });
+}
+
+function clearViewCacheKey(key) {
+  S.pageCache.delete(key);
+  S.panelCache.delete(key);
+}
+
+function clearViewCachePrefix(prefix) {
+  [S.pageCache, S.panelCache].forEach((cache) => {
+    [...cache.keys()].forEach((key) => {
+      if (String(key).startsWith(prefix)) cache.delete(key);
+    });
+  });
+}
+
+function rememberPanelElementSnapshot(key, panel) {
+  if (!panel) return;
+  const previous = S.panelCache.get(key);
+  rememberPanelSnapshot(key, panel.innerHTML, previous?.metadata || {});
 }
 
 function updateMeStatsDom() {
@@ -2259,32 +2359,29 @@ async function activateRoute(id, { force = false } = {}) {
   syncNav();
   closeDrawer();
   const cacheKey = routeCacheKey(target);
-  const cached = S.pageCache.get(cacheKey);
-  const permissionSensitiveRoute = target === "nearby" || target === "match";
-  if (
-    !force &&
-    target !== "msg" &&
-    !permissionSensitiveRoute &&
-    cached &&
-    Date.now() - cached.time < PAGE_CACHE_TTL_MS
-  ) {
+  const cached = target === "msg" ? null : reusableCacheEntry(S.pageCache, cacheKey);
+  if (cached) {
     root().innerHTML = cached.html;
     root().focus({ preventScroll: true });
     centerActiveRelationshipTab();
     hydrateRenderedRoute(target, controller.signal, seq);
     void refreshVisiblePeerPresence();
-    return;
+    if (!force && cached.fresh) return;
+    root().setAttribute("aria-busy", "true");
+    root().classList.add("is-refreshing");
+  } else {
+    root().innerHTML = withMineSubnav(target, loadingState("正在准备页面…"));
+    window.scrollTo({ top: 0, behavior: "auto" });
   }
-  root().innerHTML = withMineSubnav(target, loadingState("正在准备页面…"));
-  window.scrollTo({ top: 0, behavior: "auto" });
   try {
     const page = PAGE_RENDERERS[target] || pageNearby;
-    const html = await page(controller.signal);
+    const html = await page(controller.signal, { force });
     if (controller.signal.aborted || seq !== S.routeSeq) return;
     const rendered = `<div class="page-enter">${withMineSubnav(target, html)}</div>`;
     root().innerHTML = rendered;
-    if (target !== "msg" && !permissionSensitiveRoute) {
+    if (target !== "msg") {
       S.pageCache.set(cacheKey, { html: rendered, time: Date.now() });
+      if (isMineRoute(target)) rememberPanelSnapshot(cacheKey, html);
     }
     root().focus({ preventScroll: true });
     centerActiveRelationshipTab();
@@ -2308,11 +2405,20 @@ async function activateRoute(id, { force = false } = {}) {
     if (error && error.name === "AbortError") return;
     if (error instanceof AuthExpiredError) return;
     if (seq !== S.routeSeq) return;
+    if (cached) {
+      toast("已显示缓存内容，最新数据暂时无法更新", "error", 3600);
+      return;
+    }
     root().innerHTML = withMineSubnav(
       target,
       errorState(error.message || String(error), target)
     );
     if (S.authenticatedServicesPending) scheduleAuthenticatedServices(1000);
+  } finally {
+    if (seq === S.routeSeq) {
+      root().classList.remove("is-refreshing");
+      root().removeAttribute("aria-busy");
+    }
   }
 }
 
@@ -3651,7 +3757,27 @@ function clearMomentCache() {
   [...S.pageCache.keys()].forEach((key) => {
     if (String(key).startsWith("moments")) S.pageCache.delete(key);
   });
+  [...S.panelCache.keys()].forEach((key) => {
+    if (String(key).startsWith("moments")) S.panelCache.delete(key);
+  });
   S.pageCache.delete("me");
+  S.panelCache.delete("me");
+}
+
+function resetMomentViewTaskAssist() {
+  S.momentViewTaskAssistState = "idle";
+  S.momentViewTaskAssistSeq += 1;
+  S.momentViewTaskAssistRetries = 0;
+}
+
+function resetMomentCardViewTracking(card) {
+  if (!card) return;
+  const requestSeq = Number.parseInt(String(card.dataset.momentViewRequestSeq || "0"), 10) || 0;
+  card.dataset.momentViewRequestSeq = String(requestSeq + 1);
+  card.dataset.momentViewVisible = "0";
+  card.dataset.momentViewQueuedEntries = "0";
+  card.dataset.momentViewAttempts = "0";
+  delete card.dataset.momentViewState;
 }
 
 function disconnectMomentViewTracking() {
@@ -3659,6 +3785,9 @@ function disconnectMomentViewTracking() {
   S.momentViewObserver = null;
   S.momentViewRetryTimers.forEach((timer) => clearTimeout(timer));
   S.momentViewRetryTimers.clear();
+  root()
+    ?.querySelectorAll?.("[data-post-card][data-post-id]")
+    .forEach(resetMomentCardViewTracking);
 }
 
 function momentCardIsVisible(card) {
@@ -3683,43 +3812,152 @@ function retryMomentViewReport(card) {
   card.dataset.momentViewAttempts = String(attempts + 1);
   const timer = setTimeout(() => {
     S.momentViewRetryTimers.delete(timer);
-    if (momentCardIsVisible(card)) void reportMomentView(card);
+    drainMomentViewReports(card);
   }, 1500 * (attempts + 1));
   S.momentViewRetryTimers.add(timer);
 }
 
+function retryMomentViewTaskAssist(assistToken) {
+  if (
+    assistToken !== S.momentViewTaskAssistSeq ||
+    S.momentViewTaskAssistState !== "idle"
+  ) {
+    return;
+  }
+  S.momentViewTaskAssistRetries += 1;
+  if (S.momentViewTaskAssistRetries > MOMENT_VIEW_TASK_ASSIST_MAX_RETRIES) {
+    S.momentViewTaskAssistState = "disabled";
+    drainQueuedMomentViews();
+    return;
+  }
+  const attempt = S.momentViewTaskAssistRetries;
+  const timer = setTimeout(() => {
+    S.momentViewRetryTimers.delete(timer);
+    if (
+      assistToken !== S.momentViewTaskAssistSeq ||
+      S.momentViewTaskAssistState !== "idle"
+    ) {
+      return;
+    }
+    drainQueuedMomentViews();
+  }, 1500 * attempt);
+  S.momentViewRetryTimers.add(timer);
+}
+
+function queuedMomentViewEntries(card) {
+  return Math.max(0, Number.parseInt(String(card?.dataset.momentViewQueuedEntries || "0"), 10) || 0);
+}
+
+function drainMomentViewReports(card) {
+  if (!card?.isConnected || card.dataset.momentViewState === "pending") return;
+  if (queuedMomentViewEntries(card) <= 0) return;
+  void reportMomentView(card);
+}
+
+function drainQueuedMomentViews(container = root()) {
+  const feed = container?.matches?.("#moment-feed") ? container : container?.querySelector?.("#moment-feed");
+  feed?.querySelectorAll?.("[data-post-card][data-post-id]").forEach(drainMomentViewReports);
+}
+
+function updateMomentCardVisibility(card, visible) {
+  if (!card?.isConnected) return;
+  const wasVisible = card.dataset.momentViewVisible === "1";
+  if (!visible) {
+    card.dataset.momentViewVisible = "0";
+    return;
+  }
+  card.dataset.momentViewVisible = "1";
+  if (wasVisible) return;
+  card.dataset.momentViewQueuedEntries = String(queuedMomentViewEntries(card) + 1);
+  drainMomentViewReports(card);
+}
+
 async function reportMomentView(card) {
   const postId = String(card?.dataset.postId || "").trim();
-  if (!/^\d{1,32}$/.test(postId) || postId === "0" || !momentCardIsVisible(card)) return;
-  if (card.dataset.momentViewState === "pending" || card.dataset.momentViewState === "reported") return;
+  if (
+    !/^\d{1,32}$/.test(postId) ||
+    postId === "0" ||
+    !card?.isConnected ||
+    S.route !== "moments" ||
+    S.momentsTab === "我的" ||
+    !card.closest("#moment-feed") ||
+    queuedMomentViewEntries(card) <= 0
+  ) {
+    return;
+  }
+  if (card.dataset.momentViewState === "pending") return;
+  const assistTask = S.momentViewTaskAssistState === "idle";
+  const assistToken = assistTask ? S.momentViewTaskAssistSeq + 1 : S.momentViewTaskAssistSeq;
+  if (assistTask) {
+    S.momentViewTaskAssistSeq = assistToken;
+    S.momentViewTaskAssistState = "pending";
+  }
+  const requestSeq = String(
+    (Number.parseInt(String(card.dataset.momentViewRequestSeq || "0"), 10) || 0) + 1
+  );
+  card.dataset.momentViewRequestSeq = requestSeq;
   card.dataset.momentViewState = "pending";
   const generation = S.sessionGeneration;
+  const ownsCardRequest = () => card.dataset.momentViewRequestSeq === requestSeq;
   try {
     const result = await api("/api/moments/view", {
       method: "POST",
-      body: JSON.stringify({ post_id: postId }),
-      timeout: 12000,
+      body: JSON.stringify({ post_id: postId, assist_task: assistTask }),
+      timeout: assistTask ? 90000 : 12000,
     });
-    if (generation !== S.sessionGeneration) return;
+    if (generation !== S.sessionGeneration) {
+      if (ownsCardRequest()) delete card.dataset.momentViewState;
+      return;
+    }
     if (!result.ok || !result.data?.ok) throw new Error("动态观看记录未提交");
+    const taskAssist = assistTask ? result.data?.task_assist : null;
+    const assistRetryable =
+      assistTask &&
+      (!taskAssist || taskAssist.retryable === true || taskAssist.checked === false);
+    if (assistTask && assistToken === S.momentViewTaskAssistSeq) {
+      S.momentViewTaskAssistState = assistRetryable ? "idle" : "done";
+      if (!assistRetryable) S.momentViewTaskAssistRetries = 0;
+      if (taskAssist?.task_found && taskAssist?.completed) {
+        toast("已完成浏览动态任务，可前往任务页领取奖励", "success", 4200);
+      }
+    }
     S.pageCache.delete("tasks");
-    if (!card.isConnected) return;
-    card.dataset.momentViewState = "reported";
-    card.dataset.momentViewAttempts = "0";
-  } catch (error) {
-    if (card.isConnected && generation === S.sessionGeneration) {
+    S.panelCache.delete("tasks");
+    if (ownsCardRequest()) {
+      card.dataset.momentViewQueuedEntries = String(Math.max(0, queuedMomentViewEntries(card) - 1));
       delete card.dataset.momentViewState;
-      retryMomentViewReport(card);
+      card.dataset.momentViewAttempts = "0";
+    }
+    if (assistTask) {
+      if (assistRetryable) retryMomentViewTaskAssist(assistToken);
+      else drainQueuedMomentViews();
+    } else if (ownsCardRequest() && card.isConnected) {
+      drainMomentViewReports(card);
+    }
+  } catch (error) {
+    if (
+      assistTask &&
+      generation === S.sessionGeneration &&
+      assistToken === S.momentViewTaskAssistSeq
+    ) {
+      S.momentViewTaskAssistState = "idle";
+    }
+    if (ownsCardRequest() && card.isConnected && generation === S.sessionGeneration) {
+      delete card.dataset.momentViewState;
+      if (!assistTask) retryMomentViewReport(card);
+    }
+    if (assistTask && generation === S.sessionGeneration) {
+      retryMomentViewTaskAssist(assistToken);
     }
     if (error?.name !== "AbortError") console.info("[moment-view]", error?.message || error);
   }
 }
 
-function scanVisibleMomentCards(container = root()) {
-  if (document.hidden || S.route !== "moments" || S.momentsTab === "我的") return;
+function scanVisibleMomentCards(container = root(), { force = false } = {}) {
+  if (S.momentViewObserver && !force) return;
   const feed = container?.matches?.("#moment-feed") ? container : container?.querySelector?.("#moment-feed");
   feed?.querySelectorAll?.("[data-post-card][data-post-id]").forEach((card) => {
-    if (momentCardIsVisible(card)) void reportMomentView(card);
+    updateMomentCardVisibility(card, momentCardIsVisible(card));
   });
 }
 
@@ -3741,7 +3979,7 @@ function observeMomentCards(container = root()) {
     S.momentViewObserver = new IntersectionObserver(
       (entries) => {
         entries.forEach((entry) => {
-          if (entry.isIntersecting) void reportMomentView(entry.target);
+          updateMomentCardVisibility(entry.target, momentCardIsVisible(entry.target));
         });
       },
       { threshold: 0.01 }
@@ -3751,21 +3989,24 @@ function observeMomentCards(container = root()) {
   feed?.querySelectorAll?.("[data-post-card][data-post-id]").forEach((card) => {
     S.momentViewObserver?.observe(card);
   });
-  scheduleMomentViewScan(container);
+  scanVisibleMomentCards(container, { force: true });
 }
 
 function clearRelationshipCache(tabs = SOCIAL_TABS) {
   const selected = new Set(Array.isArray(tabs) ? tabs : [tabs]);
-  [...S.pageCache.keys()].forEach((key) => {
-    const value = String(key);
-    if (
-      value.startsWith("social:") &&
-      [...selected].some((tab) => value === `social:${tab}` || value.startsWith(`social:${tab}:`))
-    ) {
-      S.pageCache.delete(key);
-    }
+  [S.pageCache, S.panelCache].forEach((cache) => {
+    [...cache.keys()].forEach((key) => {
+      const value = String(key);
+      if (
+        value.startsWith("social:") &&
+        [...selected].some((tab) => value === `social:${tab}` || value.startsWith(`social:${tab}:`))
+      ) {
+        cache.delete(key);
+      }
+    });
   });
   S.pageCache.delete("me");
+  S.panelCache.delete("me");
 }
 
 function momentMediaHtml(post) {
@@ -3978,6 +4219,7 @@ function taskCard(item) {
 
 function applyTaskClaimSuccess(button, data) {
   S.pageCache.delete("tasks");
+  S.panelCache.delete("tasks");
   const card = button.closest(".task-card");
   const task = data && data.task && typeof data.task === "object" ? data.task : null;
   if (card && task) {
@@ -8573,7 +8815,20 @@ function syncDiscoveryTabs(tab) {
   if (panel) panel.setAttribute("aria-labelledby", `discovery-tab-${activeTab}`);
 }
 
-async function loadDiscoveryPanel(tab, { requestLocation = true, forceLocation = false } = {}) {
+function discoveryPanelCacheKey(tab) {
+  const activeTab = normalizeDiscoveryTab(tab);
+  const filters = discoveryFilterState(activeTab);
+  const location = S.nearbyLocation;
+  const locationKey =
+    activeTab === "nearby" && !filters.city && location?.latitude != null && location?.longitude != null
+      ? `${Number(location.latitude).toFixed(3)},${Number(location.longitude).toFixed(3)}`
+      : "";
+  return `nearby:${activeTab}:${[filters.gender, filters.property, filters.age, filters.city, locationKey]
+    .map((value) => encodeURIComponent(String(value || "")))
+    .join(":")}`;
+}
+
+async function loadDiscoveryPanel(tab, { requestLocation = true, forceLocation = false, force = false } = {}) {
   const activeTab = normalizeDiscoveryTab(tab);
   S.nearbyTab = activeTab;
   S.nearbyLoadSeq += 1;
@@ -8584,10 +8839,27 @@ async function loadDiscoveryPanel(tab, { requestLocation = true, forceLocation =
   syncDiscoveryTabs(activeTab);
   const panel = $("discovery-panel");
   if (!panel) return;
-  panel.innerHTML = `<div class="tab-panel-loading">正在加载${activeTab === "nearby" ? "附近的人" : "在线列表"}…</div>`;
-  S.pageCache.delete(routeCacheKey("nearby"));
+  let cacheKey = discoveryPanelCacheKey(activeTab);
+  let cached = reusableCacheEntry(S.panelCache, cacheKey);
+  if (cached) {
+    panel.innerHTML = cached.html;
+    if (!force && !forceLocation && cached.fresh) {
+      rememberCurrentPageSnapshot(routeCacheKey("nearby"));
+      if (S.nearbyController === controller) S.nearbyController = null;
+      return;
+    }
+  } else {
+    panel.innerHTML = `<div class="tab-panel-loading">正在加载${activeTab === "nearby" ? "附近的人" : "在线列表"}…</div>`;
+  }
+  panel.setAttribute("aria-busy", "true");
+  if (cached) panel.classList.add("is-refreshing");
+  else panel.classList.add("is-loading");
   try {
-    if (forceLocation) S.nearbyLocation = await requestNearbyLocation();
+    if (forceLocation) {
+      S.nearbyLocation = await requestNearbyLocation();
+      cacheKey = discoveryPanelCacheKey(activeTab);
+      cached = reusableCacheEntry(S.panelCache, cacheKey);
+    }
     let data = await fetchDiscoveryPeople(activeTab, { signal: controller.signal });
     if (activeTab === "nearby" && data?.location_required && requestLocation && !forceLocation) {
       panel.innerHTML = `<div class="tab-panel-loading">资料中没有城市，正在申请获取当前位置…</div>`;
@@ -8596,27 +8868,57 @@ async function loadDiscoveryPanel(tab, { requestLocation = true, forceLocation =
         data = await fetchDiscoveryPeople(activeTab, { signal: controller.signal });
       } catch (error) {
         if (seq !== S.nearbyLoadSeq || controller.signal.aborted) return;
-        panel.innerHTML = discoveryPanelHtml(data, activeTab, { locationError: error.message || String(error) });
+        const html = discoveryPanelHtml(data, activeTab, { locationError: error.message || String(error) });
+        panel.innerHTML = html;
+        rememberPanelSnapshot(cacheKey, html);
+        rememberCurrentPageSnapshot(routeCacheKey("nearby"));
         return;
       }
     }
     if (seq !== S.nearbyLoadSeq || controller.signal.aborted || S.route !== "nearby") return;
     panel.innerHTML = discoveryPanelHtml(data, activeTab);
+    const html = panel.innerHTML;
+    rememberPanelSnapshot(cacheKey, html);
+    rememberCurrentPageSnapshot(routeCacheKey("nearby"));
   } catch (error) {
     if (error?.name === "AbortError" || seq !== S.nearbyLoadSeq || S.route !== "nearby") return;
+    if (cached) {
+      toast("已显示缓存列表，最新数据暂时无法更新", "error", 3600);
+      return;
+    }
     panel.innerHTML = `<div class="error-state"><div><strong>列表加载失败</strong><span>${esc(
       error.message || String(error)
     )}</span><button type="button" class="btn secondary small" data-action="nearby-refresh">重新加载</button></div></div>`;
   } finally {
     if (S.nearbyController === controller) S.nearbyController = null;
+    if (seq === S.nearbyLoadSeq && panel.isConnected) {
+      panel.classList.remove("is-loading");
+      panel.classList.remove("is-refreshing");
+      panel.removeAttribute("aria-busy");
+    }
   }
 }
 
-async function pageNearby(signal) {
-  const { data } = await api("/api/home", { signal });
-  applyCapabilities(data.capabilities);
-  if (data.user) applyUser(data.user);
+async function pageNearby(signal, { force = false } = {}) {
   const activeTab = normalizeDiscoveryTab(S.nearbyTab);
+  const cacheKey = discoveryPanelCacheKey(activeTab);
+  const cached = reusableCacheEntry(S.panelCache, cacheKey);
+  if (cached && !force) {
+    if (!cached.fresh) {
+      setTimeout(() => {
+        if (S.route === "nearby" && S.nearbyTab === activeTab) void loadDiscoveryPanel(activeTab);
+      }, 0);
+    }
+    return `<div class="discovery-page">${discoveryTabsHtml(activeTab)}<div id="discovery-panel" class="discovery-panel" role="tabpanel" aria-labelledby="discovery-tab-${activeTab}">${cached.html}</div></div>`;
+  }
+  void api("/api/home", { signal })
+    .then(({ data }) => {
+      applyCapabilities(data.capabilities);
+      if (data.user) applyUser(data.user);
+    })
+    .catch((error) => {
+      if (error?.name !== "AbortError") console.info("[home-refresh]", error?.message || error);
+    });
   let peopleData;
   try {
     peopleData = await fetchDiscoveryPeople(activeTab, { signal });
@@ -8624,10 +8926,9 @@ async function pageNearby(signal) {
     if (error?.name === "AbortError") throw error;
     peopleData = { ok: false, error: error.message || String(error), items: [], count: 0 };
   }
-  return `<div class="discovery-page">${discoveryTabsHtml(activeTab)}<div id="discovery-panel" class="discovery-panel" role="tabpanel" aria-labelledby="discovery-tab-${activeTab}">${discoveryPanelHtml(
-    peopleData,
-    activeTab
-  )}</div></div>`;
+  const html = discoveryPanelHtml(peopleData, activeTab);
+  rememberPanelSnapshot(cacheKey, html);
+  return `<div class="discovery-page">${discoveryTabsHtml(activeTab)}<div id="discovery-panel" class="discovery-panel" role="tabpanel" aria-labelledby="discovery-tab-${activeTab}">${html}</div></div>`;
 }
 
 async function pageMessages(signal) {
@@ -8912,10 +9213,26 @@ function momentsTabsHtml(tab) {
     .join("");
 }
 
-async function pageMoments(signal) {
+async function pageMoments(signal, { force = false } = {}) {
   S.momentsFeedSeq += 1;
-  const view = await loadMomentsTab(S.momentsTab, signal);
+  const cacheKey = routeCacheKey("moments");
+  const cached = reusableCacheEntry(S.panelCache, cacheKey);
+  let view;
+  if (cached && !force) {
+    view = cached.metadata?.view;
+    if (!view) {
+      view = await loadMomentsTab(S.momentsTab, signal);
+    } else if (!cached.fresh) {
+      setTimeout(() => {
+        if (S.route === "moments") void switchMomentsTab(S.momentsTab, { force: true });
+      }, 0);
+    }
+  } else {
+    view = await loadMomentsTab(S.momentsTab, signal);
+  }
   S.momentsTab = view.tab;
+  const panelHtml = cached && !force && cached.metadata?.view === view ? cached.html : momentsTabPanelHtml(view);
+  rememberPanelSnapshot(cacheKey, panelHtml, { view });
   return `<div class="moments-page">
     <section class="moments-toolbar">
       <div><h2>动态</h2><p id="moment-page-subtitle">${esc(momentsTabDescription(view.tab, view.data))}</p></div>
@@ -8927,7 +9244,7 @@ async function pageMoments(signal) {
       </form></details>
     </section>
     <nav class="moment-tabs ui-scrollbar ui-scrollbar--compact" role="tablist" aria-label="动态分类">${momentsTabsHtml(view.tab)}</nav>
-    <div id="moments-tab-panel" class="moments-tab-panel" role="tabpanel">${momentsTabPanelHtml(view)}</div>
+    <div id="moments-tab-panel" class="moments-tab-panel" role="tabpanel">${panelHtml}</div>
   </div>`;
 }
 
@@ -8957,19 +9274,38 @@ async function switchMomentsTab(tab, { force = false } = {}) {
   disconnectMomentViewTracking();
   S.momentsTab = activeTab;
   syncMomentsTabUI(activeTab);
-  S.pageCache.delete(routeCacheKey("moments"));
+  const cacheKey = routeCacheKey("moments");
+  const cached = reusableCacheEntry(S.panelCache, cacheKey);
+  if (cached) {
+    panel.innerHTML = cached.html;
+    syncMomentsTabUI(activeTab, cached.metadata?.view?.data);
+    observeMomentCards(panel);
+    if (!force && cached.fresh) {
+      rememberCurrentPageSnapshot(cacheKey);
+      return;
+    }
+  }
   panel.setAttribute("aria-busy", "true");
-  panel.classList.add("is-loading");
+  if (cached) panel.classList.add("is-refreshing");
+  else panel.classList.add("is-loading");
 
   try {
     const view = await loadMomentsTab(activeTab);
     if (seq !== S.momentsFeedSeq || S.route !== "moments" || S.momentsTab !== activeTab) return;
     panel.innerHTML = momentsTabPanelHtml(view);
+    const html = panel.innerHTML;
+    rememberPanelSnapshot(cacheKey, html, { view });
     syncMomentsTabUI(activeTab, view.data);
     observeMomentCards(panel);
+    rememberCurrentPageSnapshot(cacheKey);
   } catch (error) {
     if (seq !== S.momentsFeedSeq || S.route !== "moments") return;
     if (error instanceof AuthExpiredError) return;
+    if (cached) {
+      observeMomentCards(panel);
+      toast("已显示缓存动态，最新内容暂时无法更新", "error", 3600);
+      return;
+    }
     S.momentsTab = previousTab;
     syncMomentsTabUI(previousTab);
     observeMomentCards(panel);
@@ -8977,6 +9313,7 @@ async function switchMomentsTab(tab, { force = false } = {}) {
   } finally {
     if (seq === S.momentsFeedSeq && S.route === "moments") {
       panel.classList.remove("is-loading");
+      panel.classList.remove("is-refreshing");
       panel.removeAttribute("aria-busy");
     }
   }
@@ -9089,9 +9426,28 @@ function socialTabsHtml(tab, applyCount = 0, applyHasMore = false) {
       .join("");
 }
 
-async function pageSocial(signal) {
+async function pageSocial(signal, { force = false } = {}) {
   S.socialTab = normalizeSocialTab(S.socialTab);
+  const cacheKey = routeCacheKey("social");
+  const cached = reusableCacheEntry(S.panelCache, cacheKey);
+  if (cached && !force) {
+    if (!cached.fresh) {
+      setTimeout(() => {
+        if (S.route === "social") void switchSocialTab(S.socialTab, { visitorTab: S.visitorTab, force: true });
+      }, 0);
+    }
+    const metadata = cached.metadata || {};
+    return `<nav class="tab-row relationship-tabs ui-scrollbar ui-scrollbar--compact" role="tablist" aria-label="关系中心分类">${socialTabsHtml(
+      S.socialTab,
+      metadata.applyCount,
+      metadata.applyHasMore
+    )}</nav>${relationshipToolsHtml()}<div id="social-tab-panel" class="social-tab-panel" role="tabpanel">${cached.html}</div>`;
+  }
   const view = await loadSocialTab(S.socialTab, signal);
+  rememberPanelSnapshot(cacheKey, view.body, {
+    applyCount: view.applyCount,
+    applyHasMore: view.applyHasMore,
+  });
   return `<nav class="tab-row relationship-tabs ui-scrollbar ui-scrollbar--compact" role="tablist" aria-label="关系中心分类">${socialTabsHtml(
       view.tab,
       view.applyCount,
@@ -9133,22 +9489,51 @@ async function switchSocialTab(tab, { visitorTab = S.visitorTab, force = false }
   S.socialTab = activeTab;
   if (activeTab === "visitors") S.visitorTab = activeVisitorTab;
   syncSocialTabUI(activeTab);
-  history.pushState(null, "", socialRouteHash(activeTab, S.visitorTab));
-  S.pageCache.delete(routeCacheKey("social"));
+  if (location.hash !== socialRouteHash(activeTab, S.visitorTab)) {
+    history.pushState(null, "", socialRouteHash(activeTab, S.visitorTab));
+  }
+  const cacheKey = routeCacheKey("social");
+  const cached = reusableCacheEntry(S.panelCache, cacheKey);
+  if (cached) {
+    panel.innerHTML = cached.html;
+    syncFriendApplicationCount(cached.metadata?.applyCount, cached.metadata?.applyHasMore);
+    void refreshVisiblePeerPresence();
+    if (!force && cached.fresh) {
+      rememberCurrentPageSnapshot(cacheKey);
+      return;
+    }
+  } else {
+    panel.innerHTML = `<div class="tab-panel-loading"><span>正在切换内容…</span></div>`;
+  }
   panel.setAttribute("aria-busy", "true");
-  panel.innerHTML = `<div class="tab-panel-loading"><span>正在切换内容…</span></div>`;
+  if (cached) panel.classList.add("is-refreshing");
+  else panel.classList.add("is-loading");
 
   try {
     const view = await loadSocialTab(activeTab, controller.signal);
     if (controller.signal.aborted || seq !== S.routeSeq || S.route !== "social" || S.socialTab !== activeTab) return;
     panel.innerHTML = view.body;
+    rememberPanelSnapshot(cacheKey, view.body, {
+      applyCount: view.applyCount,
+      applyHasMore: view.applyHasMore,
+    });
     syncFriendApplicationCount(view.applyCount, view.applyHasMore);
+    rememberCurrentPageSnapshot(cacheKey);
+    void refreshVisiblePeerPresence();
   } catch (error) {
     if (error?.name === "AbortError" || seq !== S.routeSeq || S.route !== "social") return;
     if (error instanceof AuthExpiredError) return;
+    if (cached) {
+      toast("已显示缓存列表，最新数据暂时无法更新", "error", 3600);
+      return;
+    }
     panel.innerHTML = errorState(error?.message || String(error), "social");
   } finally {
-    if (seq === S.routeSeq && S.route === "social") panel.removeAttribute("aria-busy");
+    if (seq === S.routeSeq && S.route === "social") {
+      panel.classList.remove("is-loading");
+      panel.classList.remove("is-refreshing");
+      panel.removeAttribute("aria-busy");
+    }
   }
 }
 
@@ -9165,10 +9550,23 @@ function matchTabLoadingLabel(tab) {
   return "匹配";
 }
 
-async function pageMatch(signal) {
+async function pageMatch(signal, { force = false } = {}) {
   const tab = normalizeMatchTab(S.matchTab);
   S.matchTab = tab;
-  const content = await loadMatchHubTab(tab, signal);
+  const cacheKey = routeCacheKey("match");
+  const cached = reusableCacheEntry(S.panelCache, cacheKey);
+  let content;
+  if (cached && !force) {
+    content = cached.html;
+    if (!cached.fresh) {
+      setTimeout(() => {
+        if (S.route === "match" && S.matchTab === tab) void switchMatchHubTab(tab, { force: true });
+      }, 0);
+    }
+  } else {
+    content = await loadMatchHubTab(tab, signal);
+    rememberPanelSnapshot(cacheKey, content);
+  }
   return `<div class="match-hub">${matchHubHeader(tab)}<div id="match-hub-panel" class="match-hub-panel" role="tabpanel" aria-labelledby="match-hub-tab-${tab}">${content}</div></div>`;
 }
 
@@ -9184,6 +9582,7 @@ function syncMatchHubTabUI(tab) {
 }
 
 async function switchMatchHubTab(tab) {
+  const { force = false } = arguments[1] || {};
   const activeTab = normalizeMatchTab(tab);
   const panel = $("match-hub-panel");
   if (S.route !== "match" || !panel) {
@@ -9191,7 +9590,7 @@ async function switchMatchHubTab(tab) {
     go("match", { matchTab: activeTab });
     return;
   }
-  if (S.matchTab === activeTab) return;
+  if (S.matchTab === activeTab && !force) return;
 
   if (S.routeController) S.routeController.abort();
   const controller = new AbortController();
@@ -9199,22 +9598,46 @@ async function switchMatchHubTab(tab) {
   S.routeController = controller;
   S.matchTab = activeTab;
   syncMatchHubTabUI(activeTab);
-  history.pushState(null, "", matchRouteHash(activeTab));
-  S.pageCache.delete(routeCacheKey("match"));
+  if (location.hash !== matchRouteHash(activeTab)) {
+    history.pushState(null, "", matchRouteHash(activeTab));
+  }
+  const cacheKey = routeCacheKey("match");
+  const cached = reusableCacheEntry(S.panelCache, cacheKey);
+  if (cached) {
+    panel.innerHTML = cached.html;
+    if (activeTab === "voice") void hydrateVoiceMatchPanel();
+    if (!force && cached.fresh) {
+      rememberCurrentPageSnapshot(cacheKey);
+      return;
+    }
+  } else {
+    panel.innerHTML = `<div class="match-panel-loading"><span>正在切换到${matchTabLoadingLabel(activeTab)}…</span></div>`;
+  }
   panel.setAttribute("aria-busy", "true");
-  panel.innerHTML = `<div class="match-panel-loading"><span>正在切换到${matchTabLoadingLabel(activeTab)}…</span></div>`;
+  if (cached) panel.classList.add("is-refreshing");
+  else panel.classList.add("is-loading");
 
   try {
     const content = await loadMatchHubTab(activeTab, controller.signal);
     if (controller.signal.aborted || seq !== S.routeSeq || S.route !== "match" || S.matchTab !== activeTab) return;
     panel.innerHTML = content;
+    rememberPanelSnapshot(cacheKey, content);
+    rememberCurrentPageSnapshot(cacheKey);
     if (activeTab === "voice") void hydrateVoiceMatchPanel();
   } catch (error) {
     if (error?.name === "AbortError" || seq !== S.routeSeq || S.route !== "match") return;
     if (error instanceof AuthExpiredError) return;
+    if (cached) {
+      toast("已显示缓存状态，最新数据暂时无法更新", "error", 3600);
+      return;
+    }
     panel.innerHTML = errorState(error?.message || String(error), "match");
   } finally {
-    if (seq === S.routeSeq && S.route === "match") panel.removeAttribute("aria-busy");
+    if (seq === S.routeSeq && S.route === "match") {
+      panel.classList.remove("is-loading");
+      panel.classList.remove("is-refreshing");
+      panel.removeAttribute("aria-busy");
+    }
   }
 }
 
@@ -9240,6 +9663,7 @@ async function pageWallet(signal) {
 async function pageTasks(signal) {
   const { data } = await api("/api/tasks", { signal });
   const tasks = itemsOf(data);
+  resetMomentViewTaskAssist();
   return `<section class="hero-card"><div class="hero-copy"><p class="eyebrow">成长任务</p><h2>每一次认真参与，都值得一点奖励</h2><p>任务进度由服务端统计，领取结果以服务端为准。</p></div></section>
     <section class="section"><div class="section-head"><div><h2>成长任务</h2><p>${tasks.length ? `共 ${tasks.length} 个任务；更新只会读取最新进度，不会重置任务` : "今日任务列表；更新不会重置任务"}</p></div><button type="button" class="btn secondary small" data-action="refresh-route" title="重新读取服务端任务进度，不会重置任务">更新进度</button></div>${
       tasks.length ? `<div class="stack">${tasks.map(taskCard).join("")}</div>` : emptyState("暂无任务", "稍后再来看看新的成长目标")
@@ -9532,6 +9956,10 @@ async function runMatch(path, body = {}) {
   if (!isBottle) {
     await Promise.allSettled([refreshMatchStats(), loadMatchHistory(1)]);
   }
+  clearViewCachePrefix("match:");
+  const cacheKey = routeCacheKey("match");
+  rememberPanelElementSnapshot(cacheKey, $("match-hub-panel"));
+  rememberCurrentPageSnapshot(cacheKey);
 }
 
 function voiceMatchPeerId(peer = S.voiceMatchPeer) {
@@ -10982,9 +11410,11 @@ async function logout() {
     S.momentsTab = "推荐";
     S.momentsSearch = "";
     S.momentsFeedSeq = 0;
+    resetMomentViewTaskAssist();
     S.socialTab = "friends";
     S.visitorTab = "seen_me";
     S.pageCache.clear();
+    S.panelCache.clear();
     S.meStats = null;
     S.meStatsAt = 0;
     S.imMessages = [];
@@ -11078,7 +11508,7 @@ async function handleAction(action, button) {
     return switchMatchHubTab(tab);
   }
   if (action === "nearby-tab") return loadDiscoveryPanel(button.dataset.tab);
-  if (action === "nearby-refresh") return loadDiscoveryPanel(S.nearbyTab);
+  if (action === "nearby-refresh") return loadDiscoveryPanel(S.nearbyTab, { force: true });
   if (action === "nearby-request-location") {
     S.nearbyLocation = null;
     return loadDiscoveryPanel("nearby", { forceLocation: true });
@@ -11794,6 +12224,10 @@ async function handleProductForm(form, submitter) {
     toastEnv(data, "漂流瓶已投入海中");
     setPanel("match-result", operationView(data, "漂流瓶已投入海中"));
     if (data.ok) form.reset();
+    clearViewCachePrefix("match:");
+    const cacheKey = routeCacheKey("match");
+    rememberPanelElementSnapshot(cacheKey, $("match-hub-panel"));
+    rememberCurrentPageSnapshot(cacheKey);
     return;
   }
   if (kind === "dating-publish") {
@@ -11980,6 +12414,9 @@ function completeBrowserLogin(data) {
   resetTurnstileChallenge({ hide: true });
   S.sessionGeneration += 1;
   S.authenticated = true;
+  S.pageCache.clear();
+  S.panelCache.clear();
+  resetMomentViewTaskAssist();
   closeMessageSyncChannel();
   S.imMessages = [];
   S.imMessageLoadingPeers.clear();
@@ -12461,8 +12898,9 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
     startMessageSyncTimer();
     void runMessageSyncCycle({ force: true });
-    scanVisibleMomentCards();
+    scanVisibleMomentCards(root(), { force: true });
   } else {
+    scanVisibleMomentCards(root(), { force: true });
     stopMessageSyncTimer();
   }
 });
