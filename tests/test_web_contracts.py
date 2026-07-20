@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import quote
 
 from bbw_protocol.client import ApiResult
 from bbw_protocol.adapters.im import ImAdapter
@@ -718,6 +719,18 @@ class ProtocolRoutingTests(unittest.TestCase):
             calls[6][1],
             {"uid": "42", "type": "pv", "postId": "123"},
         )
+
+        SocialAPI(FakeClient()).posts("招募令", "123456789012345678")
+        self.assertEqual(calls[7][0], "999999:luntannewnewnew")
+        self.assertNotIn("start", calls[7][1])
+        self.assertEqual(calls[7][1]["platename"], "招募令")
+        self.assertEqual(calls[7][1]["pageindex"], "123456789012345678")
+
+        SocialAPI(FakeClient()).posts("关注", "987654321012345678")
+        self.assertEqual(calls[8][0], "999999:luntannewnewnew")
+        self.assertNotIn("start", calls[8][1])
+        self.assertEqual(calls[8][1]["platename"], "关注")
+        self.assertEqual(calls[8][1]["pageindex"], "987654321012345678")
 
 
 class TimRestHistoryEnvelopeTests(unittest.TestCase):
@@ -1535,51 +1548,65 @@ class SocialBffRoutingTests(unittest.TestCase):
         self.assertEqual(response[1]["code"], "PROFILE_LOCATION_MISSING")
         self.assertTrue(response[1]["location_required"])
 
-    def test_recommended_moments_continue_from_last_post_id(self) -> None:
-        calls = []
-        result = ApiResult(
-            True,
-            200,
-            "[]",
-            data=[
-                {"id": "99", "authid": "8", "posttext": "first"},
-                {"id": "100", "authid": "9", "posttext": "last"},
-            ],
+    def test_id_cursor_moment_tabs_continue_from_last_post_id(self) -> None:
+        def run(tab: str, cursor: str):
+            calls = []
+            result = ApiResult(
+                True,
+                200,
+                "[]",
+                data=[
+                    {"id": "99", "authid": "8", "posttext": "first"},
+                    {"id": "100", "authid": "9", "posttext": "last"},
+                ],
+            )
+            session = SimpleNamespace(uid="42", raw_user={}, nickname="N", portrait="")
+            app = SimpleNamespace(
+                session=session,
+                social=SimpleNamespace(
+                    posts=lambda feed_tab, feed_cursor, **kwargs: calls.append(
+                        (feed_tab, feed_cursor, kwargs)
+                    )
+                    or result,
+                ),
+            )
+            web_user = SimpleNamespace(app=app)
+
+            class Harness:
+                path = f"/api/moments/posts?tab={quote(tab)}&cursor={cursor}"
+
+                def __init__(self):
+                    self.response = None
+
+                def _check_api_origin(self):
+                    return True
+
+                def sid(self):
+                    return "sid"
+
+                def user(self, _sid):
+                    return web_user
+
+                def ok(self, obj, status=200, **_kwargs):
+                    self.response = (status, obj)
+                    return self.response
+
+            harness = Harness()
+            bff_server.Handler.do_GET(harness)
+            return calls, harness.response
+
+        cases = (
+            ("推荐", "1"),
+            ("招募令", "123456789012345678"),
+            ("关注", "987654321012345678"),
         )
-        session = SimpleNamespace(uid="42", raw_user={}, nickname="N", portrait="")
-        app = SimpleNamespace(
-            session=session,
-            social=SimpleNamespace(
-                posts=lambda tab, cursor, **kwargs: calls.append((tab, cursor, kwargs)) or result,
-            ),
-        )
-        web_user = SimpleNamespace(app=app)
-
-        class Harness:
-            path = "/api/moments/posts?tab=%E6%8E%A8%E8%8D%90&cursor=1"
-
-            def __init__(self):
-                self.response = None
-
-            def _check_api_origin(self):
-                return True
-
-            def sid(self):
-                return "sid"
-
-            def user(self, _sid):
-                return web_user
-
-            def ok(self, obj, status=200, **_kwargs):
-                self.response = (status, obj)
-                return self.response
-
-        harness = Harness()
-        bff_server.Handler.do_GET(harness)
-
-        self.assertEqual(calls[0][0:2], ("推荐", "1"))
-        self.assertEqual(harness.response[1]["cursor"], "1")
-        self.assertEqual(harness.response[1]["next_cursor"], "100")
+        for tab, cursor in cases:
+            with self.subTest(tab=tab):
+                calls, response = run(tab, cursor)
+                self.assertEqual(response[0], 200)
+                self.assertEqual(calls[0][0:2], (tab, cursor))
+                self.assertEqual(response[1]["cursor"], cursor)
+                self.assertEqual(response[1]["next_cursor"], "100")
 
     def test_user_moments_target_uid_and_numbered_pages(self) -> None:
         def run(path):
@@ -2791,7 +2818,7 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("function nextMomentsCursor", moments_loader)
         self.assertIn("data?.next_cursor", moments_loader)
         self.assertIn('String(data?.next_page || "")', moments_loader)
-        self.assertIn('tab === "推荐"', moments_loader)
+        self.assertIn("MOMENT_PAGE_CURSOR_TABS.has(tab)", moments_loader)
         self.assertIn('String(posts.at(-1)?.id || "")', moments_loader)
         self.assertIn("String(page + 1)", moments_loader)
         load_more = app_js.split('if (action === "moment-load-more")', 1)[1].split(

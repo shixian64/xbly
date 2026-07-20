@@ -3450,6 +3450,7 @@ function topicCard(item) {
 }
 
 const MOMENT_TABS = ["推荐", "附近", "最新", "招募令", "关注"];
+const MOMENT_PAGE_CURSOR_TABS = new Set(["附近", "最新"]);
 
 function clearMomentCache() {
   [...S.pageCache.keys()].forEach((key) => {
@@ -8595,7 +8596,7 @@ function nextMomentsCursor(tab, currentCursor, posts, data = null) {
   const serverCursor = String(data?.next_cursor || "").trim();
   if (serverCursor) return serverCursor;
   if (!posts.length) return "";
-  if (tab === "推荐") return String(posts.at(-1)?.id || "");
+  if (!MOMENT_PAGE_CURSOR_TABS.has(tab)) return String(posts.at(-1)?.id || "");
   const page = Number.parseInt(String(currentCursor || ""), 10);
   return Number.isSafeInteger(page) && page > 0 ? String(page + 1) : "";
 }

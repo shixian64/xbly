@@ -56,6 +56,9 @@ PROFILE_CACHE_TTL_SEC = 15 * 60.0
 PROFILE_CACHE_ERROR_TTL_SEC = 30.0
 FRIEND_APPLICATION_PAGE_SIZE = 15
 FRIEND_APPLICATION_SCAN_PAGES = 5
+MOMENT_ID_CURSOR_TABS = frozenset({"推荐", "招募令", "关注"})
+MOMENT_PAGE_CURSOR_TABS = frozenset({"附近", "最新"})
+MOMENT_FEED_TABS = MOMENT_ID_CURSOR_TABS | MOMENT_PAGE_CURSOR_TABS
 RATE_LIMIT_LOCK = threading.Lock()
 RATE_LIMIT_BUCKETS: Dict[str, List[float]] = {}
 MUTATION_LOCK = threading.Lock()
@@ -2034,14 +2037,13 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return self.ok(payload)
             else:
-                allowed_tabs = {"推荐", "附近", "最新", "招募令", "关注"}
-                if tab not in allowed_tabs:
+                if tab not in MOMENT_FEED_TABS:
                     return self.ok({"ok": False, "error": "不支持的动态分类"}, 400)
                 if (
                     not cursor.isdigit()
                     or cursor == "0"
                     or len(cursor) > 32
-                    or (tab != "推荐" and int(cursor) > 100000)
+                    or (tab in MOMENT_PAGE_CURSOR_TABS and int(cursor) > 100000)
                 ):
                     return self.ok({"ok": False, "error": "动态游标无效"}, 400)
                 region = "不限"
@@ -2066,10 +2068,10 @@ class Handler(BaseHTTPRequestHandler):
             payload["cursor"] = cursor
             feed_items = payload.get("items") if isinstance(payload.get("items"), list) else []
             if feed_items:
-                if tab == "推荐":
-                    payload["next_cursor"] = str(feed_items[-1].get("id") or "")
-                else:
+                if tab in MOMENT_PAGE_CURSOR_TABS:
                     payload["next_cursor"] = str(int(cursor) + 1)
+                else:
+                    payload["next_cursor"] = str(feed_items[-1].get("id") or "")
             else:
                 payload["next_cursor"] = ""
             if tab == "附近":
