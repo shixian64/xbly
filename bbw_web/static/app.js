@@ -816,9 +816,12 @@ function messageArchivePayload(entry, direction = "") {
         : "browser";
   const upstreamMessageId = String(entry.id || "").trim().slice(0, 512);
   const upstreamMessageKey = String(entry.msgKey || "").trim().slice(0, 512);
+  const messageRandom = String(entry.messageRandom || timMessageRandom(entry) || "").slice(0, 80);
   const sentAt = archiveTimestamp(entry.timestamp);
   const media = archiveMediaPayload(entry);
-  const identity = upstreamMessageId || upstreamMessageKey || [peer, sentAt, entry.kind, entry.text, media.url || media.uuid || ""].join("|");
+  const identity = messageRandom
+    ? `${peer}|${normalizedDirection}|${messageRandom}`
+    : upstreamMessageId || upstreamMessageKey || [peer, sentAt, entry.kind, entry.text, media.url || media.uuid || ""].join("|");
   const clientMessageKey = `web-message:${archiveHash(`${normalizedDirection}|${identity}`)}`;
   const revision = archiveHash(
     JSON.stringify({
@@ -839,6 +842,7 @@ function messageArchivePayload(entry, direction = "") {
     upstream_message_key: upstreamMessageKey,
     message_key: upstreamMessageKey || clientMessageKey,
     message_sequence: String(entry.sequence || "").slice(0, 80),
+    message_random: messageRandom,
     peer_uid: peer,
     conversation_id: `C2C${peer}`,
     message_type: String(entry.kind || "text").slice(0, 64),
@@ -5491,6 +5495,51 @@ function timMessageSequence(message) {
   ).trim();
 }
 
+function timMessageRandom(message) {
+  const explicit = String(
+    message?.messageRandom ??
+      message?.message_random ??
+      message?.msgRandom ??
+      message?.msg_random ??
+      message?.MsgRandom ??
+      ""
+  ).trim();
+  if (/^\d{1,20}$/.test(explicit)) return explicit;
+  const candidates = [
+    message?.ID,
+    message?.id,
+    message?.messageID,
+    message?.messageId,
+    message?.MsgKey,
+    message?.msg_key,
+    message?.messageKey,
+    message?.message_key,
+  ];
+  for (const value of candidates) {
+    const raw = String(value || "").trim();
+    const sdkMatch = raw.match(/^\d{12,}-\d{9,13}-(\d{1,20})$/);
+    if (sdkMatch) return sdkMatch[1];
+    const historyMatch = raw.match(/^\d{1,20}_(\d{1,20})_\d{9,13}$/);
+    if (historyMatch) return historyMatch[1];
+  }
+  return "";
+}
+
+function messageIdentityKey(entry) {
+  const peer = String(entry?.peer || "");
+  const direction = entry?.type === "mine" ? "out" : "in";
+  const messageRandom = String(entry?.messageRandom || timMessageRandom(entry) || "");
+  if (peer && messageRandom) return `tim|${peer}|${direction}|${messageRandom}`;
+  const messageKey = String(entry?.msgKey || "");
+  if (messageKey && !messageKey.startsWith("web-message:")) {
+    return `key|${peer}|${direction}|${messageKey}`;
+  }
+  const id = String(entry?.id || "");
+  if (id) return `id|${id}`;
+  const mediaIdentity = entry?.media?.url || entry?.media?.uuid || entry?.media?.data || entry?.flashId || "";
+  return `fallback|${peer}|${direction}|${entry?.kind || "text"}|${entry?.timestamp || ""}|${entry?.text || ""}|${mediaIdentity}`;
+}
+
 function compareMessageOrder(a, b) {
   const byTime = Number(a?.timestamp || 0) - Number(b?.timestamp || 0);
   if (byTime) return byTime;
@@ -5575,6 +5624,7 @@ function timMessageEntry(message, peer = "", me = String(S.user?.uid || S.user?.
     ),
     msgKey: String(message?.MsgKey || message?.msg_key || message?.messageKey || message?.message_key || ""),
     sequence: timMessageSequence(message),
+    messageRandom: timMessageRandom(message),
     text: displayText,
     kind,
     objectName: messageObjectName(message),
@@ -5863,8 +5913,11 @@ function addImMessage(text, type = "system", peer = "", meta = {}) {
     ...meta,
   };
   entry.preview = entry.preview || messagePreview(entry);
-  S.imMessages.push(entry);
-  trimChatMessages(100);
+  if (entry.peer) mergePeerMessages(entry.peer, [entry]);
+  else {
+    S.imMessages.push(entry);
+    trimChatMessages(100);
+  }
   const log = $("im-log");
   if (log) {
     const shouldStickToBottom = type === "mine" || chatLogIsNearBottom(log);
@@ -5930,6 +5983,7 @@ function peerMessageRevision(peer) {
         entry.id,
         entry.msgKey,
         entry.sequence,
+        entry.messageRandom,
         entry.timestamp,
         entry.type,
         entry.kind,
@@ -5961,8 +6015,7 @@ function mergePeerMessages(peer, incoming) {
   const otherPeers = S.imMessages.filter((entry) => entry.peer !== target);
   const byKey = new Map();
   [...S.imMessages.filter((entry) => entry.peer === target), ...incoming].forEach((entry) => {
-    const mediaIdentity = entry.media?.url || entry.media?.uuid || entry.media?.data || entry.flashId || "";
-    const key = entry.id || `${entry.type}|${entry.kind || "text"}|${entry.timestamp || ""}|${entry.text}|${mediaIdentity}`;
+    const key = messageIdentityKey(entry);
     const previous = byKey.get(key);
     byKey.set(
       key,
@@ -5973,6 +6026,7 @@ function mergePeerMessages(peer, incoming) {
             rawMessage: entry.rawMessage || previous.rawMessage || null,
             msgKey: entry.msgKey || previous.msgKey || "",
             sequence: entry.sequence || previous.sequence || "",
+            messageRandom: entry.messageRandom || previous.messageRandom || "",
             revoked: Boolean(previous.revoked || entry.revoked),
             peerRead: previous.peerRead === true || entry.peerRead === true ? true : entry.peerRead ?? previous.peerRead,
             readAt: Math.max(Number(previous.readAt || 0), Number(entry.readAt || 0)),
@@ -6038,7 +6092,7 @@ async function loadConversationMessages(peer, { force = false } = {}) {
     const archiveCandidates = new Map();
     incoming.forEach((entry) => {
       if (["archive", "http", "history"].includes(String(entry.source || "").toLowerCase())) return;
-      const identity = String(entry.id || entry.msgKey || `${entry.type}|${entry.kind}|${entry.timestamp}|${entry.text}`);
+      const identity = messageIdentityKey(entry);
       const remoteMedia = archiveRemoteUrl(entry.media?.url) || archiveRemoteUrl(entry.media?.thumbnail);
       const score = (remoteMedia ? 4 : 0) + (entry.rawMessage ? 2 : 0) + (entry.text ? 1 : 0);
       const previous = archiveCandidates.get(identity);
@@ -7067,13 +7121,17 @@ function updateLocalMessage(id, patch) {
   const current = S.imMessages[index];
   const next = typeof patch === "function" ? patch(current) : { ...current, ...patch };
   S.imMessages[index] = next;
+  if (next.peer) mergePeerMessages(next.peer, []);
   refreshChatLog();
   return next;
 }
 
 function appendLocalMessage(entry) {
-  S.imMessages.push(entry);
-  trimChatMessages(500);
+  if (entry?.peer) mergePeerMessages(entry.peer, [entry]);
+  else {
+    S.imMessages.push(entry);
+    trimChatMessages(500);
+  }
   refreshChatLog();
   return entry;
 }

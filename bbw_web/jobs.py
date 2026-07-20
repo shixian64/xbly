@@ -75,6 +75,8 @@ DEFAULT_MEDIA_HOSTS = (
 )
 MAX_METADATA_STRING = 20_000
 MAX_METADATA_ITEMS = 100
+_TIM_SDK_MESSAGE_ID = re.compile(r"^\d{12,}-(\d{9,13})-(\d{1,20})$")
+_TIM_HISTORY_MESSAGE_ID = re.compile(r"^\d{1,20}_(\d{1,20})_(\d{9,13})$")
 
 
 def _safe_url(value: Any) -> str:
@@ -389,7 +391,35 @@ def _prefer_message_status(current: str, incoming: str) -> str:
     return incoming if rank.get(incoming, 1) >= rank.get(current, 1) else current
 
 
-def _message_identifier(report: Mapping[str, Any], peer_uid: str) -> str:
+def _tim_message_random(report: Mapping[str, Any]) -> str:
+    for key in ("message_random", "msg_random", "MsgRandom"):
+        candidate = str(report.get(key) or "").strip()
+        if candidate.isdigit() and len(candidate) <= 20:
+            return candidate
+    for key in ("upstream_message_id", "message_key", "upstream_message_key"):
+        candidate = str(report.get(key) or "").strip()
+        sdk_match = _TIM_SDK_MESSAGE_ID.fullmatch(candidate)
+        if sdk_match:
+            return sdk_match.group(2)
+        history_match = _TIM_HISTORY_MESSAGE_ID.fullmatch(candidate)
+        if history_match:
+            return history_match.group(1)
+    return ""
+
+
+def _message_identifier(
+    report: Mapping[str, Any],
+    peer_uid: str,
+    *,
+    sender_uid: str = "",
+    recipient_uid: str = "",
+) -> str:
+    message_random = _tim_message_random(report)
+    sender = str(sender_uid or "").strip()
+    recipient = str(recipient_uid or "").strip()
+    if message_random and sender and recipient:
+        identity = "\x1f".join(("tim-c2c", sender, recipient, message_random))
+        return f"tim-c2c:{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
     for key in (
         "upstream_message_id",
         "message_key",
@@ -411,6 +441,75 @@ def _message_identifier(report: Mapping[str, Any], peer_uid: str) -> str:
         "media": report.get("media"),
     }
     return f"derived:{_stable_json_digest(fingerprint)}"
+
+
+def _message_key_quality(value: Any) -> int:
+    raw = str(value or "").strip()
+    if not raw:
+        return 0
+    if raw.startswith("web-message:"):
+        return 1
+    return 2
+
+
+def _merge_message_metadata(current: Any, update: Mapping[str, Any]) -> dict[str, Any]:
+    previous = dict(current) if isinstance(current, Mapping) else {}
+    incoming = {key: _json_safe(value) for key, value in update.items()}
+    merged = dict(previous)
+    for key, value in incoming.items():
+        if value not in (None, "", [], {}):
+            merged[key] = value
+        elif key not in merged:
+            merged[key] = value
+
+    source_rank = {"browser": 0, "tim_sdk": 1, "rest": 2, "history": 3}
+    previous_source = str(previous.get("source") or "")
+    incoming_source = str(incoming.get("source") or "")
+    merged["source"] = max(
+        (previous_source, incoming_source),
+        key=lambda value: source_rank.get(value, 0),
+    )
+
+    previous_key = previous.get("message_key")
+    incoming_key = incoming.get("message_key")
+    merged["message_key"] = max(
+        (previous_key, incoming_key), key=_message_key_quality
+    ) or ""
+    for key in ("message_sequence", "client_message_key", "read_at", "object_name"):
+        merged[key] = incoming.get(key) or previous.get(key) or ""
+
+    merged["revoked"] = bool(previous.get("revoked") or incoming.get("revoked"))
+    read_states = (previous.get("is_peer_read"), incoming.get("is_peer_read"))
+    if True in read_states:
+        merged["is_peer_read"] = True
+    elif False in read_states:
+        merged["is_peer_read"] = False
+    else:
+        merged["is_peer_read"] = None
+
+    previous_media = previous.get("media_report")
+    incoming_media = incoming.get("media_report")
+    if isinstance(incoming_media, Mapping) and any(incoming_media.values()):
+        merged["media_report"] = dict(incoming_media)
+    elif isinstance(previous_media, Mapping):
+        merged["media_report"] = dict(previous_media)
+
+    aliases: list[str] = []
+    for value in (
+        *(previous.get("raw_upstream_message_ids") or []),
+        previous.get("raw_upstream_message_id"),
+        *(incoming.get("raw_upstream_message_ids") or []),
+        incoming.get("raw_upstream_message_id"),
+    ):
+        raw = str(value or "").strip()
+        if raw and raw not in aliases:
+            aliases.append(raw[:512])
+    merged["raw_upstream_message_ids"] = aliases[:20]
+    merged["raw_upstream_message_id"] = aliases[-1] if aliases else ""
+    merged["message_random"] = (
+        incoming.get("message_random") or previous.get("message_random") or ""
+    )
+    return merged
 
 
 def _ingest_message(
@@ -448,6 +547,8 @@ def _ingest_message(
     else:
         sender_uid = _bounded(report.get("sender_upstream_uid"), 128) or None
         recipient_uid = _bounded(report.get("recipient_upstream_uid"), 128) or None
+    raw_upstream_message_id = _bounded(report.get("upstream_message_id"), 512)
+    message_random = _tim_message_random(report)
     metadata = {
         "schema_version": _as_int(report.get("schema_version"), 1, minimum=1, maximum=10),
         "source": _bounded(report.get("source"), 64) or "browser",
@@ -458,6 +559,7 @@ def _ingest_message(
         "message_sequence": _bounded(
             report.get("message_sequence") or report.get("sequence"), 80
         ),
+        "message_random": message_random,
         "client_message_key": _bounded(report.get("client_message_key"), 512),
         "idempotency_key": _bounded(report.get("idempotency_key"), 256),
         "observed_at": _bounded(report.get("observed_at"), 80),
@@ -466,13 +568,22 @@ def _ingest_message(
         "read_at": _bounded(report.get("read_at"), 80),
         "flash_id": _bounded(report.get("flash_id"), 512),
         "media_report": _json_safe(report.get("media")),
+        "raw_upstream_message_id": raw_upstream_message_id,
+        "raw_upstream_message_ids": [raw_upstream_message_id]
+        if raw_upstream_message_id
+        else [],
     }
     retention_days = max(1, int(user.chat_retention_days or settings.message_retention_days))
     row, created = MessageRepository(db).insert_idempotent(
         owner_user_id=user.id,
         conversation_id=conversation.id,
         provider=CHAT_PROVIDER,
-        upstream_message_id=_message_identifier(report, peer_uid),
+        upstream_message_id=_message_identifier(
+            report,
+            peer_uid,
+            sender_uid=sender_uid or "",
+            recipient_uid=recipient_uid or "",
+        ),
         direction=direction,
         sender_upstream_uid=sender_uid,
         recipient_upstream_uid=recipient_uid,
@@ -490,7 +601,7 @@ def _ingest_message(
         if not row.body and report.get("text"):
             row.body = str(report.get("text"))[:100_000]
         previous_metadata = dict(row.extra_data or {})
-        merged_metadata = _merge_dict(previous_metadata, metadata)
+        merged_metadata = _merge_message_metadata(previous_metadata, metadata)
         previous_read = previous_metadata.get("is_peer_read")
         incoming_read = metadata.get("is_peer_read")
         if previous_read is True:
@@ -502,6 +613,14 @@ def _ingest_message(
         if not metadata.get("read_at") and previous_metadata.get("read_at"):
             merged_metadata["read_at"] = previous_metadata["read_at"]
         row.extra_data = merged_metadata
+        if occurred_at < row.occurred_at:
+            row.occurred_at = occurred_at
+        if row.direction == "unknown" and direction != "unknown":
+            row.direction = direction
+        if not row.sender_upstream_uid and sender_uid:
+            row.sender_upstream_uid = sender_uid
+        if not row.recipient_upstream_uid and recipient_uid:
+            row.recipient_upstream_uid = recipient_uid
         db.flush()
 
     outbox_id: uuid.UUID | None = None
@@ -746,6 +865,9 @@ def _history_message_report(
         "message_key": str(item.get("msg_key") or item.get("MsgKey") or ""),
         "message_sequence": str(
             item.get("sequence") or item.get("msg_sequence") or item.get("MsgSeq") or ""
+        ),
+        "message_random": str(
+            item.get("message_random") or item.get("msg_random") or item.get("MsgRandom") or ""
         ),
         "peer_uid": peer,
         "conversation_id": _canonical_conversation_id(peer),

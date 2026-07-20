@@ -1447,6 +1447,19 @@ def normalize_message(item: Any) -> Optional[Dict[str, Any]]:
     sequence = str(
         _first(d, ["MsgSeq", "msgSeq", "msg_seq", "sequence", "seq"], "")
     )
+    message_random = str(
+        _first(
+            d,
+            [
+                "MsgRandom",
+                "msgRandom",
+                "msg_random",
+                "messageRandom",
+                "message_random",
+            ],
+            "",
+        )
+    )
     revoked = _bool(
         _first(
             d,
@@ -1530,6 +1543,9 @@ def normalize_message(item: Any) -> Optional[Dict[str, Any]]:
         "sequence": sequence,
         "msg_sequence": sequence,
         "MsgSeq": sequence,
+        "message_random": message_random,
+        "msg_random": message_random,
+        "MsgRandom": message_random,
         "is_revoked": revoked,
         "isRevoked": revoked,
         "text": text,

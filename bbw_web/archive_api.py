@@ -55,6 +55,7 @@ class MessageReport(BaseModel):
         ),
     )
     client_message_key: str = Field(default="", max_length=512)
+    message_random: str = Field(default="", max_length=80)
     peer_uid: str = Field(min_length=1, max_length=128)
     conversation_id: str = Field(default="", max_length=256)
     message_type: str = Field(default="text", max_length=80)
@@ -198,6 +199,7 @@ def _archived_message_item(message: Any) -> dict[str, Any]:
         or ""
     )
     message_sequence = str(metadata.get("message_sequence") or "")
+    message_random = str(metadata.get("message_random") or "")
     return {
         "id": message_id,
         "message_id": message_id,
@@ -205,6 +207,9 @@ def _archived_message_item(message: Any) -> dict[str, Any]:
         "msg_key": message_key,
         "sequence": message_sequence,
         "msg_sequence": message_sequence,
+        "message_random": message_random,
+        "msg_random": message_random,
+        "MsgRandom": message_random,
         "text": str(message.body or ""),
         "body": str(message.body or ""),
         "kind": str(message.message_type or "text"),
