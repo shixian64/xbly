@@ -188,6 +188,8 @@ const S = {
   imMessageLoadingPeers: new Set(),
   imMessageLoadedPeers: new Set(),
   imArchiveLoadedPeers: new Set(),
+  imMessageOlderLoadingPeers: new Set(),
+  imMessageHistoryExhaustedPeers: new Set(),
   imComposerPanel: "",
   imComposerDraft: "",
   imComposerDraftRevision: 0,
@@ -5923,6 +5925,18 @@ function chatMessageContentHtml(entry) {
   return `${chatMessageQuoteHtml(entry)}${chatMessageBodyHtml(entry)}`;
 }
 
+function chatHistoryStatusHtml() {
+  const peer = String(S.activePeer || "");
+  if (!peer) return "";
+  if (S.imMessageOlderLoadingPeers.has(peer)) {
+    return '<div class="chat-history-status is-loading" role="status">正在加载更早消息…</div>';
+  }
+  if (S.imMessageHistoryExhaustedPeers.has(peer)) {
+    return '<div class="chat-history-status">没有更早的消息</div>';
+  }
+  return "";
+}
+
 function chatLogHtml() {
   const entries = S.imMessages.filter(
     (entry) => entry.type !== "system" && (!entry.peer || !S.activePeer || entry.peer === S.activePeer)
@@ -5937,7 +5951,7 @@ function chatLogHtml() {
     return `<div class="chat-line system">还没有消息，礼貌地打个招呼吧</div>`;
   }
   const sortedEntries = entries.sort(compareMessageOrder);
-  return sortedEntries
+  return `${chatHistoryStatusHtml()}${sortedEntries
     .map((entry) => {
       const state = chatMessageState(entry);
       const mineClass = entry.type === "mine" ? " mine" : "";
@@ -6006,7 +6020,7 @@ function chatLogHtml() {
           : ""
       }</div></div>${metaHtml ? `<div class="chat-message-meta">${metaHtml}</div>` : ""}</div>`;
     })
-    .join("");
+    .join("")}`;
 }
 
 function scrollChatLogToBottom(log = $("im-log")) {
@@ -6194,7 +6208,7 @@ function mergePeerMessages(peer, incoming) {
     );
   });
   S.imMessages = [...otherPeers, ...byKey.values()];
-  trimChatMessages(500);
+  trimChatMessages(2000);
   const retainedBlobUrls = new Set();
   S.imMessages.forEach((entry) => collectBlobObjectUrls(entry.media, retainedBlobUrls));
   previousBlobUrls.forEach((url) => {
@@ -6263,6 +6277,123 @@ async function loadConversationMessages(peer, { force = false } = {}) {
     S.imMessageLoadingPeers.delete(target);
     if (!wasLoaded && S.activePeer === target && !S.imMessages.some((entry) => entry.peer === target)) {
       refreshChatLog();
+    }
+  }
+}
+
+function oldestPeerMessageTimestamp(peer) {
+  const target = String(peer || "");
+  const timestamps = S.imMessages
+    .filter((entry) => entry.type !== "system" && String(entry.peer || "") === target)
+    .map((entry) => messageTimestampMs(entry))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return timestamps.length ? Math.min(...timestamps) : 0;
+}
+
+async function loadOlderConversationMessages(peer, log = $("im-log")) {
+  const target = String(peer || "").trim();
+  if (
+    !target ||
+    !log ||
+    String(S.activePeer || "") !== target ||
+    !S.imMessageLoadedPeers.has(target) ||
+    S.imMessageLoadingPeers.has(target) ||
+    S.imMessageOlderLoadingPeers.has(target) ||
+    S.imMessageHistoryExhaustedPeers.has(target)
+  ) {
+    return false;
+  }
+  const oldestTimestamp = oldestPeerMessageTimestamp(target);
+  if (!oldestTimestamp) return false;
+
+  const previousHeight = log.scrollHeight;
+  const previousTop = log.scrollTop;
+  const me = String(S.user?.uid || S.user?.id || "");
+  const beforeSeconds = Math.max(1, Math.floor(oldestTimestamp / 1000));
+  const beforeIso = new Date(oldestTimestamp).toISOString();
+  const previousKeys = new Set(
+    S.imMessages
+      .filter((entry) => String(entry.peer || "") === target)
+      .map((entry) => messageIdentityKey(entry))
+  );
+  S.imMessageOlderLoadingPeers.add(target);
+  log.querySelector(".chat-history-status")?.remove();
+  log.insertAdjacentHTML("afterbegin", chatHistoryStatusHtml());
+
+  const pageSize = 200;
+  const tasks = [
+    api(
+      `/api/im/messages?peer=${encodeURIComponent(target)}&before=${encodeURIComponent(beforeSeconds)}`,
+      { timeout: 12000 }
+    ).then(({ data, ok }) => {
+      if (!ok || data?.ok === false) throw new Error("服务器聊天记录暂时不可用");
+      const items = itemsOf(data);
+      return {
+        entries: items.map((item) => timMessageEntry({ ...item, source: "http" }, target, me)),
+        hasMore: data?.has_more === true || items.length >= pageSize,
+      };
+    }),
+    api(
+      `/api/archive/messages?peer=${encodeURIComponent(target)}&limit=${pageSize}&before=${encodeURIComponent(beforeIso)}`,
+      { timeout: 8000 }
+    ).then(({ data, ok }) => {
+      if (!ok || data?.ok === false) throw new Error("归档聊天记录暂时不可用");
+      const items = itemsOf(data);
+      return {
+        entries: items.map((item) => timMessageEntry({ ...item, source: "archive" }, target, me)),
+        hasMore: data?.has_more === true || items.length >= pageSize,
+      };
+    }),
+  ];
+
+  try {
+    const results = await Promise.allSettled(tasks);
+    const fulfilled = results
+      .filter((result) => result.status === "fulfilled")
+      .map((result) => result.value);
+    if (!fulfilled.length) throw new Error("更早的聊天记录暂时无法加载");
+    const incoming = fulfilled.flatMap((result) => result.entries);
+    mergePeerMessages(target, incoming);
+    const newCount = S.imMessages.filter(
+      (entry) =>
+        String(entry.peer || "") === target &&
+        !previousKeys.has(messageIdentityKey(entry))
+    ).length;
+    const failedSourceCount = results.filter((result) => result.status === "rejected").length;
+    if (!newCount && failedSourceCount) {
+      throw new Error("部分聊天记录来源暂时不可用，请稍后重试");
+    }
+    const allSourcesCompleted = results.every((result) => result.status === "fulfilled");
+    const mayHaveMore = fulfilled.some((result) => result.hasMore);
+    if (allSourcesCompleted && (!newCount || !mayHaveMore)) {
+      S.imMessageHistoryExhaustedPeers.add(target);
+    } else {
+      S.imMessageHistoryExhaustedPeers.delete(target);
+    }
+    if (String(S.activePeer || "") === target && log.isConnected) {
+      log.innerHTML = chatLogHtml();
+      const restorePosition = () => {
+        if (!log.isConnected || String(S.activePeer || "") !== target) return;
+        log.scrollTop = Math.max(0, previousTop + log.scrollHeight - previousHeight);
+      };
+      restorePosition();
+      requestAnimationFrame(restorePosition);
+    }
+    return newCount > 0;
+  } catch (error) {
+    if (String(S.activePeer || "") === target) {
+      toast(error?.message || "更早的聊天记录暂时无法加载", "error", 3600);
+    }
+    return false;
+  } finally {
+    S.imMessageOlderLoadingPeers.delete(target);
+    if (String(S.activePeer || "") === target && log.isConnected) {
+      const status = log.querySelector(".chat-history-status.is-loading");
+      if (status) {
+        const nextStatus = chatHistoryStatusHtml();
+        if (nextStatus) status.outerHTML = nextStatus;
+        else status.remove();
+      }
     }
   }
 }
@@ -6636,6 +6767,8 @@ function removeConversationListItems(peers) {
   targets.forEach((peer) => {
     clearConversationDeleteTimer(peer);
     S.imQuoteDrafts.delete(peer);
+    S.imMessageOlderLoadingPeers.delete(peer);
+    S.imMessageHistoryExhaustedPeers.delete(peer);
   });
   const wasActive = targets.has(String(S.activePeer || ""));
   if (wasActive) {
@@ -12024,6 +12157,8 @@ async function logout() {
     S.imMessageLoadingPeers.clear();
     S.imMessageLoadedPeers.clear();
     S.imArchiveLoadedPeers.clear();
+    S.imMessageOlderLoadingPeers.clear();
+    S.imMessageHistoryExhaustedPeers.clear();
     S.imComposerPanel = "";
     setChatComposerDraft("");
     S.imComposerDrafts.clear();
@@ -13052,6 +13187,8 @@ function completeBrowserLogin(data) {
   S.imMessageLoadingPeers.clear();
   S.imMessageLoadedPeers.clear();
   S.imArchiveLoadedPeers.clear();
+  S.imMessageOlderLoadingPeers.clear();
+  S.imMessageHistoryExhaustedPeers.clear();
   S.conversations = [];
   S.conversationRefreshPromise = null;
   S.conversationLastRefreshAt = 0;
@@ -13202,6 +13339,16 @@ document.addEventListener("input", (event) => {
   const empty = $("friend-search-empty");
   if (empty) empty.classList.toggle("hide", visible > 0);
 });
+
+document.addEventListener(
+  "scroll",
+  (event) => {
+    const log = event.target;
+    if (log?.id !== "im-log" || Number(log.scrollTop || 0) > 72) return;
+    void loadOlderConversationMessages(S.activePeer, log);
+  },
+  { passive: true, capture: true }
+);
 
 document.addEventListener("focusin", (event) => {
   if (usesCoarsePointer() && event.target?.matches?.("#im-text")) {

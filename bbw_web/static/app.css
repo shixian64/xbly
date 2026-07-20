@@ -2841,6 +2841,19 @@ summary:focus-visible {
   overflow-wrap: anywhere;
 }
 
+.chat-history-status {
+  width: 100%;
+  color: var(--faint);
+  padding: 0.2rem 0 0.45rem;
+  font-size: 0.66rem;
+  line-height: 1.35;
+  text-align: center;
+}
+
+.chat-history-status.is-loading {
+  color: var(--muted);
+}
+
 .chat-message-row {
   display: flex;
   width: 100%;

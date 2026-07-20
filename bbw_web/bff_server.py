@@ -1673,6 +1673,7 @@ def _tim_roaming_message_envelope(
     max_messages: int = 200,
     retention_days: int = 180,
     around_time: Optional[int] = None,
+    before_time: Optional[int] = None,
     include_read_state: bool = True,
 ) -> Dict[str, Any]:
     now_epoch = int(time.time())
@@ -1682,7 +1683,23 @@ def _tim_roaming_message_envelope(
         max_time = center + 5
     else:
         min_time = now_epoch - max(1, int(retention_days)) * 86400
-        max_time = now_epoch + 60
+        max_time = (
+            min(now_epoch + 60, max(0, int(before_time)))
+            if before_time is not None and int(before_time) > 0
+            else now_epoch + 60
+        )
+    if max_time < min_time:
+        return {
+            "ok": True,
+            "items": [],
+            "list": [],
+            "count": 0,
+            "entity": "message",
+            "status": 200,
+            "source": "tim_rest",
+            "has_more": False,
+            "next_before": "",
+        }
     page_limit = max(1, (max(1, int(max_messages)) + 99) // 100)
     raw_items: List[Dict[str, Any]] = []
     for sender, recipient in ((peer_uid, account_uid), (account_uid, peer_uid)):
@@ -1729,6 +1746,15 @@ def _tim_roaming_message_envelope(
             peer_uid=peer_uid,
             unread_count=unread_counts.get(account_uid),
         )
+    oldest_time = (
+        int(
+            _tim_epoch_sort_value(
+                items[0].get("timestamp") or items[0].get("time")
+            )
+        )
+        if items
+        else 0
+    )
     return {
         "ok": True,
         "items": items,
@@ -1737,6 +1763,8 @@ def _tim_roaming_message_envelope(
         "entity": "message",
         "status": 200,
         "source": "tim_rest",
+        "has_more": len(items) >= max(1, int(max_messages)),
+        "next_before": str(oldest_time) if oldest_time > 0 else "",
     }
 
 
@@ -3025,6 +3053,10 @@ class Handler(BaseHTTPRequestHandler):
             summary_only = q("summary", "0") == "1"
             raw_around_time = str(q("at", "") or "").strip()
             around_time = int(raw_around_time) if raw_around_time.isdigit() else None
+            raw_before_time = str(q("before", "") or "").strip()
+            before_time = int(raw_before_time) if raw_before_time.isdigit() else None
+            if before_time is not None and before_time > 1_000_000_000_000:
+                before_time //= 1000
             if summary_only and around_time is None:
                 return self.ok({"ok": False, "error": "缺少会话消息时间"}, 400)
             capabilities = Handler.web_user_capabilities(self, u)
@@ -3037,6 +3069,7 @@ class Handler(BaseHTTPRequestHandler):
                     str(peer),
                     max_messages=50 if summary_only else 200,
                     around_time=around_time if summary_only else None,
+                    before_time=before_time if not summary_only else None,
                     include_read_state=not summary_only,
                 )
             except Exception:
