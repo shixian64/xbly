@@ -447,6 +447,7 @@ class BffEnvelopeTests(unittest.TestCase):
                 {
                     "conversation_user": "9",
                     "content": "你好",
+                    "msgTimestamp": "1710000000",
                     "userInfoList": {"id": "42", "nickname": "当前用户"},
                 }
             ],
@@ -455,6 +456,11 @@ class BffEnvelopeTests(unittest.TestCase):
         self.assertEqual(item["peer_id"], "9")
         self.assertEqual(item["avatar"], "")
         self.assertEqual(item["nickname"], "9")
+        self.assertEqual(item["preview_timestamp"], "")
+        self.assertFalse(item["preview_authoritative"])
+        self.assertTrue(item["preview_timestamp_inferred"])
+        bff_server._attach_cached_conversation_summaries([item], {})
+        self.assertTrue(item["preview_stale"])
         self.assertEqual(calls, [])
 
     def test_conversation_list_uses_fresh_cached_peer_profile(self) -> None:
@@ -718,9 +724,9 @@ class TimRestHistoryEnvelopeTests(unittest.TestCase):
                     ok=True,
                     data={
                         "SessionItem": [
-                            {"Type": 1, "To_Account": "9", "MsgTime": 20},
-                            {"Type": 1, "To_Account": "9", "MsgTime": 10},
-                            {"Type": 1, "To_Account": "10", "MsgTime": 30},
+                            {"Type": 1, "To_Account": "9", "MsgTime": 20, "MsgSeq": 2},
+                            {"Type": 1, "To_Account": "9", "MsgTime": 10, "MsgSeq": 1},
+                            {"Type": 1, "To_Account": "10", "MsgTime": 30, "MsgSeq": 3},
                             {"Type": 1, "To_Account": "42", "MsgTime": 30},
                             {"Type": 2, "To_Account": "group", "MsgTime": 40},
                         ],
@@ -756,7 +762,60 @@ class TimRestHistoryEnvelopeTests(unittest.TestCase):
             [item["unread_count"] for item in payload["items"]],
             [2, 0],
         )
+        self.assertTrue(all(item["unread_authoritative"] for item in payload["items"]))
+        self.assertTrue(all(item["unread_observed_at"] for item in payload["items"]))
         self.assertEqual(payload["items"][0]["source"], "tim_rest")
+
+        bff_server._attach_cached_conversation_summaries(
+            payload["items"],
+            {
+                "10": {
+                    "last_message": "cached preview",
+                    "preview_timestamp": "1970-01-01T00:00:30+00:00",
+                    "preview_sequence": "3",
+                    "preview_source": "archive",
+                    "preview_authoritative": True,
+                }
+            },
+        )
+        self.assertEqual(payload["items"][0]["last_message"], "cached preview")
+        self.assertFalse(payload["items"][0]["preview_stale"])
+
+        stale_items = [
+            {
+                "peer_id": "10",
+                "timestamp": 30,
+                "activity_sequence": 4,
+                "source": "tim_rest",
+            }
+        ]
+        bff_server._attach_cached_conversation_summaries(
+            stale_items,
+            {
+                "10": {
+                    "last_message": "previous preview",
+                    "preview_timestamp": 30,
+                    "preview_sequence": 3,
+                    "preview_source": "archive",
+                    "preview_authoritative": True,
+                }
+            },
+        )
+        self.assertTrue(stale_items[0]["preview_stale"])
+
+        one_second_old = [{"peer_id": "10", "timestamp": 30, "source": "tim_rest"}]
+        bff_server._attach_cached_conversation_summaries(
+            one_second_old,
+            {
+                "10": {
+                    "last_message": "one second old",
+                    "preview_timestamp": 29,
+                    "preview_source": "archive",
+                    "preview_authoritative": True,
+                }
+            },
+        )
+        self.assertTrue(one_second_old[0]["preview_stale"])
 
     def test_roaming_history_merges_deduplicates_and_sorts_both_directions(self) -> None:
         calls = []
@@ -844,6 +903,39 @@ class TimRestHistoryEnvelopeTests(unittest.TestCase):
         self.assertTrue(payload["items"][0]["is_peer_read"])
         self.assertFalse(payload["items"][2]["is_peer_read"])
         self.assertEqual(payload["count"], 3)
+
+    def test_roaming_summary_uses_narrow_activity_window(self) -> None:
+        calls = []
+
+        class Client:
+            def roaming_messages(self, sender, recipient, **kwargs):
+                calls.append((sender, recipient, kwargs))
+                return SimpleNamespace(ok=True, data={"MsgList": [], "Complete": 1})
+
+            def c2c_unread_counts(self, *_args, **_kwargs):
+                raise AssertionError("summary preview must not query unread state")
+
+        payload = bff_server._tim_roaming_message_envelope(
+            Client(),
+            "42",
+            "9",
+            max_messages=50,
+            around_time=30,
+            include_read_state=False,
+        )
+
+        self.assertEqual(payload["items"], [])
+        self.assertEqual([(call[0], call[1]) for call in calls], [("9", "42"), ("42", "9")])
+        self.assertTrue(all(call[2]["min_time"] == 25 for call in calls))
+        self.assertTrue(all(call[2]["max_time"] == 35 for call in calls))
+
+    def test_message_sort_uses_sequence_within_same_second(self) -> None:
+        items = [
+            {"timestamp": 30, "sequence": "9", "msg_key": "later"},
+            {"timestamp": 30, "sequence": "8", "msg_key": "earlier"},
+        ]
+        ordered = sorted(items, key=bff_server._tim_message_sort_key)
+        self.assertEqual([item["msg_key"] for item in ordered], ["earlier", "later"])
 
 
 class SocialBffRoutingTests(unittest.TestCase):
@@ -2038,9 +2130,10 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         bff_server.Handler.do_POST(harness)
         return calls, harness.response
 
-    def _run_mark_read(self, *, authorized=True):
+    def _run_mark_read(self, *, authorized=True, peers=None):
         calls = []
         result = SimpleNamespace(ok=True)
+        allowed_peers = set(peers or ["9"]) if authorized else set()
         web_user = SimpleNamespace(
             app=SimpleNamespace(session=SimpleNamespace(uid="42")),
             native=SimpleNamespace(
@@ -2050,7 +2143,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                 )
             ),
             match_pool_online_list_enabled=False,
-            friend_message_peers={"9"} if authorized else set(),
+            friend_message_peers=allowed_peers,
             match_message_peers=set(),
             conversation_message_peers=set(),
         )
@@ -2066,7 +2159,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                 return True
 
             def body(self):
-                return {"peer": "9"}
+                return {"peers": peers} if peers is not None else {"peer": "9"}
 
             def sid(self):
                 return "sid"
@@ -2099,6 +2192,11 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         calls, response = self._run_mark_read(authorized=False)
         self.assertEqual(calls, [])
         self.assertEqual(response[0], 403)
+
+        calls, response = self._run_mark_read(peers=["9", "10", "9"])
+        self.assertCountEqual(calls, [("42", "9"), ("42", "10")])
+        self.assertEqual(response[0], 200)
+        self.assertEqual(response[1]["read_peers"], ["9", "10"])
 
     def test_match_existing_conversation_and_live_authorizer_are_allowed(self) -> None:
         for kwargs in (
@@ -2843,18 +2941,30 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("startMessageSyncTimer();", start_services)
         self.assertIn("loadArchivedConversationSummary()", start_services)
         self.assertIn("runMessageSyncCycle({ force: true })", start_services)
-        self.assertIn("refreshConversationSummary()", summary_sync)
+        self.assertIn("return Promise.allSettled([", start_services)
+        self.assertNotIn(".then(() => runMessageSyncCycle", start_services)
+        self.assertIn("refreshConversationSummary({ force })", summary_sync)
         self.assertIn("ensureTimConnected({ background: true })", background_sync)
         self.assertIn("return Promise.allSettled(tasks);", background_sync)
         self.assertNotIn('S.route === "msg" && !S.imConnected', background_sync)
         self.assertIn("S.conversationNextRefreshAt = Date.now() + CONVERSATION_REFRESH_ERROR_MS", summary_refresh)
-        self.assertIn("applyConversationSummaries(itemsOf(data), { broadcast: true })", summary_refresh)
+        self.assertIn('authority: "live"', summary_refresh)
+        self.assertNotIn("loadArchivedConversationSummary()\n    .then", summary_refresh)
         self.assertIn("/api/archive/conversations?limit=100", app_js)
         self.assertIn(
             "/api/archive/messages?peer=${encodeURIComponent(target)}&limit=200",
             app_js,
         )
-        self.assertIn('if (entry.source === "archive") return;', app_js)
+        self.assertIn('["archive", "http", "history"]', app_js)
+        self.assertIn("function mergeConversationPair", app_js)
+        self.assertIn("preview_timestamp", app_js)
+        self.assertIn("unread_authoritative", app_js)
+        self.assertIn("function hydrateStaleConversationPreviews", app_js)
+        self.assertIn("conversationPreviewHydrationPromise", app_js)
+        self.assertIn("generation === S.sessionGeneration", app_js)
+        self.assertIn(".sort(compareMessageOrder)", app_js)
+        self.assertNotIn("previewTimestamp + 2000", app_js)
+        self.assertIn("summary=1&at=", app_js)
         self.assertIn("BroadcastChannel(\"bbw-message-summary\")", app_js)
         self.assertIn("navigator.locks.request", app_js)
         self.assertIn("updateUnreadBadges();", unread_recalculation)
@@ -2888,7 +2998,8 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('return { label: "已发送", className: "is-sent", indicator: false };', app_js)
         self.assertIn('api("/api/im/read"', app_js)
         self.assertIn("function reportConversationRead(peer)", app_js)
-        self.assertIn("unreadPeers.slice(offset, offset + 5)", app_js)
+        self.assertIn("function reportConversationsRead(peers)", app_js)
+        self.assertIn("function scheduleConversationReadReport(peer", app_js)
         self.assertIn("width: fit-content", app_css)
         self.assertIn("conversation-read-state", app_css)
         self.assertIn("presence-badge", app_css)

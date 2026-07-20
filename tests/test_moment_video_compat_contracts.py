@@ -193,7 +193,7 @@ class MomentVideoCompatibilityContracts(unittest.TestCase):
         self.assertIn("worker.work(with_scheduler=with_scheduler)", worker)
         self.assertIn("def head_object(self, key: str)", r2)
         self.assertIn("ca-certificates ffmpeg tzdata", dockerfile)
-        self.assertIn("critical,default,media,sync,transcode", config)
+        self.assertIn("critical,im-ingest,default,media,sync,transcode", config)
         self.assertIn("transcode-worker:", compose)
         self.assertIn("BBW_RQ_QUEUES: transcode", compose)
         self.assertIn('BBW_RQ_WITH_SCHEDULER: "true"', compose)

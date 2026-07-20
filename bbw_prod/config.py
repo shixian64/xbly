@@ -264,7 +264,7 @@ class Settings:
             rq_queues=tuple(
                 item.strip()
                 for item in os.getenv(
-                    "BBW_RQ_QUEUES", "critical,default,media,sync,transcode"
+                    "BBW_RQ_QUEUES", "critical,im-ingest,default,media,sync,transcode"
                 ).split(",")
                 if item.strip()
             ),

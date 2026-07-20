@@ -95,6 +95,25 @@ def _message_preview(message: Any) -> str:
     }.get(str(message.message_type or "").lower(), "消息")
 
 
+def _metadata_time(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        numeric = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if abs(numeric) >= 10**12:
+        numeric /= 1000
+    try:
+        return datetime.fromtimestamp(numeric).astimezone()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
 def _archived_message_item(message: Any) -> dict[str, Any]:
     metadata = dict(message.extra_data) if isinstance(message.extra_data, dict) else {}
     media = metadata.get("media_report")
@@ -106,11 +125,14 @@ def _archived_message_item(message: Any) -> dict[str, Any]:
         or metadata.get("client_message_key")
         or ""
     )
+    message_sequence = str(metadata.get("message_sequence") or "")
     return {
         "id": message_id,
         "message_id": message_id,
         "message_key": message_key,
         "msg_key": message_key,
+        "sequence": message_sequence,
+        "msg_sequence": message_sequence,
         "text": str(message.body or ""),
         "body": str(message.body or ""),
         "kind": str(message.message_type or "text"),
@@ -158,8 +180,20 @@ def archived_conversations(request: Request, limit: int = 100) -> dict[str, Any]
             )
             user = metadata.get("user") if isinstance(metadata.get("user"), dict) else {}
             message = latest.get(conversation.id)
-            occurred_at = message.occurred_at if message is not None else conversation.last_message_at
+            activity_at = conversation.last_message_at or (
+                message.occurred_at if message is not None else None
+            )
             preview = _message_preview(message) or str(metadata.get("last_message") or "")[:500]
+            preview_at = (
+                message.occurred_at
+                if message is not None
+                else _metadata_time(metadata.get("preview_timestamp"))
+            )
+            message_metadata = (
+                dict(message.extra_data or {})
+                if message is not None and isinstance(message.extra_data, dict)
+                else {}
+            )
             avatar = str(
                 metadata.get("avatar")
                 or user.get("avatar")
@@ -187,8 +221,26 @@ def archived_conversations(request: Request, limit: int = 100) -> dict[str, Any]
                     "user": user,
                     "last_message": preview,
                     "content": preview,
-                    "timestamp": occurred_at.isoformat() if occurred_at is not None else "",
+                    "timestamp": activity_at.isoformat() if activity_at is not None else "",
+                    "preview_timestamp": preview_at.isoformat() if preview_at is not None else "",
+                    "preview_sequence": str(
+                        message_metadata.get("message_sequence")
+                        or metadata.get("preview_sequence")
+                        or ""
+                    ),
+                    "preview_source": "archive",
+                    "preview_authoritative": message is not None
+                    or metadata.get("preview_authoritative") is True,
+                    "preview_timestamp_inferred": metadata.get(
+                        "preview_timestamp_inferred"
+                    ) is True,
                     "unread_count": max(0, int(conversation.unread_count or 0)),
+                    "unread_observed_at": (
+                        conversation.unread_observed_at.isoformat()
+                        if conversation.unread_observed_at is not None
+                        else ""
+                    ),
+                    "unread_authoritative": False,
                 }
             )
     return {"ok": True, "items": items, "list": items, "count": len(items)}

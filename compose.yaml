@@ -311,7 +311,74 @@ services:
     <<: *app-security
     environment:
       <<: *app-environment
-      BBW_RQ_QUEUES: critical,default,media,sync
+      BBW_RQ_QUEUES: critical,default,media
+      BBW_PHONE_HMAC_KEY_FILE: ""
+      BBW_SESSION_HMAC_KEY_FILE: ""
+      BBW_ROOMKIT_BUSINESS_TOKEN_FILE: ""
+      BBW_TURNSTILE_SITE_KEY: ""
+      BBW_TURNSTILE_SECRET_KEY_FILE: ""
+    secrets: *worker-secrets
+    command: ["python", "-m", "bbw_web.worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - database
+      - queue
+      - egress
+    mem_limit: 320m
+    mem_reservation: 128m
+    cpus: 0.60
+    stop_grace_period: 60s
+    logging: *default-logging
+
+  im-ingest-worker:
+    image: ${APP_IMAGE:-bbw-app:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    <<: *app-security
+    environment:
+      <<: *app-environment
+      BBW_RQ_QUEUES: im-ingest
+      BBW_PHONE_HMAC_KEY_FILE: ""
+      BBW_SESSION_HMAC_KEY_FILE: ""
+      BBW_ROOMKIT_BUSINESS_TOKEN_FILE: ""
+      BBW_TURNSTILE_SITE_KEY: ""
+      BBW_TURNSTILE_SECRET_KEY_FILE: ""
+    secrets: *worker-secrets
+    command: ["python", "-m", "bbw_web.worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - database
+      - queue
+    mem_limit: 256m
+    mem_reservation: 96m
+    cpus: 0.35
+    stop_grace_period: 60s
+    logging: *default-logging
+
+  sync-worker:
+    image: ${APP_IMAGE:-bbw-app:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    <<: *app-security
+    environment:
+      <<: *app-environment
+      BBW_RQ_QUEUES: sync
       BBW_PHONE_HMAC_KEY_FILE: ""
       BBW_SESSION_HMAC_KEY_FILE: ""
       BBW_ROOMKIT_BUSINESS_TOKEN_FILE: ""

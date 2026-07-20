@@ -63,6 +63,34 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn('job_id=f"archive-media-', jobs)
         self.assertIn('job_id=f"sync-history-', jobs)
 
+    def test_conversation_freshness_jobs_and_schema_are_wired(self) -> None:
+        models = self.read("bbw_prod/models.py")
+        repositories = self.read("bbw_prod/repositories.py")
+        persistence = self.read("bbw_web/persistence.py")
+        jobs = self.read("bbw_web/jobs.py")
+        compose = self.read("compose.yaml")
+        config = self.read("bbw_prod/config.py")
+        migration = self.read(
+            "migrations/versions/20260720_0004_conversation_unread_observed_at.py"
+        )
+
+        self.assertIn("unread_observed_at", models)
+        self.assertIn("unread_is_newer", repositories)
+        self.assertIn("metadata_without_preview", repositories)
+        self.assertIn("def mark_peers_read", repositories)
+        self.assertIn('Queue("im-ingest"', persistence)
+        self.assertIn("self.im_ingest_queue.enqueue(", persistence)
+        self.assertNotIn("self.sync_queue.enqueue(", persistence)
+        self.assertIn("def mark_conversations_read", persistence)
+        self.assertIn("interval_due_at", jobs)
+        self.assertIn("due_at = min(due_candidates)", jobs)
+        self.assertIn("sync-worker:", compose)
+        self.assertIn("BBW_RQ_QUEUES: sync", compose)
+        self.assertIn("im-ingest-worker:", compose)
+        self.assertIn("BBW_RQ_QUEUES: im-ingest", compose)
+        self.assertIn("critical,im-ingest,default,media,sync,transcode", config)
+        self.assertIn('revision: str = "20260720_0004"', migration)
+
     def test_admin_bootstrap_runs_inside_lifespan_cleanup_scope(self) -> None:
         source = self.read("bbw_web/api.py")
         lifespan = source.split("async def lifespan", 1)[1].split("app = FastAPI", 1)[0]

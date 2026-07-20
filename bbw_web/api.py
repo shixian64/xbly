@@ -171,6 +171,9 @@ class CapturingHandler(legacy.Handler):
         message_policy_match_peers: Iterable[str] = (),
         match_history_loader: Optional[Callable[[int], dict[str, Any]]] = None,
         match_history_recorder: Optional[Callable[[str, dict[str, Any]], None]] = None,
+        conversation_summary_loader: Optional[
+            Callable[[list[str]], dict[str, dict[str, Any]]]
+        ] = None,
     ) -> None:
         # BaseHTTPRequestHandler.__init__ immediately starts reading a socket;
         # intentionally do not call it here.
@@ -186,6 +189,7 @@ class CapturingHandler(legacy.Handler):
         self._request_message_policy_match_peers = tuple(message_policy_match_peers)
         self._request_match_history_loader = match_history_loader
         self._request_match_history_recorder = match_history_recorder
+        self._request_conversation_summary_loader = conversation_summary_loader
         self.request_version = "HTTP/1.1"
         self.close_connection = True
         self._held_user_lock = None
@@ -565,6 +569,17 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
             )
         )
 
+    conversation_summary_loader: Optional[
+        Callable[[list[str]], dict[str, dict[str, Any]]]
+    ] = None
+    if identity is not None and path == "/api/im/conversations":
+        conversation_summary_loader = (
+            lambda peers, request_identity=identity: persistence.conversation_summary_map(
+                request_identity,
+                peers,
+            )
+        )
+
     match_history_recorder: Optional[Callable[[str, dict[str, Any]], None]] = None
     if (
         identity is not None
@@ -624,6 +639,7 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
         message_policy_match_peers=message_policy_match_peers,
         match_history_loader=match_history_loader,
         match_history_recorder=match_history_recorder,
+        conversation_summary_loader=conversation_summary_loader,
     )
     try:
         if request.method == "GET":

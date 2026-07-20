@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Generic, TypeVar
 
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -261,6 +261,29 @@ class ConversationRepository(Repository[Conversation]):
         )
         return list(self.db.scalars(stmt))
 
+    def list_for_peers(
+        self,
+        owner_user_id: uuid.UUID,
+        peer_upstream_uids: list[str],
+    ) -> list[Conversation]:
+        peers = list(dict.fromkeys(str(peer or "").strip() for peer in peer_upstream_uids if str(peer or "").strip()))
+        if not peers:
+            return []
+        stmt = (
+            select(Conversation)
+            .where(
+                Conversation.owner_user_id == owner_user_id,
+                Conversation.provider == "tim",
+                Conversation.kind == "direct",
+                Conversation.peer_upstream_uid.in_(peers[:500]),
+            )
+            .order_by(
+                Conversation.last_message_at.desc().nullslast(),
+                Conversation.updated_at.desc(),
+            )
+        )
+        return list(self.db.scalars(stmt))
+
     def get(self, owner_user_id: uuid.UUID, conversation_id: uuid.UUID) -> Conversation | None:
         return self.db.scalar(
             select(Conversation).where(
@@ -282,19 +305,83 @@ class ConversationRepository(Repository[Conversation]):
     def upsert(self, **values: Any) -> Conversation:
         stmt = insert(Conversation).values(**values)
         excluded = stmt.excluded
+        unread_is_newer = or_(
+            Conversation.unread_observed_at.is_(None),
+            and_(
+                excluded.unread_observed_at.is_not(None),
+                excluded.unread_observed_at >= Conversation.unread_observed_at,
+            ),
+        )
+        last_message_is_newer = or_(
+            Conversation.last_message_at.is_(None),
+            and_(
+                excluded.last_message_at.is_not(None),
+                excluded.last_message_at >= Conversation.last_message_at,
+            ),
+        )
+        metadata_without_preview = (
+            excluded.metadata.op("-")("last_message")
+            .op("-")("preview_timestamp")
+            .op("-")("preview_sequence")
+            .op("-")("preview_authoritative")
+            .op("-")("preview_timestamp_inferred")
+            .op("-")("last_source")
+        )
         stmt = stmt.on_conflict_do_update(
             constraint="uq_conversations_owner_source",
             set_={
                 "peer_upstream_uid": excluded.peer_upstream_uid,
                 "kind": excluded.kind,
                 "title": excluded.title,
-                "unread_count": excluded.unread_count,
-                "last_message_at": excluded.last_message_at,
-                "metadata": excluded.metadata,
+                "unread_count": case(
+                    (unread_is_newer, excluded.unread_count),
+                    else_=Conversation.unread_count,
+                ),
+                "unread_observed_at": case(
+                    (unread_is_newer, excluded.unread_observed_at),
+                    else_=Conversation.unread_observed_at,
+                ),
+                "last_message_at": case(
+                    (last_message_is_newer, excluded.last_message_at),
+                    else_=Conversation.last_message_at,
+                ),
+                "metadata": case(
+                    (
+                        last_message_is_newer,
+                        Conversation.extra_data.op("||")(excluded.metadata),
+                    ),
+                    else_=Conversation.extra_data.op("||")(metadata_without_preview),
+                ),
                 "updated_at": func.now(),
             },
         ).returning(Conversation)
         return self.db.scalars(stmt).one()
+
+    def mark_peers_read(
+        self,
+        owner_user_id: uuid.UUID,
+        peer_upstream_uids: list[str],
+        *,
+        observed_at: datetime | None = None,
+    ) -> int:
+        peers = list(dict.fromkeys(str(peer or "").strip() for peer in peer_upstream_uids if str(peer or "").strip()))
+        if not peers:
+            return 0
+        result = self.db.execute(
+            update(Conversation)
+            .where(
+                Conversation.owner_user_id == owner_user_id,
+                Conversation.provider == "tim",
+                Conversation.kind == "direct",
+                Conversation.peer_upstream_uid.in_(peers[:100]),
+            )
+            .values(
+                unread_count=0,
+                unread_observed_at=observed_at or utcnow(),
+                updated_at=func.now(),
+            )
+        )
+        return int(result.rowcount or 0)
 
 
 class MessageRepository(Repository[Message]):

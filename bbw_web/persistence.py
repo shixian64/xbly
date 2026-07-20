@@ -23,6 +23,7 @@ from bbw_prod.models import ExternalAccount, Relationship, utcnow
 from bbw_prod.repositories import (
     ConversationRepository,
     ExternalAccountRepository,
+    MessageRepository,
     RelationshipRepository,
     UserRepository,
 )
@@ -238,6 +239,23 @@ def _sanitize_profile(value: Any) -> Any:
     return value
 
 
+def _conversation_message_preview(message: Any) -> str:
+    if message is None:
+        return ""
+    body = str(message.body or "").strip()
+    if body:
+        return body[:500]
+    return {
+        "image": "图片",
+        "audio": "语音",
+        "video": "视频",
+        "file": "文件",
+        "location": "位置",
+        "face": "表情",
+        "custom": "消息",
+    }.get(str(message.message_type or "").lower(), "消息")
+
+
 class RuntimePersistence:
     PENDING_LOGIN_SECONDS = 5 * 60
     WEB_PRESENCE_TTL_SECONDS = 120
@@ -253,7 +271,7 @@ class RuntimePersistence:
         self.turnstile = TurnstileVerifier(settings)
         self.default_queue = Queue("default", connection=self.redis)
         self.media_queue = Queue("media", connection=self.redis)
-        self.sync_queue = Queue("sync", connection=self.redis)
+        self.im_ingest_queue = Queue("im-ingest", connection=self.redis)
         self._r2_storage: Any = None
 
     def startup(self) -> None:
@@ -1226,6 +1244,85 @@ class RuntimePersistence:
             page_size=page_size,
         )
 
+    def conversation_summary_map(
+        self,
+        identity: UserIdentity,
+        peers: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        targets = list(
+            dict.fromkeys(
+                str(peer or "").strip()
+                for peer in peers
+                if str(peer or "").strip()
+            )
+        )[:500]
+        if not targets:
+            return {}
+        with session_scope() as db:
+            conversations = ConversationRepository(db).list_for_peers(
+                identity.user_id,
+                targets,
+            )
+            latest = MessageRepository(db).latest_for_conversations(
+                identity.user_id,
+                [conversation.id for conversation in conversations],
+            )
+            summaries: dict[str, dict[str, Any]] = {}
+            for conversation in conversations:
+                peer = str(conversation.peer_upstream_uid or "").strip()
+                if not peer:
+                    continue
+                message = latest.get(conversation.id)
+                metadata = dict(conversation.extra_data or {})
+                occurred_at = (
+                    message.occurred_at
+                    if message is not None
+                    else None
+                )
+                message_metadata = (
+                    dict(message.extra_data or {})
+                    if message is not None and isinstance(message.extra_data, dict)
+                    else {}
+                )
+                preview = _conversation_message_preview(message) or str(
+                    metadata.get("last_message") or ""
+                )[:500]
+                preview_authoritative = message is not None or metadata.get(
+                    "preview_authoritative"
+                ) is True
+                summaries[peer] = {
+                    "last_message": preview,
+                    "content": preview,
+                    "preview_timestamp": (
+                        occurred_at.isoformat()
+                        if occurred_at is not None
+                        else str(metadata.get("preview_timestamp") or "")
+                    ),
+                    "preview_sequence": str(
+                        message_metadata.get("message_sequence")
+                        or metadata.get("preview_sequence")
+                        or ""
+                    ),
+                    "preview_source": "archive",
+                    "preview_authoritative": preview_authoritative,
+                    "preview_timestamp_inferred": metadata.get(
+                        "preview_timestamp_inferred"
+                    ) is True,
+                }
+            return summaries
+
+    def mark_conversations_read(
+        self,
+        identity: UserIdentity,
+        peers: list[str],
+    ) -> int:
+        with session_scope() as db:
+            return ConversationRepository(db).mark_peers_read(
+                identity.user_id,
+                peers,
+                observed_at=utcnow(),
+            )
+
     def enqueue_message_archive(
         self,
         *,
@@ -1315,6 +1412,30 @@ class RuntimePersistence:
                 "/api/auth/sms-login",
             }:
                 self.set_web_presence(identity.upstream_uid, active=True)
+        if method.upper() == "POST" and path == "/api/im/read":
+            raw_read_peers = response_data.get("read_peers")
+            if isinstance(raw_read_peers, list):
+                read_peers = [str(peer or "").strip() for peer in raw_read_peers]
+            elif response_ok:
+                raw_request_peers = request_data.get("peers")
+                if isinstance(raw_request_peers, list):
+                    read_peers = [str(peer or "").strip() for peer in raw_request_peers]
+                else:
+                    read_peers = [
+                        str(
+                            request_data.get("peer")
+                            or request_data.get("uid")
+                            or request_data.get("to")
+                            or ""
+                        ).strip()
+                    ]
+            else:
+                read_peers = []
+            if read_peers:
+                self.mark_conversations_read(
+                    identity,
+                    [peer for peer in read_peers if peer],
+                )
         if (
             method.upper() == "GET"
             and path == "/api/moments/posts"
@@ -1332,7 +1453,7 @@ class RuntimePersistence:
             ).hexdigest()
             if self._claim_response_digest("history", identity, digest):
                 try:
-                    self.default_queue.enqueue(
+                    self.im_ingest_queue.enqueue(
                         "bbw_web.jobs.ingest_history_response",
                         str(identity.user_id),
                         str(identity.external_account_id),
@@ -1340,6 +1461,7 @@ class RuntimePersistence:
                         query,
                         response_data,
                         job_id=f"history-response-{identity.user_id}-{digest}",
+                        job_timeout=300,
                         result_ttl=600,
                         failure_ttl=86400,
                     )

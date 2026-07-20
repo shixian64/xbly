@@ -46,6 +46,7 @@ const CONVERSATION_REFRESH_ERROR_MS = 30 * 1000;
 const ARCHIVED_CONVERSATION_TTL_MS = 30 * 1000;
 const CONVERSATION_PROFILE_TTL_MS = 15 * 60 * 1000;
 const CONVERSATION_PROFILE_ERROR_TTL_MS = 60 * 1000;
+const CONVERSATION_PREVIEW_REFRESH_MS = 10 * 1000;
 const CONVERSATION_SWIPE_THRESHOLD_PX = 42;
 const CONVERSATION_SWIPE_LOCK_PX = 8;
 const CONVERSATION_DELETE_CONFIRM_DELAY_MS = 500;
@@ -128,6 +129,9 @@ const S = {
   conversationProfilesByUid: new Map(),
   conversationProfileFetchedAt: new Map(),
   conversationProfileLoadingUids: new Set(),
+  conversationPreviewFetchedAt: new Map(),
+  conversationPreviewLoadingPeers: new Set(),
+  conversationPreviewHydrationPromise: null,
   dismissedConversationPeers: new Map(),
   dismissedConversationAccount: "",
   conversationDeleteTimers: new Map(),
@@ -137,6 +141,7 @@ const S = {
   conversationBatchDeleteTimer: null,
   conversationBatchDeleteStage: "idle",
   readConversationPeers: new Map(),
+  conversationReadReportTimers: new Map(),
   unreadTotal: 0,
   profileSeq: 0,
   profileController: null,
@@ -808,6 +813,7 @@ function messageArchivePayload(entry, direction = "") {
     upstream_message_id: upstreamMessageId,
     upstream_message_key: upstreamMessageKey,
     message_key: upstreamMessageKey || clientMessageKey,
+    message_sequence: String(entry.sequence || "").slice(0, 80),
     peer_uid: peer,
     conversation_id: `C2C${peer}`,
     message_type: String(entry.kind || "text").slice(0, 64),
@@ -1531,11 +1537,18 @@ function closeMessageSyncChannel() {
   S.messageSyncChannel = null;
 }
 
-function applyConversationSummaries(items, { broadcast = false } = {}) {
-  S.conversations = mergeConversationSources(Array.isArray(items) ? items : [], S.conversations);
+function applyConversationSummaries(
+  items,
+  { broadcast = false, authority = "live", observedAt = Date.now() } = {}
+) {
+  const prepared = (Array.isArray(items) ? items : []).map((item) =>
+    normalizeConversationSummary(item, { authority, observedAt })
+  );
+  S.conversations = mergeConversationSources(prepared, S.conversations);
   recalculateUnreadTotal();
   refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
   void hydrateConversationProfiles();
+  if (authority === "live") void hydrateStaleConversationPreviews();
   if (broadcast) {
     const channel = ensureMessageSyncChannel();
     try {
@@ -1552,6 +1565,106 @@ function applyConversationSummaries(items, { broadcast = false } = {}) {
   return S.conversations;
 }
 
+async function loadConversationPreview(peer, activityTimestamp) {
+  const target = String(peer || "").trim();
+  const activity = Math.max(0, Number(activityTimestamp || 0));
+  const generation = S.sessionGeneration;
+  if (!target || !activity || S.conversationPreviewLoadingPeers.has(target)) return false;
+  S.conversationPreviewLoadingPeers.add(target);
+  try {
+    const around = Math.floor(activity / 1000);
+    const { data } = await api(
+      `/api/im/messages?peer=${encodeURIComponent(target)}&summary=1&at=${encodeURIComponent(around)}`,
+      { timeout: 20000 }
+    );
+    const me = String(S.user?.uid || S.user?.id || "");
+    const latest = itemsOf(data)
+      .map((item) => timMessageEntry({ ...item, source: "http" }, target, me))
+      .sort(compareMessageOrder)
+      .at(-1);
+    if (!S.authenticated || generation !== S.sessionGeneration) return false;
+    S.conversationPreviewFetchedAt.set(target, Date.now());
+    if (!latest) return false;
+    const previewTimestamp = Number(latest.timestamp || 0);
+    const index = S.conversations.findIndex((item) => conversationPeer(item) === target);
+    const current = S.conversations[index];
+    if (
+      index < 0 ||
+      compareConversationPreviewRevision(
+        { preview_timestamp: previewTimestamp, preview_sequence: latest.sequence },
+        current
+      ) < 0
+    ) {
+      return false;
+    }
+    const preview = messagePreview(latest);
+    const updated = {
+      ...current,
+      last_message: preview,
+      content: preview,
+      preview_timestamp: previewTimestamp,
+      preview_sequence: latest.sequence || "",
+      preview_source: "tim_rest",
+      preview_authoritative: true,
+      preview_timestamp_inferred: false,
+    };
+    updated.preview_stale = conversationPreviewNeedsRefresh(updated, updated);
+    S.conversations[index] = updated;
+    refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
+    return true;
+  } catch {
+    if (generation === S.sessionGeneration) {
+      S.conversationPreviewFetchedAt.set(target, Date.now());
+    }
+    return false;
+  } finally {
+    if (generation === S.sessionGeneration) {
+      S.conversationPreviewLoadingPeers.delete(target);
+    }
+  }
+}
+
+async function hydrateStaleConversationPreviews() {
+  if (!S.authenticated || document.hidden) return [];
+  if (S.conversationPreviewHydrationPromise) return S.conversationPreviewHydrationPromise;
+  const generation = S.sessionGeneration;
+  const task = (async () => {
+    const results = [];
+    while (
+      S.authenticated &&
+      generation === S.sessionGeneration &&
+      !document.hidden
+    ) {
+      const now = Date.now();
+      const available = Math.max(0, 2 - S.conversationPreviewLoadingPeers.size);
+      if (!available) break;
+      const candidates = S.conversations
+        .filter((item) => {
+          const peer = conversationPeer(item);
+          return (
+            peer &&
+            item.preview_stale === true &&
+            !S.conversationPreviewLoadingPeers.has(peer) &&
+            now - Number(S.conversationPreviewFetchedAt.get(peer) || 0) >= CONVERSATION_PREVIEW_REFRESH_MS
+          );
+        })
+        .slice(0, available);
+      if (!candidates.length) break;
+      const batch = await Promise.allSettled(
+        candidates.map((item) => loadConversationPreview(conversationPeer(item), conversationTimestamp(item)))
+      );
+      results.push(...batch);
+    }
+    return results;
+  })().finally(() => {
+    if (S.conversationPreviewHydrationPromise === task) {
+      S.conversationPreviewHydrationPromise = null;
+    }
+  });
+  S.conversationPreviewHydrationPromise = task;
+  return task;
+}
+
 function loadArchivedConversationSummary({ force = false } = {}) {
   const now = Date.now();
   if (S.conversationArchivePromise) return S.conversationArchivePromise;
@@ -1561,7 +1674,7 @@ function loadArchivedConversationSummary({ force = false } = {}) {
   const task = api("/api/archive/conversations?limit=100", { timeout: 5000 })
     .then(({ data }) => {
       S.conversationArchiveLoadedAt = Date.now();
-      return applyConversationSummaries(itemsOf(data));
+      return applyConversationSummaries(itemsOf(data), { authority: "archive" });
     })
     .catch(() => S.conversations)
     .finally(() => {
@@ -1578,16 +1691,21 @@ function refreshConversationSummary({ force = false } = {}) {
   if (!force && now - S.conversationLastRefreshAt < CONVERSATION_REFRESH_MIN_MS) {
     return Promise.resolve(S.conversations);
   }
-  const task = loadArchivedConversationSummary()
-    .then(() => api("/api/im/conversations?page=1", { timeout: 15000 }))
+  const task = api("/api/im/conversations?page=1", { timeout: 15000 })
     .then(({ data }) => {
       S.conversationLastRefreshAt = Date.now();
       S.conversationNextRefreshAt = 0;
-      return applyConversationSummaries(itemsOf(data), { broadcast: true });
+      return applyConversationSummaries(itemsOf(data), {
+        authority: "live",
+        observedAt: Date.now(),
+        broadcast: true,
+      });
     })
     .catch(() => {
       S.conversationNextRefreshAt = Date.now() + CONVERSATION_REFRESH_ERROR_MS;
-      return S.conversations;
+      return S.conversations.length
+        ? S.conversations
+        : loadArchivedConversationSummary({ force: true });
     })
     .finally(() => {
       if (S.conversationRefreshPromise === task) S.conversationRefreshPromise = null;
@@ -1610,7 +1728,10 @@ function syncConversationSummaryInBackground({ force = false } = {}) {
   const now = Date.now();
   if (force || now - S.messageLastSummarySyncAt >= conversationSummarySyncInterval()) {
     S.messageLastSummarySyncAt = now;
-    return Promise.allSettled([refreshConversationSummary(), refreshVisiblePeerPresence()]);
+    return Promise.allSettled([
+      refreshConversationSummary({ force }),
+      refreshVisiblePeerPresence(),
+    ]);
   }
   return Promise.resolve([]);
 }
@@ -1666,7 +1787,10 @@ function startMessageSyncTimer() {
 
 function startMessageServices() {
   startMessageSyncTimer();
-  return loadArchivedConversationSummary().then(() => runMessageSyncCycle({ force: true }));
+  return Promise.allSettled([
+    runMessageSyncCycle({ force: true }),
+    loadArchivedConversationSummary(),
+  ]);
 }
 
 function scheduleAuthenticatedServices(delay = 250) {
@@ -2540,6 +2664,9 @@ function normalizeTimConversation(item) {
   const last = conversation.lastMessage || {};
   const lastEntry = timMessageEntry(last, peer);
   const sdkPreview = String(last.messageForShow || "").trim();
+  const observedAt = Date.now();
+  const timestamp = last.lastTime || last.time || conversation.lastMessage?.lastTime || "";
+  const sequence = timMessageSequence(last);
   return {
     conversation_id: conversationID,
     conversation_type: conversationType,
@@ -2551,8 +2678,16 @@ function normalizeTimConversation(item) {
       !sdkPreview || sdkPreview === "自定义消息" || sdkPreview === "[自定义消息]"
         ? messagePreview(lastEntry)
         : tuiEmojiPreviewText(sdkPreview),
-    timestamp: last.lastTime || last.time || conversation.lastMessage?.lastTime || "",
+    timestamp,
+    activity_sequence: sequence,
+    preview_timestamp: timestamp,
+    preview_sequence: sequence,
+    preview_source: "tim",
+    preview_authoritative: true,
+    preview_timestamp_inferred: false,
     unread_count: conversation.unreadCount || 0,
+    unread_observed_at: observedAt,
+    unread_authoritative: true,
   };
 }
 
@@ -2568,6 +2703,142 @@ function conversationTimestamp(item) {
   if (Number.isFinite(numeric) && numeric > 0) return String(Math.trunc(numeric)).length === 10 ? numeric * 1000 : numeric;
   const parsed = Date.parse(String(raw || ""));
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function conversationPreview(item) {
+  return String(item?.last_message || item?.content || item?.message || item?.text || "");
+}
+
+function conversationPreviewTimestamp(item) {
+  const raw =
+    item?.preview_timestamp ||
+    item?.last_message_timestamp ||
+    item?.preview_at ||
+    item?.message_timestamp ||
+    0;
+  return conversationTimestamp({ timestamp: raw });
+}
+
+function conversationSequenceValue(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return 0;
+  const numeric = Number(raw);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+}
+
+function conversationActivitySequence(item) {
+  return conversationSequenceValue(
+    item?.activity_sequence ?? item?.activitySequence ?? item?.msg_sequence ?? item?.msgSeq ?? item?.MsgSeq
+  );
+}
+
+function conversationActivitySourceRank(item) {
+  const source = String(item?.source || "").toLowerCase();
+  if (["tim", "tim_rest", "live", "local"].includes(source)) return 3;
+  if (source === "archive") return 2;
+  if (source === "history") return 1;
+  return 0;
+}
+
+function compareConversationActivityRevision(left, right) {
+  const byTime = conversationTimestamp(left) - conversationTimestamp(right);
+  if (byTime) return byTime;
+  const bySequence = conversationActivitySequence(left) - conversationActivitySequence(right);
+  if (bySequence) return bySequence;
+  const byObservation = conversationUnreadObservedAt(left) - conversationUnreadObservedAt(right);
+  if (byObservation) return byObservation;
+  return conversationActivitySourceRank(left) - conversationActivitySourceRank(right);
+}
+
+function conversationPreviewSequence(item) {
+  return conversationSequenceValue(
+    item?.preview_sequence ?? item?.previewSequence ?? item?.last_message_sequence
+  );
+}
+
+function compareConversationPreviewRevision(left, right) {
+  const byTime = conversationPreviewTimestamp(left) - conversationPreviewTimestamp(right);
+  if (byTime) return byTime;
+  return conversationPreviewSequence(left) - conversationPreviewSequence(right);
+}
+
+function conversationPreviewAuthoritative(item) {
+  if (item?.preview_authoritative === true) return true;
+  if (item?.preview_authoritative === false || item?.preview_timestamp_inferred === true) return false;
+  return ["tim", "tim_rest", "http", "local", "message"].includes(
+    String(item?.preview_source || item?.source || "").toLowerCase()
+  );
+}
+
+function conversationPreviewSourceRank(item) {
+  const source = String(item?.preview_source || item?.source || "").toLowerCase();
+  if (["tim", "tim_rest", "http", "local", "message"].includes(source)) return 3;
+  if (source === "archive") return 2;
+  if (source === "history") return 1;
+  return 0;
+}
+
+function conversationPreviewNeedsRefresh(activityItem, previewItem) {
+  const activityTimestamp = conversationTimestamp(activityItem);
+  if (!activityTimestamp) return false;
+  if (!conversationPreview(previewItem)) return true;
+  const previewTimestamp = conversationPreviewTimestamp(previewItem);
+  if (!previewTimestamp || activityTimestamp > previewTimestamp) return true;
+  if (activityTimestamp < previewTimestamp) return false;
+  const activitySequence = conversationActivitySequence(activityItem);
+  const previewSequence = conversationPreviewSequence(previewItem);
+  if (activitySequence && (!previewSequence || activitySequence > previewSequence)) return true;
+  return !conversationPreviewAuthoritative(previewItem);
+}
+
+function conversationUnreadObservedAt(item) {
+  const raw = item?.unread_observed_at || item?.summary_observed_at || item?.observed_at || 0;
+  return conversationTimestamp({ timestamp: raw });
+}
+
+function conversationUnreadAuthoritative(item) {
+  if (item?.unread_authoritative === true) return true;
+  if (item?.unread_authoritative === false) return false;
+  return ["tim", "tim_rest", "live", "local"].includes(
+    String(item?.source || "").toLowerCase()
+  );
+}
+
+function normalizeConversationSummary(item, { authority = "live", observedAt = Date.now() } = {}) {
+  const conversation = item && typeof item === "object" ? { ...item } : {};
+  const source = String(conversation.source || authority || "").toLowerCase();
+  const preview = conversationPreview(conversation);
+  const previewTimestamp = conversationPreviewTimestamp(conversation);
+  const archive = authority === "archive" || source === "archive";
+  const unreadAuthoritative = archive
+    ? false
+    : conversation.unread_authoritative == null
+      ? true
+      : conversation.unread_authoritative === true;
+  return {
+    ...conversation,
+    source: conversation.source || authority,
+    last_message: preview,
+    content: preview,
+    preview_timestamp: preview ? previewTimestamp : 0,
+    preview_sequence: preview ? conversation.preview_sequence || conversation.previewSequence || "" : "",
+    preview_source: conversation.preview_source || (preview ? source || authority : ""),
+    preview_authoritative:
+      Boolean(preview) && conversation.preview_authoritative == null
+        ? conversationPreviewAuthoritative(conversation)
+        : Boolean(preview) && conversation.preview_authoritative === true,
+    preview_timestamp_inferred: conversation.preview_timestamp_inferred === true,
+    unread_count: unreadAuthoritative
+      ? Math.max(0, Number(conversation.unread_count || conversation.unread || 0) || 0)
+      : 0,
+    unread: unreadAuthoritative
+      ? Math.max(0, Number(conversation.unread_count || conversation.unread || 0) || 0)
+      : 0,
+    unread_observed_at: unreadAuthoritative
+      ? conversation.unread_observed_at || observedAt
+      : conversation.unread_observed_at || 0,
+    unread_authoritative: unreadAuthoritative,
+  };
 }
 
 function filterDismissedConversations(items) {
@@ -2596,26 +2867,78 @@ function applyConversationReadOverride(peer, item) {
   return { ...item, unread_count: 0, unread: 0 };
 }
 
+function mergeConversationPair(preferred, fallback) {
+  const primary = normalizeConversationSummary(preferred, {
+    authority: String(preferred?.source || "live").toLowerCase() === "archive" ? "archive" : "live",
+  });
+  const secondary = normalizeConversationSummary(fallback, {
+    authority: String(fallback?.source || "live").toLowerCase() === "archive" ? "archive" : "live",
+  });
+  const primaryActivity = conversationTimestamp(primary);
+  const secondaryActivity = conversationTimestamp(secondary);
+  const activityWinner = compareConversationActivityRevision(primary, secondary) >= 0
+    ? primary
+    : secondary;
+  const activityFallback = activityWinner === primary ? secondary : primary;
+  const previewWinner = [primary, secondary]
+    .filter((item) => conversationPreview(item))
+    .sort((a, b) => {
+      const byRevision = compareConversationPreviewRevision(b, a);
+      if (byRevision) return byRevision;
+      return conversationPreviewSourceRank(b) - conversationPreviewSourceRank(a);
+    })[0];
+  const unreadWinner = [primary, secondary]
+    .filter(conversationUnreadAuthoritative)
+    .sort((a, b) => conversationUnreadObservedAt(b) - conversationUnreadObservedAt(a))[0];
+  let merged = preserveConversationAvatar(
+    {
+      ...activityFallback,
+      ...activityWinner,
+      timestamp: Math.max(primaryActivity, secondaryActivity),
+      last_message: previewWinner ? conversationPreview(previewWinner) : "",
+      content: previewWinner ? conversationPreview(previewWinner) : "",
+      preview_timestamp: previewWinner ? conversationPreviewTimestamp(previewWinner) : 0,
+      preview_sequence: previewWinner?.preview_sequence || previewWinner?.previewSequence || "",
+      preview_source: previewWinner?.preview_source || previewWinner?.source || "",
+      preview_authoritative: previewWinner ? conversationPreviewAuthoritative(previewWinner) : false,
+      preview_timestamp_inferred: previewWinner?.preview_timestamp_inferred === true,
+      preview_stale: conversationPreviewNeedsRefresh(activityWinner, previewWinner),
+      unread_count: unreadWinner
+        ? Math.max(0, Number(unreadWinner.unread_count || unreadWinner.unread || 0) || 0)
+        : 0,
+      unread: unreadWinner
+        ? Math.max(0, Number(unreadWinner.unread_count || unreadWinner.unread || 0) || 0)
+        : 0,
+      unread_observed_at: unreadWinner?.unread_observed_at || 0,
+      unread_authoritative: Boolean(unreadWinner),
+    },
+    activityFallback
+  );
+  const peer = conversationPeer(merged);
+  if (peer) merged = applyConversationReadOverride(peer, merged);
+  return merged;
+}
+
 function mergeConversationSources(history, cached) {
   const byPeer = new Map();
   history.filter(isC2CConversation).forEach((item) => {
     const peer = conversationPeer(item);
     if (peer) {
-      const normalized = applyConversationReadOverride(peer, item);
+      const normalized = normalizeConversationSummary(item, {
+        authority: String(item?.source || "").toLowerCase() === "archive" ? "archive" : "live",
+      });
       const current = byPeer.get(peer);
-      byPeer.set(peer, current ? preserveConversationAvatar(normalized, current) : normalized);
+      byPeer.set(peer, current ? mergeConversationPair(normalized, current) : applyConversationReadOverride(peer, normalized));
     }
   });
   cached.filter(isC2CConversation).forEach((item) => {
     const peer = conversationPeer(item);
     if (!peer) return;
-    const normalized = applyConversationReadOverride(peer, item);
+    const normalized = normalizeConversationSummary(item, {
+      authority: String(item?.source || "").toLowerCase() === "archive" ? "archive" : "live",
+    });
     const current = byPeer.get(peer);
-    if (!current || item.source === "tim" || conversationTimestamp(item) > conversationTimestamp(current)) {
-      byPeer.set(peer, preserveConversationAvatar(normalized, current));
-    } else {
-      byPeer.set(peer, preserveConversationAvatar(current, normalized));
-    }
+    byPeer.set(peer, current ? mergeConversationPair(current, normalized) : applyConversationReadOverride(peer, normalized));
   });
   return filterDismissedConversations(
     [...byPeer.values()]
@@ -4360,6 +4683,25 @@ function timMessageTimestamp(message) {
   return Number.isFinite(parsed) ? parsed : Date.now();
 }
 
+function timMessageSequence(message) {
+  return String(
+    message?.sequence ??
+      message?.MsgSeq ??
+      message?.msgSeq ??
+      message?.msg_seq ??
+      message?.seq ??
+      ""
+  ).trim();
+}
+
+function compareMessageOrder(a, b) {
+  const byTime = Number(a?.timestamp || 0) - Number(b?.timestamp || 0);
+  if (byTime) return byTime;
+  const bySequence = conversationSequenceValue(a?.sequence) - conversationSequenceValue(b?.sequence);
+  if (bySequence) return bySequence;
+  return String(a?.msgKey || a?.id || "").localeCompare(String(b?.msgKey || b?.id || ""));
+}
+
 function timMessagePeer(message, me = String(S.user?.uid || S.user?.id || "")) {
   const conversationID = String(message?.conversationID || "");
   const conversationPeer = conversationID.replace(/^C2C/, "");
@@ -4435,6 +4777,7 @@ function timMessageEntry(message, peer = "", me = String(S.user?.uid || S.user?.
       message?.ID || message?.id || message?.messageID || message?.messageId || message?.sequence || message?.MsgKey || message?.msg_uid || ""
     ),
     msgKey: String(message?.MsgKey || message?.msg_key || message?.messageKey || message?.message_key || ""),
+    sequence: timMessageSequence(message),
     text: displayText,
     kind,
     objectName: messageObjectName(message),
@@ -4628,7 +4971,7 @@ function chatLogHtml() {
     }
     return `<div class="chat-line system">还没有消息，礼貌地打个招呼吧</div>`;
   }
-  const sortedEntries = entries.sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
+  const sortedEntries = entries.sort(compareMessageOrder);
   return sortedEntries
     .map((entry) => {
       const state = chatMessageState(entry);
@@ -4794,6 +5137,7 @@ function mergePeerMessages(peer, incoming) {
             ...entry,
             rawMessage: entry.rawMessage || previous.rawMessage || null,
             msgKey: entry.msgKey || previous.msgKey || "",
+            sequence: entry.sequence || previous.sequence || "",
             revoked: Boolean(previous.revoked || entry.revoked),
             peerRead: previous.peerRead === true || entry.peerRead === true ? true : entry.peerRead ?? previous.peerRead,
             readAt: Math.max(Number(previous.readAt || 0), Number(entry.readAt || 0)),
@@ -4857,7 +5201,7 @@ async function loadConversationMessages(peer, { force = false } = {}) {
     mergePeerMessages(target, incoming);
     const archiveCandidates = new Map();
     incoming.forEach((entry) => {
-      if (entry.source === "archive") return;
+      if (["archive", "http", "history"].includes(String(entry.source || "").toLowerCase())) return;
       const identity = String(entry.id || entry.msgKey || `${entry.type}|${entry.kind}|${entry.timestamp}|${entry.text}`);
       const remoteMedia = archiveRemoteUrl(entry.media?.url) || archiveRemoteUrl(entry.media?.thumbnail);
       const score = (remoteMedia ? 4 : 0) + (entry.rawMessage ? 2 : 0) + (entry.text ? 1 : 0);
@@ -4915,7 +5259,15 @@ function ensureConversationForPeer(peer, { name = "", avatar = "" } = {}) {
     _avatar_from_fallback: false,
     last_message: "",
     timestamp: Date.now(),
+    activity_sequence: "",
+    preview_timestamp: 0,
+    preview_sequence: "",
+    preview_source: "",
+    preview_authoritative: false,
+    preview_timestamp_inferred: false,
     unread_count: 0,
+    unread_observed_at: Date.now(),
+    unread_authoritative: true,
   };
   S.conversations.unshift(created);
   recalculateUnreadTotal();
@@ -4929,9 +5281,20 @@ function updateConversationActivity(peer, { name = "", avatar = "", lastMessage 
   conversation.last_message = String(lastMessage || "");
   conversation.content = conversation.last_message;
   conversation.timestamp = Date.now();
+  if (conversation.last_message) {
+    conversation.activity_sequence = "";
+    conversation.preview_timestamp = conversation.timestamp;
+    conversation.preview_sequence = "";
+    conversation.preview_source = "local";
+    conversation.preview_authoritative = true;
+    conversation.preview_timestamp_inferred = false;
+    conversation.preview_stale = false;
+  }
   if (unreadCount != null) {
     conversation.unread_count = Math.max(0, Number(unreadCount) || 0);
     conversation.unread = conversation.unread_count;
+    conversation.unread_observed_at = Date.now();
+    conversation.unread_authoritative = true;
   }
   S.conversations = [conversation, ...S.conversations.filter((item) => conversationPeer(item) !== target)];
   recalculateUnreadTotal();
@@ -5696,21 +6059,60 @@ function reportConversationRead(peer) {
   }).then(({ data }) => data?.ok === true);
 }
 
+async function reportConversationsRead(peers) {
+  const targets = [
+    ...new Set(
+      (Array.isArray(peers) ? peers : [])
+        .map((peer) => String(peer || "").trim())
+        .filter(Boolean)
+    ),
+  ];
+  if (!targets.length) return true;
+  for (let offset = 0; offset < targets.length; offset += 100) {
+    const { data } = await api("/api/im/read", {
+      method: "POST",
+      body: JSON.stringify({ peers: targets.slice(offset, offset + 100) }),
+      timeout: 15000,
+    });
+    if (data?.ok !== true) return false;
+  }
+  return true;
+}
+
+function scheduleConversationReadReport(peer, delay = 400) {
+  const target = String(peer || "").trim();
+  if (!target) return;
+  const previous = S.conversationReadReportTimers.get(target);
+  if (previous) clearTimeout(previous);
+  const timer = setTimeout(() => {
+    S.conversationReadReportTimers.delete(target);
+    void reportConversationRead(target).catch(() => false);
+  }, Math.max(0, Number(delay) || 0));
+  S.conversationReadReportTimers.set(target, timer);
+}
+
 function markConversationRead(peer) {
   const target = String(peer || "").trim();
   if (!target) return;
   const current = S.conversations.find((item) => conversationPeer(item) === target);
   S.readConversationPeers.set(target, Math.max(conversationTimestamp(current), Date.now()));
   S.conversations = S.conversations.map((item) =>
-    conversationPeer(item) === target ? { ...item, unread_count: 0, unread: 0 } : item
+    conversationPeer(item) === target
+      ? {
+          ...item,
+          unread_count: 0,
+          unread: 0,
+          unread_observed_at: Date.now(),
+          unread_authoritative: true,
+        }
+      : item
   );
   recalculateUnreadTotal();
   if (S.imMode === "sdk" && S.chat && typeof S.chat.setMessageRead === "function") {
     const conversationID = current?.conversation_id || `C2C${target}`;
     void Promise.resolve(S.chat.setMessageRead({ conversationID })).catch(() => {});
-  } else {
-    void reportConversationRead(target).catch(() => false);
   }
+  scheduleConversationReadReport(target);
 }
 
 function refreshChatComposerKeepingText({ focus = false } = {}) {
@@ -5833,11 +6235,17 @@ function updateConversationPreviewFromMessages(peer) {
   if (!conversation) return;
   const messages = S.imMessages
     .filter((entry) => String(entry.peer || "") === target && entry.type !== "system")
-    .sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
+    .sort(compareMessageOrder);
   const latest = messages[messages.length - 1];
   if (!latest) return;
   conversation.last_message = messagePreview(latest);
   conversation.content = conversation.last_message;
+  conversation.preview_timestamp = Number(latest.timestamp || 0);
+  conversation.preview_sequence = latest.sequence || "";
+  conversation.preview_source = latest.source || "message";
+  conversation.preview_authoritative = true;
+  conversation.preview_timestamp_inferred = false;
+  conversation.preview_stale = false;
 }
 
 function markLocalMessageRevoked(entry, serverEntry = null) {
@@ -10128,7 +10536,12 @@ async function logout() {
     S.conversationProfilesByUid.clear();
     S.conversationProfileFetchedAt.clear();
     S.conversationProfileLoadingUids.clear();
+    S.conversationPreviewFetchedAt.clear();
+    S.conversationPreviewLoadingPeers.clear();
+    S.conversationPreviewHydrationPromise = null;
     S.readConversationPeers.clear();
+    S.conversationReadReportTimers.forEach((timer) => clearTimeout(timer));
+    S.conversationReadReportTimers.clear();
     S.unreadTotal = 0;
     S.messageLastPolicySyncAt = 0;
     S.messageLastSummarySyncAt = 0;
@@ -10690,7 +11103,10 @@ async function handleAction(action, button) {
   }
   if (action === "mark-all-read") {
     const sdkCanSyncRead = S.imMode === "sdk" && S.chat && typeof S.chat.setMessageRead === "function";
-    let syncedRead = sdkCanSyncRead;
+    const unreadPeers = S.conversations
+      .filter((item) => Number(item.unread_count || item.unread || 0) > 0)
+      .map(conversationPeer)
+      .filter(Boolean);
     if (sdkCanSyncRead) {
       await Promise.all(
         S.conversations.map((item) => {
@@ -10699,23 +11115,17 @@ async function handleAction(action, button) {
           return S.chat.setMessageRead({ conversationID: item.conversation_id || `C2C${peer}` }).catch(() => {});
         })
       );
-    } else {
-      const unreadPeers = S.conversations
-        .filter((item) => Number(item.unread_count || item.unread || 0) > 0)
-        .map(conversationPeer)
-        .filter(Boolean);
-      let failed = 0;
-      for (let offset = 0; offset < unreadPeers.length; offset += 5) {
-        const results = await Promise.allSettled(
-          unreadPeers.slice(offset, offset + 5).map((peer) => reportConversationRead(peer))
-        );
-        failed += results.filter(
-          (result) => result.status !== "fulfilled" || result.value !== true
-        ).length;
-      }
-      syncedRead = unreadPeers.length === 0 || failed === 0;
     }
-    S.conversations = S.conversations.map((item) => ({ ...item, unread_count: 0, unread: 0 }));
+    const syncedRead =
+      unreadPeers.length === 0 || (await reportConversationsRead(unreadPeers).catch(() => false));
+    const readObservedAt = Date.now();
+    S.conversations = S.conversations.map((item) => ({
+      ...item,
+      unread_count: 0,
+      unread: 0,
+      unread_observed_at: readObservedAt,
+      unread_authoritative: true,
+    }));
     S.conversations.forEach((item) => {
       const peer = conversationPeer(item);
       if (peer) S.readConversationPeers.set(peer, Math.max(conversationTimestamp(item), Date.now()));

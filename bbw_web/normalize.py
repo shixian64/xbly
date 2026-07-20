@@ -1012,6 +1012,27 @@ def normalize_conversation(item: Any) -> Optional[Dict[str, Any]]:
     timestamp = str(
         _first(d, ["msgTimestamp", "msg_timestamp", "timestamp", "sent_time", "time"], "")
     )
+    explicit_preview_timestamp = str(
+        _first(
+            d,
+            ["previewTimestamp", "preview_timestamp", "last_message_timestamp"],
+            "",
+        )
+    )
+    activity_sequence = str(
+        _first(
+            d,
+            ["activitySequence", "activity_sequence", "MsgSeq", "msgSeq", "msg_seq", "sequence", "seq"],
+            "",
+        )
+    )
+    preview_sequence = str(
+        _first(
+            d,
+            ["previewSequence", "preview_sequence", "last_message_sequence"],
+            "",
+        )
+    )
     if not any((record_id, peer_id, content, timestamp, user)):
         return None
     return {
@@ -1023,12 +1044,34 @@ def normalize_conversation(item: Any) -> Optional[Dict[str, Any]]:
         "content": content,
         "last_message": content,
         "timestamp": timestamp,
+        "activity_sequence": activity_sequence,
         "from_user_id": str(_first(d, ["fromUserId", "from_user_id", "from"], "")),
         "to_user_id": str(_first(d, ["toUserId", "to_user_id", "to"], "")),
         "object_name": str(_first(d, ["objectName", "object_name"], "")),
         "channel_type": str(_first(d, ["channelType", "channel_type"], "")),
         "msg_uid": str(_first(d, ["msgUID", "msg_uid", "message_uid"], "")),
         "unread_count": _num(_first(d, ["unreadCount", "unread_count", "unread"], 0)),
+        "unread_observed_at": str(
+            _first(
+                d,
+                ["unreadObservedAt", "unread_observed_at", "summary_observed_at", "observed_at"],
+                "",
+            )
+        ),
+        "unread_authoritative": _first(
+            d,
+            ["unreadAuthoritative", "unread_authoritative"],
+            None,
+        ),
+        "preview_timestamp": explicit_preview_timestamp,
+        "preview_sequence": preview_sequence,
+        "preview_source": str(_first(d, ["previewSource", "preview_source"], "")),
+        "preview_authoritative": _first(
+            d,
+            ["previewAuthoritative", "preview_authoritative"],
+            bool(content and explicit_preview_timestamp),
+        ),
+        "preview_timestamp_inferred": bool(content and timestamp and not explicit_preview_timestamp),
         "online": str(
             _first(
                 d,
@@ -1401,6 +1444,9 @@ def normalize_message(item: Any) -> Optional[Dict[str, Any]]:
     msg_key = str(
         _first(d, ["MsgKey", "msg_key", "messageKey", "message_key", "msgUID", "msg_uid"], "")
     )
+    sequence = str(
+        _first(d, ["MsgSeq", "msgSeq", "msg_seq", "sequence", "seq"], "")
+    )
     revoked = _bool(
         _first(
             d,
@@ -1481,6 +1527,9 @@ def normalize_message(item: Any) -> Optional[Dict[str, Any]]:
         "id": message_id,
         "msg_key": msg_key,
         "MsgKey": msg_key,
+        "sequence": sequence,
+        "msg_sequence": sequence,
+        "MsgSeq": sequence,
         "is_revoked": revoked,
         "isRevoked": revoked,
         "text": text,

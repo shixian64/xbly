@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1041,6 +1042,14 @@ def conversation_envelope(
 ) -> Dict[str, Any]:
     """Attach cached peer display data without delaying the conversation summary."""
     payload = RE(result, "conversation")
+    observed_at = time.time()
+    for item in payload["items"]:
+        item["unread_observed_at"] = observed_at
+        item["unread_authoritative"] = True
+        if item.get("last_message") and not item.get("preview_timestamp"):
+            item["preview_source"] = item.get("source") or "history"
+            item["preview_authoritative"] = False
+            item["preview_timestamp_inferred"] = True
     cache = profile_cache if profile_cache is not None else {}
     _attach_cached_conversation_profiles(app, payload["items"], cache)
     payload["list"] = payload["items"]
@@ -1069,6 +1078,78 @@ def _attach_cached_conversation_profiles(
             )
         existing_user = item.get("user") if isinstance(item.get("user"), dict) else {}
         item["user"] = {**profile, **existing_user}
+
+
+def _conversation_summary_time(value: Any) -> float:
+    numeric = _tim_epoch_sort_value(value)
+    if numeric:
+        return numeric
+    raw = str(value or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _conversation_sequence_value(value: Any) -> int:
+    raw = str(value or "").strip()
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _attach_cached_conversation_summaries(
+    items: List[Dict[str, Any]],
+    summaries: Mapping[str, Mapping[str, Any]],
+) -> None:
+    for item in items:
+        peer = str(item.get("peer_id") or item.get("conversation_user") or "").strip()
+        cached = summaries.get(peer) if peer else None
+        if isinstance(cached, Mapping):
+            cached_preview = str(cached.get("last_message") or cached.get("content") or "")
+            current_preview = str(item.get("last_message") or item.get("content") or "")
+            cached_time = _conversation_summary_time(cached.get("preview_timestamp"))
+            current_time = _conversation_summary_time(item.get("preview_timestamp"))
+            cached_sequence = _conversation_sequence_value(cached.get("preview_sequence"))
+            current_sequence = _conversation_sequence_value(item.get("preview_sequence"))
+            cached_is_newer = (cached_time, cached_sequence) >= (
+                current_time,
+                current_sequence,
+            )
+            if cached_preview and (not current_preview or cached_is_newer):
+                item["last_message"] = cached_preview
+                item["content"] = cached_preview
+                item["preview_timestamp"] = cached.get("preview_timestamp") or ""
+                item["preview_sequence"] = cached.get("preview_sequence") or ""
+                item["preview_source"] = cached.get("preview_source") or "archive"
+                item["preview_authoritative"] = cached.get("preview_authoritative") is True
+                item["preview_timestamp_inferred"] = (
+                    cached.get("preview_timestamp_inferred") is True
+                )
+        activity_time = _conversation_summary_time(item.get("timestamp"))
+        preview_time = _conversation_summary_time(item.get("preview_timestamp"))
+        activity_sequence = _conversation_sequence_value(
+            item.get("activity_sequence") or item.get("MsgSeq")
+        )
+        preview_sequence = _conversation_sequence_value(item.get("preview_sequence"))
+        item["preview_stale"] = bool(
+            activity_time
+            and (
+                not preview_time
+                or activity_time > preview_time
+                or (
+                    activity_time == preview_time
+                    and (
+                        (activity_sequence and activity_sequence > preview_sequence)
+                        or item.get("preview_authoritative") is not True
+                        or item.get("preview_timestamp_inferred") is True
+                    )
+                )
+            )
+        )
 
 
 def _tim_epoch_sort_value(value: Any) -> float:
@@ -1161,6 +1242,7 @@ def _tim_recent_conversation_envelope(
     rows: List[Dict[str, Any]] = []
     seen: Set[str] = set()
     previous_cursor: Optional[Tuple[int, int, int, int]] = None
+    observed_at = time.time()
     for _page in range(max(1, min(int(max_pages), 10))):
         result = client.recent_contacts(
             account_uid,
@@ -1196,7 +1278,10 @@ def _tim_recent_conversation_envelope(
                     "peer_id": peer,
                     "conversation_user": peer,
                     "timestamp": raw.get("MsgTime"),
+                    "activity_sequence": raw.get("MsgSeq"),
                     "unread_count": raw.get("UnreadMsgNum") or 0,
+                    "unread_observed_at": observed_at,
+                    "unread_authoritative": True,
                     "source": "tim_rest",
                 }
             )
@@ -1228,6 +1313,8 @@ def _tim_recent_conversation_envelope(
         peer = str(item.get("peer_id") or "")
         if peer in unread_counts:
             item["unread_count"] = unread_counts[peer]
+        item["unread_observed_at"] = observed_at
+        item["unread_authoritative"] = True
     cache = profile_cache if profile_cache is not None else {}
     _attach_cached_conversation_profiles(app, items, cache)
     return {
@@ -1241,8 +1328,14 @@ def _tim_recent_conversation_envelope(
     }
 
 
-def _tim_message_sort_key(item: Mapping[str, Any]) -> float:
-    return _tim_epoch_sort_value(item.get("timestamp") or item.get("time"))
+def _tim_message_sort_key(item: Mapping[str, Any]) -> Tuple[float, int, str]:
+    return (
+        _tim_epoch_sort_value(item.get("timestamp") or item.get("time")),
+        _conversation_sequence_value(
+            item.get("sequence") or item.get("msg_sequence") or item.get("MsgSeq")
+        ),
+        str(item.get("msg_key") or item.get("id") or ""),
+    )
 
 
 def _tim_roaming_message_envelope(
@@ -1252,9 +1345,17 @@ def _tim_roaming_message_envelope(
     *,
     max_messages: int = 200,
     retention_days: int = 180,
+    around_time: Optional[int] = None,
+    include_read_state: bool = True,
 ) -> Dict[str, Any]:
     now_epoch = int(time.time())
-    min_time = now_epoch - max(1, int(retention_days)) * 86400
+    if around_time is not None and int(around_time) > 0:
+        center = int(around_time)
+        min_time = max(0, center - 5)
+        max_time = center + 5
+    else:
+        min_time = now_epoch - max(1, int(retention_days)) * 86400
+        max_time = now_epoch + 60
     page_limit = max(1, (max(1, int(max_messages)) + 99) // 100)
     raw_items: List[Dict[str, Any]] = []
     for sender, recipient in ((peer_uid, account_uid), (account_uid, peer_uid)):
@@ -1264,7 +1365,7 @@ def _tim_roaming_message_envelope(
                 sender,
                 recipient,
                 min_time=min_time,
-                max_time=now_epoch + 60,
+                max_time=max_time,
                 max_count=min(100, max(1, int(max_messages))),
                 last_msg_key=last_msg_key,
             )
@@ -1293,13 +1394,14 @@ def _tim_roaming_message_envelope(
     items = sorted(by_identity.values(), key=_tim_message_sort_key)[
         -max(1, int(max_messages)):
     ]
-    unread_counts = _tim_c2c_unread_counts(client, peer_uid, [account_uid])
-    _tim_apply_outgoing_read_state(
-        items,
-        account_uid=account_uid,
-        peer_uid=peer_uid,
-        unread_count=unread_counts.get(account_uid),
-    )
+    if include_read_state:
+        unread_counts = _tim_c2c_unread_counts(client, peer_uid, [account_uid])
+        _tim_apply_outgoing_read_state(
+            items,
+            account_uid=account_uid,
+            peer_uid=peer_uid,
+            unread_count=unread_counts.get(account_uid),
+        )
     return {
         "ok": True,
         "items": items,
@@ -2511,6 +2613,21 @@ class Handler(BaseHTTPRequestHandler):
                         502,
                     )
                 payload = conversation_envelope(app, result, u.profile_cache)
+            summary_loader = getattr(self, "_request_conversation_summary_loader", None)
+            if callable(summary_loader):
+                try:
+                    peers = [
+                        str(item.get("peer_id") or item.get("conversation_user") or "").strip()
+                        for item in payload.get("items", [])
+                        if isinstance(item, Mapping)
+                    ]
+                    _attach_cached_conversation_summaries(
+                        payload.get("items", []),
+                        summary_loader(peers),
+                    )
+                    payload["list"] = payload.get("items", [])
+                except Exception:
+                    pass
             conversation_peers = getattr(u, "conversation_message_peers", None)
             if conversation_peers is None:
                 conversation_peers = set()
@@ -2525,35 +2642,53 @@ class Handler(BaseHTTPRequestHandler):
             peer = q("peer") or q("uid") or q("yourid")
             if not peer:
                 return self.ok({"ok": False, "error": "缺少聊天对象 UID"}, 400)
+            summary_only = q("summary", "0") == "1"
+            raw_around_time = str(q("at", "") or "").strip()
+            around_time = int(raw_around_time) if raw_around_time.isdigit() else None
+            if summary_only and around_time is None:
+                return self.ok({"ok": False, "error": "缺少会话消息时间"}, 400)
             capabilities = Handler.web_user_capabilities(self, u)
             if not Handler.can_message_peer(self, u, peer):
                 return Handler.deny_private_message(self, capabilities)
             try:
-                return self.ok(
-                    _tim_roaming_message_envelope(
-                        u.native.tim_rest,
-                        str(app.session.uid or ""),
-                        str(peer),
-                    )
+                payload = _tim_roaming_message_envelope(
+                    u.native.tim_rest,
+                    str(app.session.uid or ""),
+                    str(peer),
+                    max_messages=50 if summary_only else 200,
+                    around_time=around_time if summary_only else None,
+                    include_read_state=not summary_only,
                 )
             except Exception:
                 result = app.im.history_messages(peer)
-            if _is_html_protocol_result(result) or not getattr(result, "ok", False):
-                return self.ok(
-                    {
-                        "ok": False,
-                        "code": "UPSTREAM_HISTORY_UNAVAILABLE",
-                        "error": {
-                            "title": "上游聊天记录暂时不可用",
-                            "detail": "已改用服务器归档的聊天记录",
+                if _is_html_protocol_result(result) or not getattr(result, "ok", False):
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "code": "UPSTREAM_HISTORY_UNAVAILABLE",
+                            "error": {
+                                "title": "上游聊天记录暂时不可用",
+                                "detail": "已改用服务器归档的聊天记录",
+                            },
+                            "items": [],
+                            "list": [],
+                            "count": 0,
                         },
-                        "items": [],
-                        "list": [],
-                        "count": 0,
-                    },
-                    502,
+                        502,
+                    )
+                payload = RE(result, "message")
+            if summary_only:
+                latest_items = sorted(
+                    [item for item in payload.get("items", []) if isinstance(item, Mapping)],
+                    key=_tim_message_sort_key,
+                )[-1:]
+                payload.update(
+                    items=latest_items,
+                    list=latest_items,
+                    count=len(latest_items),
+                    summary=True,
                 )
-            return self.ok(RE(result, "message"))
+            return self.ok(payload)
 
         if path == "/api/heartbeat":
             return self.ok(u.heartbeat.status() if u.heartbeat else {"running": False})
@@ -2845,26 +2980,61 @@ class Handler(BaseHTTPRequestHandler):
 
             # TIM REST fallback (when browser TIM.login hangs)
             if path == "/api/im/read":
-                peer_uid = str(
-                    data.get("peer") or data.get("uid") or data.get("to") or ""
-                ).strip()
+                raw_peers = data.get("peers")
+                if isinstance(raw_peers, list):
+                    peer_uids = list(
+                        dict.fromkeys(
+                            str(peer or "").strip()
+                            for peer in raw_peers[:100]
+                            if str(peer or "").strip()
+                        )
+                    )
+                else:
+                    peer_uid = str(
+                        data.get("peer") or data.get("uid") or data.get("to") or ""
+                    ).strip()
+                    peer_uids = [peer_uid] if peer_uid else []
                 account_uid = str(app.session.uid or "").strip()
-                if not peer_uid or not account_uid:
+                if not peer_uids or not account_uid:
                     return self.ok({"ok": False, "error": "缺少聊天对象 UID"}, 400)
                 capabilities = Handler.web_user_capabilities(self, u)
-                if not Handler.can_message_peer(self, u, peer_uid):
-                    return Handler.deny_private_message(self, capabilities)
-                result = u.native.tim_rest.mark_c2c_read(account_uid, peer_uid)
-                if not result.ok:
+                for peer_uid in peer_uids:
+                    if not Handler.can_message_peer(self, u, peer_uid):
+                        return Handler.deny_private_message(self, capabilities)
+                read_peers: List[str] = []
+                failed_peers: List[str] = []
+                def mark_peer_read(peer_uid: str) -> Tuple[str, Any]:
+                    return peer_uid, u.native.tim_rest.mark_c2c_read(account_uid, peer_uid)
+
+                if len(peer_uids) == 1:
+                    read_results = [mark_peer_read(peer_uids[0])]
+                else:
+                    with ThreadPoolExecutor(max_workers=min(5, len(peer_uids))) as executor:
+                        read_results = list(executor.map(mark_peer_read, peer_uids))
+                for peer_uid, result in read_results:
+                    if result.ok:
+                        read_peers.append(peer_uid)
+                    else:
+                        failed_peers.append(peer_uid)
+                if failed_peers:
                     return self.ok(
                         {
                             "ok": False,
                             "code": "IM_READ_REPORT_FAILED",
                             "error": "消息已读状态暂时无法同步",
+                            "read_peers": read_peers,
+                            "failed_peers": failed_peers,
                         },
                         502,
                     )
-                return self.ok({"ok": True, "read": True})
+                return self.ok(
+                    {
+                        "ok": True,
+                        "read": True,
+                        "read_peers": read_peers,
+                        "count": len(read_peers),
+                    }
+                )
 
             if path == "/api/im/rest/send":
                 message_type = str(

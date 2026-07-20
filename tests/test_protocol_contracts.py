@@ -436,6 +436,9 @@ class NormalizerContractTests(unittest.TestCase):
         self.assertEqual(item["nickname"], "N")
         self.assertEqual(item["last_message"], "你好")
         self.assertEqual(item["timestamp"], "1710000000")
+        self.assertEqual(item["preview_timestamp"], "")
+        self.assertTrue(item["preview_timestamp_inferred"])
+        self.assertFalse(item["preview_authoritative"])
         self.assertEqual(item["msg_uid"], "m1")
         self.assertEqual(item["online"], "Online")
 
@@ -477,6 +480,7 @@ class NormalizerContractTests(unittest.TestCase):
                         "fromUserId": "42",
                         "toUserId": "9",
                         "msgTimestamp": "1710000001",
+                        "MsgSeq": "7",
                         "payload": {"text": "历史消息"},
                         "isPeerRead": True,
                         "readTime": "1710000042",
@@ -486,6 +490,7 @@ class NormalizerContractTests(unittest.TestCase):
         )[0]
         self.assertEqual(message["id"], "m2")
         self.assertEqual(message["text"], "历史消息")
+        self.assertEqual(message["sequence"], "7")
         self.assertTrue(message["is_peer_read"])
         self.assertEqual(message["read_state"], "read")
         self.assertEqual(message["read_time"], "1710000042")

@@ -304,6 +304,7 @@ def _upsert_conversation(
     reported_id: Any = "",
     title: Any = "",
     unread_count: int | None = None,
+    unread_observed_at: datetime | None = None,
     last_message_at: datetime | None = None,
     metadata: Mapping[str, Any] | None = None,
 ):
@@ -322,6 +323,11 @@ def _upsert_conversation(
         if unread_count is not None
         else int(existing.unread_count if existing else 0)
     )
+    effective_unread_observed_at = (
+        _as_utc(unread_observed_at)
+        if unread_observed_at is not None
+        else existing.unread_observed_at if existing else None
+    )
     extra = _merge_dict(existing.extra_data if existing else {}, metadata or {})
     return repo.upsert(
         owner_user_id=owner_user_id,
@@ -331,6 +337,7 @@ def _upsert_conversation(
         kind="direct",
         title=effective_title,
         unread_count=effective_unread,
+        unread_observed_at=effective_unread_observed_at,
         last_message_at=effective_last,
         extra_data=extra,
     )
@@ -447,6 +454,9 @@ def _ingest_message(
         "object_name": _bounded(report.get("object_name"), 128),
         "message_key": _bounded(
             report.get("message_key") or report.get("upstream_message_key"), 512
+        ),
+        "message_sequence": _bounded(
+            report.get("message_sequence") or report.get("sequence"), 80
         ),
         "client_message_key": _bounded(report.get("client_message_key"), 512),
         "idempotency_key": _bounded(report.get("idempotency_key"), 256),
@@ -734,6 +744,9 @@ def _history_message_report(
         "direction": direction,
         "upstream_message_id": str(item.get("id") or ""),
         "message_key": str(item.get("msg_key") or item.get("MsgKey") or ""),
+        "message_sequence": str(
+            item.get("sequence") or item.get("msg_sequence") or item.get("MsgSeq") or ""
+        ),
         "peer_uid": peer,
         "conversation_id": _canonical_conversation_id(peer),
         "message_type": message_type,
@@ -782,24 +795,52 @@ def ingest_history_response(
                 peer = _bounded(item.get("peer_id") or item.get("conversation_user"), 128)
                 if not peer:
                     continue
+                unread_authoritative = item.get("unread_authoritative") is not False
+                preview = _bounded(
+                    item.get("last_message") or item.get("content"),
+                    500,
+                )
+                conversation_metadata = {
+                    "reported_conversation_id": _bounded(item.get("id"), 256),
+                    "object_name": _bounded(item.get("object_name"), 128),
+                    "avatar": _bounded(item.get("avatar"), 4096),
+                    "user": _json_safe(item.get("user")),
+                    "last_source": "history",
+                }
+                if preview:
+                    conversation_metadata.update(
+                        last_message=preview,
+                        preview_timestamp=_bounded(
+                            item.get("preview_timestamp"),
+                            80,
+                        ),
+                        preview_sequence=_bounded(item.get("preview_sequence"), 80),
+                        preview_authoritative=item.get("preview_authoritative") is True,
+                        preview_timestamp_inferred=item.get("preview_timestamp_inferred") is True,
+                    )
                 _upsert_conversation(
                     db,
                     owner_user_id=owner_id,
                     peer_uid=peer,
                     reported_id=item.get("id"),
                     title=item.get("nickname"),
-                    unread_count=_as_int(item.get("unread_count"), 0),
+                    unread_count=(
+                        _as_int(item.get("unread_count"), 0)
+                        if unread_authoritative
+                        else None
+                    ),
+                    unread_observed_at=(
+                        _optional_time(
+                            item.get("unread_observed_at")
+                            or item.get("summary_observed_at")
+                            or item.get("observed_at")
+                        )
+                        or utcnow()
+                        if unread_authoritative
+                        else None
+                    ),
                     last_message_at=_optional_time(item.get("timestamp")),
-                    metadata={
-                        "reported_conversation_id": _bounded(item.get("id"), 256),
-                        "object_name": _bounded(item.get("object_name"), 128),
-                        "avatar": _bounded(item.get("avatar"), 4096),
-                        "user": _json_safe(item.get("user")),
-                        "last_message": _bounded(
-                            item.get("last_message") or item.get("content"), 500
-                        ),
-                        "last_source": "history",
-                    },
+                    metadata=conversation_metadata,
                 )
                 conversations += 1
         elif route == "/api/im/messages":
@@ -1213,9 +1254,27 @@ def schedule_due_syncs() -> dict[str, Any]:
         for account, _user in account_rows:
             interval = active_seconds if account.user_id in active_ids else inactive_seconds
             cursor = cursor_rows.get(account.user_id)
-            due_at = cursor.next_sync_at if cursor and cursor.next_sync_at else None
-            if due_at is None and account.last_sync_at is not None:
-                due_at = _as_utc(account.last_sync_at) + timedelta(seconds=interval)
+            stored_due_at = (
+                _as_utc(cursor.next_sync_at)
+                if cursor and cursor.next_sync_at
+                else None
+            )
+            last_sync_at = (
+                _as_utc(cursor.last_succeeded_at)
+                if cursor and cursor.last_succeeded_at
+                else _as_utc(account.last_sync_at)
+                if account.last_sync_at is not None
+                else None
+            )
+            interval_due_at = (
+                last_sync_at + timedelta(seconds=interval)
+                if last_sync_at is not None
+                else None
+            )
+            due_candidates = [
+                value for value in (stored_due_at, interval_due_at) if value is not None
+            ]
+            due_at = min(due_candidates) if due_candidates else None
             if due_at is not None and _as_utc(due_at) > now:
                 continue
             candidates.append((account.user_id, account.id, interval))
@@ -1379,6 +1438,7 @@ def _tim_recent_conversations(
     conversations: list[dict[str, Any]] = []
     seen: set[str] = set()
     previous_cursor: tuple[int, int, int, int] | None = None
+    observed_at = utcnow()
     for _page in range(max(1, min(int(max_pages), 10))):
         result = client.recent_contacts(
             account_uid,
@@ -1411,9 +1471,12 @@ def _tim_recent_conversations(
                     "peer_id": peer,
                     "conversation_user": peer,
                     "timestamp": item.get("MsgTime"),
+                    "activity_sequence": item.get("MsgSeq"),
                     "unread_count": _as_int(
                         item.get("UnreadMsgCount") or item.get("UnreadMsgNum"), 0
                     ),
+                    "unread_observed_at": observed_at,
+                    "unread_authoritative": True,
                     "source": "tim_rest",
                 }
             )
@@ -1511,6 +1574,7 @@ def _durable_message_conversations(
                 "conversation_user": peer,
                 "timestamp": observed_at,
                 "unread_count": 0,
+                "unread_authoritative": False,
                 "source": "durable",
             }
         )

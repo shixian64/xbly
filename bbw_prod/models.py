@@ -308,6 +308,7 @@ class Conversation(UUIDPrimaryKeyMixin, TimestampMixin, SerializableMixin, Base)
     kind: Mapped[str] = mapped_column(String(32), nullable=False, default="direct", server_default="direct")
     title: Mapped[str | None] = mapped_column(String(200))
     unread_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    unread_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     extra_data: Mapped[dict[str, Any]] = mapped_column(
         "metadata", JSONB, nullable=False, default=dict, server_default=JSON_EMPTY_OBJECT
