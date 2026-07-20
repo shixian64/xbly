@@ -408,6 +408,7 @@ class TimRestClient:
         to_account: str,
         text: str,
         *,
+        cloud_custom_data: Any = None,
         sync_other_machine: int = 1,
     ) -> RestResult:
         """Send a C2C text message as from_account (admin API, appears from that user)."""
@@ -425,6 +426,7 @@ class TimRestClient:
                     "MsgContent": {"Text": text[:2000]},
                 }
             ],
+            cloud_custom_data=cloud_custom_data,
             sync_other_machine=sync_other_machine,
         )
 

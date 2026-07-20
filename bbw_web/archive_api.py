@@ -39,6 +39,18 @@ class MediaReport(BaseModel):
         return value
 
 
+class QuoteReport(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    message_id: str = Field(default="", max_length=512)
+    message_random: str = Field(default="", max_length=80)
+    sender_uid: str = Field(default="", max_length=128)
+    sender_name: str = Field(default="", max_length=120)
+    text: str = Field(default="", max_length=500)
+    kind: str = Field(default="text", max_length=40)
+    sent_at: str = Field(default="", max_length=80)
+
+
 class MessageReport(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -66,6 +78,7 @@ class MessageReport(BaseModel):
     delivery: str = Field(default="", max_length=80)
     revoked: bool = False
     media: Optional[MediaReport] = None
+    quote: Optional[QuoteReport] = None
     flash_id: str = Field(default="", max_length=512)
 
     @field_validator("peer_uid", "upstream_message_id", "message_key", "conversation_id")
@@ -200,6 +213,7 @@ def _archived_message_item(message: Any) -> dict[str, Any]:
     )
     message_sequence = str(metadata.get("message_sequence") or "")
     message_random = str(metadata.get("message_random") or "")
+    quote = metadata.get("quote") if isinstance(metadata.get("quote"), dict) else None
     return {
         "id": message_id,
         "message_id": message_id,
@@ -210,6 +224,7 @@ def _archived_message_item(message: Any) -> dict[str, Any]:
         "message_random": message_random,
         "msg_random": message_random,
         "MsgRandom": message_random,
+        "quote": quote,
         "text": str(message.body or ""),
         "body": str(message.body or ""),
         "kind": str(message.message_type or "text"),

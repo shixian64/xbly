@@ -193,6 +193,8 @@ const S = {
   imComposerDraftRevision: 0,
   imComposerDrafts: new Map(),
   imComposerDraftRevisions: new Map(),
+  imQuote: null,
+  imQuoteDrafts: new Map(),
   imVoiceMode: false,
   imStickers: [],
   imStickerGroups: [],
@@ -819,6 +821,7 @@ function messageArchivePayload(entry, direction = "") {
   const messageRandom = String(entry.messageRandom || timMessageRandom(entry) || "").slice(0, 80);
   const sentAt = archiveTimestamp(entry.timestamp);
   const media = archiveMediaPayload(entry);
+  const quote = normalizeMessageQuote(entry.quote);
   const identity = messageRandom
     ? `${peer}|${normalizedDirection}|${messageRandom}`
     : upstreamMessageId || upstreamMessageKey || [peer, sentAt, entry.kind, entry.text, media.url || media.uuid || ""].join("|");
@@ -829,6 +832,7 @@ function messageArchivePayload(entry, direction = "") {
       delivery: String(entry.delivery || ""),
       text: String(entry.text || ""),
       media,
+      quote,
       flash_id: String(entry.flashId || ""),
     })
   );
@@ -854,6 +858,7 @@ function messageArchivePayload(entry, direction = "") {
     revoked: Boolean(entry.revoked),
     flash_id: String(entry.flashId || "").slice(0, 512),
     media,
+    quote,
   };
 }
 
@@ -5099,6 +5104,90 @@ function parseJsonValue(value) {
   }
 }
 
+function normalizeMessageQuote(value) {
+  let payload = value && typeof value === "object" && !Array.isArray(value) ? value : parseJsonValue(value);
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  if (payload.bbw_message && typeof payload.bbw_message === "object") {
+    payload = payload.bbw_message.quote;
+  } else if (payload.quote && typeof payload.quote === "object") {
+    payload = payload.quote;
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const bounded = (candidate, limit) => String(candidate ?? "").trim().slice(0, limit);
+  const quote = {
+    message_id: bounded(payload.message_id ?? payload.messageId ?? payload.id, 512),
+    message_random: bounded(payload.message_random ?? payload.messageRandom ?? payload.msg_random, 80),
+    sender_uid: bounded(payload.sender_uid ?? payload.senderUid ?? payload.from, 128),
+    sender_name: bounded(payload.sender_name ?? payload.senderName ?? payload.author, 120),
+    text: bounded(payload.text ?? payload.preview ?? payload.content, 500),
+    kind: bounded(payload.kind ?? payload.message_type ?? payload.type, 40) || "text",
+    sent_at: bounded(payload.sent_at ?? payload.sentAt ?? payload.timestamp ?? payload.time, 80),
+  };
+  return [quote.message_id, quote.message_random, quote.sender_uid, quote.text].some(Boolean) ? quote : null;
+}
+
+function messageQuoteCloudCustomData(quote) {
+  const normalized = normalizeMessageQuote(quote);
+  if (!normalized) return "";
+  return JSON.stringify({ bbw_message: { version: 1, quote: normalized } });
+}
+
+function messageQuoteFrom(message, payload, cloud) {
+  return (
+    normalizeMessageQuote(message?.quote) ||
+    normalizeMessageQuote(payload?.quote) ||
+    normalizeMessageQuote(cloud?.parsed) ||
+    normalizeMessageQuote(cloud?.raw)
+  );
+}
+
+function messageQuotePreviewText(entry) {
+  if (!entry) return "[消息]";
+  return String(messagePreview(entry) || "[消息]").trim().slice(0, 500);
+}
+
+function messageQuoteSnapshot(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  const peer = String(entry.peer || S.activePeer || "").trim();
+  const me = String(S.user?.uid || S.user?.id || "").trim();
+  const senderUid = String(
+    entry.senderUid ||
+      entry.sender_uid ||
+      entry.rawMessage?.from ||
+      entry.rawMessage?.from_user_id ||
+      (entry.type === "mine" ? me : peer)
+  ).trim();
+  const conversation = S.conversations.find((item) => conversationPeer(item) === peer) || {};
+  const senderName = String(
+    entry.senderName ||
+      entry.sender_name ||
+      (entry.type === "mine"
+        ? S.user?.nickname || S.user?.name || "我"
+        : conversationDisplayName(conversation) || (peer === S.activePeer ? S.activePeerName : "") || `用户 ${peer}`)
+  ).trim();
+  return normalizeMessageQuote({
+    message_id: entry.id,
+    message_random: entry.messageRandom || timMessageRandom(entry),
+    sender_uid: senderUid,
+    sender_name: senderName,
+    text: messageQuotePreviewText(entry),
+    kind: entry.kind || "text",
+    sent_at: entry.timestamp,
+  });
+}
+
+function messageQuoteAuthorLabel(quote) {
+  const normalized = normalizeMessageQuote(quote);
+  if (!normalized) return "未知用户";
+  if (normalized.sender_name) return normalized.sender_name;
+  const me = String(S.user?.uid || S.user?.id || "");
+  if (normalized.sender_uid && normalized.sender_uid === me) return "我";
+  if (normalized.sender_uid && normalized.sender_uid === String(S.activePeer || "")) {
+    return S.activePeerName || `用户 ${normalized.sender_uid}`;
+  }
+  return normalized.sender_uid ? `用户 ${normalized.sender_uid}` : "未知用户";
+}
+
 function decodeMessageData(value) {
   if (value == null) return "";
   if (typeof value === "string") return value;
@@ -5631,6 +5720,7 @@ function timMessageEntry(message, peer = "", me = String(S.user?.uid || S.user?.
     payload,
     cloudCustomData: cloud.raw,
     cloudCustomDataParsed: cloud.parsed,
+    quote: messageQuoteFrom(message, payload, cloud),
     media: normalizeEntryMedia(kind, payload, message),
     flashId: kind === "flash" ? messageFlashID(message, payload, cloud) : "",
     type: outgoing ? "mine" : "",
@@ -5726,6 +5816,30 @@ function canRetryFailedChatMessage(entry) {
   );
 }
 
+function canQuoteChatMessage(entry) {
+  return Boolean(
+    entry &&
+      entry.type !== "system" &&
+      !entry.revoked &&
+      entry.delivery !== "sending" &&
+      entry.delivery !== "failed" &&
+      String(entry.peer || "") === String(S.activePeer || "") &&
+      !isSystemCustomerServicePeer(entry.peer) &&
+      canStartPrivateChat(entry.peer) &&
+      (String(entry.id || "").trim() || String(entry.messageRandom || timMessageRandom(entry) || "").trim())
+  );
+}
+
+function chatMessageQuoteHtml(entry) {
+  const quote = normalizeMessageQuote(entry?.quote);
+  if (!quote || entry?.revoked) return "";
+  return `<button type="button" class="chat-message-quote" data-action="jump-to-quoted-message" data-quote-message-id="${esc(
+    quote.message_id
+  )}" data-quote-message-random="${esc(quote.message_random)}" aria-label="跳转到被引用的消息"><strong>${esc(
+    messageQuoteAuthorLabel(quote)
+  )}</strong><span>${esc(quote.text || "[消息]")}</span></button>`;
+}
+
 function chatMessageBodyHtml(entry) {
   if (entry.revoked) {
     if (canEditRevokedMessage(entry)) {
@@ -5805,6 +5919,10 @@ function chatMessageBodyHtml(entry) {
   return `<span class="chat-message-text">${messageTextHtml(entry.text || "[暂不支持的消息]")}</span>`;
 }
 
+function chatMessageContentHtml(entry) {
+  return `${chatMessageQuoteHtml(entry)}${chatMessageBodyHtml(entry)}`;
+}
+
 function chatLogHtml() {
   const entries = S.imMessages.filter(
     (entry) => entry.type !== "system" && (!entry.peer || !S.activePeer || entry.peer === S.activePeer)
@@ -5826,6 +5944,7 @@ function chatLogHtml() {
       const revokeAction = revokeActionInfo(entry);
       const canRetry = canRetryFailedChatMessage(entry);
       const canEditRevoked = canEditRevokedMessage(entry);
+      const canQuote = canQuoteChatMessage(entry);
       const sentTime = chatMessageTimeInfo(entry.timestamp);
       const readTime = chatMessageReadTimeInfo(entry, sentTime);
       const stateIndicator =
@@ -5855,17 +5974,30 @@ function chatLogHtml() {
             )}" aria-label="重试发送" title="重新发送这条消息">重试</button>`
           : ""
       }${
+        canQuote
+          ? `<button type="button" class="chat-message-action quote contextual" data-action="quote-chat-message" data-message-id="${esc(
+              entry.id
+            )}" data-message-random="${esc(
+              entry.messageRandom || timMessageRandom(entry)
+            )}" aria-label="引用消息" title="引用这条消息">引用</button>`
+          : ""
+      }${
         revokeAction
-          ? `<button type="button" class="chat-message-action${
+          ? `<button type="button" class="chat-message-action contextual${
               revokeAction.outsideDefaultWindow ? " is-outside-default-window" : ""
             }" data-action="revoke-chat-message" data-message-id="${esc(entry.id)}" aria-label="${esc(
               revokeAction.title
             )}" title="${esc(revokeAction.title)}">${esc(revokeAction.label)}</button>`
           : ""
       }`;
-      return `<div class="chat-message-row${mineClass}"><div class="chat-message-main${mineClass}">${stateIndicator}<div class="chat-line${mineClass}${
+      const hasContextActions = Boolean(canQuote || revokeAction);
+      return `<div class="chat-message-row${mineClass}${hasContextActions ? " has-context-actions" : ""}" data-message-id="${esc(entry.id)}" data-message-random="${esc(
+        entry.messageRandom || timMessageRandom(entry)
+      )}"><div class="chat-message-main${mineClass}">${stateIndicator}<div class="chat-line${mineClass}${
         entry.revoked ? ` is-revoked${canEditRevoked ? " can-edit" : ""}` : ""
-      } chat-kind-${esc(entry.kind || "text")}" data-message-id="${esc(entry.id)}">${chatMessageBodyHtml(entry)}${
+      } chat-kind-${esc(entry.kind || "text")}" data-message-id="${esc(entry.id)}" data-chat-message-bubble${
+        hasContextActions ? ' tabindex="0" aria-label="显示消息操作" aria-expanded="false"' : ""
+      }>${chatMessageContentHtml(entry)}${
         entry.delivery === "sending" && entry.kind !== "text"
           ? `<progress class="chat-upload-track" max="100" value="${Math.min(
               100,
@@ -5949,6 +6081,28 @@ function refreshChatLog({ forceBottom = false } = {}) {
   if (shouldStickToBottom) scrollChatLogToBottom(log);
 }
 
+function closeChatMessageActions() {
+  document.querySelectorAll(".chat-message-row.is-actions-open").forEach((row) => {
+    row.classList.remove("is-actions-open");
+    const bubble = row.querySelector("[data-chat-message-bubble]");
+    bubble?.setAttribute("aria-label", "显示消息操作");
+    bubble?.setAttribute("aria-expanded", "false");
+  });
+}
+
+function toggleChatMessageActions(row) {
+  if (!row?.classList.contains("has-context-actions")) return false;
+  const shouldOpen = !row.classList.contains("is-actions-open");
+  closeChatMessageActions();
+  if (shouldOpen) {
+    row.classList.add("is-actions-open");
+    const bubble = row.querySelector("[data-chat-message-bubble]");
+    bubble?.setAttribute("aria-label", "隐藏消息操作");
+    bubble?.setAttribute("aria-expanded", "true");
+  }
+  return shouldOpen;
+}
+
 function clearPeerMediaReconcile(peer = "") {
   const target = String(peer || "").trim();
   const entries = target
@@ -5994,6 +6148,7 @@ function peerMessageRevision(peer) {
         entry.peerRead,
         entry.readAt,
         entry.flashId,
+        JSON.stringify(normalizeMessageQuote(entry.quote) || null),
         entry.media?.url,
         entry.media?.thumbnail,
         entry.media?.uuid,
@@ -6033,6 +6188,7 @@ function mergePeerMessages(peer, incoming) {
             retryFile: entry.delivery === "sent" ? null : entry.retryFile ?? previous.retryFile ?? null,
             retryMeta: entry.delivery === "sent" ? null : entry.retryMeta ?? previous.retryMeta ?? null,
             retryError: entry.delivery === "sent" ? "" : entry.retryError ?? previous.retryError ?? "",
+            quote: normalizeMessageQuote(entry.quote) || normalizeMessageQuote(previous.quote),
           }
         : entry
     );
@@ -6466,6 +6622,7 @@ function closeActiveConversationForRemoval() {
   S.imVoiceMode = false;
   S.activePeer = "";
   restoreChatComposerDraft("");
+  restoreChatMessageQuote("");
   S.activePeerName = "";
 }
 
@@ -6476,7 +6633,10 @@ function removeConversationListItems(peers) {
   const conversations = S.conversations.filter((item) => targets.has(conversationPeer(item)));
   if (!conversations.length) return { count: 0, wasActive: false };
   dismissConversationPeers(conversations);
-  targets.forEach(clearConversationDeleteTimer);
+  targets.forEach((peer) => {
+    clearConversationDeleteTimer(peer);
+    S.imQuoteDrafts.delete(peer);
+  });
   const wasActive = targets.has(String(S.activePeer || ""));
   if (wasActive) {
     closeActiveConversationForRemoval();
@@ -6708,6 +6868,14 @@ function chatComposerPanelHtml() {
   return "";
 }
 
+function chatComposerQuoteHtml() {
+  const quote = normalizeMessageQuote(S.imQuote);
+  if (!quote) return "";
+  return `<div class="chat-compose-quote"><div class="chat-compose-quote-content"><strong>正在引用 ${esc(
+    messageQuoteAuthorLabel(quote)
+  )}</strong><span>${esc(quote.text || "[消息]")}</span></div><button type="button" data-action="cancel-chat-quote">取消引用</button></div>`;
+}
+
 function chatComposerHtml() {
   const recording = S.imRecordingState;
   const recordingAvailability = voiceRecordingAvailability();
@@ -6717,7 +6885,7 @@ function chatComposerHtml() {
     S.imComposerPanel ? " panel-open" : ""
   }" data-form="im-send"><input type="hidden" name="peer" value="${esc(
     S.activePeer
-  )}" /><div class="chat-compose-main">
+  )}" />${chatComposerQuoteHtml()}<div class="chat-compose-main">
       <button type="button" class="chat-tool-button chat-voice-toggle${voiceMode ? " on" : ""}" data-action="toggle-chat-voice" ${
         recordingAvailability.available ? "" : "disabled"
       } title="${esc(recordingAvailability.reason)}" aria-pressed="${voiceMode ? "true" : "false"}">${
@@ -7022,6 +7190,29 @@ function restoreChatComposerDraft(peer) {
   return next;
 }
 
+function setChatMessageQuote(value, peer = S.activePeer) {
+  const target = String(peer || "").trim();
+  const quote = normalizeMessageQuote(value);
+  if (!target || !quote) return clearChatMessageQuote(target);
+  S.imQuoteDrafts.set(target, quote);
+  if (target === String(S.activePeer || "")) S.imQuote = quote;
+  return quote;
+}
+
+function clearChatMessageQuote(peer = S.activePeer) {
+  const target = String(peer || "").trim();
+  if (target) S.imQuoteDrafts.delete(target);
+  if (!target || target === String(S.activePeer || "")) S.imQuote = null;
+  return null;
+}
+
+function restoreChatMessageQuote(peer) {
+  const target = String(peer || "").trim();
+  S.imQuote = target ? normalizeMessageQuote(S.imQuoteDrafts.get(target)) : null;
+  if (target && !S.imQuote) S.imQuoteDrafts.delete(target);
+  return S.imQuote;
+}
+
 function reportConversationRead(peer) {
   const target = String(peer || "").trim();
   if (!target) return Promise.resolve(false);
@@ -7102,6 +7293,17 @@ function refreshChatComposerKeepingText({ focus = false } = {}) {
     syncChatComposerInput(input);
     if (focus) input.focus({ preventScroll: true });
   }
+}
+
+function refreshChatComposerQuote({ focus = false } = {}) {
+  const composer = document.querySelector(".chat-composer");
+  if (!composer) return false;
+  composer.querySelector(".chat-compose-quote")?.remove();
+  const main = composer.querySelector(".chat-compose-main");
+  const quoteHtml = chatComposerQuoteHtml();
+  if (main && quoteHtml) main.insertAdjacentHTML("beforebegin", quoteHtml);
+  if (focus && !S.imVoiceMode) $("im-text")?.focus({ preventScroll: true });
+  return true;
 }
 
 function closeChatComposerPanelForKeyboard() {
@@ -7277,6 +7479,76 @@ function findChatMessage(id, peer = S.activePeer) {
   );
 }
 
+function findChatMessageByIdentity(id, messageRandom, peer = S.activePeer) {
+  const messageID = String(id || "").trim();
+  const random = String(messageRandom || "").trim();
+  const target = String(peer || "");
+  return (
+    S.imMessages.find((entry) => {
+      if (String(entry.peer || "") !== target) return false;
+      if (messageID && String(entry.id || "") === messageID) return true;
+      return Boolean(random && String(entry.messageRandom || timMessageRandom(entry) || "") === random);
+    }) || null
+  );
+}
+
+function quoteChatMessage(id, messageRandom = "") {
+  const entry = findChatMessageByIdentity(id, messageRandom);
+  if (!canQuoteChatMessage(entry)) throw new Error("这条消息当前无法引用");
+  const quote = messageQuoteSnapshot(entry);
+  if (!quote) throw new Error("无法生成这条消息的引用摘要");
+  setChatMessageQuote(quote, entry.peer);
+  S.imComposerPanel = "";
+  S.imVoiceMode = false;
+  const composer = document.querySelector(".chat-composer");
+  composer?.classList.remove("voice-mode", "panel-open");
+  composer?.querySelector(".chat-composer-panel")?.remove();
+  composer?.querySelectorAll('[data-action="toggle-chat-panel"]').forEach((button) => {
+    button.classList.remove("on");
+    button.setAttribute("aria-expanded", "false");
+  });
+  const voiceToggle = composer?.querySelector('[data-action="toggle-chat-voice"]');
+  if (voiceToggle) {
+    voiceToggle.classList.remove("on");
+    voiceToggle.setAttribute("aria-pressed", "false");
+    voiceToggle.textContent = "语音";
+  }
+  refreshChatComposerQuote({ focus: true });
+  return quote;
+}
+
+function findQuotedMessage(quote, peer = S.activePeer) {
+  const normalized = normalizeMessageQuote(quote);
+  if (!normalized) return null;
+  return findChatMessageByIdentity(normalized.message_id, normalized.message_random, peer);
+}
+
+async function jumpToQuotedMessage(quote) {
+  const normalized = normalizeMessageQuote(quote);
+  if (!normalized) throw new Error("引用信息不完整");
+  let entry = findQuotedMessage(normalized);
+  if (!entry && S.activePeer) {
+    await loadConversationMessages(S.activePeer, { force: true });
+    entry = findQuotedMessage(normalized);
+  }
+  if (!entry) {
+    toast("原消息不在当前已加载的记录中", "error", 3200);
+    return false;
+  }
+  const rows = [...document.querySelectorAll("#im-log .chat-message-row")];
+  const target = rows.find((row) => {
+    if (normalized.message_id && row.dataset.messageId === normalized.message_id) return true;
+    return Boolean(normalized.message_random && row.dataset.messageRandom === normalized.message_random);
+  });
+  if (!target) return false;
+  target.classList.remove("is-quote-target");
+  void target.offsetWidth;
+  target.classList.add("is-quote-target");
+  target.scrollIntoView({ behavior: "smooth", block: "center" });
+  setTimeout(() => target.classList.remove("is-quote-target"), 1800);
+  return true;
+}
+
 async function retryFailedChatMessage(id) {
   const entry = findChatMessage(id);
   if (!canRetryFailedChatMessage(entry)) throw new Error("这条消息没有可用的重试数据");
@@ -7285,6 +7557,7 @@ async function retryFailedChatMessage(id) {
     return sendTextMessage(entry.peer, entry.text, {
       retryMessageId: entry.id,
       peerName: conversation.nickname || conversation.peer_name || conversation.user?.nickname || `用户 ${entry.peer}`,
+      quote: entry.quote,
     });
   }
   if (entry.kind === "flash") {
@@ -7385,10 +7658,11 @@ function localMessageID(prefix = "message") {
   return `local-${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "" } = {}) {
+async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "", quote = null } = {}) {
   const target = String(peer || "").trim();
   const content = String(text || "").trim();
   const previous = retryMessageId ? findChatMessage(retryMessageId, target) : null;
+  const messageQuote = normalizeMessageQuote(quote || previous?.quote);
   const pendingID = previous?.id || localMessageID("text");
   const pending = {
     ...(previous || {}),
@@ -7409,6 +7683,7 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "" 
     progress: 0,
     retryError: "",
     preview: content,
+    quote: messageQuote,
   };
   if (previous) updateLocalMessage(pendingID, pending);
   else appendLocalMessage(pending);
@@ -7423,11 +7698,14 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "" 
     let sentEntry;
     if (S.imConnected && S.imMode === "sdk" && S.chat && resolveTimApi()) {
       const TIM = resolveTimApi();
-      const message = S.chat.createTextMessage({
+      const cloudCustomData = messageQuoteCloudCustomData(messageQuote);
+      const options = {
         to: target,
         conversationType: TIM.TYPES.CONV_C2C,
         payload: { text: content },
-      });
+      };
+      if (cloudCustomData) options.cloudCustomData = cloudCustomData;
+      const message = S.chat.createTextMessage(options);
       const result = await S.chat.sendMessage(message);
       const sentMessage = result?.data?.message || result?.message || message;
       sentEntry = timMessageEntry(sentMessage, target);
@@ -7439,7 +7717,7 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "" 
       const wasDisconnected = !S.imConnected;
       const { data } = await api("/api/im/rest/send", {
         method: "POST",
-        body: JSON.stringify({ to: target, text: content }),
+        body: JSON.stringify({ to: target, text: content, quote: messageQuote }),
         timeout: 15000,
       });
       if (!data.ok) {
@@ -7464,6 +7742,7 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "" 
         source: "rest",
         peerRead: false,
         delivery: "sent",
+        quote: messageQuote,
       };
     } else {
       throw new Error("消息通道尚未连接");
@@ -7485,6 +7764,7 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "" 
       progress: 1,
       retryError: "",
       preview: content,
+      quote: messageQuote,
     };
     updateLocalMessage(pendingID, replacement);
     updateConversationActivity(target, {
@@ -11748,6 +12028,8 @@ async function logout() {
     setChatComposerDraft("");
     S.imComposerDrafts.clear();
     S.imComposerDraftRevisions.clear();
+    S.imQuote = null;
+    S.imQuoteDrafts.clear();
     S.imVoiceMode = false;
     S.imStickers = [];
     S.imStickerGroups = [];
@@ -12016,6 +12298,22 @@ async function handleAction(action, button) {
     await revokeChatMessage(button.dataset.messageId);
     return;
   }
+  if (action === "quote-chat-message") {
+    quoteChatMessage(button.dataset.messageId, button.dataset.messageRandom);
+    return;
+  }
+  if (action === "cancel-chat-quote") {
+    clearChatMessageQuote();
+    refreshChatComposerQuote({ focus: true });
+    return;
+  }
+  if (action === "jump-to-quoted-message") {
+    await jumpToQuotedMessage({
+      message_id: button.dataset.quoteMessageId,
+      message_random: button.dataset.quoteMessageRandom,
+    });
+    return;
+  }
   if (action === "edit-revoked-message") {
     editRevokedMessage(button.dataset.messageId);
     return;
@@ -12207,6 +12505,7 @@ async function handleAction(action, button) {
     }
     S.activePeer = uid;
     restoreChatComposerDraft(uid);
+    restoreChatMessageQuote(uid);
     S.activePeerName = button.dataset.name || `用户 ${uid}`;
     ensureConversationForPeer(uid, {
       name: S.activePeerName,
@@ -12236,6 +12535,7 @@ async function handleAction(action, button) {
     S.imVoiceMode = false;
     S.activePeer = "";
     restoreChatComposerDraft("");
+    restoreChatMessageQuote("");
     S.activePeerName = "";
     refreshMessageConversationRegion({ refreshList: false });
     return;
@@ -12633,6 +12933,9 @@ async function handleProductForm(form, submitter) {
     setChatComposerDraft(submittedDraft);
     const submittedDraftRevision = S.imComposerDraftRevision;
     const submittedPeerDraftRevision = Number(S.imComposerDraftRevisions.get(peer) || 0);
+    const submittedQuote = normalizeMessageQuote(
+      peer === String(S.activePeer || "") ? S.imQuote : S.imQuoteDrafts.get(peer)
+    );
     const text = submittedDraft.trim();
     if (!peer || !text) throw new Error("请输入对方 UID 和消息内容");
     if (isSystemCustomerServicePeer(peer)) throw new Error("系统客服消息无需回复");
@@ -12645,8 +12948,10 @@ async function handleProductForm(form, submitter) {
       `用户 ${peer}`;
     if (!canStartPrivateChat(peer)) throw new Error("该私信入口仅向管理员授权的用户开放");
 
-    const sendTask = sendTextMessage(peer, text, { peerName: submittedPeerName });
+    const sendTask = sendTextMessage(peer, text, { peerName: submittedPeerName, quote: submittedQuote });
     consumeSubmittedChatDraft(peer, submittedDraft, submittedDraftRevision, submittedPeerDraftRevision);
+    clearChatMessageQuote(peer);
+    if (peer === String(S.activePeer || "")) document.querySelector(".chat-compose-quote")?.remove();
     return sendTask;
   }
   if (kind === "lab-call") {
@@ -13023,7 +13328,30 @@ document.addEventListener("keyup", (event) => {
   else closeFlashViewer();
 });
 
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    closeChatMessageActions();
+    return;
+  }
+  if (event.repeat || ![" ", "Enter"].includes(event.key)) return;
+  const bubble = event.target.closest && event.target.closest("[data-chat-message-bubble]");
+  if (!bubble || event.target !== bubble) return;
+  const row = bubble.closest(".chat-message-row");
+  if (!row?.classList.contains("has-context-actions")) return;
+  event.preventDefault();
+  toggleChatMessageActions(row);
+});
+
 document.addEventListener("click", (event) => {
+  const actionButton = event.target.closest && event.target.closest("[data-action]");
+  const messageBubble = event.target.closest && event.target.closest("[data-chat-message-bubble]");
+  const nativeInteractive = event.target.closest && event.target.closest("button, a, input, textarea, select, audio, video");
+  if (messageBubble && !actionButton && !nativeInteractive) {
+    event.preventDefault();
+    toggleChatMessageActions(messageBubble.closest(".chat-message-row"));
+    return;
+  }
+  closeChatMessageActions();
   const swipedCard = event.target.closest && event.target.closest(".conversation-card");
   if (swipedCard?.closest("[data-conversation-item]")?.dataset.suppressConversationClick === "true") {
     event.preventDefault();
@@ -13037,7 +13365,6 @@ document.addEventListener("click", (event) => {
     else go(target);
     return;
   }
-  const actionButton = event.target.closest("[data-action]");
   if (!actionButton) return;
   event.preventDefault();
   void withPending(actionButton, () => handleAction(actionButton.dataset.action, actionButton));

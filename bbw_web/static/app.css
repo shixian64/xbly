@@ -2902,6 +2902,56 @@ summary:focus-visible {
   white-space: pre-wrap;
 }
 
+.chat-message-quote {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  gap: 0.16rem;
+  border: 0;
+  border-left: 3px solid rgba(117, 79, 181, 0.42);
+  border-radius: 7px;
+  background: rgba(117, 79, 181, 0.07);
+  color: inherit;
+  margin: 0 0 0.38rem;
+  padding: 0.34rem 0.45rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-message-quote strong,
+.chat-message-quote span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-message-quote strong {
+  color: var(--brand-dark);
+  font-size: 0.68rem;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.chat-message-quote span {
+  display: -webkit-box;
+  color: var(--muted);
+  font-size: 0.67rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.chat-message-quote:hover,
+.chat-message-quote:focus-visible {
+  background: rgba(117, 79, 181, 0.13);
+  outline: 1px solid rgba(117, 79, 181, 0.2);
+}
+
+.chat-message-row.is-quote-target .chat-line {
+  box-shadow: 0 0 0 3px rgba(117, 79, 181, 0.28), var(--shadow-sm);
+}
+
 .chat-inline-emoji {
   display: inline-block;
   width: 1.75em;
@@ -2963,6 +3013,25 @@ summary:focus-visible {
   cursor: pointer;
 }
 
+.chat-message-action.contextual {
+  display: none;
+}
+
+.chat-message-row.is-actions-open .chat-message-action.contextual {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.chat-message-row.has-context-actions .chat-line {
+  cursor: pointer;
+}
+
+.chat-message-row.has-context-actions .chat-line:focus-visible {
+  outline: 2px solid rgba(117, 79, 181, 0.28);
+  outline-offset: 2px;
+}
+
 .chat-message-action:hover,
 .chat-message-action:focus-visible {
   background: var(--surface-solid);
@@ -2984,6 +3053,16 @@ summary:focus-visible {
 
 .chat-message-action.retry:hover,
 .chat-message-action.retry:focus-visible {
+  background: var(--brand-soft);
+  color: var(--brand-dark);
+}
+
+.chat-message-action.quote {
+  color: var(--brand-dark);
+}
+
+.chat-message-action.quote:hover,
+.chat-message-action.quote:focus-visible {
   background: var(--brand-soft);
   color: var(--brand-dark);
 }
@@ -3046,6 +3125,10 @@ summary:focus-visible {
   .chat-message-action:focus-visible {
     opacity: 1;
   }
+
+  .chat-message-row.is-actions-open .chat-message-action.contextual {
+    opacity: 1;
+  }
 }
 
 .chat-message-state.is-read {
@@ -3088,6 +3171,59 @@ summary:focus-visible {
   border-top: 1px solid var(--line);
   background: rgba(247, 247, 249, 0.98);
   padding: 0.65rem 0.75rem;
+}
+
+.chat-compose-quote {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+  border-left: 3px solid rgba(117, 79, 181, 0.48);
+  border-radius: 8px;
+  background: rgba(117, 79, 181, 0.08);
+  padding: 0.42rem 0.5rem;
+}
+
+.chat-compose-quote-content {
+  display: grid;
+  min-width: 0;
+  gap: 0.12rem;
+}
+
+.chat-compose-quote-content strong,
+.chat-compose-quote-content span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-compose-quote-content strong {
+  color: var(--brand-dark);
+  font-size: 0.69rem;
+}
+
+.chat-compose-quote-content span {
+  color: var(--muted);
+  font-size: 0.66rem;
+}
+
+.chat-compose-quote > button {
+  min-height: 30px;
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--muted);
+  padding: 0.25rem 0.48rem;
+  font-size: 0.66rem;
+  font-weight: 650;
+}
+
+.chat-compose-quote > button:hover,
+.chat-compose-quote > button:focus-visible {
+  border-color: rgba(117, 79, 181, 0.3);
+  color: var(--brand-dark);
 }
 
 .chat-compose-main {
@@ -5713,6 +5849,7 @@ html.flash-viewing body {
   .chat-sticker-tab,
   .chat-panel-head button,
   .chat-playback-fallback button,
+  .chat-compose-quote > button,
   .chat-compose-main .btn,
   .chat-head > .utility-btn {
     min-height: 44px;

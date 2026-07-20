@@ -29,6 +29,7 @@ if str(ROOT) not in sys.path:
 from bbw_web.store import SessionStore  # noqa: E402
 from bbw_web import normalize as N  # noqa: E402
 from bbw_web import flash_photo as F  # noqa: E402
+from bbw_web.message_quote import encode_message_quote, normalize_message_quote  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 COOKIE_NAME = "bbw_sid"
@@ -3439,7 +3440,19 @@ class Handler(BaseHTTPRequestHandler):
                 capabilities = Handler.web_user_capabilities(self, u)
                 if not Handler.can_message_peer(self, u, to_uid):
                     return Handler.deny_private_message(self, capabilities)
-                r = u.native.tim_rest.send_text(from_uid, to_uid, text)
+                quote = normalize_message_quote(data.get("quote"))
+                quote_cloud_data = encode_message_quote(quote)
+                send_options = (
+                    {"cloud_custom_data": quote_cloud_data}
+                    if quote_cloud_data
+                    else {}
+                )
+                r = u.native.tim_rest.send_text(
+                    from_uid,
+                    to_uid,
+                    text,
+                    **send_options,
+                )
                 # Best-effort: also mirror into banghua history if action exists.
                 hist = None
                 try:

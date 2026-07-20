@@ -60,6 +60,7 @@ from bbw_prod.services import (
 from bbw_protocol.adapters.tim_rest import TimRestClient
 from bbw_web.media_archive import MediaArchiveError, PreparedMedia, download_and_prepare
 from bbw_web.match_history import MATCH_HISTORY_PROVIDER, MATCH_HISTORY_RETENTION_DAYS
+from bbw_web.message_quote import extract_message_quote, normalize_message_quote
 from bbw_web.normalize import normalize_conversations, normalize_messages
 from bbw_web.r2 import R2Storage
 
@@ -568,6 +569,7 @@ def _ingest_message(
         "read_at": _bounded(report.get("read_at"), 80),
         "flash_id": _bounded(report.get("flash_id"), 512),
         "media_report": _json_safe(report.get("media")),
+        "quote": normalize_message_quote(report.get("quote")),
         "raw_upstream_message_id": raw_upstream_message_id,
         "raw_upstream_message_ids": [raw_upstream_message_id]
         if raw_upstream_message_id
@@ -885,6 +887,11 @@ def _history_message_report(
         "read_at": str(item.get("read_time") or item.get("readTime") or ""),
         "flash_id": str(item.get("flash_unique_id") or ""),
         "media": media,
+        "quote": extract_message_quote(
+            item.get("cloud_custom_data")
+            or item.get("cloudCustomData")
+            or item.get("CloudCustomData")
+        ),
         "sender_upstream_uid": from_uid,
         "recipient_upstream_uid": to_uid,
     }
