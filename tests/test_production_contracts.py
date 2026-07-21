@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import hashlib
 import importlib.util
 import json
 import sys
@@ -753,7 +754,10 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn(".boot-screen", css)
         hide_rule = css.split(".hide {", 1)[1].split("}", 1)[0]
         self.assertIn("display: none !important", hide_rule)
-        self.assertIn("auth-bootstrap", html)
+        self.assertIn(
+            f'/static/app.js?v={hashlib.sha256((ROOT / "bbw_web" / "static" / "app.js").read_bytes()).hexdigest()[:16]}',
+            html,
+        )
 
         show_login = js.split("function showLogin", 1)[1].split("function applyUser", 1)[0]
         self.assertIn('bootScreen.classList.add("hide")', show_login)

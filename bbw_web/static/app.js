@@ -2901,7 +2901,7 @@ function presenceFromEntity(entity) {
   const hidden = flagEnabled(item.hide_online ?? item.hideOnline);
   if (hidden) return normalizePeerPresence("", true);
   if (Object.prototype.hasOwnProperty.call(item, "is_online") && item.is_online != null) {
-    return normalizePeerPresence(Boolean(item.is_online));
+    return normalizePeerPresence(item.is_online);
   }
   return normalizePeerPresence(
     item.presence_status ?? item.online_status ?? item.onlineStatus ?? item.online
@@ -2964,7 +2964,7 @@ function presenceFromRow(item) {
     Object.prototype.hasOwnProperty.call(item || {}, "is_online") &&
     item.is_online != null
   ) {
-    presence = normalizePeerPresence(Boolean(item.is_online));
+    presence = normalizePeerPresence(item.is_online);
   }
   return presence;
 }
@@ -3001,16 +3001,32 @@ function timPresenceRows(result) {
   return [];
 }
 
+function handlePeerPresenceEvent(event) {
+  const rows = timPresenceRows(event);
+  const resolvedUids = rememberPeerPresence(rows, "tim-event");
+  const unknownUids = new Set(
+    rows.map((item) => presenceUidFromRow(item)).filter((uid) => uid && !resolvedUids.has(uid))
+  );
+  unknownUids.forEach((uid) => {
+    const cached = S.presenceByUid.get(uid);
+    if (cached?.status === "unknown") S.presenceByUid.set(uid, { ...cached, updatedAt: 0 });
+  });
+  if (unknownUids.size) void refreshVisiblePeerPresence();
+}
+
 async function subscribePeerPresence(uids) {
   if (S.imMode !== "sdk" || !S.chat || typeof S.chat.subscribeUserStatus !== "function") return;
-  const additions = uids.filter((uid) => uid && !S.subscribedPresenceUids.has(uid)).slice(0, 100);
+  const additions = [...new Set(uids.filter((uid) => uid && !S.subscribedPresenceUids.has(uid)))];
   if (!additions.length) return;
-  try {
-    await S.chat.subscribeUserStatus({ userIDList: additions });
-    additions.forEach((uid) => S.subscribedPresenceUids.add(uid));
-  } catch {
-    // REST polling remains the product fallback when status subscription is unavailable.
-  }
+  const chunks = [];
+  for (let index = 0; index < additions.length; index += 100) chunks.push(additions.slice(index, index + 100));
+  const results = await Promise.allSettled(
+    chunks.map((chunk) => S.chat.subscribeUserStatus({ userIDList: chunk }))
+  );
+  results.forEach((result, index) => {
+    if (result.status !== "fulfilled") return;
+    chunks[index].forEach((uid) => S.subscribedPresenceUids.add(uid));
+  });
 }
 
 async function refreshVisiblePeerPresence({ force = false } = {}) {
@@ -3276,7 +3292,7 @@ function userCard(item, options = {}) {
     }>资料</button>`);
   }
   const titleMetaHtml = String(options.titleMetaHtml || "");
-  const presence = options.presence && id ? presenceBadgeHtml(id, user) : "";
+  const presence = options.presence && id ? presenceBadgeHtml(id, user, "", true) : "";
   const cardClass = ["user-card", String(options.className || "").trim()].filter(Boolean).join(" ");
   return `<article class="${esc(cardClass)}">
     ${avatarHtml(user.avatar || user.portrait)}
@@ -7909,7 +7925,8 @@ function chatPaneHtml() {
   )}</h2><p class="chat-peer-presence">${presenceBadgeHtml(
     S.activePeer,
     { ...(conversation.user || {}), ...conversation },
-    "presence-compact"
+    "presence-compact",
+    true
   )}</p></div><button type="button" class="utility-btn chat-profile" data-action="open-profile" data-uid="${esc(
     S.activePeer
   )}">资料</button></div>
@@ -12843,7 +12860,7 @@ function attachTimHandlers(chat, TIM, credential) {
     chat.on(TIM.EVENT.MESSAGE_READ_RECEIPT_RECEIVED, S.imReadHandler);
   }
 
-  S.imPresenceHandler = (event) => rememberPeerPresence(timPresenceRows(event), "tim-event");
+  S.imPresenceHandler = handlePeerPresenceEvent;
   if (TIM.EVENT?.USER_STATUS_UPDATED) chat.on(TIM.EVENT.USER_STATUS_UPDATED, S.imPresenceHandler);
 
   const markRealtimeDisconnected = (message, reconnectDelay = 5000) => {

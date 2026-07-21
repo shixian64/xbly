@@ -49,7 +49,7 @@
 			header_up X-Forwarded-Proto https
 
 			health_uri /healthz
-			health_interval 30s
+			health_interval 2s
 			health_timeout 5s
 			health_status 200
 

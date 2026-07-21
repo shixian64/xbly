@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 import time
@@ -74,7 +75,10 @@ class MessageHistoryPaginationFrontendTests(unittest.TestCase):
         ):
             self.assertIn(marker, app_js)
         self.assertIn(".chat-history-status", app_css)
-        self.assertIn("history-pagination", index_html)
+        self.assertIn(
+            f'/static/app.js?v={hashlib.sha256((ROOT / "bbw_web" / "static" / "app.js").read_bytes()).hexdigest()[:16]}',
+            index_html,
+        )
 
 
 if __name__ == "__main__":

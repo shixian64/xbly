@@ -535,8 +535,11 @@ def _normalize_presence_result(result: Any, requested: List[str]) -> Dict[str, A
         for uid in requested
     ]
     ok = bool(getattr(result, "ok", False))
+    unknown_count = sum(1 for item in items if item.get("status") == "unknown")
     return {
         "ok": ok,
+        "partial": unknown_count > 0,
+        "unknown_count": unknown_count,
         "items": items,
         "list": items,
         "count": len(items),
@@ -3241,9 +3244,12 @@ class Handler(BaseHTTPRequestHandler):
                 for uid in requested
             ]
             available = bool(normalized.get("ok")) or bool(web_online)
+            unknown_count = sum(1 for item in items if item.get("status") == "unknown")
             payload = {
                 "ok": available,
-                "partial": not bool(normalized.get("ok")) and bool(unresolved),
+                "partial": bool(normalized.get("partial"))
+                or (not bool(normalized.get("ok")) and bool(unresolved)),
+                "unknown_count": unknown_count,
                 "items": items,
                 "list": items,
                 "count": len(items),

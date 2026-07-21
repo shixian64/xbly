@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -643,6 +644,8 @@ class BffEnvelopeTests(unittest.TestCase):
         self.assertEqual(payload["items"][0]["label"], "在线")
         self.assertEqual(payload["items"][1]["label"], "离线")
         self.assertEqual(payload["items"][2]["status"], "unknown")
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["unknown_count"], 1)
         self.assertEqual(bff_server._presence_uids(["9,10", "10,11"]), ["9", "10", "11"])
 
 
@@ -1649,6 +1652,8 @@ class SocialBffRoutingTests(unittest.TestCase):
         self.assertEqual(response[1]["items"][0]["status"], "online")
         self.assertEqual(response[1]["items"][0]["source"], "web")
         self.assertEqual(response[1]["items"][1]["status"], "unknown")
+        self.assertTrue(response[1]["partial"])
+        self.assertEqual(response[1]["unknown_count"], 1)
         self.assertEqual(response[1]["retry_after"], 480)
 
     def test_false_social_lists_render_as_empty_instead_of_errors(self) -> None:
@@ -4011,7 +4016,14 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
         self.assertIn(".profile-moment-feed", app_css)
         self.assertIn(".profile-moment-time", app_css)
         self.assertIn(".profile-moments-button", app_css)
-        self.assertIn("-profile-moments-compact-cards", index_html)
+        self.assertIn(
+            f'/static/app.css?v={hashlib.sha256((root / "bbw_web" / "static" / "app.css").read_bytes()).hexdigest()[:16]}',
+            index_html,
+        )
+        self.assertIn(
+            f'/static/app.js?v={hashlib.sha256((root / "bbw_web" / "static" / "app.js").read_bytes()).hexdigest()[:16]}',
+            index_html,
+        )
 
     def test_bottle_card_uses_apk_content_and_readable_visual_hierarchy(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -4364,9 +4376,104 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
         self.assertIn("presence-badge", app_css)
 
         user_card = app_js.split("function userCard", 1)[1].split("function formatSocialTime", 1)[0]
+        chat_pane = app_js.split("function chatPaneHtml", 1)[1].split(
+            "function renderConversationList", 1
+        )[0]
         self.assertIn('<div class="card-actions">${presence}${actions.join("")}</div>', user_card)
+        self.assertIn('presenceBadgeHtml(id, user, "", true)', user_card)
+        self.assertIn('"presence-compact",\n    true', chat_pane)
         self.assertNotIn('<strong>${esc(name)}</strong>${presence}', user_card)
         self.assertIn(".card-actions > .presence-badge", app_css)
+
+    def test_peer_presence_runtime_handles_sdk_shapes_and_all_subscription_chunks(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for the frontend presence test")
+
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        badge_functions = "function flagEnabled" + app_js.split(
+            "function flagEnabled", 1
+        )[1].split("function updatePeerPresenceDom", 1)[0]
+        row_functions = "function presenceUidFromRow" + app_js.split(
+            "function presenceUidFromRow", 1
+        )[1].split("async function subscribePeerPresence", 1)[0]
+        subscribe_function = "async function subscribePeerPresence" + app_js.split(
+            "async function subscribePeerPresence", 1
+        )[1].split("async function refreshVisiblePeerPresence", 1)[0]
+        script = (
+            r"""
+const S = {
+  presenceByUid: new Map(),
+  subscribedPresenceUids: new Set(),
+  imMode: "sdk",
+  chat: null,
+};
+let refreshCalls = 0;
+function esc(value) { return String(value); }
+function updatePeerPresenceDom() {}
+function refreshVisiblePeerPresence() { refreshCalls += 1; return Promise.resolve(); }
+"""
+            + badge_functions
+            + row_functions
+            + subscribe_function
+            + r"""
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+(async () => {
+  const rows = timPresenceRows({ data: { successUserList: [
+    { userID: "1", statusType: 1 },
+    { userID: "2", statusType: 2 },
+    { userID: "3", statusType: 3 },
+    { userID: "4", statusType: 0 },
+  ] } });
+  assert(rows.length === 4, "successUserList was not recognized");
+  assert(presenceFromRow(rows[0]).status === "online", "statusType=1 should be online");
+  assert(presenceFromRow(rows[1]).status === "offline", "statusType=2 should be offline");
+  assert(presenceFromRow(rows[2]).status === "offline", "statusType=3 should be offline");
+  assert(presenceFromRow(rows[3]).status === "unknown", "statusType=0 should be unknown");
+  assert(presenceFromEntity({ is_online: "0" }).status === "offline", "string zero became online");
+  assert(presenceFromEntity({ is_online: "false" }).status === "offline", "string false became online");
+  assert(presenceFromRow({ uid: "5", is_online: "0" }).status === "offline", "row string zero became online");
+  assert(presenceFromRow({ uid: "6", is_online: "false" }).status === "offline", "row string false became online");
+  const unknownBadge = presenceBadgeHtml("4", {}, "presence-compact", true);
+  assert(unknownBadge.includes("状态未知"), "visible unknown badge lost its label");
+  assert(unknownBadge.includes('data-presence-unknown-visible="true"'), "unknown badge was not marked visible");
+
+  handlePeerPresenceEvent({ data: { successUserList: [{ userID: "4", statusType: 0 }] } });
+  assert(S.presenceByUid.get("4").updatedAt === 0, "unknown event did not expire cache immediately");
+  assert(refreshCalls === 1, "unknown event did not trigger REST fallback refresh");
+
+  const chunks = [];
+  S.chat = {
+    subscribeUserStatus({ userIDList }) {
+      chunks.push([...userIDList]);
+      return chunks.length === 2 ? Promise.reject(new Error("chunk failed")) : Promise.resolve();
+    },
+  };
+  const uids = Array.from({ length: 205 }, (_, index) => String(index + 1));
+  await subscribePeerPresence(uids);
+  assert(chunks.map((chunk) => chunk.length).join(",") === "100,100,5", "subscription was not chunked");
+  assert(S.subscribedPresenceUids.size === 105, "failed subscription chunk was recorded as successful");
+  assert(!S.subscribedPresenceUids.has("101"), "failed chunk user was marked subscribed");
+  assert(S.subscribedPresenceUids.has("205"), "final subscription chunk was skipped");
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exitCode = 1;
+});
+"""
+        )
+        result = subprocess.run(
+            [node, "-e", script],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_message_composer_supports_ctrl_enter_to_send(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -5201,28 +5308,16 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn(".mine-tab-panel.is-loading", app_css)
         self.assertIn("scrollbar-gutter: stable", app_css)
 
-    def test_static_asset_cache_versions_match_mobile_media_release(self) -> None:
+    def test_static_asset_cache_versions_match_content_hashes(self) -> None:
         root = Path(__file__).resolve().parents[1]
         index_html = (root / "bbw_web" / "static" / "index.html").read_text(encoding="utf-8")
 
         css_version = index_html.split('/static/app.css?v=', 1)[1].split('"', 1)[0]
         js_version = index_html.split('/static/app.js?v=', 1)[1].split('"', 1)[0]
-        self.assertEqual(css_version, js_version)
-        self.assertIn("mobile-media-retry-secure-viewport", css_version)
-        self.assertIn("conversation-avatar-stable", css_version)
-        self.assertIn("conversation-avatar-stable-reload", css_version)
-        self.assertIn("conversation-profile-fast", css_version)
-        self.assertIn("conversation-list-stable-paint", css_version)
-        self.assertIn("session-bootstrap-retry", css_version)
-        self.assertIn("route-dom-cache", css_version)
-        self.assertIn("panel-dom-cache", css_version)
-        self.assertIn("private-message-policy-recheck", css_version)
-        self.assertIn("private-message-entry-scope", css_version)
-        self.assertTrue(
-            css_version.endswith(
-                "-voice-url-renewal-imcloud-revoke-replay-v2-unread-authoritative-private-message-policy-hardening-unread-tie-fix-message-policy-refresh-race-fix-message-policy-cleanup-queue-fix-message-policy-latest-reconnect-fix-message-policy-deferred-reconnect-fix-contact-chat-route-restore-fix"
-            )
-        )
+        css_hash = hashlib.sha256((root / "bbw_web" / "static" / "app.css").read_bytes()).hexdigest()[:16]
+        js_hash = hashlib.sha256((root / "bbw_web" / "static" / "app.js").read_bytes()).hexdigest()[:16]
+        self.assertEqual(css_version, css_hash)
+        self.assertEqual(js_version, js_hash)
 
 
 class FlashPhotoBffContractTests(unittest.TestCase):

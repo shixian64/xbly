@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import unittest
@@ -298,8 +299,10 @@ class FrontendMessageQuoteContracts(unittest.TestCase):
         self.assertIn(".chat-message-row.is-quote-target", app_css)
         self.assertIn(".chat-message-actions.contextual", app_css)
         self.assertIn(".chat-message-row.is-actions-open", app_css)
-        self.assertIn("message-dedup-message-quote", index_html)
-        self.assertIn("message-actions-on-tap", index_html)
+        self.assertIn(
+            f'/static/app.js?v={hashlib.sha256((ROOT / "bbw_web" / "static" / "app.js").read_bytes()).hexdigest()[:16]}',
+            index_html,
+        )
         self.assertIn('normalize_message_quote(data.get("quote"))', bff_source)
         self.assertIn('{"cloud_custom_data": quote_cloud_data}', bff_source)
 

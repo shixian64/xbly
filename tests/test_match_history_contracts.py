@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import sys
 import threading
 import unittest
@@ -492,8 +493,14 @@ class MatchHistoryFrontendContractTests(unittest.TestCase):
         self.assertIn(".match-history-mode", app_css)
         css_version = index_html.split('/static/app.css?v=', 1)[1].split('"', 1)[0]
         js_version = index_html.split('/static/app.js?v=', 1)[1].split('"', 1)[0]
-        self.assertEqual(css_version, js_version)
-        self.assertIn("-match-history", css_version)
+        self.assertEqual(
+            css_version,
+            hashlib.sha256((ROOT / "bbw_web" / "static" / "app.css").read_bytes()).hexdigest()[:16],
+        )
+        self.assertEqual(
+            js_version,
+            hashlib.sha256((ROOT / "bbw_web" / "static" / "app.js").read_bytes()).hexdigest()[:16],
+        )
 
 
 if __name__ == "__main__":
