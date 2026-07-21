@@ -3559,6 +3559,7 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("proactivePrivateMessageEnabled: false", app_js)
         self.assertIn("directImCredentialsEnabled: false", app_js)
         self.assertIn("messagePolicyReady: false", app_js)
+        self.assertIn('messagePolicyFingerprint: ""', app_js)
         self.assertIn('["online", "在线列表"]', nearby)
         self.assertIn('["nearby", "附近的人"]', nearby)
         self.assertIn('data-form="nearby-filter"', nearby)
@@ -3650,7 +3651,21 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('data-action="add-friend"', open_profile)
         self.assertIn('api("/api/im/message-policy"', app_js)
         self.assertIn("setMessagePolicyReady(false)", app_js)
-        self.assertIn("setMessagePolicyReady(true)", app_js)
+        self.assertIn("function currentMessagePolicyFingerprint()", app_js)
+        self.assertIn(
+            "const policyChanged = next && S.messagePolicyFingerprint !== nextFingerprint",
+            app_js,
+        )
+        self.assertIn("if (!readyChanged && !policyChanged)", app_js)
+        self.assertIn(
+            "if (!S.messagePolicyReady) setMessagePolicyReady(false)",
+            app_js,
+        )
+        self.assertIn("currentMessagePolicyFingerprint()", app_js)
+        self.assertIn(
+            "if (transition.readyChanged || transition.policyChanged)",
+            app_js,
+        )
         self.assertIn("proactive_private_message", app_js)
         self.assertIn("direct_im_credentials", app_js)
         self.assertIn("if (!S.directImCredentialsEnabled)", app_js)

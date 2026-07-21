@@ -99,6 +99,7 @@ const S = {
   directImCredentialsEnabled: false,
   messagePolicyReady: false,
   messagePolicyGeneration: 0,
+  messagePolicyFingerprint: "",
   messagePolicyCleanupPromise: null,
   nearbyCustomCityEnabled: false,
   privateMessagePeers: new Set(),
@@ -1302,6 +1303,7 @@ function applyUser(user) {
     S.directImCredentialsEnabled = false;
     S.messagePolicyReady = false;
     S.messagePolicyGeneration += 1;
+    S.messagePolicyFingerprint = "";
     S.privateMessagePeers.clear();
     S.matchMessagePeers.clear();
     S.blockedPrivateMessagePeers.clear();
@@ -1491,13 +1493,31 @@ function updateUnreadBadges() {
   });
 }
 
-function setMessagePolicyReady(ready) {
+function currentMessagePolicyFingerprint() {
+  return JSON.stringify({
+    proactive: S.proactivePrivateMessageEnabled,
+    direct: S.directImCredentialsEnabled,
+    allowed: [...S.privateMessagePeers].sort(),
+    match: [...S.matchMessagePeers].sort(),
+    blocked: [...S.blockedPrivateMessagePeers].sort(),
+  });
+}
+
+function setMessagePolicyReady(ready, fingerprint = "") {
   const next = ready === true;
-  if (S.messagePolicyReady === next) return;
+  const nextFingerprint = next ? String(fingerprint || "") : "";
+  const readyChanged = S.messagePolicyReady !== next;
+  const policyChanged = next && S.messagePolicyFingerprint !== nextFingerprint;
+  if (!readyChanged && !policyChanged) {
+    return { readyChanged: false, policyChanged: false };
+  }
   S.messagePolicyReady = next;
+  S.messagePolicyFingerprint = nextFingerprint;
   S.messagePolicyGeneration += 1;
   syncPrivateMessageControls();
-  if (next || !(S.imMode || S.chat || S.imConnecting || S._imConnecting)) return;
+  if (next || !(S.imMode || S.chat || S.imConnecting || S._imConnecting)) {
+    return { readyChanged, policyChanged };
+  }
   S.imLastError = "私聊安全策略暂时不可用，消息通道已暂停";
   const cleanup = cleanupIM();
   S.messagePolicyCleanupPromise = cleanup;
@@ -1507,6 +1527,7 @@ function setMessagePolicyReady(ready) {
     }
     updateImConnectionStatus();
   });
+  return { readyChanged, policyChanged };
 }
 
 function resumeMessageChannelAfterPolicyReady() {
@@ -1532,20 +1553,24 @@ function refreshMessagePolicy() {
   return api("/api/im/message-policy", { timeout: 6000 })
     .then(({ data }) => {
       if (data?.ok !== true) {
-        setMessagePolicyReady(false);
+        if (!S.messagePolicyReady) setMessagePolicyReady(false);
         return {};
       }
       applyCapabilities(data.capabilities);
       replaceMessagePolicyAllowedPeers(data.allowed_peers);
       replaceMessagePolicyMatchPeers(data.match_peers);
       replaceBlockedPrivateMessagePeers(data.blocked_peers);
-      const policyWasReady = S.messagePolicyReady;
-      setMessagePolicyReady(true);
-      if (!policyWasReady) resumeMessageChannelAfterPolicyReady();
+      const transition = setMessagePolicyReady(
+        true,
+        currentMessagePolicyFingerprint()
+      );
+      if (transition.readyChanged || transition.policyChanged) {
+        resumeMessageChannelAfterPolicyReady();
+      }
       return data.capabilities || {};
     })
     .catch(() => {
-      setMessagePolicyReady(false);
+      if (!S.messagePolicyReady) setMessagePolicyReady(false);
       return {};
     });
 }
@@ -14358,6 +14383,7 @@ function completeBrowserLogin(data) {
   S.authenticated = true;
   S.messagePolicyReady = false;
   S.messagePolicyGeneration += 1;
+  S.messagePolicyFingerprint = "";
   clearAllViewCaches();
   resetMomentViewTaskAssist();
   closeMessageSyncChannel();
