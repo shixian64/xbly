@@ -3663,6 +3663,12 @@ class SocialFrontendContractTests(unittest.TestCase):
         )
         self.assertIn("currentMessagePolicyFingerprint()", app_js)
         self.assertIn(
+            "applyCapabilities(data.capabilities, { deferMessageReconnect: true })",
+            app_js,
+        )
+        self.assertIn("S.messagePolicyCleanupPromise = cleanup", app_js)
+        self.assertIn("if (!S.authenticated || deferMessageReconnect) return", app_js)
+        self.assertIn(
             "if (transition.readyChanged || transition.policyChanged)",
             app_js,
         )
@@ -5020,7 +5026,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("private-message-entry-scope", css_version)
         self.assertTrue(
             css_version.endswith(
-                "-voice-url-renewal-imcloud-revoke-replay-v2-unread-authoritative-private-message-policy-hardening-unread-tie-fix"
+                "-voice-url-renewal-imcloud-revoke-replay-v2-unread-authoritative-private-message-policy-hardening-unread-tie-fix-message-policy-refresh-race-fix"
             )
         )
 

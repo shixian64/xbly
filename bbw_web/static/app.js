@@ -1349,7 +1349,10 @@ function applyUser(user) {
   }
 }
 
-function applyCapabilities(capabilities) {
+function applyCapabilities(
+  capabilities,
+  { deferMessageReconnect = false } = {}
+) {
   if (!capabilities || typeof capabilities !== "object") return;
   const previousProactive = S.proactivePrivateMessageEnabled;
   const previousDirectCredentials = S.directImCredentialsEnabled;
@@ -1376,11 +1379,20 @@ function applyCapabilities(capabilities) {
     clearViewCacheKey("nearby");
     clearViewCachePrefix("nearby:");
   }
-  if ((proactiveChanged || directCredentialsChanged) && S.authenticated && (S.imMode || S.chat || S.imConnecting)) {
-    void cleanupIM().finally(() => {
-      if (!S.authenticated) return;
-      S.imNextReconnectAt = 0;
-      void ensureTimConnected({ force: true, background: true });
+  if (
+    (proactiveChanged || directCredentialsChanged) &&
+    S.authenticated &&
+    (S.imMode || S.chat || S.imConnecting || S._imConnecting)
+  ) {
+    const cleanup = cleanupIM();
+    S.messagePolicyCleanupPromise = cleanup;
+    void cleanup.finally(() => {
+      if (S.messagePolicyCleanupPromise === cleanup) {
+        S.messagePolicyCleanupPromise = null;
+      }
+      updateImConnectionStatus();
+      if (!S.authenticated || deferMessageReconnect) return;
+      resumeMessageChannelAfterPolicyReady();
     });
   }
 }
@@ -1556,7 +1568,7 @@ function refreshMessagePolicy() {
         if (!S.messagePolicyReady) setMessagePolicyReady(false);
         return {};
       }
-      applyCapabilities(data.capabilities);
+      applyCapabilities(data.capabilities, { deferMessageReconnect: true });
       replaceMessagePolicyAllowedPeers(data.allowed_peers);
       replaceMessagePolicyMatchPeers(data.match_peers);
       replaceBlockedPrivateMessagePeers(data.blocked_peers);
