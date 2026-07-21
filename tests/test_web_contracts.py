@@ -3864,8 +3864,12 @@ class RichMessageFrontendContractTests(unittest.TestCase):
 
         self.assertIn("function incomingMessageSenderName(message, conversation, peer)", app_js)
         self.assertIn("message?.nick", app_js)
+        self.assertIn("S.conversationProfilesByUid.get(target)", app_js)
+        self.assertIn('entry.type !== "mine" ? incomingMessageSenderName(message, current, peer) : ""', app_js)
         self.assertIn("name: senderName", app_js)
-        self.assertIn('toast(`收到 ${conversationNameIsPlaceholder(displayName, peer) ? "对方" : displayName} 的新消息`)', app_js)
+        self.assertIn("nickname: resolvedName || current.nickname", app_js)
+        self.assertIn("const notificationName = senderName ||", app_js)
+        self.assertIn('toast(`收到 ${notificationName} 的新消息`)', app_js)
         self.assertNotIn("toast(`收到来自 ${peer} 的新消息`)", app_js)
 
     def test_sticker_packages_use_image_grid_and_group_tabs(self) -> None:
