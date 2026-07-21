@@ -4245,6 +4245,9 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         audio_refresh = self._app_fragment(
             app_js, "function chatAudioIdentity", "function syncChatAudioPlaybackUi"
         )
+        audio_recovery = self._app_fragment(
+            app_js, "async function recoverChatAudioPlayback", "function syncChatAudioPlaybackUi"
+        )
         audio_toggle = self._app_fragment(
             app_js, "async function toggleChatAudioPlayback", "function ensureChatMediaViewer"
         )
@@ -4260,19 +4263,37 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("!isUnauthenticatedTencentRichMediaUrl(url)", audio_url)
         self.assertIn('data-audio-message-random="${esc(', audio_render)
         self.assertIn('data-audio-message-sequence="${esc(', audio_render)
+        self.assertIn('data-audio-message-time="${esc(entry.timestamp)}"', audio_render)
         self.assertIn('data-audio-peer="${esc(entry.peer)}"', audio_render)
         self.assertIn('data-audio-source-needs-refresh="${sourceNeedsRefresh ? "1" : "0"}"', audio_render)
         self.assertIn('sourceNeedsRefresh ? "" : ` src=', audio_render)
-        self.assertIn("while (true)", audio_refresh)
+        self.assertIn("CHAT_AUDIO_REFRESH_PAGE_SIZE = 15", app_js)
+        self.assertIn("CHAT_AUDIO_REFRESH_MAX_PAGES = 8", app_js)
+        self.assertIn("CHAT_AUDIO_REFRESH_MAX_MS = 20 * 1000", app_js)
+        self.assertIn("S.chat.findMessage(identity.id)", audio_refresh)
+        self.assertIn("S.chat.getMessageListHopping({", audio_refresh)
+        self.assertIn("time: Math.floor(identity.timestamp / 1000)", audio_refresh)
+        self.assertIn("page < CHAT_AUDIO_REFRESH_MAX_PAGES", audio_refresh)
+        self.assertIn("const remainingMs = deadline - Date.now()", audio_refresh)
+        self.assertNotIn("while (true)", audio_refresh)
         self.assertIn("options.nextReqMessageID = nextReqMessageID", audio_refresh)
         self.assertIn("data.isCompleted", audio_refresh)
         self.assertIn("updateRefreshedChatAudioEntry", audio_refresh)
         self.assertIn("archiveMessageBestEffort(next", audio_refresh)
-        self.assertIn("await refreshChatAudioSource(audio, { resumePlayback: true })", audio_toggle)
+        self.assertIn("await recoverChatAudioPlayback(audio, { resumePlayback: true", audio_toggle)
+        self.assertIn("reloadChatPlayback(audio, { manual })", audio_recovery)
+        self.assertIn("!canRefreshChatAudioSourceFromSdk()", audio_recovery)
+        refresh_index = playback_error.index("refreshChatAudioSource(media")
+        request_guard_index = playback_error.rfind(
+            'media.dataset.playbackRequested === "1"', 0, refresh_index
+        )
+        self.assertGreaterEqual(request_guard_index, 0)
         self.assertLess(
-            playback_error.index("refreshChatAudioSource(media"),
+            refresh_index,
             playback_error.index("chatMediaRetryState(source)"),
         )
+        self.assertIn("reloadChatPlayback(media)", playback_error)
+        self.assertIn("await recoverChatAudioPlayback(media, { resumePlayback: true", app_js)
         self.assertIn("语音播放地址已失效，请等待实时消息连接后重试", app_js)
         self.assertIn("S.imAudioSourceRefreshes.clear()", cleanup)
 

@@ -71,6 +71,9 @@ const PANEL_DOM_CACHE_LIMIT = 80;
 const MESSAGE_REVOKE_DEFAULT_WINDOW_MS = 2 * 60 * 1000;
 const MEDIA_RECONCILE_DELAYS_MS = [1200, 3500, 8000];
 const CHAT_MEDIA_RETRY_DELAYS_MS = [700, 1800, 4000];
+const CHAT_AUDIO_REFRESH_PAGE_SIZE = 15;
+const CHAT_AUDIO_REFRESH_MAX_PAGES = 8;
+const CHAT_AUDIO_REFRESH_MAX_MS = 20 * 1000;
 const VOICE_TRANSCRIPT_STORAGE_KEY = "bbw:im:voice-transcripts";
 const VOICE_TRANSCRIPT_STORAGE_LIMIT = 300;
 const MOMENT_VIDEO_FRAME_CHECK_MS = 2500;
@@ -6312,7 +6315,7 @@ function chatMessageBodyHtml(entry) {
       entry.messageRandom || timMessageRandom(entry)
     )}" data-audio-message-sequence="${esc(
       entry.sequence || timMessageSequence(entry)
-    )}" data-audio-peer="${esc(entry.peer)}" data-audio-source-needs-refresh="${sourceNeedsRefresh ? "1" : "0"}" data-media-playback data-media-source="${esc(
+    )}" data-audio-message-time="${esc(entry.timestamp)}" data-audio-peer="${esc(entry.peer)}" data-audio-source-needs-refresh="${sourceNeedsRefresh ? "1" : "0"}" data-media-playback data-media-source="${esc(
       media.url
     )}"${sourceNeedsRefresh ? "" : ` src="${esc(media.url)}"`}></audio><div class="chat-playback-fallback" data-playback-fallback hidden><span>语音加载失败</span><button type="button" data-action="retry-chat-playback">重试</button></div>${chatVoiceTranscriptHtml(
       entry
@@ -9181,6 +9184,7 @@ function chatAudioIdentity(audio) {
     id: String(audio?.dataset?.audioMessageId || "").trim(),
     messageRandom: String(audio?.dataset?.audioMessageRandom || "").trim(),
     messageSequence: String(audio?.dataset?.audioMessageSequence || "").trim(),
+    timestamp: Number(audio?.dataset?.audioMessageTime || 0),
     peer: String(audio?.dataset?.audioPeer || S.activePeer || "").trim(),
   };
 }
@@ -9207,17 +9211,64 @@ function chatAudioEntryMatchesIdentity(entry, identity) {
 async function findSdkAudioMessage(identity) {
   const conversationID = `C2C${identity.peer}`;
   const me = String(S.user?.uid || S.user?.id || "");
+  const deadline = Date.now() + CHAT_AUDIO_REFRESH_MAX_MS;
+  const matchingMessage = (message) => {
+    if (!message) return null;
+    const entry = timMessageEntry(message, identity.peer, me);
+    return chatAudioEntryMatchesIdentity(entry, identity) ? { message, entry } : null;
+  };
+  if (identity.id && typeof S.chat.findMessage === "function") {
+    try {
+      const localMatch = matchingMessage(S.chat.findMessage(identity.id));
+      if (localMatch) return localMatch;
+    } catch {
+      /* Continue with bounded remote lookup when the local cache is unavailable. */
+    }
+  }
+  if (
+    Number.isFinite(identity.timestamp) &&
+    identity.timestamp > 0 &&
+    typeof S.chat.getMessageListHopping === "function"
+  ) {
+    try {
+      const hoppingResult = await withTimeout(
+        S.chat.getMessageListHopping({
+          conversationID,
+          time: Math.floor(identity.timestamp / 1000),
+          count: CHAT_AUDIO_REFRESH_PAGE_SIZE,
+          direction: 0,
+        }),
+        6000,
+        "定位语音消息"
+      );
+      const hoppingData =
+        hoppingResult?.data && typeof hoppingResult.data === "object" ? hoppingResult.data : hoppingResult || {};
+      const hoppingMessages = Array.isArray(hoppingData.messageList) ? hoppingData.messageList : [];
+      for (const message of hoppingMessages) {
+        const match = matchingMessage(message);
+        if (match) return match;
+      }
+    } catch {
+      /* Fall back to a small bounded history scan. */
+    }
+  }
   const seenCursors = new Set();
   let nextReqMessageID = "";
-  while (true) {
-    const options = { conversationID, count: 30 };
+  for (let page = 0; page < CHAT_AUDIO_REFRESH_MAX_PAGES; page += 1) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return null;
+    const options = { conversationID, count: CHAT_AUDIO_REFRESH_PAGE_SIZE };
     if (nextReqMessageID) options.nextReqMessageID = nextReqMessageID;
-    const result = await withTimeout(S.chat.getMessageList(options), 10000, "刷新语音播放地址");
+    const result = await withTimeout(
+      S.chat.getMessageList(options),
+      Math.min(6000, remainingMs),
+      "刷新语音播放地址"
+    );
     const data = result?.data && typeof result.data === "object" ? result.data : result || {};
     const messages = Array.isArray(data.messageList) ? data.messageList : [];
     for (const message of messages) {
-      const entry = timMessageEntry(message, identity.peer, me);
-      if (chatAudioEntryMatchesIdentity(entry, identity)) return { message, entry };
+      const match = matchingMessage(message);
+      if (match) return match;
     }
     const completed = data.isCompleted === true || String(data.isCompleted || "").toLowerCase() === "true";
     const cursor = String(data.nextReqMessageID || "").trim();
@@ -9225,6 +9276,7 @@ async function findSdkAudioMessage(identity) {
     seenCursors.add(cursor);
     nextReqMessageID = cursor;
   }
+  return null;
 }
 
 function updateRefreshedChatAudioEntry(identity, sdkMessage, sdkEntry) {
@@ -9274,6 +9326,7 @@ function applyRefreshedChatAudioSource(audio, entry) {
   audio.dataset.audioMessageSequence = String(
     entry.sequence || timMessageSequence(entry) || audio.dataset.audioMessageSequence || ""
   );
+  audio.dataset.audioMessageTime = String(entry.timestamp || audio.dataset.audioMessageTime || "");
   audio.dataset.audioPeer = String(entry.peer || audio.dataset.audioPeer || "");
   audio.dataset.audioSourceNeedsRefresh = "0";
   audio.dataset.audioSourceRefreshAttempted = source;
@@ -9300,6 +9353,17 @@ function setChatAudioRefreshFailure(audio, error) {
   setChatPlaybackFallback(audio, detail || "语音播放地址刷新失败，请稍后重试", true);
 }
 
+function canRefreshChatAudioSourceFromSdk() {
+  if (!(S.imConnected && S.imMode === "sdk" && S.chat && typeof S.chat.getMessageList === "function")) {
+    return false;
+  }
+  try {
+    return typeof S.chat.isReady !== "function" || S.chat.isReady();
+  } catch {
+    return false;
+  }
+}
+
 async function refreshChatAudioSource(audio, { resumePlayback = false } = {}) {
   const identity = chatAudioIdentity(audio);
   if (!identity.peer || (!identity.id && !identity.messageRandom && !identity.messageSequence)) {
@@ -9307,16 +9371,8 @@ async function refreshChatAudioSource(audio, { resumePlayback = false } = {}) {
     setChatAudioRefreshFailure(audio, error);
     throw error;
   }
-  if (!(S.imConnected && S.imMode === "sdk" && S.chat && typeof S.chat.getMessageList === "function")) {
+  if (!canRefreshChatAudioSourceFromSdk()) {
     const error = new Error("语音播放地址已失效，请等待实时消息连接后重试");
-    setChatAudioRefreshFailure(audio, error);
-    throw error;
-  }
-  try {
-    if (typeof S.chat.isReady === "function" && !S.chat.isReady()) {
-      throw new Error("语音播放地址已失效，请等待实时消息连接后重试");
-    }
-  } catch (error) {
     setChatAudioRefreshFailure(audio, error);
     throw error;
   }
@@ -9369,6 +9425,24 @@ async function refreshChatAudioSource(audio, { resumePlayback = false } = {}) {
   return entry;
 }
 
+async function recoverChatAudioPlayback(audio, { resumePlayback = true, manual = true } = {}) {
+  const source = String(audio?.dataset?.mediaSource || "").trim();
+  const requiresRefresh =
+    audio?.dataset?.audioSourceNeedsRefresh === "1" || isUnauthenticatedTencentRichMediaUrl(source);
+  if (!requiresRefresh && !canRefreshChatAudioSourceFromSdk()) {
+    reloadChatPlayback(audio, { manual });
+    return false;
+  }
+  try {
+    await refreshChatAudioSource(audio, { resumePlayback });
+    return true;
+  } catch (error) {
+    if (error instanceof AuthExpiredError || requiresRefresh) throw error;
+    reloadChatPlayback(audio, { manual });
+    return false;
+  }
+}
+
 function syncChatAudioPlaybackUi(audio) {
   const wrap = audio?.closest?.(".chat-audio");
   const button = wrap?.querySelector("[data-audio-control], .chat-audio-button");
@@ -9398,7 +9472,7 @@ async function toggleChatAudioPlayback(button) {
     audio.dataset.audioSourceNeedsRefresh === "1" ||
     isUnauthenticatedTencentRichMediaUrl(source)
   ) {
-    await refreshChatAudioSource(audio, { resumePlayback: true });
+    await recoverChatAudioPlayback(audio, { resumePlayback: true, manual: true });
     return;
   }
   if (!audio.paused) {
@@ -9839,19 +9913,27 @@ function handleChatPlaybackError(media) {
   const source = String(media.dataset.mediaSource || "").trim();
   if (!source) return;
   if (media.matches?.("audio[data-audio-message-id]")) {
-    if (media.dataset.audioSourceRefreshAttempted !== source) {
+    const requiresRefresh =
+      media.dataset.audioSourceNeedsRefresh === "1" || isUnauthenticatedTencentRichMediaUrl(source);
+    if (
+      media.dataset.playbackRequested === "1" &&
+      media.dataset.audioSourceRefreshAttempted !== source &&
+      canRefreshChatAudioSourceFromSdk()
+    ) {
       media.dataset.audioSourceRefreshAttempted = source;
       media.dataset.mediaRetryPending = "1";
       media.hidden = true;
       setChatPlaybackFallback(media, "正在刷新语音播放地址…", true);
       void refreshChatAudioSource(media, {
         resumePlayback: media.dataset.playbackRequested === "1",
-      }).catch(() => {
-        /* refreshChatAudioSource exposes a localized playback fallback. */
+      }).catch((error) => {
+        if (!requiresRefresh && !(error instanceof AuthExpiredError) && media.isConnected) {
+          reloadChatPlayback(media);
+        }
       });
       return;
     }
-    if (isUnauthenticatedTencentRichMediaUrl(source)) {
+    if (requiresRefresh) {
       setChatAudioRefreshFailure(media, new Error("语音播放地址已失效，请等待实时消息连接后重试"));
       return;
     }
@@ -13338,7 +13420,7 @@ async function handleAction(action, button) {
     const media = button.closest("[data-playback-wrap]")?.querySelector("[data-media-playback]");
     if (!media) throw new Error("媒体重试控件不可用");
     if (media.matches?.("audio[data-audio-message-id]")) {
-      await refreshChatAudioSource(media, { resumePlayback: true });
+      await recoverChatAudioPlayback(media, { resumePlayback: true, manual: true });
       return;
     }
     if (
