@@ -3862,13 +3862,22 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
 
-        self.assertIn("function incomingMessageSenderName(message, conversation, peer)", app_js)
+        sender_info = self._app_fragment(
+            app_js,
+            "function incomingMessageSenderInfo(message, conversation, peer)",
+            "function conversationNameIsPlaceholder",
+        )
+
+        self.assertIn("function incomingMessageSenderInfo(message, conversation, peer)", app_js)
         self.assertIn("message?.nick", app_js)
         self.assertIn("S.conversationProfilesByUid.get(target)", app_js)
-        self.assertIn('entry.type !== "mine" ? incomingMessageSenderName(message, current, peer) : ""', app_js)
-        self.assertIn("name: senderName", app_js)
-        self.assertIn("nickname: resolvedName || current.nickname", app_js)
-        self.assertIn("const notificationName = senderName ||", app_js)
+        self.assertLess(sender_info.index("conversationDisplayName(conversation)"), sender_info.index("cachedProfile?.nickname"))
+        self.assertIn(': { name: "", authoritative: false }', app_js)
+        self.assertIn("name: sender.name", app_js)
+        self.assertIn("replaceName: sender.authoritative", app_js)
+        self.assertIn("replaceName || conversationNameIsPlaceholder(currentName, target)", app_js)
+        self.assertIn("if (active && sender.authoritative) S.activePeerName = sender.name", app_js)
+        self.assertIn("const notificationName = sender.name ||", app_js)
         self.assertIn('toast(`收到 ${notificationName} 的新消息`)', app_js)
         self.assertNotIn("toast(`收到来自 ${peer} 的新消息`)", app_js)
 

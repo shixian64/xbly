@@ -3169,11 +3169,11 @@ function conversationDisplayName(item) {
   ).trim();
 }
 
-function incomingMessageSenderName(message, conversation, peer) {
+function incomingMessageSenderInfo(message, conversation, peer) {
   const sender = message?.sender && typeof message.sender === "object" ? message.sender : {};
   const target = String(peer || "").trim();
   const cachedProfile = target ? S.conversationProfilesByUid.get(target) : null;
-  const candidates = [
+  const explicitCandidates = [
     message?.nick,
     message?.nickname,
     message?.senderName,
@@ -3181,11 +3181,19 @@ function incomingMessageSenderName(message, conversation, peer) {
     sender.nick,
     sender.nickname,
     sender.name,
+  ];
+  const explicitName = String(
+    explicitCandidates.find((value) => !conversationNameIsPlaceholder(value, target)) || ""
+  ).trim();
+  const fallbackCandidates = [
+    conversationDisplayName(conversation),
     cachedProfile?.nickname,
     cachedProfile?.name,
-    conversationDisplayName(conversation),
   ];
-  return String(candidates.find((value) => !conversationNameIsPlaceholder(value, target)) || "").trim();
+  const fallbackName = String(
+    fallbackCandidates.find((value) => !conversationNameIsPlaceholder(value, target)) || ""
+  ).trim();
+  return { name: explicitName || fallbackName, authoritative: Boolean(explicitName) };
 }
 
 function conversationNameIsPlaceholder(name, peer) {
@@ -6827,7 +6835,7 @@ function activeConversation() {
   return S.conversations.find((item) => conversationPeer(item) === S.activePeer) || null;
 }
 
-function ensureConversationForPeer(peer, { name = "", avatar = "" } = {}) {
+function ensureConversationForPeer(peer, { name = "", avatar = "", replaceName = false } = {}) {
   const target = String(peer || "").trim();
   if (!target) return null;
   restoreDismissedConversationPeer(target);
@@ -6835,10 +6843,14 @@ function ensureConversationForPeer(peer, { name = "", avatar = "" } = {}) {
   const resolvedName = conversationNameIsPlaceholder(name, target) ? "" : String(name).trim();
   if (index >= 0) {
     const current = S.conversations[index];
+    const currentName = conversationDisplayName(current);
+    const shouldReplaceName = Boolean(
+      resolvedName && (replaceName || conversationNameIsPlaceholder(currentName, target))
+    );
     const explicitAvatar = validAvatarValue(avatar);
     const next = {
       ...current,
-      nickname: resolvedName || current.nickname,
+      nickname: shouldReplaceName ? resolvedName : current.nickname,
       avatar: explicitAvatar || conversationAvatar(current),
       _avatar_from_fallback: explicitAvatar ? false : Boolean(current._avatar_from_fallback),
     };
@@ -6870,9 +6882,12 @@ function ensureConversationForPeer(peer, { name = "", avatar = "" } = {}) {
   return created;
 }
 
-function updateConversationActivity(peer, { name = "", avatar = "", lastMessage = "", unreadCount } = {}) {
+function updateConversationActivity(
+  peer,
+  { name = "", avatar = "", lastMessage = "", unreadCount, replaceName = false } = {}
+) {
   const target = String(peer || "").trim();
-  const conversation = ensureConversationForPeer(target, { name, avatar });
+  const conversation = ensureConversationForPeer(target, { name, avatar, replaceName });
   if (!conversation) return null;
   conversation.last_message = String(lastMessage || "");
   conversation.content = conversation.last_message;
@@ -11993,12 +12008,17 @@ function attachTimHandlers(chat, TIM, credential) {
       const entry = timMessageEntry(message, peer, String(credential.userID));
       const preview = messagePreview(entry);
       const currentUnread = Number(current?.unread_count || current?.unread || 0);
-      const senderName = entry.type !== "mine" ? incomingMessageSenderName(message, current, peer) : "";
+      const sender =
+        entry.type !== "mine"
+          ? incomingMessageSenderInfo(message, current, peer)
+          : { name: "", authoritative: false };
       const conversation = updateConversationActivity(peer, {
-        name: senderName,
+        name: sender.name,
+        replaceName: sender.authoritative,
         lastMessage: preview,
         unreadCount: entry.type === "mine" ? currentUnread : active ? 0 : currentUnread + 1,
       });
+      if (active && sender.authoritative) S.activePeerName = sender.name;
       addImMessage(entry.text, entry.type, peer, entry);
       archiveMessageBestEffort(entry, entry.type === "mine" ? "outgoing" : "incoming");
       if (["image", "audio", "video", "file", "face"].includes(entry.kind)) schedulePeerMediaReconcile(peer);
@@ -12007,7 +12027,7 @@ function attachTimHandlers(chat, TIM, credential) {
       } else if (peer && entry.type !== "mine") {
         S.readConversationPeers.delete(peer);
         const displayName = conversationDisplayName(applyCachedConversationProfile(conversation));
-        const notificationName = senderName || (conversationNameIsPlaceholder(displayName, peer) ? "对方" : displayName);
+        const notificationName = sender.name || (conversationNameIsPlaceholder(displayName, peer) ? "对方" : displayName);
         toast(`收到 ${notificationName} 的新消息`);
       }
       refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
