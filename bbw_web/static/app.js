@@ -5544,9 +5544,9 @@ function isTencentRichMediaUrl(value) {
   if (!isRemoteMessageMediaUrl(url)) return false;
   try {
     const parsed = new URL(url);
-    return /(?:^|\.)imrich\.qcloud\.com$/i.test(parsed.hostname);
+    return /(?:^|\.)(?:imrich\.qcloud\.com|rich\.my-imcloud\.com)$/i.test(parsed.hostname);
   } catch {
-    return /^(?:https?:)?\/\/[^/?#]*\bimrich\.qcloud\.com\b/i.test(url);
+    return /^(?:https?:)?\/\/(?:[^./?#]+\.)*(?:imrich\.qcloud\.com|rich\.my-imcloud\.com)(?=[:/?#]|$)/i.test(url);
   }
 }
 

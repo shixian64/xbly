@@ -4258,6 +4258,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
 
         self.assertIn("imAudioSourceRefreshes: new Map()", app_js)
         self.assertIn("imrich\\.qcloud\\.com", audio_url)
+        self.assertIn("rich\\.my-imcloud\\.com", audio_url)
         self.assertIn("function isTencentRichMediaUrl", audio_url)
         self.assertIn('String(key).toLowerCase() === "authkey"', audio_url)
         self.assertLess(audio_url.index('"url"'), audio_url.index('"remoteAudioUrl"'))
@@ -4454,7 +4455,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("panel-dom-cache", css_version)
         self.assertIn("private-message-policy-recheck", css_version)
         self.assertIn("private-message-entry-scope", css_version)
-        self.assertTrue(css_version.endswith("-voice-url-renewal"))
+        self.assertTrue(css_version.endswith("-voice-url-renewal-imcloud"))
 
 
 class FlashPhotoBffContractTests(unittest.TestCase):
