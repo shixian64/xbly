@@ -177,6 +177,9 @@ const S = {
   conversationBatchDeleteStage: "idle",
   readConversationPeers: new Map(),
   conversationReadReportTimers: new Map(),
+  sdkMessageReadReceiptTimers: new Map(),
+  sdkMessageReadReceiptPending: new Set(),
+  sdkMessageReadReceiptReported: new Set(),
   unreadTotal: 0,
   profileSeq: 0,
   profileController: null,
@@ -7079,7 +7082,10 @@ async function loadConversationMessages(peer, { force = false } = {}) {
       archiveMessageBestEffort(entry, entry.type === "mine" ? "outgoing" : "incoming")
     );
     S.imMessageLoadedPeers.add(target);
-    if (changed && S.activePeer === target) refreshChatLog();
+    if (S.activePeer === target) {
+      if (changed) refreshChatLog();
+      scheduleSdkMessageReadReceipts(target);
+    }
   } finally {
     S.imMessageLoadingPeers.delete(target);
     if (!wasLoaded && S.activePeer === target) refreshChatLog();
@@ -8188,6 +8194,74 @@ function restoreChatMessageQuote(peer) {
   return S.imQuote;
 }
 
+function sdkMessageNeedsReadReceipt(entry) {
+  const message = entry?.rawMessage;
+  if (!message || entry?.type === "mine" || entry?.revoked) return false;
+  return optionalReadState(
+    message.needReadReceipt ??
+      message.need_read_receipt ??
+      message.isNeedReadReceipt ??
+      message.readReceiptInfo?.needReadReceipt ??
+      message.read_receipt_info?.need_read_receipt
+  ) === true;
+}
+
+async function reportSdkMessageReadReceipts(peer) {
+  // Android TUIKit enables explicit per-message receipts by default. Clearing
+  // the conversation unread count alone only emits the legacy C2C read report,
+  // which does not update TUIKit's per-message "已读/未读" indicator.
+  const target = String(peer || "").trim();
+  if (
+    !target ||
+    String(S.activePeer || "") !== target ||
+    S.imMode !== "sdk" ||
+    !S.chat ||
+    typeof S.chat.sendMessageReadReceipt !== "function"
+  ) {
+    return false;
+  }
+  const candidates = S.imMessages.filter((entry) => {
+    if (String(entry?.peer || "") !== target || !sdkMessageNeedsReadReceipt(entry)) return false;
+    const key = messageIdentityKey(entry);
+    return !S.sdkMessageReadReceiptPending.has(key) && !S.sdkMessageReadReceiptReported.has(key);
+  });
+  if (!candidates.length) return true;
+
+  let synced = true;
+  for (let offset = 0; offset < candidates.length; offset += 30) {
+    if (String(S.activePeer || "") !== target) return false;
+    const entries = candidates.slice(offset, offset + 30);
+    const keys = entries.map(messageIdentityKey);
+    keys.forEach((key) => S.sdkMessageReadReceiptPending.add(key));
+    try {
+      await withTimeout(
+        Promise.resolve(S.chat.sendMessageReadReceipt(entries.map((entry) => entry.rawMessage))),
+        8000,
+        "同步逐条消息已读回执"
+      );
+      keys.forEach((key) => S.sdkMessageReadReceiptReported.add(key));
+    } catch (error) {
+      synced = false;
+      console.info("[TIM read receipt]", error?.message || error);
+    } finally {
+      keys.forEach((key) => S.sdkMessageReadReceiptPending.delete(key));
+    }
+  }
+  return synced;
+}
+
+function scheduleSdkMessageReadReceipts(peer, delay = 80) {
+  const target = String(peer || "").trim();
+  if (!target) return;
+  const previous = S.sdkMessageReadReceiptTimers.get(target);
+  if (previous) clearTimeout(previous);
+  const timer = setTimeout(() => {
+    S.sdkMessageReadReceiptTimers.delete(target);
+    void reportSdkMessageReadReceipts(target);
+  }, Math.max(0, Number(delay) || 0));
+  S.sdkMessageReadReceiptTimers.set(target, timer);
+}
+
 function reportConversationRead(peer) {
   const target = String(peer || "").trim();
   if (!target) return Promise.resolve(false);
@@ -8251,6 +8325,7 @@ function markConversationRead(peer) {
     const conversationID = current?.conversation_id || `C2C${target}`;
     void Promise.resolve(S.chat.setMessageRead({ conversationID })).catch(() => {});
   }
+  scheduleSdkMessageReadReceipts(target);
   scheduleConversationReadReport(target);
 }
 
@@ -13538,6 +13613,10 @@ async function logout() {
     S.readConversationPeers.clear();
     S.conversationReadReportTimers.forEach((timer) => clearTimeout(timer));
     S.conversationReadReportTimers.clear();
+    S.sdkMessageReadReceiptTimers.forEach((timer) => clearTimeout(timer));
+    S.sdkMessageReadReceiptTimers.clear();
+    S.sdkMessageReadReceiptPending.clear();
+    S.sdkMessageReadReceiptReported.clear();
     S.unreadTotal = 0;
     S.messageLastPolicySyncAt = 0;
     S.messageLastSummarySyncAt = 0;
