@@ -2203,6 +2203,48 @@ class Handler(BaseHTTPRequestHandler):
         setattr(user, timestamp_attribute, time.monotonic())
         return True, payload
 
+    def _load_message_block_snapshot(
+        self,
+        user: Any,
+        *,
+        path: str,
+        fetcher: Any,
+        peer_attribute: str,
+        timestamp_attribute: str,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """Read and persist one block direction under the production guard."""
+
+        guard_factory = getattr(
+            self,
+            "_request_message_block_snapshot_guard",
+            None,
+        )
+        try:
+            if callable(guard_factory):
+                with guard_factory(path):
+                    return Handler._store_message_block_snapshot(
+                        self,
+                        user,
+                        path=path,
+                        result=fetcher(),
+                        peer_attribute=peer_attribute,
+                        timestamp_attribute=timestamp_attribute,
+                    )
+            return Handler._store_message_block_snapshot(
+                self,
+                user,
+                path=path,
+                result=fetcher(),
+                peer_attribute=peer_attribute,
+                timestamp_attribute=timestamp_attribute,
+            )
+        except Exception:
+            return False, {
+                "ok": False,
+                "code": "MESSAGE_BLOCK_POLICY_SYNC_UNAVAILABLE",
+                "error": "黑名单状态同步繁忙或暂时不可用，请稍后重试",
+            }
+
     def ensure_message_blocks_loaded(self, user: Any) -> bool:
         """Load both blacklist directions before authorizing any private message."""
 
@@ -2229,37 +2271,33 @@ class Handler(BaseHTTPRequestHandler):
         incoming_ok = incoming_snapshot_at > 0
         refresh_failed = False
         if not own_fresh:
-            try:
-                loaded, _payload = Handler._store_message_block_snapshot(
-                    self,
-                    user,
-                    path="/api/social/blacklist",
-                    result=social.my_blacklist(),
-                    peer_attribute="blocked_message_peers",
-                    timestamp_attribute="blocked_message_peers_snapshot_at",
-                )
-                refresh_failed = refresh_failed or not loaded
-                own_ok = loaded or own_snapshot_at > 0
-            except Exception:
-                refresh_failed = True
-                own_ok = own_snapshot_at > 0
+            loaded, _payload = Handler._load_message_block_snapshot(
+                self,
+                user,
+                path="/api/social/blacklist",
+                fetcher=social.my_blacklist,
+                peer_attribute="blocked_message_peers",
+                timestamp_attribute="blocked_message_peers_snapshot_at",
+            )
+            refresh_failed = refresh_failed or not loaded
+            own_ok = loaded or own_snapshot_at > 0
         if not incoming_fresh:
-            try:
-                loaded, _payload = Handler._store_message_block_snapshot(
-                    self,
-                    user,
-                    path="/api/social/blacklist-me",
-                    result=social.blacklist_me(),
-                    peer_attribute="blocked_by_message_peers",
-                    timestamp_attribute="blocked_by_message_peers_snapshot_at",
-                )
-                refresh_failed = refresh_failed or not loaded
-                incoming_ok = loaded or incoming_snapshot_at > 0
-            except Exception:
-                refresh_failed = True
-                incoming_ok = incoming_snapshot_at > 0
+            loaded, _payload = Handler._load_message_block_snapshot(
+                self,
+                user,
+                path="/api/social/blacklist-me",
+                fetcher=social.blacklist_me,
+                peer_attribute="blocked_by_message_peers",
+                timestamp_attribute="blocked_by_message_peers_snapshot_at",
+            )
+            refresh_failed = refresh_failed or not loaded
+            incoming_ok = loaded or incoming_snapshot_at > 0
         if refresh_failed:
-            setattr(user, "message_blocks_retry_at", now + MESSAGE_BLOCK_SNAPSHOT_RETRY_SEC)
+            setattr(
+                user,
+                "message_blocks_retry_at",
+                time.monotonic() + MESSAGE_BLOCK_SNAPSHOT_RETRY_SEC,
+            )
         else:
             setattr(user, "message_blocks_retry_at", 0.0)
         return own_ok and incoming_ok
@@ -2466,19 +2504,26 @@ class Handler(BaseHTTPRequestHandler):
                 for k, v in app.bootstrap(include_im=False).items()
             }
             if capabilities.get("direct_im_credentials"):
-                try:
-                    tim = {
-                        "ok": True,
-                        **u.native.im.tim_login_payload(
-                            prefer="server",
-                            allow_local_fallback=False,
-                        ),
-                    }
-                except Exception as exc:
+                if not Handler.ensure_message_blocks_loaded(self, u):
                     tim = {
                         "ok": False,
-                        "error": _safe_error(exc, "消息登录凭证获取失败"),
+                        "code": "MESSAGE_BLOCK_POLICY_UNAVAILABLE",
+                        "error": "黑名单状态暂时无法确认，实时消息凭证已暂停下发",
                     }
+                else:
+                    try:
+                        tim = {
+                            "ok": True,
+                            **u.native.im.tim_login_payload(
+                                prefer="server",
+                                allow_local_fallback=False,
+                            ),
+                        }
+                    except Exception as exc:
+                        tim = {
+                            "ok": False,
+                            "error": _safe_error(exc, "消息登录凭证获取失败"),
+                        }
             else:
                 tim = Handler.broad_im_credentials_disabled_payload(self, capabilities)
             u.persist()
@@ -2749,34 +2794,40 @@ class Handler(BaseHTTPRequestHandler):
                 )
             return self.ok(payload)
         if path == "/api/social/blacklist":
-            result = app.social.my_blacklist()
-            _stored, payload = Handler._store_message_block_snapshot(
+            _stored, payload = Handler._load_message_block_snapshot(
                 self,
                 u,
                 path=path,
-                result=result,
+                fetcher=app.social.my_blacklist,
                 peer_attribute="blocked_message_peers",
                 timestamp_attribute="blocked_message_peers_snapshot_at",
             )
             status = (
                 503
-                if payload.get("code") == "MESSAGE_BLOCK_POLICY_PERSISTENCE_FAILED"
+                if payload.get("code")
+                in {
+                    "MESSAGE_BLOCK_POLICY_PERSISTENCE_FAILED",
+                    "MESSAGE_BLOCK_POLICY_SYNC_UNAVAILABLE",
+                }
                 else 200
             )
             return self.ok(payload, status)
         if path == "/api/social/blacklist-me":
-            result = app.social.blacklist_me()
-            _stored, payload = Handler._store_message_block_snapshot(
+            _stored, payload = Handler._load_message_block_snapshot(
                 self,
                 u,
                 path=path,
-                result=result,
+                fetcher=app.social.blacklist_me,
                 peer_attribute="blocked_by_message_peers",
                 timestamp_attribute="blocked_by_message_peers_snapshot_at",
             )
             status = (
                 503
-                if payload.get("code") == "MESSAGE_BLOCK_POLICY_PERSISTENCE_FAILED"
+                if payload.get("code")
+                in {
+                    "MESSAGE_BLOCK_POLICY_PERSISTENCE_FAILED",
+                    "MESSAGE_BLOCK_POLICY_SYNC_UNAVAILABLE",
+                }
                 else 200
             )
             return self.ok(payload, status)
@@ -3073,6 +3124,15 @@ class Handler(BaseHTTPRequestHandler):
             capabilities = Handler.web_user_capabilities(self, u)
             if not capabilities.get("direct_im_credentials"):
                 return Handler.deny_broad_im_credentials(self, capabilities)
+            if not Handler.ensure_message_blocks_loaded(self, u):
+                return self.ok(
+                    {
+                        "ok": False,
+                        "code": "MESSAGE_BLOCK_POLICY_UNAVAILABLE",
+                        "error": "黑名单状态暂时无法确认，实时消息凭证已暂停下发",
+                    },
+                    503,
+                )
             try:
                 payload = u.native.im.tim_login_payload(
                     prefer="server",

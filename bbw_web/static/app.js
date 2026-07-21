@@ -97,6 +97,9 @@ const S = {
   labEnabled: false,
   proactivePrivateMessageEnabled: false,
   directImCredentialsEnabled: false,
+  messagePolicyReady: false,
+  messagePolicyGeneration: 0,
+  messagePolicyCleanupPromise: null,
   nearbyCustomCityEnabled: false,
   privateMessagePeers: new Set(),
   matchMessagePeers: new Set(),
@@ -258,7 +261,7 @@ function usesCoarsePointer() {
 }
 
 function voiceRecordingAvailability() {
-  if (!S.directImCredentialsEnabled) {
+  if (!(S.directImCredentialsEnabled && S.messagePolicyReady)) {
     return { available: false, reason: "当前账号使用受控消息通道，暂不支持发送语音消息" };
   }
   if (!window.isSecureContext) {
@@ -1297,6 +1300,8 @@ function applyUser(user) {
     avatar.hidden = true;
     S.proactivePrivateMessageEnabled = false;
     S.directImCredentialsEnabled = false;
+    S.messagePolicyReady = false;
+    S.messagePolicyGeneration += 1;
     S.privateMessagePeers.clear();
     S.matchMessagePeers.clear();
     S.blockedPrivateMessagePeers.clear();
@@ -1486,18 +1491,63 @@ function updateUnreadBadges() {
   });
 }
 
+function setMessagePolicyReady(ready) {
+  const next = ready === true;
+  if (S.messagePolicyReady === next) return;
+  S.messagePolicyReady = next;
+  S.messagePolicyGeneration += 1;
+  syncPrivateMessageControls();
+  if (next || !(S.imMode || S.chat || S.imConnecting || S._imConnecting)) return;
+  S.imLastError = "私聊安全策略暂时不可用，消息通道已暂停";
+  const cleanup = cleanupIM();
+  S.messagePolicyCleanupPromise = cleanup;
+  void cleanup.finally(() => {
+    if (S.messagePolicyCleanupPromise === cleanup) {
+      S.messagePolicyCleanupPromise = null;
+    }
+    updateImConnectionStatus();
+  });
+}
+
+function resumeMessageChannelAfterPolicyReady() {
+  const sessionGeneration = S.sessionGeneration;
+  const policyGeneration = S.messagePolicyGeneration;
+  const pending = [S.messagePolicyCleanupPromise, S._imConnecting].filter(Boolean);
+  void Promise.allSettled(pending).then(() => {
+    if (
+      !isCurrentAuthenticatedSession(sessionGeneration) ||
+      !S.messagePolicyReady ||
+      S.messagePolicyGeneration !== policyGeneration ||
+      S.imConnected ||
+      S.imConnecting
+    ) {
+      return;
+    }
+    S.imNextReconnectAt = 0;
+    void ensureTimConnected({ force: true, background: true });
+  });
+}
+
 function refreshMessagePolicy() {
   return api("/api/im/message-policy", { timeout: 6000 })
     .then(({ data }) => {
-      if (data?.ok === false) return {};
+      if (data?.ok !== true) {
+        setMessagePolicyReady(false);
+        return {};
+      }
       applyCapabilities(data.capabilities);
       replaceMessagePolicyAllowedPeers(data.allowed_peers);
       replaceMessagePolicyMatchPeers(data.match_peers);
       replaceBlockedPrivateMessagePeers(data.blocked_peers);
-      syncPrivateMessageControls();
+      const policyWasReady = S.messagePolicyReady;
+      setMessagePolicyReady(true);
+      if (!policyWasReady) resumeMessageChannelAfterPolicyReady();
       return data.capabilities || {};
     })
-    .catch(() => ({}));
+    .catch(() => {
+      setMessagePolicyReady(false);
+      return {};
+    });
 }
 
 function messageSyncAccountId() {
@@ -2935,6 +2985,7 @@ function canStartPrivateChat(uid) {
   const target = String(uid || "").trim();
   const currentUid = String(S.user?.uid || S.user?.id || "").trim();
   if (
+    !S.messagePolicyReady ||
     !target ||
     ["0", "none", "null"].includes(target.toLowerCase()) ||
     target === currentUid ||
@@ -7622,12 +7673,12 @@ function chatComposerPanelHtml() {
     }>${S.imStickersLoading ? "正在加载" : "重新加载"}</button></div>${body}</section>`;
   }
   if (S.imComposerPanel === "more") {
-    const directMediaActions = S.directImCredentialsEnabled
+    const directMediaActions = S.directImCredentialsEnabled && S.messagePolicyReady
       ? `<button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="image"><strong>图片与动图</strong><span>从相册或文件中选择</span></button>
       <button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="video"><strong>视频</strong><span>发送短视频文件</span></button>
       <button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="file"><strong>文件</strong><span>发送其他类型文件</span></button>`
       : "";
-    const stickerAction = S.directImCredentialsEnabled
+    const stickerAction = S.directImCredentialsEnabled && S.messagePolicyReady
       ? '<button type="button" class="chat-more-action" data-action="toggle-chat-panel" data-panel="sticker"><strong>表情包</strong><span>内置表情与收藏表情</span></button>'
       : "";
     return `<section class="chat-composer-panel chat-more-panel ui-scrollbar" aria-label="更多消息功能"><div class="chat-panel-head"><strong>更多功能</strong><span>选择要发送的内容</span></div><div class="chat-more-grid">
@@ -8439,6 +8490,7 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
   if (!(await ensurePrivateChatPermission(target))) {
     throw new Error("该私信入口仅向管理员授权的用户开放");
   }
+  const policyGeneration = S.messagePolicyGeneration;
   const previous = retryMessageId ? findChatMessage(retryMessageId, target) : null;
   const messageQuote = normalizeMessageQuote(quote || previous?.quote);
   const pendingID = previous?.id || localMessageID("text");
@@ -8475,6 +8527,9 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
   try {
     let sentEntry;
     if (S.imConnected && S.imMode === "sdk" && S.chat && resolveTimApi()) {
+      if (!S.messagePolicyReady || S.messagePolicyGeneration !== policyGeneration) {
+        throw new Error("私聊安全策略已更新，请重试");
+      }
       const TIM = resolveTimApi();
       const cloudCustomData = messageQuoteCloudCustomData(messageQuote);
       const options = {
@@ -8637,6 +8692,9 @@ function replaceUploadedLocalMediaUrl(localUrl, mergedMedia, remoteMedia) {
 }
 
 async function ensureTimMediaReady() {
+  if (!S.messagePolicyReady) {
+    throw new Error("私聊安全策略尚未就绪，请稍后重试");
+  }
   try {
     await ensureTimUploadPluginLoaded();
   } catch (error) {
@@ -8698,6 +8756,7 @@ async function sendTimMediaFile(kind, file, meta = {}) {
     revokeChatObjectUrl(meta.localUrl);
     throw new Error("该私信入口仅向管理员授权的用户开放");
   }
+  const policyGeneration = S.messagePolicyGeneration;
   const retryMessageID = String(meta.retryMessageId || "");
   const previous = retryMessageID ? findChatMessage(retryMessageID, peer) : null;
   const pendingID = previous?.id || localMessageID(kind);
@@ -8741,6 +8800,9 @@ async function sendTimMediaFile(kind, file, meta = {}) {
   refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
   try {
     const { chat, TIM } = await ensureTimMediaReady();
+    if (!S.messagePolicyReady || S.messagePolicyGeneration !== policyGeneration) {
+      throw new Error("私聊安全策略已更新，请重试");
+    }
     if (!TIM?.TYPES?.CONV_C2C) throw new Error("实时消息类型不可用");
     const options = {
       to: peer,
@@ -9034,6 +9096,7 @@ async function sendChatSticker(index, data, { retryMessageId = "" } = {}) {
   const faceData = String(data || "").trim();
   if (!peer || !faceData) throw new Error("表情包数据不完整");
   if (!(await ensurePrivateChatPermission(peer))) throw new Error("该私信入口仅向管理员授权的用户开放");
+  const policyGeneration = S.messagePolicyGeneration;
   const previous = retryMessageId ? findChatMessage(retryMessageId, peer) : null;
   const pendingID = previous?.id || localMessageID("face");
   const numericIndex = Math.max(0, Math.trunc(Number(index) || 0));
@@ -9060,6 +9123,9 @@ async function sendChatSticker(index, data, { retryMessageId = "" } = {}) {
   else appendLocalMessage(pending);
   try {
     const { chat, TIM } = await ensureTimMediaReady();
+    if (!S.messagePolicyReady || S.messagePolicyGeneration !== policyGeneration) {
+      throw new Error("私聊安全策略已更新，请重试");
+    }
     const message = chat.createFaceMessage({
       to: peer,
       conversationType: TIM.TYPES.CONV_C2C,
@@ -12928,7 +12994,12 @@ async function diagnoseTimConnectionFailure() {
 /** Fetch BFF UserSig and login TIM (idempotent when already connected). */
 async function ensureTimConnected({ force = false, background = false } = {}) {
   const sessionGeneration = S.sessionGeneration;
-  if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
+  const policyGeneration = S.messagePolicyGeneration;
+  const policyIsCurrent = () =>
+    isCurrentAuthenticatedSession(sessionGeneration) &&
+    S.messagePolicyReady &&
+    S.messagePolicyGeneration === policyGeneration;
+  if (!policyIsCurrent()) return false;
   if (S.imConnected && S.chat && !force) return true;
   if (S._imConnecting && S.imConnectingGeneration === sessionGeneration) return S._imConnecting;
   if (S._imConnecting && S.imConnectingGeneration !== sessionGeneration) S._imConnecting = null;
@@ -12943,7 +13014,7 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
         try {
           setImConnectingUi(true, "正在启用受控消息通道…");
           const { data: health } = await api("/api/im/rest/health", { timeout: 12000 });
-          if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
+          if (!policyIsCurrent()) return false;
           if (health && (health.ok === true || Number(health.error_code) === 0)) {
             S.imConnected = true;
             S.imMode = "rest";
@@ -12971,7 +13042,7 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
         notifyConnection(msg, "error", 4200);
         return false;
       }
-      if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
+      if (!policyIsCurrent()) return false;
 
       const uploadPluginReady = withTimeout(
         ensureTimUploadPluginLoaded(),
@@ -12990,18 +13061,21 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
       const order = ["server"];
       let lastErr = "";
       for (const prefer of order) {
-        if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
+        if (!policyIsCurrent()) return false;
         try {
           setImConnectingUi(true, "正在验证消息登录凭证…");
           addImMessage(`获取 TIM 凭证（${prefer}）…`, "system");
           const cred = await fetchTimCredential(prefer);
-          if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
+          if (!policyIsCurrent()) return false;
           addImMessage(
             `凭证就绪 source=${cred.source || prefer} uid=${cred.userID} sig_len=${cred.sig_len || String(cred.userSig).length}`,
             "system"
           );
           const ok = await connectTIM(cred, sessionGeneration);
-          if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
+          if (!policyIsCurrent()) {
+            await cleanupIM();
+            return false;
+          }
           if (ok) {
             void uploadPluginReady.then((ready) => {
               if (!ready || !S.chat || typeof S.chat.registerPlugin !== "function" || !window.TIMUploadPlugin) return;
@@ -13019,6 +13093,7 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
           await new Promise((r) => setTimeout(r, 400));
         } catch (error) {
           if (error instanceof AuthExpiredError) throw error;
+          if (!policyIsCurrent()) return false;
           lastErr = error?.message || String(error);
           addImMessage(`凭证 ${prefer} 失败：${lastErr}`, "system");
         }
@@ -13033,7 +13108,7 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
       try {
         addImMessage("实时消息连接失败，尝试启用文本备用通道…", "system");
         const { data: h } = await api("/api/im/rest/health", { timeout: 12000 });
-        if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
+        if (!policyIsCurrent()) return false;
         if (h && (h.ok === true || Number(h.error_code) === 0)) {
           S.imConnected = true;
           S.imMode = "rest";
@@ -14281,6 +14356,8 @@ function completeBrowserLogin(data) {
   resetTurnstileChallenge({ hide: true });
   S.sessionGeneration += 1;
   S.authenticated = true;
+  S.messagePolicyReady = false;
+  S.messagePolicyGeneration += 1;
   clearAllViewCaches();
   resetMomentViewTaskAssist();
   closeMessageSyncChannel();

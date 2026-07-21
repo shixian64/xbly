@@ -203,6 +203,7 @@ class ProductionContractTests(unittest.TestCase):
         persistence = self.read("bbw_web/persistence.py")
         repositories = self.read("bbw_prod/repositories.py")
         api = self.read("bbw_web/api.py")
+        bff_server = self.read("bbw_web/bff_server.py")
 
         for marker in (
             'MESSAGE_POLICY_PROVIDER = "web-policy"',
@@ -242,6 +243,10 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn("SOCIAL_DM_POLICY_PERSISTENCE_FAILED", api)
         self.assertIn("CONVERSATION_DM_GRANT_PERSISTENCE_FAILED", api)
         self.assertIn('"/api/social/blacklist-me": "blacklisted_by"', api)
+        self.assertIn("message_block_snapshot_guard", api)
+        self.assertIn(":message-block-snapshot:", api)
+        self.assertIn("persistence.redis.lock(", api)
+        self.assertIn("with guard_factory(path):", bff_server)
         self.assertIn("persistence.remember_message_policy_response(", api)
 
     def test_archived_direct_conversation_authorizes_private_message_peer(self) -> None:

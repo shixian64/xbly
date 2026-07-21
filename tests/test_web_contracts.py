@@ -2706,6 +2706,103 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         )
         self.assertEqual(web_user.blocked_by_message_peers, {"9"})
 
+    def test_blacklist_fetch_and_persistence_run_inside_direction_guard(self) -> None:
+        events = []
+        empty = ApiResult(False, 200, "false", data=False)
+
+        class Guard:
+            def __init__(self, path):
+                self.path = path
+
+            def __enter__(self):
+                events.append(("enter", self.path))
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                events.append(("exit", self.path))
+
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(
+                session=SimpleNamespace(uid="42"),
+                social=SimpleNamespace(
+                    my_blacklist=lambda: events.append(
+                        ("fetch", "/api/social/blacklist")
+                    )
+                    or empty,
+                    blacklist_me=lambda: events.append(
+                        ("fetch", "/api/social/blacklist-me")
+                    )
+                    or empty,
+                ),
+            ),
+            blocked_message_peers=set(),
+            blocked_by_message_peers=set(),
+            blocked_message_peers_snapshot_at=0.0,
+            blocked_by_message_peers_snapshot_at=0.0,
+            message_blocks_retry_at=0.0,
+        )
+        harness = SimpleNamespace(
+            _request_message_block_snapshot_guard=lambda path: Guard(path),
+            _request_message_block_snapshot_recorder=lambda path, _peers: events.append(
+                ("persist", path)
+            ),
+        )
+
+        self.assertTrue(
+            bff_server.Handler.ensure_message_blocks_loaded(harness, web_user)
+        )
+        self.assertEqual(
+            events,
+            [
+                ("enter", "/api/social/blacklist"),
+                ("fetch", "/api/social/blacklist"),
+                ("persist", "/api/social/blacklist"),
+                ("exit", "/api/social/blacklist"),
+                ("enter", "/api/social/blacklist-me"),
+                ("fetch", "/api/social/blacklist-me"),
+                ("persist", "/api/social/blacklist-me"),
+                ("exit", "/api/social/blacklist-me"),
+            ],
+        )
+
+    def test_blacklist_retry_window_starts_after_slow_refresh_failure(self) -> None:
+        failed = ApiResult(
+            False,
+            503,
+            "upstream unavailable",
+            message="upstream unavailable",
+        )
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(
+                session=SimpleNamespace(uid="42"),
+                social=SimpleNamespace(
+                    my_blacklist=lambda: failed,
+                    blacklist_me=lambda: failed,
+                ),
+            ),
+            blocked_message_peers={"9"},
+            blocked_by_message_peers={"10"},
+            blocked_message_peers_snapshot_at=1.0,
+            blocked_by_message_peers_snapshot_at=1.0,
+            message_blocks_retry_at=0.0,
+        )
+
+        with patch.object(
+            bff_server.time,
+            "monotonic",
+            side_effect=[100.0, 135.0],
+        ):
+            self.assertTrue(
+                bff_server.Handler.ensure_message_blocks_loaded(
+                    SimpleNamespace(),
+                    web_user,
+                )
+            )
+
+        self.assertEqual(
+            web_user.message_blocks_retry_at,
+            135.0 + bff_server.MESSAGE_BLOCK_SNAPSHOT_RETRY_SEC,
+        )
+
     def test_blacklist_read_failure_preserves_previous_snapshot(self) -> None:
         results = [
             ApiResult(False, 503, "upstream unavailable", message="upstream unavailable"),
@@ -2870,6 +2967,10 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                 )
             ),
             match_pool_online_list_enabled=False,
+            blocked_message_peers=set(),
+            blocked_by_message_peers=set(),
+            blocked_message_peers_snapshot_at=time.monotonic(),
+            blocked_by_message_peers_snapshot_at=time.monotonic(),
         )
 
         class Harness:
@@ -2929,6 +3030,42 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                         harness.response[1]["capabilities"]["direct_im_credentials"],
                         enabled,
                     )
+
+        failed = ApiResult(
+            False,
+            503,
+            "upstream unavailable",
+            message="upstream unavailable",
+        )
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(
+                session=SimpleNamespace(uid="42"),
+                social=SimpleNamespace(
+                    my_blacklist=lambda: failed,
+                    blacklist_me=lambda: failed,
+                ),
+            ),
+            native=SimpleNamespace(
+                im=SimpleNamespace(
+                    tim_login_payload=lambda **_kwargs: self.fail(
+                        "credential mint must wait for message policy"
+                    )
+                )
+            ),
+            match_pool_online_list_enabled=True,
+            blocked_message_peers=set(),
+            blocked_by_message_peers=set(),
+            blocked_message_peers_snapshot_at=0.0,
+            blocked_by_message_peers_snapshot_at=0.0,
+            message_blocks_retry_at=0.0,
+        )
+        unavailable = Harness("/api/im/tim", True)
+        bff_server.Handler.do_GET(unavailable)
+        self.assertEqual(unavailable.response[0], 503)
+        self.assertEqual(
+            unavailable.response[1]["code"],
+            "MESSAGE_BLOCK_POLICY_UNAVAILABLE",
+        )
 
         self.assertEqual(
             tim_calls,
@@ -3040,6 +3177,10 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                         )
                     ),
                     match_pool_online_list_enabled=enabled,
+                    blocked_message_peers=set(),
+                    blocked_by_message_peers=set(),
+                    blocked_message_peers_snapshot_at=time.monotonic(),
+                    blocked_by_message_peers_snapshot_at=time.monotonic(),
                     persist=lambda: None,
                 )
                 harness = Harness(web_user, enabled)
@@ -3417,6 +3558,7 @@ class SocialFrontendContractTests(unittest.TestCase):
 
         self.assertIn("proactivePrivateMessageEnabled: false", app_js)
         self.assertIn("directImCredentialsEnabled: false", app_js)
+        self.assertIn("messagePolicyReady: false", app_js)
         self.assertIn('["online", "在线列表"]', nearby)
         self.assertIn('["nearby", "附近的人"]', nearby)
         self.assertIn('data-form="nearby-filter"', nearby)
@@ -3467,6 +3609,7 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("matchMessagePeers: new Set()", app_js)
         self.assertIn("blockedPrivateMessagePeers: new Set()", app_js)
         self.assertIn("S.proactivePrivateMessageEnabled", can_start_private_chat)
+        self.assertIn("!S.messagePolicyReady", can_start_private_chat)
         self.assertIn("S.privateMessagePeers.has(target)", can_start_private_chat)
         self.assertIn("S.matchMessagePeers.has(target)", can_start_private_chat)
         self.assertIn("hasExistingConversation(target)", can_start_private_chat)
@@ -3506,6 +3649,8 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('${chatAllowed ? "" : " hidden"}>聊天</button>', open_profile)
         self.assertIn('data-action="add-friend"', open_profile)
         self.assertIn('api("/api/im/message-policy"', app_js)
+        self.assertIn("setMessagePolicyReady(false)", app_js)
+        self.assertIn("setMessagePolicyReady(true)", app_js)
         self.assertIn("proactive_private_message", app_js)
         self.assertIn("direct_im_credentials", app_js)
         self.assertIn("if (!S.directImCredentialsEnabled)", app_js)
@@ -3525,11 +3670,14 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('"direct_im_credentials": enabled', bff_server_py)
         self.assertIn('if path == "/api/im/tim"', bff_server_py)
         self.assertIn('if not capabilities.get("direct_im_credentials")', bff_server_py)
+        self.assertIn("if not Handler.ensure_message_blocks_loaded(self, u):", bff_server_py)
         self.assertIn('prefer="server"', bff_server_py)
         self.assertIn("allow_local_fallback=False", bff_server_py)
         tim_connect = app_js.split("async function ensureTimConnected", 1)[1].split(
             "async function cleanupIM", 1
         )[0]
+        self.assertIn("const policyIsCurrent = () =>", tim_connect)
+        self.assertIn("if (!policyIsCurrent()) return false;", tim_connect)
         self.assertNotIn(
             "if (!S.proactivePrivateMessageEnabled) return false;",
             tim_connect,
@@ -3545,8 +3693,14 @@ class SocialFrontendContractTests(unittest.TestCase):
         composer_panel = app_js.split("function chatComposerPanelHtml()", 1)[1].split(
             "function chatComposerQuoteHtml", 1
         )[0]
-        self.assertIn("const directMediaActions = S.directImCredentialsEnabled", composer_panel)
-        self.assertIn("const stickerAction = S.directImCredentialsEnabled", composer_panel)
+        self.assertIn(
+            "const directMediaActions = S.directImCredentialsEnabled && S.messagePolicyReady",
+            composer_panel,
+        )
+        self.assertIn(
+            "const stickerAction = S.directImCredentialsEnabled && S.messagePolicyReady",
+            composer_panel,
+        )
         self.assertIn('data-kind="flash"', composer_panel)
 
     def test_moments_and_social_tabs_update_only_their_content_panels(self) -> None:

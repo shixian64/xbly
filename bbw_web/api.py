@@ -23,7 +23,7 @@ import json
 import logging
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 from urllib.parse import urlencode, urlparse
@@ -171,6 +171,7 @@ class CapturingHandler(legacy.Handler):
         message_policy_allowed_peers: Iterable[str] = (),
         message_policy_match_peers: Iterable[str] = (),
         message_policy_blocked_peers: Iterable[str] = (),
+        message_block_snapshot_guard: Optional[Callable[[str], Any]] = None,
         message_block_snapshot_recorder: Optional[
             Callable[[str, Iterable[str]], None]
         ] = None,
@@ -194,6 +195,7 @@ class CapturingHandler(legacy.Handler):
         self._request_message_policy_allowed_peers = tuple(message_policy_allowed_peers)
         self._request_message_policy_match_peers = tuple(message_policy_match_peers)
         self._request_message_policy_blocked_peers = tuple(message_policy_blocked_peers)
+        self._request_message_block_snapshot_guard = message_block_snapshot_guard
         self._request_message_block_snapshot_recorder = message_block_snapshot_recorder
         self._request_match_history_loader = match_history_loader
         self._request_match_history_recorder = match_history_recorder
@@ -652,10 +654,42 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
 
         match_history_recorder = persist_match_history
 
+    message_block_snapshot_guard: Optional[Callable[[str], Any]] = None
     message_block_snapshot_recorder: Optional[
         Callable[[str, Iterable[str]], None]
     ] = None
     if identity is not None:
+        @contextmanager
+        def serialize_message_block_snapshot(
+            snapshot_path: str,
+            *,
+            request_identity: Any = identity,
+        ):
+            kind = {
+                "/api/social/blacklist": "blacklist",
+                "/api/social/blacklist-me": "blacklisted_by",
+            }.get(snapshot_path)
+            if kind is None:
+                raise ValueError("unsupported message block snapshot")
+            lock = persistence.redis.lock(
+                (
+                    f"{persistence.settings.redis_prefix}:message-block-snapshot:"
+                    f"{request_identity.user_id}:{kind}"
+                ),
+                timeout=60,
+                blocking_timeout=2,
+                thread_local=False,
+            )
+            if not lock.acquire(blocking=True):
+                raise TimeoutError("message block snapshot synchronization is busy")
+            try:
+                yield
+            finally:
+                try:
+                    lock.release()
+                except Exception:
+                    LOGGER.exception("message block snapshot lock release failed")
+
         def persist_message_block_snapshot(
             snapshot_path: str,
             peers: Iterable[str],
@@ -676,6 +710,7 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
                 source_path=snapshot_path,
             )
 
+        message_block_snapshot_guard = serialize_message_block_snapshot
         message_block_snapshot_recorder = persist_message_block_snapshot
 
     handler = CapturingHandler(
@@ -702,6 +737,7 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
         message_policy_allowed_peers=message_policy_allowed_peers,
         message_policy_match_peers=message_policy_match_peers,
         message_policy_blocked_peers=message_policy_blocked_peers,
+        message_block_snapshot_guard=message_block_snapshot_guard,
         message_block_snapshot_recorder=message_block_snapshot_recorder,
         match_history_loader=match_history_loader,
         match_history_recorder=match_history_recorder,
