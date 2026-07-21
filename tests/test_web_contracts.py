@@ -3858,6 +3858,16 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn('if path == "/api/im/rest/revoke"', server_py)
         self.assertIn("20023", server_py)
 
+    def test_incoming_message_toast_prefers_the_sender_nickname(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("function incomingMessageSenderName(message, conversation, peer)", app_js)
+        self.assertIn("message?.nick", app_js)
+        self.assertIn("name: senderName", app_js)
+        self.assertIn('toast(`收到 ${conversationNameIsPlaceholder(displayName, peer) ? "对方" : displayName} 的新消息`)', app_js)
+        self.assertNotIn("toast(`收到来自 ${peer} 的新消息`)", app_js)
+
     def test_sticker_packages_use_image_grid_and_group_tabs(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")

@@ -3169,6 +3169,22 @@ function conversationDisplayName(item) {
   ).trim();
 }
 
+function incomingMessageSenderName(message, conversation, peer) {
+  const sender = message?.sender && typeof message.sender === "object" ? message.sender : {};
+  const name = String(
+    message?.nick ||
+      message?.nickname ||
+      message?.senderName ||
+      message?.sender_name ||
+      sender.nick ||
+      sender.nickname ||
+      sender.name ||
+      conversationDisplayName(applyCachedConversationProfile(conversation)) ||
+      ""
+  ).trim();
+  return conversationNameIsPlaceholder(name, peer) ? "" : name;
+}
+
 function conversationNameIsPlaceholder(name, peer) {
   const value = String(name || "").trim();
   const target = String(peer || "").trim();
@@ -11974,7 +11990,9 @@ function attachTimHandlers(chat, TIM, credential) {
       const entry = timMessageEntry(message, peer, String(credential.userID));
       const preview = messagePreview(entry);
       const currentUnread = Number(current?.unread_count || current?.unread || 0);
-      updateConversationActivity(peer, {
+      const senderName = incomingMessageSenderName(message, current, peer);
+      const conversation = updateConversationActivity(peer, {
+        name: senderName,
         lastMessage: preview,
         unreadCount: entry.type === "mine" ? currentUnread : active ? 0 : currentUnread + 1,
       });
@@ -11985,7 +12003,8 @@ function attachTimHandlers(chat, TIM, credential) {
         markConversationRead(peer);
       } else if (peer && entry.type !== "mine") {
         S.readConversationPeers.delete(peer);
-        toast(`收到来自 ${peer} 的新消息`);
+        const displayName = conversationDisplayName(applyCachedConversationProfile(conversation));
+        toast(`收到 ${conversationNameIsPlaceholder(displayName, peer) ? "对方" : displayName} 的新消息`);
       }
       refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
     });
