@@ -212,7 +212,12 @@ def _archived_message_item(message: Any) -> dict[str, Any]:
         or metadata.get("client_message_key")
         or ""
     )
+    revoked = bool(
+        metadata.get("revoked") or str(getattr(message, "status", "") or "") == "revoked"
+    )
     message_sequence = str(metadata.get("message_sequence") or "")
+    if not message_sequence and revoked and message_id.isdigit() and len(message_id) <= 20:
+        message_sequence = message_id
     message_random = str(metadata.get("message_random") or "")
     quote = metadata.get("quote") if isinstance(metadata.get("quote"), dict) else None
     return {
@@ -238,12 +243,88 @@ def _archived_message_item(message: Any) -> dict[str, Any]:
         "time": message.occurred_at.isoformat(),
         "timestamp": message.occurred_at.isoformat(),
         "source": "archive",
-        "revoked": bool(metadata.get("revoked")),
+        "revoked": revoked,
         "is_peer_read": metadata.get("is_peer_read"),
         "read_at": str(metadata.get("read_at") or ""),
         "flash_id": str(metadata.get("flash_id") or ""),
         "media": media,
     }
+
+
+def _archived_items_refer_to_same_message(
+    left: dict[str, Any], right: dict[str, Any]
+) -> bool:
+    if left.get("flow") and right.get("flow") and left["flow"] != right["flow"]:
+        return False
+    if left.get("from") and right.get("from") and left["from"] != right["from"]:
+        return False
+    if left.get("to") and right.get("to") and left["to"] != right["to"]:
+        return False
+    pairs = (
+        (left.get("message_random"), right.get("message_random")),
+        (left.get("message_key"), right.get("message_key")),
+        (left.get("id"), right.get("id")),
+        (left.get("sequence"), right.get("sequence")),
+        (left.get("id"), right.get("sequence")),
+        (left.get("sequence"), right.get("id")),
+    )
+    return any(
+        str(first or "").strip() and str(first or "").strip() == str(second or "").strip()
+        for first, second in pairs
+    )
+
+
+def _merge_archived_message_items(
+    previous: dict[str, Any], incoming: dict[str, Any]
+) -> dict[str, Any]:
+    def quality(item: dict[str, Any]) -> tuple[int, int, int, int]:
+        return (
+            1 if str(item.get("message_random") or "").strip() else 0,
+            1 if str(item.get("text") or "").strip() else 0,
+            1 if str(item.get("message_key") or "").strip() else 0,
+            1 if not str(item.get("id") or "").isdigit() else 0,
+        )
+
+    primary, secondary = (
+        (incoming, previous) if quality(incoming) > quality(previous) else (previous, incoming)
+    )
+    merged = {**secondary, **primary}
+    for key in (
+        "message_key",
+        "msg_key",
+        "sequence",
+        "msg_sequence",
+        "message_random",
+        "msg_random",
+        "MsgRandom",
+        "text",
+        "body",
+    ):
+        merged[key] = primary.get(key) or secondary.get(key) or ""
+    merged["revoked"] = bool(previous.get("revoked") or incoming.get("revoked"))
+    if merged["revoked"]:
+        merged["status"] = "revoked"
+    return merged
+
+
+def _deduplicate_archived_message_items(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    for item in items:
+        index = next(
+            (
+                position
+                for position, previous in enumerate(merged)
+                if _archived_items_refer_to_same_message(previous, item)
+            ),
+            -1,
+        )
+        if index < 0:
+            merged.append(item)
+        else:
+            merged[index] = _merge_archived_message_items(merged[index], item)
+    return merged
 
 
 @router.get("/conversations")
@@ -393,7 +474,9 @@ def archived_messages(
             before=before,
             limit=bounded_limit,
         )
-        items = [_archived_message_item(message) for message in reversed(rows)]
+        items = _deduplicate_archived_message_items(
+            [_archived_message_item(message) for message in reversed(rows)]
+        )
     next_before = rows[-1].occurred_at.isoformat() if len(rows) == bounded_limit else ""
     return {
         "ok": True,

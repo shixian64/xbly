@@ -408,6 +408,27 @@ def _tim_message_random(report: Mapping[str, Any]) -> str:
     return ""
 
 
+def _tim_message_sequence(report: Mapping[str, Any]) -> str:
+    for key in (
+        "message_sequence",
+        "sequence",
+        "MsgSeq",
+        "msgSeq",
+        "msg_seq",
+        "seq",
+    ):
+        candidate = str(report.get(key) or "").strip()
+        if candidate:
+            return candidate[:80]
+    if not _as_bool(report.get("revoked")):
+        return ""
+    for key in ("upstream_message_id", "message_key", "upstream_message_key"):
+        candidate = str(report.get(key) or "").strip()
+        if candidate.isdigit() and len(candidate) <= 20:
+            return candidate
+    return ""
+
+
 def _message_identifier(
     report: Mapping[str, Any],
     peer_uid: str,
@@ -513,6 +534,60 @@ def _merge_message_metadata(current: Any, update: Mapping[str, Any]) -> dict[str
     return merged
 
 
+def _find_message_by_sequence(
+    db: Any,
+    *,
+    owner_user_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    sequence: str,
+    direction: str,
+    sender_uid: str | None,
+    recipient_uid: str | None,
+) -> Message | None:
+    normalized = str(sequence or "").strip()
+    if not normalized:
+        return None
+    conditions = [
+        Message.owner_user_id == owner_user_id,
+        Message.conversation_id == conversation_id,
+        Message.provider == CHAT_PROVIDER,
+        or_(
+            Message.extra_data["message_sequence"].astext == normalized,
+            Message.upstream_message_id == normalized,
+        ),
+    ]
+    if direction != "unknown":
+        conditions.append(Message.direction.in_((direction, "unknown")))
+    if sender_uid:
+        conditions.append(
+            or_(
+                Message.sender_upstream_uid == sender_uid,
+                Message.sender_upstream_uid.is_(None),
+            )
+        )
+    if recipient_uid:
+        conditions.append(
+            or_(
+                Message.recipient_upstream_uid == recipient_uid,
+                Message.recipient_upstream_uid.is_(None),
+            )
+        )
+    rows = list(db.scalars(select(Message).where(*conditions).limit(20)))
+    if not rows:
+        return None
+
+    def quality(row: Message) -> tuple[int, int, int, int]:
+        metadata = dict(row.extra_data or {}) if isinstance(row.extra_data, Mapping) else {}
+        return (
+            1 if str(metadata.get("message_random") or "").strip() else 0,
+            1 if str(row.body or "") else 0,
+            1 if str(row.upstream_message_id or "").startswith("tim-c2c:") else 0,
+            len(str(metadata.get("raw_upstream_message_ids") or "")),
+        )
+
+    return max(rows, key=quality)
+
+
 def _ingest_message(
     db: Any,
     *,
@@ -550,6 +625,7 @@ def _ingest_message(
         recipient_uid = _bounded(report.get("recipient_upstream_uid"), 128) or None
     raw_upstream_message_id = _bounded(report.get("upstream_message_id"), 512)
     message_random = _tim_message_random(report)
+    message_sequence = _tim_message_sequence(report)
     metadata = {
         "schema_version": _as_int(report.get("schema_version"), 1, minimum=1, maximum=10),
         "source": _bounded(report.get("source"), 64) or "browser",
@@ -557,9 +633,7 @@ def _ingest_message(
         "message_key": _bounded(
             report.get("message_key") or report.get("upstream_message_key"), 512
         ),
-        "message_sequence": _bounded(
-            report.get("message_sequence") or report.get("sequence"), 80
-        ),
+        "message_sequence": message_sequence,
         "message_random": message_random,
         "client_message_key": _bounded(report.get("client_message_key"), 512),
         "idempotency_key": _bounded(report.get("idempotency_key"), 256),
@@ -576,26 +650,45 @@ def _ingest_message(
         else [],
     }
     retention_days = max(1, int(user.chat_retention_days or settings.message_retention_days))
-    row, created = MessageRepository(db).insert_idempotent(
+    upstream_message_id = _message_identifier(
+        report,
+        peer_uid,
+        sender_uid=sender_uid or "",
+        recipient_uid=recipient_uid or "",
+    )
+    repository = MessageRepository(db)
+    row = _find_message_by_sequence(
+        db,
         owner_user_id=user.id,
         conversation_id=conversation.id,
-        provider=CHAT_PROVIDER,
-        upstream_message_id=_message_identifier(
-            report,
-            peer_uid,
-            sender_uid=sender_uid or "",
-            recipient_uid=recipient_uid or "",
-        ),
+        sequence=message_sequence,
         direction=direction,
-        sender_upstream_uid=sender_uid,
-        recipient_upstream_uid=recipient_uid,
-        message_type=message_type,
-        body=str(report.get("text") or "")[:100_000] or None,
-        status=_message_status(report, direction),
-        occurred_at=occurred_at,
-        retention_expires_at=utcnow() + timedelta(days=retention_days),
-        extra_data=metadata,
+        sender_uid=sender_uid,
+        recipient_uid=recipient_uid,
     )
+    created = False
+    if row is not None and message_random and row.upstream_message_id != upstream_message_id:
+        canonical = repository.get_by_upstream(user.id, CHAT_PROVIDER, upstream_message_id)
+        if canonical is not None:
+            row = canonical
+        else:
+            row.upstream_message_id = upstream_message_id
+    if row is None:
+        row, created = repository.insert_idempotent(
+            owner_user_id=user.id,
+            conversation_id=conversation.id,
+            provider=CHAT_PROVIDER,
+            upstream_message_id=upstream_message_id,
+            direction=direction,
+            sender_upstream_uid=sender_uid,
+            recipient_upstream_uid=recipient_uid,
+            message_type=message_type,
+            body=str(report.get("text") or "")[:100_000] or None,
+            status=_message_status(report, direction),
+            occurred_at=occurred_at,
+            retention_expires_at=utcnow() + timedelta(days=retention_days),
+            extra_data=metadata,
+        )
     if not created:
         # Idempotency must not discard later delivery/read/revoke information.
         incoming_status = _message_status(report, direction)

@@ -6254,7 +6254,7 @@ function timMessageTimestamp(message) {
 }
 
 function timMessageSequence(message) {
-  return String(
+  const explicit = String(
     message?.sequence ??
       message?.MsgSeq ??
       message?.msgSeq ??
@@ -6262,6 +6262,20 @@ function timMessageSequence(message) {
       message?.seq ??
       ""
   ).trim();
+  if (explicit) return explicit;
+  if (!timMessageRevoked(message)) return "";
+  const candidates = [
+    message?.ID,
+    message?.id,
+    message?.messageID,
+    message?.messageId,
+    message?.upstream_message_id,
+  ];
+  for (const value of candidates) {
+    const raw = String(value || "").trim();
+    if (/^\d{1,20}$/.test(raw)) return raw;
+  }
+  return "";
 }
 
 function timMessageRandom(message) {
@@ -6350,6 +6364,8 @@ function messagesReferToSameMessage(left, right) {
     [left.msgKey, right.msgKey],
     [left.id, right.id],
     [left.sequence || timMessageSequence(left), right.sequence || timMessageSequence(right)],
+    [left.id, right.sequence || timMessageSequence(right)],
+    [left.sequence || timMessageSequence(left), right.id],
   ];
   return identities.some(([leftValue, rightValue]) => {
     const first = String(leftValue || "").trim();
@@ -6952,6 +6968,7 @@ function peerMessageRevision(peer) {
         entry.delivery,
         entry.progress,
         entry.revoked,
+        entry.recalledText,
         entry.peerRead,
         entry.readAt,
         entry.flashId,
@@ -6980,19 +6997,30 @@ function mergePeerMessages(peer, incoming) {
   const byKey = new Map();
   [...S.imMessages.filter((entry) => entry.peer === target), ...incoming].forEach((entry) => {
     const key = messageIdentityKey(entry);
-    const previous = byKey.get(key);
-    byKey.set(
-      key,
-      previous
-        ? {
+    const matched = [...byKey.entries()].find(
+      ([existingKey, previous]) => existingKey === key || messagesReferToSameMessage(previous, entry)
+    );
+    const previousKey = matched?.[0] || "";
+    const previous = matched?.[1];
+    const merged = previous
+      ? {
             ...previous,
             ...entry,
+            id:
+              entry.messageRandom || timMessageRandom(entry) || !(previous.messageRandom || timMessageRandom(previous))
+                ? entry.id || previous.id || ""
+                : previous.id || entry.id || "",
             rawMessage: entry.rawMessage || previous.rawMessage || null,
             msgKey: entry.msgKey || previous.msgKey || "",
             sequence: entry.sequence || previous.sequence || "",
             messageRandom: entry.messageRandom || previous.messageRandom || "",
             direction: timMessageDirection(entry) || timMessageDirection(previous),
             revoked: Boolean(previous.revoked || entry.revoked),
+            recalledText:
+              entry.recalledText ||
+              previous.recalledText ||
+              (previous.revoked && previous.kind === "text" ? String(previous.text || "") : "") ||
+              (entry.revoked && entry.kind === "text" ? String(entry.text || "") : ""),
             peerRead: previous.peerRead === true || entry.peerRead === true ? true : entry.peerRead ?? previous.peerRead,
             readAt: Math.max(Number(previous.readAt || 0), Number(entry.readAt || 0)),
             retryFile: entry.delivery === "sent" ? null : entry.retryFile ?? previous.retryFile ?? null,
@@ -7005,8 +7033,9 @@ function mergePeerMessages(peer, incoming) {
                 ? Number(entry.voiceTextStatus || 0)
                 : Number(previous.voiceTextStatus || 0),
           }
-        : entry
-    );
+        : entry;
+    if (previousKey) byKey.delete(previousKey);
+    byKey.set(messageIdentityKey(merged), merged);
   });
   S.imMessages = [...otherPeers, ...byKey.values()];
   trimChatMessages(2000);
