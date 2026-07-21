@@ -9185,6 +9185,7 @@ function chatAudioIdentity(audio) {
     messageRandom: String(audio?.dataset?.audioMessageRandom || "").trim(),
     messageSequence: String(audio?.dataset?.audioMessageSequence || "").trim(),
     timestamp: Number(audio?.dataset?.audioMessageTime || 0),
+    source: String(audio?.dataset?.mediaSource || "").trim(),
     peer: String(audio?.dataset?.audioPeer || S.activePeer || "").trim(),
   };
 }
@@ -9208,6 +9209,16 @@ function chatAudioEntryMatchesIdentity(entry, identity) {
   );
 }
 
+function chatAudioEntryHasRefreshedSource(entry, identity) {
+  const candidateUrl = mediaUrl(entry?.media?.url);
+  const currentUrl = mediaUrl(identity?.source);
+  return Boolean(
+    isRemoteMessageMediaUrl(candidateUrl) &&
+      !isUnauthenticatedTencentRichMediaUrl(candidateUrl) &&
+      (!currentUrl || candidateUrl !== currentUrl)
+  );
+}
+
 async function findSdkAudioMessage(identity) {
   const conversationID = `C2C${identity.peer}`;
   const me = String(S.user?.uid || S.user?.id || "");
@@ -9215,7 +9226,9 @@ async function findSdkAudioMessage(identity) {
   const matchingMessage = (message) => {
     if (!message) return null;
     const entry = timMessageEntry(message, identity.peer, me);
-    return chatAudioEntryMatchesIdentity(entry, identity) ? { message, entry } : null;
+    return chatAudioEntryMatchesIdentity(entry, identity) && chatAudioEntryHasRefreshedSource(entry, identity)
+      ? { message, entry }
+      : null;
   };
   if (identity.id && typeof S.chat.findMessage === "function") {
     try {
@@ -9288,7 +9301,7 @@ function updateRefreshedChatAudioEntry(identity, sdkMessage, sdkEntry) {
   );
   if (!current) throw new Error("这条语音已不在当前聊天记录中");
   const refreshedUrl = mediaUrl(sdkEntry?.media?.url);
-  if (!refreshedUrl || isUnauthenticatedTencentRichMediaUrl(refreshedUrl)) {
+  if (!chatAudioEntryHasRefreshedSource(sdkEntry, identity)) {
     throw new Error("语音播放地址仍未更新，请稍后重试");
   }
   const next = {
