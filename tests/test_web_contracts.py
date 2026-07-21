@@ -4236,7 +4236,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
         audio_url = self._app_fragment(
             app_js,
-            "function isUnauthenticatedTencentRichMediaUrl",
+            "function isTencentRichMediaUrl",
             "function normalizeMessageKind",
         )
         audio_render = self._app_fragment(
@@ -4258,6 +4258,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
 
         self.assertIn("imAudioSourceRefreshes: new Map()", app_js)
         self.assertIn("imrich\\.qcloud\\.com", audio_url)
+        self.assertIn("function isTencentRichMediaUrl", audio_url)
         self.assertIn('String(key).toLowerCase() === "authkey"', audio_url)
         self.assertLess(audio_url.index('"url"'), audio_url.index('"remoteAudioUrl"'))
         self.assertIn("!isUnauthenticatedTencentRichMediaUrl(url)", audio_url)
@@ -4272,6 +4273,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("CHAT_AUDIO_REFRESH_MAX_MS = 20 * 1000", app_js)
         self.assertIn('source: String(audio?.dataset?.mediaSource || "").trim()', audio_refresh)
         self.assertIn("function chatAudioEntryHasRefreshedSource", audio_refresh)
+        self.assertIn("const sourceRequiresRenewal = isTencentRichMediaUrl(currentUrl)", audio_refresh)
         self.assertIn("candidateUrl !== currentUrl", audio_refresh)
         self.assertIn("chatAudioEntryHasRefreshedSource(entry, identity)", audio_refresh)
         self.assertIn("S.chat.findMessage(identity.id)", audio_refresh)
@@ -4288,11 +4290,14 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("await recoverChatAudioPlayback(audio, { resumePlayback: true", audio_toggle)
         self.assertIn("reloadChatPlayback(audio, { manual })", audio_recovery)
         self.assertIn("!canRefreshChatAudioSourceFromSdk()", audio_recovery)
+        self.assertIn("const shouldRefresh = mustRefresh || isTencentRichMediaUrl(source)", audio_recovery)
+        self.assertIn("if (!shouldRefresh ||", audio_recovery)
         refresh_index = playback_error.index("refreshChatAudioSource(media")
         request_guard_index = playback_error.rfind(
             'media.dataset.playbackRequested === "1"', 0, refresh_index
         )
         self.assertGreaterEqual(request_guard_index, 0)
+        self.assertIn("shouldRefresh &&", playback_error)
         self.assertLess(
             refresh_index,
             playback_error.index("chatMediaRetryState(source)"),
@@ -4449,6 +4454,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("panel-dom-cache", css_version)
         self.assertIn("private-message-policy-recheck", css_version)
         self.assertIn("private-message-entry-scope", css_version)
+        self.assertTrue(css_version.endswith("-voice-url-renewal"))
 
 
 class FlashPhotoBffContractTests(unittest.TestCase):

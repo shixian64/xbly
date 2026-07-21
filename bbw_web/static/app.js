@@ -5539,18 +5539,28 @@ function preferredMessageMediaUrl(objects, preferredKeys, fallbackKeys = []) {
   );
 }
 
-function isUnauthenticatedTencentRichMediaUrl(value) {
+function isTencentRichMediaUrl(value) {
   const url = mediaUrl(value);
   if (!isRemoteMessageMediaUrl(url)) return false;
   try {
     const parsed = new URL(url);
-    if (!/(?:^|\.)imrich\.qcloud\.com$/i.test(parsed.hostname)) return false;
+    return /(?:^|\.)imrich\.qcloud\.com$/i.test(parsed.hostname);
+  } catch {
+    return /^(?:https?:)?\/\/[^/?#]*\bimrich\.qcloud\.com\b/i.test(url);
+  }
+}
+
+function isUnauthenticatedTencentRichMediaUrl(value) {
+  const url = mediaUrl(value);
+  if (!isTencentRichMediaUrl(url)) return false;
+  try {
+    const parsed = new URL(url);
     const authKey = [...parsed.searchParams.entries()].find(
       ([key]) => String(key).toLowerCase() === "authkey"
     );
     return !String(authKey?.[1] || "").trim();
   } catch {
-    return /^(?:https?:)?\/\/[^/?#]*\bimrich\.qcloud\.com\b/i.test(url) && !/[?&]authKey=[^&#]+/i.test(url);
+    return !/[?&]authKey=[^&#]+/i.test(url);
   }
 }
 
@@ -9212,10 +9222,11 @@ function chatAudioEntryMatchesIdentity(entry, identity) {
 function chatAudioEntryHasRefreshedSource(entry, identity) {
   const candidateUrl = mediaUrl(entry?.media?.url);
   const currentUrl = mediaUrl(identity?.source);
+  const sourceRequiresRenewal = isTencentRichMediaUrl(currentUrl);
   return Boolean(
     isRemoteMessageMediaUrl(candidateUrl) &&
       !isUnauthenticatedTencentRichMediaUrl(candidateUrl) &&
-      (!currentUrl || candidateUrl !== currentUrl)
+      (!currentUrl || !sourceRequiresRenewal || candidateUrl !== currentUrl)
   );
 }
 
@@ -9440,9 +9451,10 @@ async function refreshChatAudioSource(audio, { resumePlayback = false } = {}) {
 
 async function recoverChatAudioPlayback(audio, { resumePlayback = true, manual = true } = {}) {
   const source = String(audio?.dataset?.mediaSource || "").trim();
-  const requiresRefresh =
+  const mustRefresh =
     audio?.dataset?.audioSourceNeedsRefresh === "1" || isUnauthenticatedTencentRichMediaUrl(source);
-  if (!requiresRefresh && !canRefreshChatAudioSourceFromSdk()) {
+  const shouldRefresh = mustRefresh || isTencentRichMediaUrl(source);
+  if (!shouldRefresh || (!mustRefresh && !canRefreshChatAudioSourceFromSdk())) {
     reloadChatPlayback(audio, { manual });
     return false;
   }
@@ -9450,7 +9462,7 @@ async function recoverChatAudioPlayback(audio, { resumePlayback = true, manual =
     await refreshChatAudioSource(audio, { resumePlayback });
     return true;
   } catch (error) {
-    if (error instanceof AuthExpiredError || requiresRefresh) throw error;
+    if (error instanceof AuthExpiredError || mustRefresh) throw error;
     reloadChatPlayback(audio, { manual });
     return false;
   }
@@ -9926,9 +9938,11 @@ function handleChatPlaybackError(media) {
   const source = String(media.dataset.mediaSource || "").trim();
   if (!source) return;
   if (media.matches?.("audio[data-audio-message-id]")) {
-    const requiresRefresh =
+    const mustRefresh =
       media.dataset.audioSourceNeedsRefresh === "1" || isUnauthenticatedTencentRichMediaUrl(source);
+    const shouldRefresh = mustRefresh || isTencentRichMediaUrl(source);
     if (
+      shouldRefresh &&
       media.dataset.playbackRequested === "1" &&
       media.dataset.audioSourceRefreshAttempted !== source &&
       canRefreshChatAudioSourceFromSdk()
@@ -9940,13 +9954,13 @@ function handleChatPlaybackError(media) {
       void refreshChatAudioSource(media, {
         resumePlayback: media.dataset.playbackRequested === "1",
       }).catch((error) => {
-        if (!requiresRefresh && !(error instanceof AuthExpiredError) && media.isConnected) {
+        if (!mustRefresh && !(error instanceof AuthExpiredError) && media.isConnected) {
           reloadChatPlayback(media);
         }
       });
       return;
     }
-    if (requiresRefresh) {
+    if (mustRefresh) {
       setChatAudioRefreshFailure(media, new Error("语音播放地址已失效，请等待实时消息连接后重试"));
       return;
     }
