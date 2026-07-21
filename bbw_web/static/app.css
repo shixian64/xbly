@@ -3274,7 +3274,7 @@ summary:focus-visible {
   display: grid;
   min-width: 0;
   align-items: end;
-  grid-template-columns: auto minmax(120px, 1fr) auto auto auto;
+  grid-template-columns: auto minmax(120px, 1fr) auto auto;
   gap: 0.42rem;
 }
 
@@ -3483,7 +3483,6 @@ summary:focus-visible {
   padding: 0.25rem 0.42rem;
 }
 
-.chat-emoticon-grid,
 .chat-sticker-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -3491,7 +3490,6 @@ summary:focus-visible {
   margin-top: 0.55rem;
 }
 
-.chat-emoticon-grid button,
 .chat-sticker-grid button {
   min-width: 0;
   overflow: hidden;
@@ -3505,7 +3503,6 @@ summary:focus-visible {
   white-space: nowrap;
 }
 
-.chat-emoticon-grid button:hover,
 .chat-sticker-grid button:hover {
   border-color: rgba(117, 79, 181, 0.25);
   color: var(--brand-dark);
@@ -5818,7 +5815,7 @@ html.flash-viewing body {
   }
 
   .chat-compose-main {
-    grid-template-columns: auto minmax(0, 1fr) auto auto;
+    grid-template-columns: auto minmax(0, 1fr) auto;
     gap: 0.35rem;
   }
 
@@ -5870,10 +5867,6 @@ html.flash-viewing body {
 
   .chat-more-action {
     min-height: 66px;
-  }
-
-  .chat-emoticon-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .chat-sticker-grid {
@@ -6003,7 +5996,6 @@ html.flash-viewing body {
   .chat-record-button,
   .chat-more-action,
   .chat-flash-button,
-  .chat-emoticon-grid button,
   .chat-sticker-tab,
   .chat-panel-head button,
   .chat-playback-fallback button,

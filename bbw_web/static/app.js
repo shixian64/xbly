@@ -5045,25 +5045,6 @@ const TIM_KIND_BY_ELEMENT = {
   10: "relay",
 };
 
-const CHAT_TEXT_EMOTICONS = [
-  "[微笑]",
-  "[大笑]",
-  "[害羞]",
-  "[可爱]",
-  "[调皮]",
-  "[得意]",
-  "[惊讶]",
-  "[难过]",
-  "[流泪]",
-  "[生气]",
-  "[加油]",
-  "[赞]",
-  "[握手]",
-  "[抱抱]",
-  "[心动]",
-  "[晚安]",
-];
-
 // TUIEmoji encodes built-in small expressions as text tokens. Keep this order
 // aligned with the APK's assets/chatbuildinemojis/emoji_0.png ... emoji_61.png.
 const TUI_EMOJI_DEFINITIONS = [
@@ -5135,6 +5116,7 @@ const TUI_EMOJI_BY_NAME = Object.fromEntries(
   TUI_EMOJI_DEFINITIONS.map(([name, label], index) => [name, { index, label }])
 );
 const TUI_EMOJI_TOKEN_RE = /\[TUIEmoji_([A-Za-z0-9]+)\]/g;
+const TUI_EMOJI_STICKER_GROUP_ID = "built-in-tuiemoji";
 
 const CHAT_MEDIA_LIMITS = {
   image: 29360128,
@@ -7334,16 +7316,16 @@ async function loadChatStickers({ force = false } = {}) {
     if (data?.ok === false) throw new Error(errorInfo(data, "表情包加载失败").title);
     S.imStickerGroups = stickerGroupsFromEnvelope(data);
     S.imStickers = S.imStickerGroups.flatMap((group) => group.stickers);
-    const activeStillExists = S.imStickerGroups.some(
+    const activeStillExists = chatStickerGroups().some(
       (group) => String(group.id) === String(S.imStickerActiveGroup)
     );
-    if (!activeStillExists) S.imStickerActiveGroup = String(S.imStickerGroups[0]?.id || "");
+    if (!activeStillExists) S.imStickerActiveGroup = TUI_EMOJI_STICKER_GROUP_ID;
     S.imStickersLoaded = true;
   } catch (error) {
     S.imStickersLoaded = true;
     S.imStickerGroups = [];
     S.imStickers = [];
-    S.imStickerActiveGroup = "";
+    S.imStickerActiveGroup = TUI_EMOJI_STICKER_GROUP_ID;
     toast(error?.message || "表情包加载失败", "error");
   } finally {
     S.imStickersLoading = false;
@@ -7351,12 +7333,33 @@ async function loadChatStickers({ force = false } = {}) {
   }
 }
 
+function builtInTuiEmojiGroup() {
+  return {
+    id: TUI_EMOJI_STICKER_GROUP_ID,
+    name: "内置表情",
+    kind: "emoji",
+    stickers: TUI_EMOJI_DEFINITIONS.map(([name, label], index) => ({
+      id: name,
+      name: label,
+      token: `[TUIEmoji_${name}]`,
+      url: `/static/tuiemoji/emoji_${index}.png`,
+    })),
+  };
+}
+
+function chatStickerGroups() {
+  return [
+    builtInTuiEmojiGroup(),
+    ...S.imStickerGroups.map((group) => ({ ...group, kind: "sticker" })),
+  ];
+}
+
 function activeStickerGroup() {
-  if (!S.imStickerGroups.length) return null;
+  const groups = chatStickerGroups();
   return (
-    S.imStickerGroups.find(
+    groups.find(
       (group) => String(group.id) === String(S.imStickerActiveGroup)
-    ) || S.imStickerGroups[0]
+    ) || groups[0]
   );
 }
 
@@ -7374,20 +7377,21 @@ function chatStickerItemHtml(sticker) {
   }<span class="chat-sticker-item-name">${esc(name)}</span></button>`;
 }
 
+function chatTuiEmojiItemHtml(emoji) {
+  const name = String(emoji?.name || "内置表情");
+  return `<button type="button" class="chat-sticker-item chat-tui-emoji-item" data-action="insert-chat-tui-emoji" data-value="${esc(
+    emoji?.token
+  )}" title="${esc(name)}" aria-label="插入内置表情：${esc(name)}"><img src="${esc(
+    emoji?.url
+  )}" alt="" loading="lazy" decoding="async" /><span class="chat-sticker-item-name">${esc(name)}</span></button>`;
+}
+
 function chatComposerPanelHtml() {
-  if (S.imComposerPanel === "emoji") {
-    return `<section class="chat-composer-panel ui-scrollbar" aria-label="常用表情"><div class="chat-panel-head"><strong>常用表情</strong><span>选择后插入消息</span></div><div class="chat-emoticon-grid">${CHAT_TEXT_EMOTICONS.map(
-      (value) => `<button type="button" data-action="insert-chat-emoticon" data-value="${esc(value)}">${esc(
-        value.replace(/^\[|\]$/g, "")
-      )}</button>`
-    ).join("")}</div></section>`;
-  }
   if (S.imComposerPanel === "sticker") {
+    const groups = chatStickerGroups();
     const activeGroup = activeStickerGroup();
-    const body = S.imStickersLoading
-      ? `<div class="chat-panel-empty">正在加载表情包…</div>`
-      : activeGroup
-        ? `<div class="chat-sticker-tabs ui-scrollbar ui-scrollbar--compact" role="tablist" aria-label="表情包分组">${S.imStickerGroups.map(
+    const body = activeGroup
+      ? `<div class="chat-sticker-tabs ui-scrollbar ui-scrollbar--compact" role="tablist" aria-label="表情包分组">${groups.map(
             (group) => {
               const active = String(group.id) === String(activeGroup.id);
               return `<button type="button" role="tab" class="chat-sticker-tab${active ? " on" : ""}" aria-selected="${
@@ -7399,10 +7403,12 @@ function chatComposerPanelHtml() {
           ).join("")}</div><section class="chat-sticker-group ui-scrollbar" role="tabpanel" aria-label="${esc(
             activeGroup.name
           )}"><div class="chat-sticker-grid">${activeGroup.stickers
-            .map(chatStickerItemHtml)
+            .map(activeGroup.kind === "emoji" ? chatTuiEmojiItemHtml : chatStickerItemHtml)
             .join("")}</div></section>`
-        : `<div class="chat-panel-empty">${S.imStickersLoaded ? "暂无可用表情包" : "打开后将加载表情包"}</div>`;
-    return `<section class="chat-composer-panel chat-sticker-panel ui-scrollbar" aria-label="表情包"><div class="chat-panel-head"><strong>表情包</strong><button type="button" data-action="reload-chat-stickers">重新加载</button></div>${body}</section>`;
+      : `<div class="chat-panel-empty">暂无可用表情包</div>`;
+    return `<section class="chat-composer-panel chat-sticker-panel ui-scrollbar" aria-label="表情包"><div class="chat-panel-head"><strong>表情包</strong><button type="button" data-action="reload-chat-stickers" ${
+      S.imStickersLoading ? "disabled" : ""
+    }>${S.imStickersLoading ? "正在加载" : "重新加载"}</button></div>${body}</section>`;
   }
   if (S.imComposerPanel === "more") {
     return `<section class="chat-composer-panel chat-more-panel ui-scrollbar" aria-label="更多消息功能"><div class="chat-panel-head"><strong>更多功能</strong><span>选择要发送的内容</span></div><div class="chat-more-grid">
@@ -7410,7 +7416,7 @@ function chatComposerPanelHtml() {
       <button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="video"><strong>视频</strong><span>发送短视频文件</span></button>
       <button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="file"><strong>文件</strong><span>发送其他类型文件</span></button>
       <button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="flash"><strong>闪图</strong><span>阅后失效的图片</span></button>
-      <button type="button" class="chat-more-action" data-action="toggle-chat-panel" data-panel="sticker"><strong>表情包</strong><span>发送收藏表情</span></button>
+      <button type="button" class="chat-more-action" data-action="toggle-chat-panel" data-panel="sticker"><strong>表情包</strong><span>内置表情与收藏表情</span></button>
     </div></section>`;
   }
   return "";
@@ -7428,7 +7434,6 @@ function chatComposerHtml() {
   const recording = S.imRecordingState;
   const recordingAvailability = voiceRecordingAvailability();
   const voiceMode = S.imVoiceMode && recordingAvailability.available;
-  const panelIsExpression = S.imComposerPanel === "emoji" || S.imComposerPanel === "sticker";
   return `<form class="chat-composer${voiceMode ? " voice-mode" : ""}${recording?.active ? " is-recording" : ""}${
     S.imComposerPanel ? " panel-open" : ""
   }" data-form="im-send"><input type="hidden" name="peer" value="${esc(
@@ -7450,9 +7455,6 @@ function chatComposerHtml() {
           recordingAvailability.reason
         )}">${recording?.active ? (recording.cancel ? "松手取消" : "松手发送") : "按住说话"}</button>
       </div>
-      <button type="button" class="chat-tool-button chat-expression-toggle${panelIsExpression ? " on" : ""}" data-action="toggle-chat-panel" data-panel="emoji" aria-expanded="${
-        panelIsExpression ? "true" : "false"
-      }">表情</button>
       <button type="button" class="chat-tool-button chat-more-toggle${S.imComposerPanel === "more" ? " on" : ""}" data-action="toggle-chat-panel" data-panel="more" aria-expanded="${
         S.imComposerPanel === "more" ? "true" : "false"
       }">更多</button>
@@ -12966,13 +12968,16 @@ async function handleAction(action, button) {
       if (S.route !== "msg" || String(S.activePeer || "") !== peer) return;
     }
     S.imComposerPanel = nextPanel;
-    if (S.imComposerPanel === "emoji" || S.imComposerPanel === "sticker") S.imVoiceMode = false;
+    if (S.imComposerPanel === "sticker") S.imVoiceMode = false;
     if (openingOnTouch && !keyboardWasOpen) $("im-text")?.blur();
-    refreshChatComposerKeepingText({ focus: S.imComposerPanel === "emoji" && !openingOnTouch });
-    if (S.imComposerPanel === "sticker" && !S.imStickersLoaded) void loadChatStickers();
+    refreshChatComposerKeepingText();
+    if (S.imComposerPanel === "sticker") {
+      if (!S.imStickerActiveGroup) S.imStickerActiveGroup = TUI_EMOJI_STICKER_GROUP_ID;
+      if (!S.imStickersLoaded) void loadChatStickers();
+    }
     return;
   }
-  if (action === "insert-chat-emoticon") {
+  if (action === "insert-chat-tui-emoji") {
     const input = $("im-text");
     if (!input) return;
     const value = String(button.dataset.value || "");
@@ -12990,7 +12995,7 @@ async function handleAction(action, button) {
   }
   if (action === "select-sticker-group") {
     const groupID = String(button.dataset.groupId || "");
-    if (!S.imStickerGroups.some((group) => String(group.id) === groupID)) return;
+    if (!chatStickerGroups().some((group) => String(group.id) === groupID)) return;
     const tabScrollLeft = button.closest(".chat-sticker-tabs")?.scrollLeft || 0;
     S.imStickerActiveGroup = groupID;
     refreshChatComposerKeepingText();
