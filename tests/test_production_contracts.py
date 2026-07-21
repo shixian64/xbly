@@ -230,6 +230,7 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn('Conversation.kind == kind', repositories)
         self.assertIn("persistence.can_message_peer(", api)
         self.assertIn("persistence.message_policy_allowed_peers(identity)", api)
+        self.assertIn("persistence.message_policy_match_peers(identity)", api)
         self.assertIn("MATCH_DM_GRANT_PERSISTENCE_FAILED", api)
         self.assertIn("persistence.remember_message_policy_response(", api)
 
@@ -338,6 +339,9 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn("beibeiwu", params)
         self.assertIn("friend", params)
         self.assertIn("web-policy", params)
+        self.assertIn("conversations.peer_upstream_uid", str(db.statement))
+        self.assertIn("tim", params)
+        self.assertIn("direct", params)
 
     def test_archived_messages_are_returned_for_the_authenticated_owner(self) -> None:
         from datetime import UTC, datetime

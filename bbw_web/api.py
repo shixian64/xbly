@@ -168,6 +168,7 @@ class CapturingHandler(legacy.Handler):
         match_pool_online_list_enabled: Optional[bool] = None,
         nearby_custom_city_enabled: Optional[bool] = None,
         message_peer_authorizer: Optional[Callable[[str], bool]] = None,
+        message_policy_allowed_peers: Iterable[str] = (),
         message_policy_match_peers: Iterable[str] = (),
         match_history_loader: Optional[Callable[[int], dict[str, Any]]] = None,
         match_history_recorder: Optional[Callable[[str, dict[str, Any]], None]] = None,
@@ -186,6 +187,7 @@ class CapturingHandler(legacy.Handler):
         self._request_match_pool_online_list_enabled = match_pool_online_list_enabled
         self._request_nearby_custom_city_enabled = nearby_custom_city_enabled
         self._request_message_peer_authorizer = message_peer_authorizer
+        self._request_message_policy_allowed_peers = tuple(message_policy_allowed_peers)
         self._request_message_policy_match_peers = tuple(message_policy_match_peers)
         self._request_match_history_loader = match_history_loader
         self._request_match_history_recorder = match_history_recorder
@@ -551,14 +553,21 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
                 headers={"Retry-After": "900"},
             )
 
+    message_policy_allowed_peers: tuple[str, ...] = ()
     message_policy_match_peers: tuple[str, ...] = ()
     if identity is not None and path == "/api/im/message-policy":
         try:
-            message_policy_match_peers = tuple(
+            message_policy_allowed_peers = tuple(
                 persistence.message_policy_allowed_peers(identity)
             )
         except Exception:
             LOGGER.exception("message policy allowed peer lookup failed")
+        try:
+            message_policy_match_peers = tuple(
+                persistence.message_policy_match_peers(identity)
+            )
+        except Exception:
+            LOGGER.exception("message policy match peer lookup failed")
 
     match_history_loader: Optional[Callable[[int], dict[str, Any]]] = None
     if identity is not None and path == "/api/match/history":
@@ -636,6 +645,7 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
             if identity is not None
             else None
         ),
+        message_policy_allowed_peers=message_policy_allowed_peers,
         message_policy_match_peers=message_policy_match_peers,
         match_history_loader=match_history_loader,
         match_history_recorder=match_history_recorder,

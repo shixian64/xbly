@@ -14,12 +14,12 @@ from typing import Any, Mapping, Optional
 from redis import Redis
 from rq import Queue
 from rq.exceptions import InvalidJobOperation
-from sqlalchemy import and_, or_, select, text
+from sqlalchemy import and_, or_, select, text, union_all
 
 from bbw_prod.config import Settings
 from bbw_prod.crypto import CredentialCipher, normalize_phone
 from bbw_prod.db import session_scope
-from bbw_prod.models import ExternalAccount, Relationship, utcnow
+from bbw_prod.models import Conversation, ExternalAccount, Relationship, utcnow
 from bbw_prod.repositories import (
     ConversationRepository,
     ExternalAccountRepository,
@@ -1092,32 +1092,48 @@ class RuntimePersistence:
     def message_policy_allowed_peers(
         self, identity: UserIdentity, *, limit: int = 2000
     ) -> list[str]:
-        """Return durable friends and messaging grants for browser restoration."""
+        """Return durable peers whose existing or matched conversations may continue."""
 
         with session_scope() as db:
-            values = db.scalars(
-                select(Relationship.subject_upstream_uid)
-                .where(
-                    Relationship.owner_user_id == identity.user_id,
-                    or_(
-                        and_(
-                            Relationship.provider == MESSAGE_POLICY_PROVIDER,
-                            Relationship.kind.in_(
-                                [
-                                    MESSAGE_POLICY_MATCH_KIND,
-                                    MESSAGE_POLICY_CONVERSATION_KIND,
-                                ]
-                            ),
-                        ),
-                        and_(
-                            Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
-                            Relationship.kind == SOCIAL_FRIEND_KIND,
+            relationship_peers = select(
+                Relationship.subject_upstream_uid.label("peer"),
+                Relationship.updated_at.label("observed_at"),
+            ).where(
+                Relationship.owner_user_id == identity.user_id,
+                or_(
+                    and_(
+                        Relationship.provider == MESSAGE_POLICY_PROVIDER,
+                        Relationship.kind.in_(
+                            [
+                                MESSAGE_POLICY_MATCH_KIND,
+                                MESSAGE_POLICY_CONVERSATION_KIND,
+                            ]
                         ),
                     ),
-                    Relationship.status == "active",
-                    Relationship.ended_at.is_(None),
-                )
-                .order_by(Relationship.updated_at.desc())
+                    and_(
+                        Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                        Relationship.kind == SOCIAL_FRIEND_KIND,
+                    ),
+                ),
+                Relationship.status == "active",
+                Relationship.ended_at.is_(None),
+            )
+            conversation_peers = select(
+                Conversation.peer_upstream_uid.label("peer"),
+                Conversation.updated_at.label("observed_at"),
+            ).where(
+                Conversation.owner_user_id == identity.user_id,
+                Conversation.provider == "tim",
+                Conversation.kind == "direct",
+                Conversation.peer_upstream_uid.is_not(None),
+            )
+            allowed_peers = union_all(
+                relationship_peers,
+                conversation_peers,
+            ).subquery()
+            values = db.scalars(
+                select(allowed_peers.c.peer)
+                .order_by(allowed_peers.c.observed_at.desc())
                 .limit(max(1, min(int(limit), 5000)))
             )
             return list(

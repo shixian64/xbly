@@ -94,6 +94,7 @@ const S = {
   proactivePrivateMessageEnabled: false,
   directImCredentialsEnabled: false,
   nearbyCustomCityEnabled: false,
+  privateMessagePeers: new Set(),
   matchMessagePeers: new Set(),
   routeController: null,
   routeSeq: 0,
@@ -1284,6 +1285,7 @@ function applyUser(user) {
     avatar.hidden = true;
     S.proactivePrivateMessageEnabled = false;
     S.directImCredentialsEnabled = false;
+    S.privateMessagePeers.clear();
     S.matchMessagePeers.clear();
     $("side-name").textContent = "游客";
     $("side-meta").textContent = "尚未登录";
@@ -1475,7 +1477,8 @@ function refreshMessagePolicy() {
   return api("/api/im/message-policy", { timeout: 6000 })
     .then(({ data }) => {
       applyCapabilities(data.capabilities);
-      rememberMessagePolicyMatchPeers(data.allowed_peers || data.match_peers);
+      rememberMessagePolicyAllowedPeers(data.allowed_peers);
+      rememberMessagePolicyMatchPeers(data.match_peers);
       syncPrivateMessageControls({ refreshChat: false });
       return data.capabilities || {};
     })
@@ -2926,34 +2929,90 @@ function canStartPrivateChat(uid) {
   }
   return (
     S.proactivePrivateMessageEnabled ||
+    S.privateMessagePeers.has(target) ||
     S.matchMessagePeers.has(target) ||
     hasExistingConversation(target)
   );
 }
 
-function rememberMatchMessagePeers(data) {
-  if (!data || data.ok !== true) return;
-  rememberMessagePolicyMatchPeers(
-    itemsOf(data).map((item) => item?.user_id || item?.uid || item?.id)
-  );
+async function ensurePrivateChatPermission(uid) {
+  if (canStartPrivateChat(uid)) return true;
+  await refreshMessagePolicy();
+  return canStartPrivateChat(uid);
 }
 
-function rememberMessagePolicyMatchPeers(values) {
+function canOpenPrivateChatEntry(uid, origin = "") {
+  const target = String(uid || "").trim();
+  if (!target || !canStartPrivateChat(target)) return false;
+  if (S.proactivePrivateMessageEnabled) return true;
+  return String(origin || "").trim() === "match" && S.matchMessagePeers.has(target);
+}
+
+async function ensurePrivateChatEntryPermission(uid, origin = "") {
+  if (canOpenPrivateChatEntry(uid, origin)) return true;
+  await refreshMessagePolicy();
+  return canOpenPrivateChatEntry(uid, origin);
+}
+
+function privateMessagePeerId(value) {
+  if (value == null) return "";
+  if (typeof value !== "object") return String(value || "").trim();
+  for (const key of [
+    "peer_id",
+    "conversation_user",
+    "user_id",
+    "uid",
+    "id",
+    "yourid",
+    "target_uid",
+    "userId",
+    "targetId",
+  ]) {
+    const peer = String(value[key] || "").trim();
+    if (peer) return peer;
+  }
+  for (const key of ["user", "target", "profile"]) {
+    const peer = privateMessagePeerId(value[key]);
+    if (peer) return peer;
+  }
+  return "";
+}
+
+function rememberMatchMessagePeers(data) {
+  if (!data || data.ok !== true) return;
+  const peers = [
+    ...(Array.isArray(data.message_peers) ? data.message_peers : []),
+    ...itemsOf(data),
+    data.target,
+  ];
+  rememberMessagePolicyMatchPeers(peers);
+  rememberMessagePolicyAllowedPeers(peers);
+}
+
+function rememberPrivateMessagePeers(values, targetSet) {
   (Array.isArray(values) ? values : []).forEach((value) => {
-    const uid = String(value || "").trim();
+    const uid = privateMessagePeerId(value);
     if (
       uid &&
       !["0", "none", "null"].includes(uid.toLowerCase()) &&
       uid !== String(S.user?.uid || S.user?.id || "")
     ) {
-      S.matchMessagePeers.add(uid);
+      targetSet.add(uid);
     }
   });
 }
 
+function rememberMessagePolicyAllowedPeers(values) {
+  rememberPrivateMessagePeers(values, S.privateMessagePeers);
+}
+
+function rememberMessagePolicyMatchPeers(values) {
+  rememberPrivateMessagePeers(values, S.matchMessagePeers);
+}
+
 function syncPrivateMessageControls({ refreshChat = true } = {}) {
   document.querySelectorAll('[data-action="open-chat"]').forEach((button) => {
-    const allowed = canStartPrivateChat(button.dataset.uid);
+    const allowed = canOpenPrivateChatEntry(button.dataset.uid, button.dataset.chatOrigin);
     button.hidden = !allowed;
     button.classList.toggle("hide", !allowed);
     button.setAttribute("aria-disabled", String(!allowed));
@@ -2992,8 +3051,9 @@ function userCard(item, options = {}) {
     }
   }
   const chatOrigin = String(options.chatOrigin || "").trim();
-  if (options.chat && id) {
-    const chatAllowed = canStartPrivateChat(id);
+  const renderChatAction = options.chat !== false && options.profile !== false;
+  if (renderChatAction && id) {
+    const chatAllowed = canOpenPrivateChatEntry(id, chatOrigin);
     actions.push(`<button type="button" class="btn primary small${chatAllowed ? "" : " hide"}" data-action="open-chat" data-uid="${esc(id)}" data-name="${esc(
       name
     )}" data-avatar="${esc(user.avatar || user.portrait || "")}"${
@@ -8412,7 +8472,7 @@ async function sendTimMediaFile(kind, file, meta = {}) {
     revokeChatObjectUrl(meta.localUrl);
     throw new Error("系统客服消息无需回复");
   }
-  if (!canStartPrivateChat(peer)) {
+  if (!(await ensurePrivateChatPermission(peer))) {
     revokeChatObjectUrl(meta.localUrl);
     throw new Error("该私信入口仅向管理员授权的用户开放");
   }
@@ -8656,7 +8716,7 @@ async function sendFlashPhoto(file, { retryMessageId = "" } = {}) {
   validateChatFile("flash", file);
   const peer = String(S.activePeer || "").trim();
   if (!peer) throw new Error("请先选择聊天对象");
-  if (!canStartPrivateChat(peer)) throw new Error("该私信入口仅向管理员授权的用户开放");
+  if (!(await ensurePrivateChatPermission(peer))) throw new Error("该私信入口仅向管理员授权的用户开放");
   const previous = retryMessageId ? findChatMessage(retryMessageId, peer) : null;
   const pendingID = previous?.id || localMessageID("flash");
   const pending = {
@@ -8751,7 +8811,7 @@ async function sendChatSticker(index, data, { retryMessageId = "" } = {}) {
   const peer = String(S.activePeer || "").trim();
   const faceData = String(data || "").trim();
   if (!peer || !faceData) throw new Error("表情包数据不完整");
-  if (!canStartPrivateChat(peer)) throw new Error("该私信入口仅向管理员授权的用户开放");
+  if (!(await ensurePrivateChatPermission(peer))) throw new Error("该私信入口仅向管理员授权的用户开放");
   const previous = retryMessageId ? findChatMessage(retryMessageId, peer) : null;
   const pendingID = previous?.id || localMessageID("face");
   const numericIndex = Math.max(0, Math.trunc(Number(index) || 0));
@@ -10102,6 +10162,8 @@ async function loadMatchHistory(page = 1, { append = false } = {}) {
   try {
     const { data } = await api(`/api/match/history?page=${encodeURIComponent(String(normalizedPage))}`);
     if (data?.ok === false) throw new Error(errorInfo(data, "匹配历史加载失败").title);
+    rememberMatchMessagePeers(data);
+    syncPrivateMessageControls({ refreshChat: false });
     if (!append) {
       panel.innerHTML = matchHistoryHtml(data);
       void refreshVisiblePeerPresence();
@@ -10133,6 +10195,7 @@ async function pageMatching(signal) {
       : { ok: false, error: historyResult.reason?.message || "匹配历史加载失败" };
   applyCapabilities(data.capabilities);
   if (data.user) applyUser(data.user);
+  rememberMatchMessagePeers(historyData);
   const display = data.display || (data.status && data.status.display) || {};
   const filters = data.filters || data.status?.filters || {};
   const gender = MATCH_GENDERS.includes(filters.gender) ? filters.gender : "不限";
@@ -10457,7 +10520,7 @@ async function loadSocialTab(tab, signal) {
     ]);
     if (friendResult.status !== "fulfilled") throw friendResult.reason;
     const friends = itemsOf(friendResult.value.data);
-    rememberMessagePolicyMatchPeers(
+    rememberMessagePolicyAllowedPeers(
       friends.map((item) => item?.user_id || item?.uid || item?.id)
     );
     syncPrivateMessageControls({ refreshChat: false });
@@ -11003,7 +11066,7 @@ async function openProfile(uid, { chatOrigin = "" } = {}) {
   const profileUid = String(user.id || user.uid || target);
   const isSelf = profileUid === currentUid;
   const normalizedChatOrigin = String(chatOrigin || "").trim();
-  const chatAllowed = !isSelf && canStartPrivateChat(profileUid);
+  const chatAllowed = !isSelf && canOpenPrivateChatEntry(profileUid, normalizedChatOrigin);
   const profileIsFriend = user.is_friend === true || String(user.is_friend || "") === "1";
   const profileFriendApplied =
     user.is_friend_apply === true || String(user.is_friend_apply || "") === "1";
@@ -11488,6 +11551,7 @@ async function startVoiceMatch() {
     await refreshVoiceMatchStats();
     return;
   }
+  rememberMatchMessagePeers(data);
   S.voiceMatchServerState = voiceMatchServerState(data);
   if (data.target) S.voiceMatchPeer = data.target;
   updateVoiceMatchPanel();
@@ -13033,12 +13097,12 @@ async function handleAction(action, button) {
       toggleConversationSelection(uid);
       return;
     }
-    if (action === "open-chat" && !canStartPrivateChat(uid)) {
-      await refreshMessagePolicy();
-      if (!canStartPrivateChat(uid)) {
-        toast("该私信入口仅向管理员授权的用户开放", "error", 4200);
-        return;
-      }
+    if (
+      action === "open-chat" &&
+      !(await ensurePrivateChatEntryPermission(uid, button.dataset.chatOrigin))
+    ) {
+      toast("该私信入口仅向管理员授权的用户开放", "error", 4200);
+      return;
     }
     if (uid !== S.activePeer) {
       S.imComposerPanel = "";
@@ -13490,7 +13554,7 @@ async function handleProductForm(form, submitter) {
       submittedConversation.peer_name ||
       submittedConversation.user?.nickname ||
       `用户 ${peer}`;
-    if (!canStartPrivateChat(peer)) throw new Error("该私信入口仅向管理员授权的用户开放");
+    if (!(await ensurePrivateChatPermission(peer))) throw new Error("该私信入口仅向管理员授权的用户开放");
 
     const sendTask = sendTextMessage(peer, text, { peerName: submittedPeerName, quote: submittedQuote });
     consumeSubmittedChatDraft(peer, submittedDraft, submittedDraftRevision, submittedPeerDraftRevision);

@@ -2855,8 +2855,7 @@ class Handler(BaseHTTPRequestHandler):
             match_peers = {
                 str(peer).strip()
                 for peer in (
-                    list(getattr(u, "friend_message_peers", set()) or set())
-                    + list(getattr(u, "match_message_peers", set()) or set())
+                    list(getattr(u, "match_message_peers", set()) or set())
                     + list(
                         getattr(self, "_request_message_policy_match_peers", ())
                         or ()
@@ -2866,12 +2865,28 @@ class Handler(BaseHTTPRequestHandler):
                 and str(peer).strip().lower() not in {"0", "none", "null"}
                 and str(peer).strip() != str(app.session.uid or "")
             }
+            allowed_peers = {
+                str(peer).strip()
+                for peer in (
+                    list(getattr(u, "friend_message_peers", set()) or set())
+                    + list(getattr(u, "match_message_peers", set()) or set())
+                    + list(getattr(u, "conversation_message_peers", set()) or set())
+                    + list(
+                        getattr(self, "_request_message_policy_allowed_peers", ())
+                        or ()
+                    )
+                )
+                if str(peer).strip()
+                and str(peer).strip().lower() not in {"0", "none", "null"}
+                and str(peer).strip() != str(app.session.uid or "")
+            }
+            allowed_peers.update(match_peers)
             return self.ok(
                 {
                     "ok": True,
                     "capabilities": Handler.web_user_capabilities(self, u),
                     "match_peers": sorted(match_peers)[:5000],
-                    "allowed_peers": sorted(match_peers)[:5000],
+                    "allowed_peers": sorted(allowed_peers)[:5000],
                 }
             )
         if path == "/api/im/tim":
@@ -4002,6 +4017,7 @@ class Handler(BaseHTTPRequestHandler):
                         "message": "已匹配到用户，正在发起语音通话",
                         "target": target,
                         "items": [target],
+                        "message_peers": [target_id],
                         "count": 1,
                         **state,
                     }
@@ -4157,11 +4173,13 @@ class Handler(BaseHTTPRequestHandler):
                     if match_peers is None:
                         match_peers = set()
                         setattr(u, "match_message_peers", match_peers)
-                    match_peers.update(
+                    matched_peers = {
                         peer
                         for peer in _message_peer_ids(payload)
                         if peer != str(app.session.uid or "")
-                    )
+                    }
+                    match_peers.update(matched_peers)
+                    payload["message_peers"] = sorted(matched_peers)
                     recorded_peers = _remember_web_match_history(u, path, payload)
                     if recorded_peers:
                         payload["history_saved"] = True
@@ -4462,13 +4480,31 @@ def _message_peer_ids(payload: Any) -> Set[str]:
     for row in rows:
         if not isinstance(row, Mapping):
             continue
-        value = (
-            row.get("peer_id")
-            or row.get("conversation_user")
-            or row.get("user_id")
-            or row.get("uid")
-            or row.get("id")
-        )
+        value: Any = ""
+        for key in (
+            "peer_id",
+            "conversation_user",
+            "user_id",
+            "uid",
+            "id",
+            "yourid",
+            "target_uid",
+            "userId",
+            "targetId",
+        ):
+            value = row.get(key)
+            if value:
+                break
+        if not value:
+            for key in ("user", "target", "profile"):
+                nested = row.get(key)
+                if not isinstance(nested, Mapping):
+                    continue
+                nested_peers = _message_peer_ids({"items": [nested]})
+                if nested_peers:
+                    peers.update(nested_peers)
+                    break
+            continue
         peer = str(value or "").strip()
         if (
             peer

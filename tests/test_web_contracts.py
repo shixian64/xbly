@@ -1966,6 +1966,20 @@ class MatchRoutingContractTests(unittest.TestCase):
         )
         self.assertEqual(bff_server._saved_match_properties({}, "Z"), ["Z"])
 
+    def test_match_message_peer_ids_accept_normalized_and_legacy_shapes(self) -> None:
+        self.assertEqual(
+            bff_server._message_peer_ids(
+                {
+                    "items": [
+                        {"id": "9"},
+                        {"yourid": "10"},
+                        {"target": {"userId": "11"}},
+                    ]
+                }
+            ),
+            {"9", "10", "11"},
+        )
+
     def _run_match(self, path: str, payload: dict, raw_user=None):
         calls = []
         result = ApiResult(
@@ -2243,6 +2257,7 @@ class MatchRoutingContractTests(unittest.TestCase):
         self.assertEqual(session.raw_user["match_gender"], "女")
         self.assertEqual(session.raw_user["match_property"], "B")
         self.assertEqual(response[0], 200)
+        self.assertEqual(response[1]["message_peers"], ["9"])
         self.assertEqual(
             response[1]["filters"],
             {"gender": "女", "property": "B", "properties": ["B"]},
@@ -2683,6 +2698,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         web_user = SimpleNamespace(
             app=SimpleNamespace(session=SimpleNamespace(uid="42")),
             match_pool_online_list_enabled=False,
+            friend_message_peers={"11"},
             match_message_peers={"9"},
         )
 
@@ -2712,7 +2728,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
 
         self.assertEqual(harness.response[0], 200)
         self.assertEqual(harness.response[1]["match_peers"], ["10", "9"])
-        self.assertEqual(harness.response[1]["allowed_peers"], ["10", "9"])
+        self.assertEqual(harness.response[1]["allowed_peers"], ["10", "11", "9"])
         self.assertFalse(
             harness.response[1]["capabilities"]["proactive_private_message"]
         )
@@ -3182,32 +3198,36 @@ class SocialFrontendContractTests(unittest.TestCase):
         )[0]
 
         self.assertIn("proactivePrivateMessageEnabled: false", app_js)
+        self.assertIn("privateMessagePeers: new Set()", app_js)
         self.assertIn("matchMessagePeers: new Set()", app_js)
         self.assertIn("S.proactivePrivateMessageEnabled", can_start_private_chat)
+        self.assertIn("S.privateMessagePeers.has(target)", can_start_private_chat)
         self.assertIn("S.matchMessagePeers.has(target)", can_start_private_chat)
         self.assertIn("hasExistingConversation(target)", can_start_private_chat)
+        self.assertIn("function canOpenPrivateChatEntry(uid, origin", app_js)
+        self.assertIn('String(origin || "").trim() === "match"', app_js)
+        self.assertIn("S.matchMessagePeers.has(target)", app_js)
+        self.assertIn("function ensurePrivateChatEntryPermission(uid, origin", app_js)
         self.assertIn("function rememberMatchMessagePeers(data)", app_js)
+        self.assertIn("function rememberMessagePolicyAllowedPeers(values)", app_js)
         self.assertIn("function rememberMessagePolicyMatchPeers(values)", app_js)
         self.assertIn(
-            "rememberMessagePolicyMatchPeers(data.allowed_peers || data.match_peers)",
+            "rememberMessagePolicyAllowedPeers(data.allowed_peers)",
             app_js,
         )
+        self.assertIn("rememberMessagePolicyMatchPeers(data.match_peers)", app_js)
         self.assertIn('chatOrigin: "match"', app_js)
-        self.assertIn("const chatAllowed = canStartPrivateChat(id)", user_card)
+        self.assertIn("const renderChatAction = options.chat !== false", user_card)
+        self.assertIn("const chatAllowed = canOpenPrivateChatEntry(id, chatOrigin)", user_card)
         self.assertIn('aria-disabled="${String(!chatAllowed)}"', user_card)
         self.assertIn('${chatAllowed ? "" : " hidden"}>聊天</button>', user_card)
         self.assertIn("button.hidden = !allowed", app_js)
-        self.assertIn('action === "open-chat" && !canStartPrivateChat(uid)', app_js)
-        self.assertIn("await refreshMessagePolicy();", app_js)
-        policy_recheck = app_js.split(
-            'if (action === "open-chat" && !canStartPrivateChat(uid))', 1
-        )[1].split("if (uid !== S.activePeer)", 1)[0]
-        self.assertLess(
-            policy_recheck.index("await refreshMessagePolicy();"),
-            policy_recheck.index('toast("该私信入口仅向管理员授权的用户开放"'),
+        self.assertIn("button.dataset.chatOrigin", app_js)
+        self.assertIn("ensurePrivateChatEntryPermission(uid, button.dataset.chatOrigin)", app_js)
+        self.assertIn(
+            "const chatAllowed = !isSelf && canOpenPrivateChatEntry(profileUid, normalizedChatOrigin)",
+            open_profile,
         )
-        self.assertIn("if (!canStartPrivateChat(uid)) {", policy_recheck)
-        self.assertIn("const chatAllowed = !isSelf && canStartPrivateChat(profileUid)", open_profile)
         self.assertIn('${chatAllowed ? "" : " hidden"}>聊天</button>', open_profile)
         self.assertIn('data-action="add-friend"', open_profile)
         self.assertIn('api("/api/im/message-policy"', app_js)
@@ -3221,7 +3241,7 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("identity.match_pool_online_list_enabled", api_py)
         self.assertIn('if path == "/api/im/message-policy"', bff_server_py)
         self.assertIn('"match_peers": sorted(match_peers)[:5000]', bff_server_py)
-        self.assertIn('"allowed_peers": sorted(match_peers)[:5000]', bff_server_py)
+        self.assertIn('"allowed_peers": sorted(allowed_peers)[:5000]', bff_server_py)
         self.assertIn("app.bootstrap(include_im=False)", bff_server_py)
         self.assertIn("Handler.can_message_peer(self, u, to_uid)", bff_server_py)
         self.assertIn("Handler.can_message_peer(self, u, target_id)", bff_server_py)
@@ -4327,6 +4347,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("route-dom-cache", css_version)
         self.assertIn("panel-dom-cache", css_version)
         self.assertIn("private-message-policy-recheck", css_version)
+        self.assertIn("private-message-entry-scope", css_version)
 
 
 class FlashPhotoBffContractTests(unittest.TestCase):
