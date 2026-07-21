@@ -69,6 +69,7 @@ const PANEL_DOM_CACHE_LIMIT = 80;
 // application console may extend it; the admin REST recall route has no fixed
 // time limit while the message is still inside its roaming-storage lifetime.
 const MESSAGE_REVOKE_DEFAULT_WINDOW_MS = 2 * 60 * 1000;
+const MESSAGE_PENDING_REVOKE_LIMIT = 50;
 const MEDIA_RECONCILE_DELAYS_MS = [1200, 3500, 8000];
 const CHAT_MEDIA_RETRY_DELAYS_MS = [700, 1800, 4000];
 const CHAT_AUDIO_REFRESH_PAGE_SIZE = 15;
@@ -191,6 +192,7 @@ const S = {
   imNextReconnectAt: 0,
   imLastError: "",
   imMessages: [],
+  imPendingRevocations: new Map(),
   imMessageLoadingPeers: new Set(),
   imMessageLoadedPeers: new Set(),
   imArchiveLoadedPeers: new Set(),
@@ -820,7 +822,9 @@ function messageArchivePayload(entry, direction = "") {
   if (!entry || typeof entry !== "object") return null;
   const peer = String(entry.peer || "").trim();
   if (!peer || entry.type === "system") return null;
-  const normalizedDirection = direction || (entry.type === "mine" ? "outgoing" : "incoming");
+  const entryDirection = timMessageDirection(entry);
+  const normalizedDirection =
+    direction || (entryDirection === "out" ? "outgoing" : entryDirection === "in" ? "incoming" : "unknown");
   const rawSource = String(entry.source || "tim").trim().toLowerCase();
   const source = ["tim", "sdk", "tim_sdk"].includes(rawSource)
     ? "tim_sdk"
@@ -6038,9 +6042,35 @@ function timMessageRandom(message) {
   return "";
 }
 
+function timMessageDirection(message, me = String(S.user?.uid || S.user?.id || "")) {
+  const explicit = String(message?.direction || message?.flow || "").trim().toLowerCase();
+  if (["out", "outgoing", "sent", "send"].includes(explicit)) return "out";
+  if (["in", "incoming", "received", "receive"].includes(explicit)) return "in";
+  if (message?.type === "mine") return "out";
+
+  const sender = String(message?.from || message?.from_user_id || message?.fromUserId || message?.From_Account || "");
+  if (me && sender) return sender === me ? "out" : "in";
+  const recipient = String(message?.to || message?.to_user_id || message?.toUserId || message?.To_Account || "");
+  if (me && recipient) return recipient === me ? "in" : "out";
+  const revoker = String(
+    message?.revoker ??
+      message?.revokerID ??
+      message?.revokerId ??
+      message?.revokeUserID ??
+      message?.revokeUserId ??
+      message?.revoke_user_id ??
+      message?.operatorID ??
+      message?.operatorId ??
+      message?.operator_id ??
+      ""
+  );
+  if (me && revoker) return revoker === me ? "out" : "in";
+  return "";
+}
+
 function messageIdentityKey(entry) {
   const peer = String(entry?.peer || "");
-  const direction = entry?.type === "mine" ? "out" : "in";
+  const direction = timMessageDirection(entry) || "unknown";
   const messageRandom = String(entry?.messageRandom || timMessageRandom(entry) || "");
   if (peer && messageRandom) return `tim|${peer}|${direction}|${messageRandom}`;
   const messageKey = String(entry?.msgKey || "");
@@ -6051,6 +6081,29 @@ function messageIdentityKey(entry) {
   if (id) return `id|${id}`;
   const mediaIdentity = entry?.media?.url || entry?.media?.uuid || entry?.media?.data || entry?.flashId || "";
   return `fallback|${peer}|${direction}|${entry?.kind || "text"}|${entry?.timestamp || ""}|${entry?.text || ""}|${mediaIdentity}`;
+}
+
+function messagesReferToSameMessage(left, right) {
+  if (!left || !right) return false;
+  const leftPeer = String(left.peer || "");
+  const rightPeer = String(right.peer || "");
+  if (leftPeer && rightPeer && leftPeer !== rightPeer) return false;
+  const leftDirection = timMessageDirection(left);
+  const rightDirection = timMessageDirection(right);
+  if (leftDirection && rightDirection && leftDirection !== rightDirection) return false;
+  const leftIdentity = messageIdentityKey(left);
+  if (leftIdentity === messageIdentityKey(right) && !leftIdentity.startsWith("fallback|")) return true;
+  const identities = [
+    [left.messageRandom || timMessageRandom(left), right.messageRandom || timMessageRandom(right)],
+    [left.msgKey, right.msgKey],
+    [left.id, right.id],
+    [left.sequence || timMessageSequence(left), right.sequence || timMessageSequence(right)],
+  ];
+  return identities.some(([leftValue, rightValue]) => {
+    const first = String(leftValue || "").trim();
+    const second = String(rightValue || "").trim();
+    return Boolean(first && second && first === second);
+  });
 }
 
 function compareMessageOrder(a, b) {
@@ -6067,8 +6120,12 @@ function timMessagePeer(message, me = String(S.user?.uid || S.user?.id || "")) {
   const from = String(message?.from || message?.from_user_id || message?.fromUserId || message?.From_Account || "");
   const to = String(message?.to || message?.to_user_id || message?.toUserId || message?.To_Account || "");
   const directPeer = String(message?.peerID || message?.peer_id || message?.userID || message?.To_Account || "");
-  const outgoing = message?.flow === "out" || (me && from === me);
-  return String((outgoing ? to : from) || conversationPeer || directPeer || "");
+  const direction = timMessageDirection(message, me);
+  if (direction === "out") return String(to || conversationPeer || directPeer || "");
+  if (direction === "in") return String(from || conversationPeer || directPeer || "");
+  return String(
+    conversationPeer || directPeer || (from && from !== me ? from : "") || (to && to !== me ? to : "") || from || to || ""
+  );
 }
 
 function timPeerReadState(message) {
@@ -6116,8 +6173,8 @@ function timMessageRevoked(message) {
 
 function timMessageEntry(message, peer = "", me = String(S.user?.uid || S.user?.id || "")) {
   const target = String(peer || timMessagePeer(message, me));
-  const sender = String(message?.from || message?.from_user_id || message?.fromUserId || message?.From_Account || "");
-  const outgoing = message?.flow === "out" || sender === me;
+  const direction = timMessageDirection(message, me);
+  const outgoing = direction === "out";
   const status = String(message?.status || message?.send_status || "").toLowerCase();
   const payload = messagePayload(message);
   const cloud = messageCloudCustomData(message, payload);
@@ -6148,6 +6205,7 @@ function timMessageEntry(message, peer = "", me = String(S.user?.uid || S.user?.
     media: normalizeEntryMedia(kind, payload, message),
     flashId: kind === "flash" ? messageFlashID(message, payload, cloud) : "",
     type: outgoing ? "mine" : "",
+    direction,
     peer: target,
     timestamp: timMessageTimestamp(message),
     source: message?.source || "tim",
@@ -6395,6 +6453,15 @@ function chatLogHtml() {
   const entries = S.imMessages.filter(
     (entry) => entry.type !== "system" && (!entry.peer || !S.activePeer || entry.peer === S.activePeer)
   );
+  if (
+    entries.length &&
+    S.activePeer &&
+    S.imMessageLoadingPeers.has(S.activePeer) &&
+    !S.imMessageLoadedPeers.has(S.activePeer) &&
+    entries.every((entry) => entry.revoked)
+  ) {
+    return `<div class="chat-line system">正在加载聊天记录…</div>`;
+  }
   if (!entries.length) {
     if (S.activePeer && S.imMessageLoadingPeers.has(S.activePeer)) {
       return `<div class="chat-line system">正在加载聊天记录…</div>`;
@@ -6522,6 +6589,7 @@ function addImMessage(text, type = "system", peer = "", meta = {}) {
     payload: { text: String(text) },
     media: {},
     type: type === "mine" ? "mine" : "",
+    direction: type === "mine" ? "out" : "in",
     peer: String(peer || ""),
     timestamp: Date.now(),
     delivery: type === "mine" ? "sent" : "",
@@ -6668,6 +6736,7 @@ function mergePeerMessages(peer, incoming) {
             msgKey: entry.msgKey || previous.msgKey || "",
             sequence: entry.sequence || previous.sequence || "",
             messageRandom: entry.messageRandom || previous.messageRandom || "",
+            direction: timMessageDirection(entry) || timMessageDirection(previous),
             revoked: Boolean(previous.revoked || entry.revoked),
             peerRead: previous.peerRead === true || entry.peerRead === true ? true : entry.peerRead ?? previous.peerRead,
             readAt: Math.max(Number(previous.readAt || 0), Number(entry.readAt || 0)),
@@ -6704,15 +6773,17 @@ async function loadConversationMessages(peer, { force = false } = {}) {
   if (!wasLoaded && S.activePeer === target) refreshChatLog();
   const me = String(S.user?.uid || S.user?.id || "");
   const tasks = [
-    api(`/api/im/messages?peer=${encodeURIComponent(target)}`, { timeout: 10000 }).then(({ data }) =>
-      itemsOf(data).map((item) => timMessageEntry({ ...item, source: "http" }, target, me))
-    ),
+    api(`/api/im/messages?peer=${encodeURIComponent(target)}`, { timeout: 10000 }).then(({ data, ok }) => {
+      if (!ok || data?.ok === false) throw new Error("服务器聊天记录暂时不可用");
+      return itemsOf(data).map((item) => timMessageEntry({ ...item, source: "http" }, target, me));
+    }),
   ];
   if (shouldLoadArchive) {
     tasks.push(
       api(`/api/archive/messages?peer=${encodeURIComponent(target)}&limit=200`, { timeout: 6000 }).then(
         ({ data, ok }) => {
-          if (ok && data?.ok !== false) S.imArchiveLoadedPeers.add(target);
+          if (!ok || data?.ok === false) throw new Error("归档聊天记录暂时不可用");
+          S.imArchiveLoadedPeers.add(target);
           return itemsOf(data).map((item) =>
             timMessageEntry({ ...item, source: "archive" }, target, me)
           );
@@ -6734,7 +6805,14 @@ async function loadConversationMessages(peer, { force = false } = {}) {
   }
   try {
     const results = await Promise.allSettled(tasks);
-    const incoming = results.flatMap((result) => (result.status === "fulfilled" ? result.value : []));
+    const fulfilled = results
+      .filter((result) => result.status === "fulfilled")
+      .map((result) => result.value);
+    if (!fulfilled.length) return;
+    const incoming = mergePendingMessageRevocations(
+      target,
+      fulfilled.flat()
+    );
     const changed = mergePeerMessages(target, incoming);
     const archiveCandidates = new Map();
     incoming.forEach((entry) => {
@@ -6752,9 +6830,7 @@ async function loadConversationMessages(peer, { force = false } = {}) {
     if (changed && S.activePeer === target) refreshChatLog();
   } finally {
     S.imMessageLoadingPeers.delete(target);
-    if (!wasLoaded && S.activePeer === target && !S.imMessages.some((entry) => entry.peer === target)) {
-      refreshChatLog();
-    }
+    if (!wasLoaded && S.activePeer === target) refreshChatLog();
   }
 }
 
@@ -12322,6 +12398,70 @@ function applyPeerReadEvent(event) {
   if (changed) refreshChatLog();
 }
 
+function mergeRevokedMessage(previous, revoked) {
+  return {
+    ...previous,
+    ...revoked,
+    id: revoked.id || previous.id || "",
+    msgKey: revoked.msgKey || previous.msgKey || "",
+    sequence: revoked.sequence || previous.sequence || "",
+    messageRandom: revoked.messageRandom || previous.messageRandom || "",
+    type: previous.type || revoked.type,
+    direction: timMessageDirection(previous) || timMessageDirection(revoked),
+    peer: previous.peer || revoked.peer,
+    kind: previous.kind || revoked.kind,
+    objectName: previous.objectName || revoked.objectName || "",
+    timestamp: previous.timestamp || revoked.timestamp,
+    rawMessage: revoked.rawMessage || previous.rawMessage || null,
+    recalledText:
+      previous.recalledText ||
+      (previous.kind === "text" ? String(previous.text || "") : "") ||
+      revoked.recalledText,
+    text: "",
+    media: {},
+    flashId: "",
+    revoked: true,
+    preview: "[消息已撤回]",
+  };
+}
+
+function queuePendingMessageRevocation(revoked) {
+  const peer = String(revoked?.peer || "").trim();
+  if (!peer) return false;
+  const pending = [...(S.imPendingRevocations.get(peer) || [])];
+  const index = pending.findIndex((entry) => messagesReferToSameMessage(entry, revoked));
+  if (index >= 0) pending[index] = mergeRevokedMessage(pending[index], revoked);
+  else pending.push(revoked);
+  S.imPendingRevocations.set(peer, pending.slice(-MESSAGE_PENDING_REVOKE_LIMIT));
+  return true;
+}
+
+function mergePendingMessageRevocations(peer, incoming) {
+  const target = String(peer || "").trim();
+  const pending = [...(S.imPendingRevocations.get(target) || [])];
+  if (!pending.length) return Array.isArray(incoming) ? incoming : [];
+  S.imPendingRevocations.delete(target);
+  const merged = [...(Array.isArray(incoming) ? incoming : [])];
+  pending.forEach((revoked) => {
+    const incomingIndex = merged.findIndex((entry) => messagesReferToSameMessage(entry, revoked));
+    if (incomingIndex >= 0) {
+      releaseMessageLocalMedia(merged[incomingIndex]);
+      merged[incomingIndex] = mergeRevokedMessage(merged[incomingIndex], revoked);
+      return;
+    }
+    const existingIndex = S.imMessages.findIndex(
+      (entry) => String(entry.peer || "") === target && messagesReferToSameMessage(entry, revoked)
+    );
+    if (existingIndex >= 0) {
+      releaseMessageLocalMedia(S.imMessages[existingIndex]);
+      S.imMessages[existingIndex] = mergeRevokedMessage(S.imMessages[existingIndex], revoked);
+      return;
+    }
+    merged.push(revoked);
+  });
+  return merged;
+}
+
 function applyMessageRevokedEvent(event, me = String(S.user?.uid || S.user?.id || "")) {
   const changedPeers = new Set();
   timEventRows(event).forEach((message) => {
@@ -12338,31 +12478,24 @@ function applyMessageRevokedEvent(event, me = String(S.user?.uid || S.user?.id |
     const index = S.imMessages.findIndex(
       (entry) =>
         String(entry.peer || "") === String(peer || "") &&
-        ((revoked.id && String(entry.id || "") === String(revoked.id)) ||
-          (revoked.msgKey && String(entry.msgKey || "") === String(revoked.msgKey)))
+        messagesReferToSameMessage(entry, revoked)
     );
     if (index >= 0) {
       const previous = S.imMessages[index];
       releaseMessageLocalMedia(previous);
-      archived = {
-        ...previous,
-        ...revoked,
-        type: previous.type || revoked.type,
-        peer: previous.peer || revoked.peer,
-        rawMessage: revoked.rawMessage || previous.rawMessage || null,
-        msgKey: revoked.msgKey || previous.msgKey || "",
-        recalledText:
-          previous.recalledText ||
-          (previous.kind === "text" ? String(previous.text || "") : "") ||
-          revoked.recalledText,
-        revoked: true,
-      };
+      archived = mergeRevokedMessage(previous, revoked);
       S.imMessages[index] = archived;
+      if (peer) changedPeers.add(String(peer));
+    } else if (peer && !S.imMessageLoadedPeers.has(String(peer))) {
+      // TIM can replay revoke events during login before this conversation's
+      // messages arrive. Defer the orphan notice so it never becomes the only
+      // visible chat content while the real history is still loading.
+      queuePendingMessageRevocation(revoked);
     } else if (revoked.id || revoked.msgKey) {
       S.imMessages.push(revoked);
+      if (peer) changedPeers.add(String(peer));
     }
-    archiveMessageBestEffort(archived, archived.type === "mine" ? "outgoing" : "incoming");
-    if (peer) changedPeers.add(String(peer));
+    archiveMessageBestEffort(archived);
   });
   if (!changedPeers.size) return;
   changedPeers.forEach(updateConversationPreviewFromMessages);
@@ -13034,6 +13167,7 @@ async function logout() {
     S.meStats = null;
     S.meStatsAt = 0;
     S.imMessages = [];
+    S.imPendingRevocations.clear();
     S.imMessageLoadingPeers.clear();
     S.imMessageLoadedPeers.clear();
     S.imArchiveLoadedPeers.clear();
@@ -14082,6 +14216,7 @@ function completeBrowserLogin(data) {
   resetMomentViewTaskAssist();
   closeMessageSyncChannel();
   S.imMessages = [];
+  S.imPendingRevocations.clear();
   S.imMessageLoadingPeers.clear();
   S.imMessageLoadedPeers.clear();
   S.imArchiveLoadedPeers.clear();

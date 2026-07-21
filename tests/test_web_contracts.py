@@ -3858,6 +3858,52 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn('if path == "/api/im/rest/revoke"', server_py)
         self.assertIn("20023", server_py)
 
+    def test_replayed_revocations_wait_for_history_before_rendering(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+
+        revoke_handler = self._app_fragment(
+            app_js,
+            "function applyMessageRevokedEvent(event",
+            "function attachTimHandlers",
+        )
+        message_loader = self._app_fragment(
+            app_js,
+            "async function loadConversationMessages(peer",
+            "function oldestPeerMessageTimestamp",
+        )
+        chat_log = self._app_fragment(
+            app_js,
+            "function chatLogHtml()",
+            "function scrollChatLogToBottom",
+        )
+        message_matcher = self._app_fragment(
+            app_js,
+            "function messagesReferToSameMessage(left, right)",
+            "function compareMessageOrder",
+        )
+
+        self.assertIn("imPendingRevocations: new Map()", app_js)
+        self.assertIn("function timMessageDirection", app_js)
+        self.assertIn("function messagesReferToSameMessage", app_js)
+        self.assertIn(
+            "if (leftDirection && rightDirection && leftDirection !== rightDirection) return false;",
+            message_matcher,
+        )
+        self.assertIn("!S.imMessageLoadedPeers.has(String(peer))", revoke_handler)
+        self.assertIn("queuePendingMessageRevocation(revoked)", revoke_handler)
+        self.assertIn("mergePendingMessageRevocations(", message_loader)
+        self.assertIn('if (!ok || data?.ok === false) throw new Error("服务器聊天记录暂时不可用")', message_loader)
+        self.assertIn('if (!ok || data?.ok === false) throw new Error("归档聊天记录暂时不可用")', message_loader)
+        self.assertIn("if (!fulfilled.length) return;", message_loader)
+        self.assertLess(
+            message_loader.index("if (!fulfilled.length) return;"),
+            message_loader.index("mergePendingMessageRevocations("),
+        )
+        self.assertIn("if (!wasLoaded && S.activePeer === target) refreshChatLog();", message_loader)
+        self.assertIn("entries.every((entry) => entry.revoked)", chat_log)
+        self.assertIn("正在加载聊天记录", chat_log)
+
     def test_incoming_message_toast_prefers_the_sender_nickname(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
