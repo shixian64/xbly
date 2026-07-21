@@ -493,7 +493,7 @@ class MatchHistoryFrontendContractTests(unittest.TestCase):
         css_version = index_html.split('/static/app.css?v=', 1)[1].split('"', 1)[0]
         js_version = index_html.split('/static/app.js?v=', 1)[1].split('"', 1)[0]
         self.assertEqual(css_version, js_version)
-        self.assertTrue(css_version.endswith("-match-history"))
+        self.assertIn("-match-history", css_version)
 
 
 if __name__ == "__main__":

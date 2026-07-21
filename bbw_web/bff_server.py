@@ -2175,6 +2175,14 @@ class Handler(BaseHTTPRequestHandler):
             or target == current_uid
         ):
             return False
+        if target in set(getattr(user, "blocked_message_peers", set()) or set()):
+            return False
+        authorizer = getattr(self, "_request_message_peer_authorizer", None)
+        if callable(authorizer):
+            try:
+                return bool(authorizer(target))
+            except Exception:
+                return False
         if Handler.web_user_capabilities(self, user).get("proactive_private_message"):
             return True
         for attribute in (
@@ -2184,12 +2192,6 @@ class Handler(BaseHTTPRequestHandler):
         ):
             if target in set(getattr(user, attribute, set()) or set()):
                 return True
-        authorizer = getattr(self, "_request_message_peer_authorizer", None)
-        if callable(authorizer):
-            try:
-                return bool(authorizer(target))
-            except Exception:
-                return False
         return False
 
     def deny_private_message(self, capabilities: Dict[str, bool]) -> None:
@@ -2345,19 +2347,22 @@ class Handler(BaseHTTPRequestHandler):
                 k: {"ok": v.ok, "code": v.code, "message": v.message}
                 for k, v in app.bootstrap(include_im=False).items()
             }
-            try:
-                tim = {
-                    "ok": True,
-                    **u.native.im.tim_login_payload(
-                        prefer="server",
-                        allow_local_fallback=False,
-                    ),
-                }
-            except Exception as exc:
-                tim = {
-                    "ok": False,
-                    "error": _safe_error(exc, "消息登录凭证获取失败"),
-                }
+            if capabilities.get("direct_im_credentials"):
+                try:
+                    tim = {
+                        "ok": True,
+                        **u.native.im.tim_login_payload(
+                            prefer="server",
+                            allow_local_fallback=False,
+                        ),
+                    }
+                except Exception as exc:
+                    tim = {
+                        "ok": False,
+                        "error": _safe_error(exc, "消息登录凭证获取失败"),
+                    }
+            else:
+                tim = Handler.broad_im_credentials_disabled_payload(self, capabilities)
             u.persist()
             return self.ok(
                 {
@@ -2627,7 +2632,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.ok(payload)
         if path == "/api/social/blacklist":
             result = app.social.my_blacklist()
-            return self.ok(empty_list_envelope(result, RL(result), "黑名单为空"))
+            payload = empty_list_envelope(result, RL(result), "黑名单为空")
+            setattr(
+                u,
+                "blocked_message_peers",
+                {
+                    peer
+                    for peer in _message_peer_ids(payload)
+                    if peer != str(app.session.uid or "")
+                },
+            )
+            return self.ok(payload)
         if path == "/api/social/blacklist-me":
             result = app.social.blacklist_me()
             return self.ok(empty_list_envelope(result, RL(result), "黑名单为空"))
@@ -2852,6 +2867,19 @@ class Handler(BaseHTTPRequestHandler):
 
         # ---- im ----
         if path == "/api/im/message-policy":
+            blocked_peers = {
+                str(peer).strip()
+                for peer in (
+                    list(getattr(u, "blocked_message_peers", set()) or set())
+                    + list(
+                        getattr(self, "_request_message_policy_blocked_peers", ())
+                        or ()
+                    )
+                )
+                if str(peer).strip()
+                and str(peer).strip().lower() not in {"0", "none", "null"}
+                and str(peer).strip() != str(app.session.uid or "")
+            }
             match_peers = {
                 str(peer).strip()
                 for peer in (
@@ -2881,15 +2909,21 @@ class Handler(BaseHTTPRequestHandler):
                 and str(peer).strip() != str(app.session.uid or "")
             }
             allowed_peers.update(match_peers)
+            match_peers.difference_update(blocked_peers)
+            allowed_peers.difference_update(blocked_peers)
             return self.ok(
                 {
                     "ok": True,
                     "capabilities": Handler.web_user_capabilities(self, u),
                     "match_peers": sorted(match_peers)[:5000],
                     "allowed_peers": sorted(allowed_peers)[:5000],
+                    "blocked_peers": sorted(blocked_peers)[:5000],
                 }
             )
         if path == "/api/im/tim":
+            capabilities = Handler.web_user_capabilities(self, u)
+            if not capabilities.get("direct_im_credentials"):
+                return Handler.deny_broad_im_credentials(self, capabilities)
             try:
                 payload = u.native.im.tim_login_payload(
                     prefer="server",
@@ -3682,9 +3716,21 @@ class Handler(BaseHTTPRequestHandler):
                     return self.ok({"ok": False, "error": exc.message}, exc.status)
 
             if path == "/api/social/blacklist-add":
-                return self.ok(R(app.social.add_blacklist(**_params(data))))
+                payload = R(app.social.add_blacklist(**_params(data)))
+                if payload.get("ok"):
+                    blocked = getattr(u, "blocked_message_peers", None)
+                    if blocked is None:
+                        blocked = set()
+                        setattr(u, "blocked_message_peers", blocked)
+                    blocked.update(_message_peer_ids({"items": [data]}))
+                return self.ok(payload)
             if path == "/api/social/blacklist-del":
-                return self.ok(R(app.social.delete_blacklist(**_params(data))))
+                payload = R(app.social.delete_blacklist(**_params(data)))
+                if payload.get("ok"):
+                    blocked = getattr(u, "blocked_message_peers", None)
+                    if blocked is not None:
+                        blocked.difference_update(_message_peer_ids({"items": [data]}))
+                return self.ok(payload)
             if path == "/api/moments/view":
                 postid = str(
                     data.get("postid") or data.get("post_id") or data.get("id") or ""
@@ -4618,9 +4664,10 @@ def _web_user_capabilities(
         "match_pool_online_list": True,
         "voice_match": True,
         "proactive_private_message": enabled,
-        # Direct TIM credentials intentionally restore browser SDK media send.
-        # SDK calls do not pass through Handler.can_message_peer().
-        "direct_im_credentials": True,
+        # A TIM UserSig is account-wide and cannot be scoped to one peer. Only
+        # accounts authorized for arbitrary proactive private messages receive
+        # it; all other accounts use the per-peer checked BFF transport.
+        "direct_im_credentials": enabled,
         "nearby_custom_city": (
             bool(getattr(user, "nearby_custom_city_enabled", False))
             if nearby_custom_city_enabled is None

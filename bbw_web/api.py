@@ -170,6 +170,7 @@ class CapturingHandler(legacy.Handler):
         message_peer_authorizer: Optional[Callable[[str], bool]] = None,
         message_policy_allowed_peers: Iterable[str] = (),
         message_policy_match_peers: Iterable[str] = (),
+        message_policy_blocked_peers: Iterable[str] = (),
         match_history_loader: Optional[Callable[[int], dict[str, Any]]] = None,
         match_history_recorder: Optional[Callable[[str, dict[str, Any]], None]] = None,
         conversation_summary_loader: Optional[
@@ -189,6 +190,7 @@ class CapturingHandler(legacy.Handler):
         self._request_message_peer_authorizer = message_peer_authorizer
         self._request_message_policy_allowed_peers = tuple(message_policy_allowed_peers)
         self._request_message_policy_match_peers = tuple(message_policy_match_peers)
+        self._request_message_policy_blocked_peers = tuple(message_policy_blocked_peers)
         self._request_match_history_loader = match_history_loader
         self._request_match_history_recorder = match_history_recorder
         self._request_conversation_summary_loader = conversation_summary_loader
@@ -555,6 +557,7 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
 
     message_policy_allowed_peers: tuple[str, ...] = ()
     message_policy_match_peers: tuple[str, ...] = ()
+    message_policy_blocked_peers: tuple[str, ...] = ()
     if identity is not None and path == "/api/im/message-policy":
         try:
             message_policy_allowed_peers = tuple(
@@ -568,6 +571,12 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
             )
         except Exception:
             LOGGER.exception("message policy match peer lookup failed")
+        try:
+            message_policy_blocked_peers = tuple(
+                persistence.message_policy_blocked_peers(identity)
+            )
+        except Exception:
+            LOGGER.exception("message policy blocked peer lookup failed")
 
     match_history_loader: Optional[Callable[[int], dict[str, Any]]] = None
     if identity is not None and path == "/api/match/history":
@@ -647,6 +656,7 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
         ),
         message_policy_allowed_peers=message_policy_allowed_peers,
         message_policy_match_peers=message_policy_match_peers,
+        message_policy_blocked_peers=message_policy_blocked_peers,
         match_history_loader=match_history_loader,
         match_history_recorder=match_history_recorder,
         conversation_summary_loader=conversation_summary_loader,
@@ -676,6 +686,12 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
     new_sid = _cookie_value(response_headers, cookie_name)
 
     message_policy_paths = {
+        "/api/social/friends",
+        "/api/social/agree-friend",
+        "/api/social/delete-friend",
+        "/api/social/blacklist",
+        "/api/social/blacklist-add",
+        "/api/social/blacklist-del",
         "/api/match/online",
         "/api/match/local",
         "/api/match/voice/start",
@@ -695,6 +711,27 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
             )
         except Exception:
             LOGGER.exception("message policy response persistence failed")
+            if (
+                path
+                in {
+                    "/api/social/friends",
+                    "/api/social/agree-friend",
+                    "/api/social/delete-friend",
+                    "/api/social/blacklist",
+                    "/api/social/blacklist-add",
+                    "/api/social/blacklist-del",
+                }
+                and status < 400
+                and response_data.get("ok") is True
+            ):
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "code": "SOCIAL_DM_POLICY_PERSISTENCE_FAILED",
+                        "error": "关系状态已返回，但私聊权限同步失败，请刷新后重试",
+                    },
+                    status_code=503,
+                )
             if (
                 path in {"/api/match/online", "/api/match/local", "/api/match/voice/start"}
                 and status < 400

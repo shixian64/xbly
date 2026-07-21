@@ -100,6 +100,7 @@ const S = {
   nearbyCustomCityEnabled: false,
   privateMessagePeers: new Set(),
   matchMessagePeers: new Set(),
+  blockedPrivateMessagePeers: new Set(),
   routeController: null,
   routeSeq: 0,
   pageCache: new Map(),
@@ -257,6 +258,9 @@ function usesCoarsePointer() {
 }
 
 function voiceRecordingAvailability() {
+  if (!S.directImCredentialsEnabled) {
+    return { available: false, reason: "当前账号使用受控消息通道，暂不支持发送语音消息" };
+  }
   if (!window.isSecureContext) {
     return { available: false, reason: "录音需要安全网页环境或本机访问" };
   }
@@ -1295,6 +1299,7 @@ function applyUser(user) {
     S.directImCredentialsEnabled = false;
     S.privateMessagePeers.clear();
     S.matchMessagePeers.clear();
+    S.blockedPrivateMessagePeers.clear();
     $("side-name").textContent = "游客";
     $("side-meta").textContent = "尚未登录";
     return;
@@ -1484,10 +1489,12 @@ function updateUnreadBadges() {
 function refreshMessagePolicy() {
   return api("/api/im/message-policy", { timeout: 6000 })
     .then(({ data }) => {
+      if (data?.ok === false) return {};
       applyCapabilities(data.capabilities);
-      rememberMessagePolicyAllowedPeers(data.allowed_peers);
-      rememberMessagePolicyMatchPeers(data.match_peers);
-      syncPrivateMessageControls({ refreshChat: false });
+      replaceMessagePolicyAllowedPeers(data.allowed_peers);
+      replaceMessagePolicyMatchPeers(data.match_peers);
+      replaceBlockedPrivateMessagePeers(data.blocked_peers);
+      syncPrivateMessageControls();
       return data.capabilities || {};
     })
     .catch(() => ({}));
@@ -2931,7 +2938,8 @@ function canStartPrivateChat(uid) {
     !target ||
     ["0", "none", "null"].includes(target.toLowerCase()) ||
     target === currentUid ||
-    isSystemCustomerServicePeer(target)
+    isSystemCustomerServicePeer(target) ||
+    S.blockedPrivateMessagePeers.has(target)
   ) {
     return false;
   }
@@ -2951,9 +2959,8 @@ async function ensurePrivateChatPermission(uid) {
 
 function canOpenPrivateChatEntry(uid, origin = "") {
   const target = String(uid || "").trim();
-  if (!target || !canStartPrivateChat(target)) return false;
-  if (S.proactivePrivateMessageEnabled) return true;
-  return String(origin || "").trim() === "match" && S.matchMessagePeers.has(target);
+  void origin;
+  return Boolean(target && canStartPrivateChat(target));
 }
 
 async function ensurePrivateChatEntryPermission(uid, origin = "") {
@@ -3010,12 +3017,35 @@ function rememberPrivateMessagePeers(values, targetSet) {
   });
 }
 
+function replacePrivateMessagePeers(values, targetSet) {
+  const next = new Set();
+  rememberPrivateMessagePeers(values, next);
+  targetSet.clear();
+  next.forEach((uid) => targetSet.add(uid));
+}
+
 function rememberMessagePolicyAllowedPeers(values) {
   rememberPrivateMessagePeers(values, S.privateMessagePeers);
 }
 
+function replaceMessagePolicyAllowedPeers(values) {
+  replacePrivateMessagePeers(values, S.privateMessagePeers);
+}
+
 function rememberMessagePolicyMatchPeers(values) {
   rememberPrivateMessagePeers(values, S.matchMessagePeers);
+}
+
+function replaceMessagePolicyMatchPeers(values) {
+  replacePrivateMessagePeers(values, S.matchMessagePeers);
+}
+
+function replaceBlockedPrivateMessagePeers(values) {
+  replacePrivateMessagePeers(values, S.blockedPrivateMessagePeers);
+  S.blockedPrivateMessagePeers.forEach((uid) => {
+    S.privateMessagePeers.delete(uid);
+    S.matchMessagePeers.delete(uid);
+  });
 }
 
 function syncPrivateMessageControls({ refreshChat = true } = {}) {
@@ -3023,6 +3053,11 @@ function syncPrivateMessageControls({ refreshChat = true } = {}) {
     const allowed = canOpenPrivateChatEntry(button.dataset.uid, button.dataset.chatOrigin);
     button.hidden = !allowed;
     button.classList.toggle("hide", !allowed);
+    button.setAttribute("aria-disabled", String(!allowed));
+  });
+  document.querySelectorAll('[data-action="select-conversation"]').forEach((button) => {
+    const allowed = canOpenPrivateChatEntry(button.dataset.uid, "conversation");
+    button.disabled = !S.conversationBatchMode && !allowed;
     button.setAttribute("aria-disabled", String(!allowed));
   });
   if (refreshChat && S.route === "msg") {
@@ -3795,11 +3830,15 @@ function conversationCard(item) {
   );
   const unread = Number(conversation.unread_count || conversation.unread || 0);
   const active = peer && peer === S.activePeer;
+  const chatAllowed = canOpenPrivateChatEntry(peer, "conversation");
+  const chatDisabled = !S.conversationBatchMode && !chatAllowed;
   const batchSelected = S.conversationBatchMode && S.selectedConversationPeers.has(peer);
   const selectionLabel = `${batchSelected ? "取消选择" : "选择"}与 ${name} 的聊天`;
   const cardLabel = S.conversationBatchMode
     ? selectionLabel
-    : `打开与 ${name} 的聊天`;
+    : chatAllowed
+      ? `打开与 ${name} 的聊天`
+      : `当前无法打开与 ${name} 的聊天`;
   const presence = peer ? presenceBadgeHtml(peer, { ...nestedUser, ...conversation }, "presence-compact") : "";
   const selectionControl = S.conversationBatchMode
     ? `<label class="conversation-select-control"><input type="checkbox" data-action="toggle-conversation-selection" data-uid="${esc(
@@ -3821,7 +3860,9 @@ function conversationCard(item) {
       peer
     )}" data-name="${esc(name)}" data-avatar="${esc(avatar || "")}" aria-label="${esc(cardLabel)}" ${
       S.conversationBatchMode ? `aria-pressed="${String(batchSelected)}"` : ""
-    } title="${esc(name)}">
+    } aria-disabled="${String(!chatAllowed)}"${chatDisabled ? " disabled" : ""} title="${esc(
+      chatAllowed ? name : "当前私聊权限不可用"
+    )}">
       ${conversationAvatarHtml(avatar)}
       <span class="conversation-copy"><span class="conversation-title-line"><strong>${esc(name)}</strong>${presence}</span><span class="conversation-preview">${esc(
         preview
@@ -3866,6 +3907,7 @@ function friendListHtml(items) {
             chat: true,
             profile: true,
             presence: true,
+            chatOrigin: "friends",
           })}</div>`;
         })
         .join("")}</div></section>`
@@ -4028,7 +4070,7 @@ function socialCardForTab(item, tab) {
   if (tab === "follows") return userCard(item, { profile: true, unfollow: true });
   if (tab === "fans") return userCard(item, { profile: true, follow: !item?.is_follower });
   if (tab === "apply") return friendApplicationCard(item);
-  if (tab === "black") return userCard(item, { profile: true, unblock: true });
+  if (tab === "black") return userCard(item, { chat: false, profile: true, unblock: true });
   return userCard(item, { profile: true });
 }
 
@@ -7577,12 +7619,18 @@ function chatComposerPanelHtml() {
     }>${S.imStickersLoading ? "正在加载" : "重新加载"}</button></div>${body}</section>`;
   }
   if (S.imComposerPanel === "more") {
-    return `<section class="chat-composer-panel chat-more-panel ui-scrollbar" aria-label="更多消息功能"><div class="chat-panel-head"><strong>更多功能</strong><span>选择要发送的内容</span></div><div class="chat-more-grid">
-      <button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="image"><strong>图片与动图</strong><span>从相册或文件中选择</span></button>
+    const directMediaActions = S.directImCredentialsEnabled
+      ? `<button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="image"><strong>图片与动图</strong><span>从相册或文件中选择</span></button>
       <button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="video"><strong>视频</strong><span>发送短视频文件</span></button>
-      <button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="file"><strong>文件</strong><span>发送其他类型文件</span></button>
+      <button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="file"><strong>文件</strong><span>发送其他类型文件</span></button>`
+      : "";
+    const stickerAction = S.directImCredentialsEnabled
+      ? '<button type="button" class="chat-more-action" data-action="toggle-chat-panel" data-panel="sticker"><strong>表情包</strong><span>内置表情与收藏表情</span></button>'
+      : "";
+    return `<section class="chat-composer-panel chat-more-panel ui-scrollbar" aria-label="更多消息功能"><div class="chat-panel-head"><strong>更多功能</strong><span>选择要发送的内容</span></div><div class="chat-more-grid">
+      ${directMediaActions}
       <button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="flash"><strong>闪图</strong><span>阅后失效的图片</span></button>
-      <button type="button" class="chat-more-action" data-action="toggle-chat-panel" data-panel="sticker"><strong>表情包</strong><span>内置表情与收藏表情</span></button>
+      ${stickerAction}
     </div></section>`;
   }
   return "";
@@ -8385,6 +8433,9 @@ function localMessageID(prefix = "message") {
 async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "", quote = null } = {}) {
   const target = String(peer || "").trim();
   const content = String(text || "").trim();
+  if (!(await ensurePrivateChatPermission(target))) {
+    throw new Error("该私信入口仅向管理员授权的用户开放");
+  }
   const previous = retryMessageId ? findChatMessage(retryMessageId, target) : null;
   const messageQuote = normalizeMessageQuote(quote || previous?.quote);
   const pendingID = previous?.id || localMessageID("text");
@@ -11006,9 +11057,7 @@ async function loadSocialTab(tab, signal) {
     ]);
     if (friendResult.status !== "fulfilled") throw friendResult.reason;
     const friends = itemsOf(friendResult.value.data);
-    rememberMessagePolicyAllowedPeers(
-      friends.map((item) => item?.user_id || item?.uid || item?.id)
-    );
+    rememberMessagePolicyAllowedPeers(friends);
     syncPrivateMessageControls({ refreshChat: false });
     applyCount = applyResult.status === "fulfilled" ? Number(applyResult.value.data?.count || 0) : 0;
     applyHasMore = applyResult.status === "fulfilled" && applyResult.value.data?.has_more === true;
@@ -11055,6 +11104,7 @@ async function loadSocialTab(tab, signal) {
       black: ["黑名单", "可以在这里解除屏蔽"],
     };
     const { data } = await api(paths[activeTab], { signal });
+    if (activeTab === "black") replaceBlockedPrivateMessagePeers(itemsOf(data));
     const [title, detail] = copy[activeTab];
     body = `<section class="section"><div class="section-head"><div><h2>${title}</h2><p>${detail}</p></div><button type="button" class="btn secondary small" data-action="refresh-route">刷新</button></div>${envelopeHtml(
       data,
@@ -12525,7 +12575,6 @@ function attachTimHandlers(chat, TIM, credential) {
       const entry = timMessageEntry(message, peer, String(credential.userID));
       if (deferReplayedMessageRevocation(entry)) return;
       const preview = messagePreview(entry);
-      const currentUnread = Number(current?.unread_count || current?.unread || 0);
       const sender =
         entry.type !== "mine"
           ? incomingMessageSenderInfo(message, current, peer)
@@ -12534,7 +12583,10 @@ function attachTimHandlers(chat, TIM, credential) {
         name: sender.name,
         replaceName: sender.authoritative,
         lastMessage: preview,
-        unreadCount: entry.type === "mine" ? currentUnread : active ? 0 : currentUnread + 1,
+        // Tencent Cloud Chat updates unreadCount through
+        // CONVERSATION_LIST_UPDATED for the same message. Incrementing here
+        // races that authoritative event and turns one unread message into two.
+        unreadCount: entry.type !== "mine" && active ? 0 : undefined,
       });
       if (active && sender.authoritative) S.activePeerName = sender.name;
       addImMessage(entry.text, entry.type, peer, entry);
@@ -13671,11 +13723,8 @@ async function handleAction(action, button) {
       toggleConversationSelection(uid);
       return;
     }
-    if (
-      action === "open-chat" &&
-      !(await ensurePrivateChatEntryPermission(uid, button.dataset.chatOrigin))
-    ) {
-      toast("该私信入口仅向管理员授权的用户开放", "error", 4200);
+    if (!(await ensurePrivateChatEntryPermission(uid, button.dataset.chatOrigin))) {
+      toast("当前无法打开与该用户的私聊", "error", 4200);
       return;
     }
     if (uid !== S.activePeer) {
@@ -13758,7 +13807,9 @@ async function handleAction(action, button) {
       body: JSON.stringify({ myid: S.user?.uid || S.user?.id || "", yourid: uid }),
     });
     if (toastEnv(data, "已移出黑名单")) {
+      S.blockedPrivateMessagePeers.delete(uid);
       clearRelationshipCache("black");
+      await refreshMessagePolicy();
       await switchSocialTab("black", { force: true });
     }
     return;

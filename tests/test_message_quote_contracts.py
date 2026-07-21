@@ -290,13 +290,13 @@ class FrontendMessageQuoteContracts(unittest.TestCase):
             "restoreChatMessageQuote(uid)",
             "function toggleChatMessageActions(row)",
             "data-chat-message-bubble",
-            'class="chat-message-action quote contextual"',
+            'class="chat-message-action quote"',
         ):
             self.assertIn(marker, app_js)
         self.assertIn(".chat-message-quote", app_css)
         self.assertIn(".chat-compose-quote", app_css)
         self.assertIn(".chat-message-row.is-quote-target", app_css)
-        self.assertIn(".chat-message-action.contextual", app_css)
+        self.assertIn(".chat-message-actions.contextual", app_css)
         self.assertIn(".chat-message-row.is-actions-open", app_css)
         self.assertIn("message-dedup-message-quote", index_html)
         self.assertIn("message-actions-on-tap", index_html)

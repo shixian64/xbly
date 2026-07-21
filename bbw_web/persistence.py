@@ -81,6 +81,7 @@ MESSAGE_POLICY_MATCH_KIND = "match"
 MESSAGE_POLICY_CONVERSATION_KIND = "message_peer"
 SOCIAL_RELATIONSHIP_PROVIDER = "beibeiwu"
 SOCIAL_FRIEND_KIND = "friend"
+SOCIAL_BLACKLIST_KIND = "blacklist"
 
 
 def _message_peer_uid(value: Any) -> str:
@@ -108,6 +109,16 @@ def _response_items(payload: Any) -> list[dict[str, Any]]:
     if nested is not payload:
         return _response_items(nested)
     return []
+
+
+def _response_has_item_list(payload: Any) -> bool:
+    if not isinstance(payload, Mapping):
+        return isinstance(payload, list)
+    for key in ("items", "list", "users"):
+        if isinstance(payload.get(key), list):
+            return True
+    nested = payload.get("data")
+    return nested is not payload and _response_has_item_list(nested)
 
 
 def _item_peer_uid(item: Mapping[str, Any]) -> str:
@@ -1050,15 +1061,160 @@ class RuntimePersistence:
                 )
         return normalized
 
+    def replace_social_message_relationships(
+        self,
+        *,
+        identity: UserIdentity,
+        peers: list[str] | tuple[str, ...] | set[str],
+        kind: str,
+        deactivate_missing: bool = True,
+        source_path: str = "",
+    ) -> list[str]:
+        """Synchronize friend/block relationships used by the message guard.
+
+        These snapshots come from authenticated upstream responses. Persisting
+        them before the response reaches the browser avoids a race where a
+        freshly rendered friend entry opens successfully but the following
+        BFF send is denied because the background ingestion job has not run.
+        """
+
+        if kind not in {SOCIAL_FRIEND_KIND, SOCIAL_BLACKLIST_KIND}:
+            raise ValueError("unsupported social message relationship kind")
+        normalized = list(
+            dict.fromkeys(
+                peer
+                for peer in (_message_peer_uid(value) for value in peers)
+                if peer and peer != _message_peer_uid(identity.upstream_uid)
+            )
+        )
+        now = utcnow()
+        with session_scope() as db:
+            existing_rows = list(
+                db.scalars(
+                    select(Relationship).where(
+                        Relationship.owner_user_id == identity.user_id,
+                        Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                        Relationship.kind == kind,
+                    )
+                )
+            )
+            existing_by_peer = {
+                _message_peer_uid(row.subject_upstream_uid): row
+                for row in existing_rows
+                if _message_peer_uid(row.subject_upstream_uid)
+            }
+            repo = RelationshipRepository(db)
+            for peer in normalized:
+                existing = existing_by_peer.get(peer)
+                metadata = dict(existing.extra_data or {}) if existing else {}
+                metadata.update(
+                    {
+                        "server_owned": True,
+                        "message_policy_source": source_path or "social_snapshot",
+                    }
+                )
+                repo.upsert(
+                    owner_user_id=identity.user_id,
+                    provider=SOCIAL_RELATIONSHIP_PROVIDER,
+                    subject_upstream_uid=peer,
+                    kind=kind,
+                    status="active",
+                    started_at=existing.started_at if existing else now,
+                    ended_at=None,
+                    extra_data=metadata,
+                )
+            if deactivate_missing:
+                normalized_set = set(normalized)
+                for peer, existing in existing_by_peer.items():
+                    if peer in normalized_set or existing.status != "active":
+                        continue
+                    metadata = dict(existing.extra_data or {})
+                    metadata.update(
+                        {
+                            "server_owned": True,
+                            "message_policy_source": source_path or "social_snapshot",
+                        }
+                    )
+                    repo.upsert(
+                        owner_user_id=identity.user_id,
+                        provider=SOCIAL_RELATIONSHIP_PROVIDER,
+                        subject_upstream_uid=peer,
+                        kind=kind,
+                        status="inactive",
+                        started_at=existing.started_at,
+                        ended_at=now,
+                        extra_data=metadata,
+                    )
+        return normalized
+
+    def set_social_message_relationship(
+        self,
+        *,
+        identity: UserIdentity,
+        peer: Any,
+        kind: str,
+        active: bool,
+        source_path: str = "",
+    ) -> list[str]:
+        """Apply one successful friend/block mutation synchronously."""
+
+        if kind not in {SOCIAL_FRIEND_KIND, SOCIAL_BLACKLIST_KIND}:
+            raise ValueError("unsupported social message relationship kind")
+        target = _message_peer_uid(peer)
+        if not target or target == _message_peer_uid(identity.upstream_uid):
+            return []
+        now = utcnow()
+        with session_scope() as db:
+            existing = db.scalar(
+                select(Relationship).where(
+                    Relationship.owner_user_id == identity.user_id,
+                    Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                    Relationship.subject_upstream_uid == target,
+                    Relationship.kind == kind,
+                )
+            )
+            if existing is None and not active:
+                return [target]
+            metadata = dict(existing.extra_data or {}) if existing else {}
+            metadata.update(
+                {
+                    "server_owned": True,
+                    "message_policy_source": source_path or "social_action",
+                }
+            )
+            RelationshipRepository(db).upsert(
+                owner_user_id=identity.user_id,
+                provider=SOCIAL_RELATIONSHIP_PROVIDER,
+                subject_upstream_uid=target,
+                kind=kind,
+                status="active" if active else "inactive",
+                started_at=existing.started_at if existing else now,
+                ended_at=None if active else now,
+                extra_data=metadata,
+            )
+        return [target]
+
     def can_message_peer(self, identity: UserIdentity, peer: Any) -> bool:
         """Authorize one private-message target from live durable state."""
 
         target = _message_peer_uid(peer)
         if not target or target == _message_peer_uid(identity.upstream_uid):
             return False
-        if identity.match_pool_online_list_enabled:
-            return True
         with session_scope() as db:
+            blocked = db.scalar(
+                select(Relationship.id).where(
+                    Relationship.owner_user_id == identity.user_id,
+                    Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                    Relationship.subject_upstream_uid == target,
+                    Relationship.kind == SOCIAL_BLACKLIST_KIND,
+                    Relationship.status == "active",
+                    Relationship.ended_at.is_(None),
+                )
+            )
+            if blocked is not None:
+                return False
+            if identity.match_pool_online_list_enabled:
+                return True
             grant = db.scalar(
                 select(Relationship.id).where(
                     Relationship.owner_user_id == identity.user_id,
@@ -1095,6 +1251,17 @@ class RuntimePersistence:
         """Return durable peers whose existing or matched conversations may continue."""
 
         with session_scope() as db:
+            blocked_peers = set(
+                db.scalars(
+                    select(Relationship.subject_upstream_uid).where(
+                        Relationship.owner_user_id == identity.user_id,
+                        Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                        Relationship.kind == SOCIAL_BLACKLIST_KIND,
+                        Relationship.status == "active",
+                        Relationship.ended_at.is_(None),
+                    )
+                )
+            )
             relationship_peers = select(
                 Relationship.subject_upstream_uid.label("peer"),
                 Relationship.updated_at.label("observed_at"),
@@ -1140,7 +1307,9 @@ class RuntimePersistence:
                 dict.fromkeys(
                     peer
                     for peer in (_message_peer_uid(value) for value in values)
-                    if peer and peer != _message_peer_uid(identity.upstream_uid)
+                    if peer
+                    and peer != _message_peer_uid(identity.upstream_uid)
+                    and peer not in blocked_peers
                 )
             )
 
@@ -1150,12 +1319,49 @@ class RuntimePersistence:
         """Return durable match grants for restoring the browser allowlist."""
 
         with session_scope() as db:
+            blocked_peers = set(
+                db.scalars(
+                    select(Relationship.subject_upstream_uid).where(
+                        Relationship.owner_user_id == identity.user_id,
+                        Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                        Relationship.kind == SOCIAL_BLACKLIST_KIND,
+                        Relationship.status == "active",
+                        Relationship.ended_at.is_(None),
+                    )
+                )
+            )
             values = db.scalars(
                 select(Relationship.subject_upstream_uid)
                 .where(
                     Relationship.owner_user_id == identity.user_id,
                     Relationship.provider == MESSAGE_POLICY_PROVIDER,
                     Relationship.kind == MESSAGE_POLICY_MATCH_KIND,
+                    Relationship.status == "active",
+                    Relationship.ended_at.is_(None),
+                )
+                .order_by(Relationship.updated_at.desc())
+                .limit(max(1, min(int(limit), 5000)))
+            )
+            return [
+                peer
+                for peer in (_message_peer_uid(value) for value in values)
+                if peer
+                and peer != _message_peer_uid(identity.upstream_uid)
+                and peer not in blocked_peers
+            ]
+
+    def message_policy_blocked_peers(
+        self, identity: UserIdentity, *, limit: int = 2000
+    ) -> list[str]:
+        """Return active user blocks that must override every message grant."""
+
+        with session_scope() as db:
+            values = db.scalars(
+                select(Relationship.subject_upstream_uid)
+                .where(
+                    Relationship.owner_user_id == identity.user_id,
+                    Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                    Relationship.kind == SOCIAL_BLACKLIST_KIND,
                     Relationship.status == "active",
                     Relationship.ended_at.is_(None),
                 )
@@ -1183,6 +1389,41 @@ class RuntimePersistence:
         if int(status) >= 400 or response_data.get("ok") is not True:
             return []
         method_upper = str(method or "").upper()
+        if method_upper == "GET" and path in {
+            "/api/social/friends",
+            "/api/social/blacklist",
+        }:
+            if not _response_has_item_list(response_data):
+                return []
+            kind = (
+                SOCIAL_FRIEND_KIND
+                if path == "/api/social/friends"
+                else SOCIAL_BLACKLIST_KIND
+            )
+            peers = [_item_peer_uid(item) for item in _response_items(response_data)]
+            return self.replace_social_message_relationships(
+                identity=identity,
+                peers=peers,
+                kind=kind,
+                deactivate_missing=response_data.get("has_more") is not True,
+                source_path=path,
+            )
+        social_actions = {
+            "/api/social/agree-friend": (SOCIAL_FRIEND_KIND, True),
+            "/api/social/delete-friend": (SOCIAL_FRIEND_KIND, False),
+            "/api/social/blacklist-add": (SOCIAL_BLACKLIST_KIND, True),
+            "/api/social/blacklist-del": (SOCIAL_BLACKLIST_KIND, False),
+        }
+        if method_upper == "POST" and path in social_actions:
+            kind, active = social_actions[path]
+            peer = _item_peer_uid(request_data) or _item_peer_uid(response_data)
+            return self.set_social_message_relationship(
+                identity=identity,
+                peer=peer,
+                kind=kind,
+                active=active,
+                source_path=path,
+            )
         if method_upper == "POST" and path in {
             "/api/match/online",
             "/api/match/local",

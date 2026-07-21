@@ -210,10 +210,14 @@ class ProductionContractTests(unittest.TestCase):
             'MESSAGE_POLICY_CONVERSATION_KIND = "message_peer"',
             'SOCIAL_RELATIONSHIP_PROVIDER = "beibeiwu"',
             'SOCIAL_FRIEND_KIND = "friend"',
+            'SOCIAL_BLACKLIST_KIND = "blacklist"',
             "def grant_message_peers(",
+            "def replace_social_message_relationships(",
+            "def set_social_message_relationship(",
             "def can_message_peer(",
             "def message_policy_allowed_peers(",
             "def message_policy_match_peers(",
+            "def message_policy_blocked_peers(",
             "def remember_message_policy_response(",
             '"/api/match/online"',
             '"/api/match/local"',
@@ -231,7 +235,9 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn("persistence.can_message_peer(", api)
         self.assertIn("persistence.message_policy_allowed_peers(identity)", api)
         self.assertIn("persistence.message_policy_match_peers(identity)", api)
+        self.assertIn("persistence.message_policy_blocked_peers(identity)", api)
         self.assertIn("MATCH_DM_GRANT_PERSISTENCE_FAILED", api)
+        self.assertIn("SOCIAL_DM_POLICY_PERSISTENCE_FAILED", api)
         self.assertIn("persistence.remember_message_policy_response(", api)
 
     def test_archived_direct_conversation_authorizes_private_message_peer(self) -> None:
@@ -256,7 +262,10 @@ class ProductionContractTests(unittest.TestCase):
             upstream_uid="42",
         )
 
-        for scalar_values, expected in (([None, object()], True), ([None, None], False)):
+        for scalar_values, expected in (
+            ([None, None, object()], True),
+            ([None, None, None], False),
+        ):
             with self.subTest(archived_conversation=expected):
                 db = FakeDb(scalar_values)
 
@@ -266,9 +275,47 @@ class ProductionContractTests(unittest.TestCase):
 
                 with patch("bbw_web.persistence.session_scope", fake_session_scope):
                     self.assertIs(runtime.can_message_peer(identity, "9"), expected)
-                self.assertEqual(len(db.statements), 2)
+                self.assertEqual(len(db.statements), 3)
 
     def test_active_friend_relationship_authorizes_private_message_peer(self) -> None:
+        try:
+            from bbw_web.persistence import RuntimePersistence, UserIdentity
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        class FakeDb:
+            def __init__(self) -> None:
+                self.statements: list[object] = []
+                self.scalar_values = [None, object()]
+
+            def scalar(self, statement: object) -> object:
+                self.statements.append(statement)
+                return self.scalar_values.pop(0)
+
+        runtime = RuntimePersistence.__new__(RuntimePersistence)
+        identity = UserIdentity(
+            user_id=uuid.uuid4(),
+            external_account_id=uuid.uuid4(),
+            upstream_uid="42",
+        )
+        db = FakeDb()
+
+        @contextmanager
+        def fake_session_scope():
+            yield db
+
+        with patch("bbw_web.persistence.session_scope", fake_session_scope):
+            self.assertTrue(runtime.can_message_peer(identity, "9"))
+
+        self.assertEqual(len(db.statements), 2)
+        statement = str(db.statements[1])
+        self.assertIn("relationships.provider", statement)
+        self.assertIn("relationships.kind", statement)
+        params = {str(value) for value in db.statements[1].compile().params.values()}
+        self.assertIn("beibeiwu", params)
+        self.assertIn("friend", params)
+
+    def test_active_blacklist_overrides_global_private_message_permission(self) -> None:
         try:
             from bbw_web.persistence import RuntimePersistence, UserIdentity
         except ImportError as exc:
@@ -287,6 +334,7 @@ class ProductionContractTests(unittest.TestCase):
             user_id=uuid.uuid4(),
             external_account_id=uuid.uuid4(),
             upstream_uid="42",
+            match_pool_online_list_enabled=True,
         )
         db = FakeDb()
 
@@ -295,15 +343,50 @@ class ProductionContractTests(unittest.TestCase):
             yield db
 
         with patch("bbw_web.persistence.session_scope", fake_session_scope):
-            self.assertTrue(runtime.can_message_peer(identity, "9"))
+            self.assertFalse(runtime.can_message_peer(identity, "9"))
 
         self.assertEqual(len(db.statements), 1)
-        statement = str(db.statements[0])
-        self.assertIn("relationships.provider", statement)
-        self.assertIn("relationships.kind", statement)
         params = {str(value) for value in db.statements[0].compile().params.values()}
-        self.assertIn("beibeiwu", params)
-        self.assertIn("friend", params)
+        self.assertIn("blacklist", params)
+
+    def test_friend_summary_response_does_not_revoke_full_friend_snapshot(self) -> None:
+        try:
+            from bbw_web.persistence import RuntimePersistence, UserIdentity
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        runtime = RuntimePersistence.__new__(RuntimePersistence)
+        identity = UserIdentity(
+            user_id=uuid.uuid4(),
+            external_account_id=uuid.uuid4(),
+            upstream_uid="42",
+        )
+
+        with patch.object(
+            runtime,
+            "replace_social_message_relationships",
+            return_value=[],
+        ) as replace_snapshot:
+            result = runtime.remember_message_policy_response(
+                identity=identity,
+                method="GET",
+                path="/api/social/friends",
+                request_data={},
+                response_data={"ok": True, "count": 3},
+                status=200,
+            )
+            self.assertEqual(result, [])
+            replace_snapshot.assert_not_called()
+
+            runtime.remember_message_policy_response(
+                identity=identity,
+                method="GET",
+                path="/api/social/friends",
+                request_data={},
+                response_data={"ok": True, "items": [], "list": [], "count": 0},
+                status=200,
+            )
+            replace_snapshot.assert_called_once()
 
     def test_message_policy_allowed_peers_restores_friend_and_match_grants(self) -> None:
         try:
@@ -313,10 +396,12 @@ class ProductionContractTests(unittest.TestCase):
 
         class FakeDb:
             def __init__(self) -> None:
-                self.statement = None
+                self.statements: list[object] = []
 
             def scalars(self, statement: object) -> list[str]:
-                self.statement = statement
+                self.statements.append(statement)
+                if len(self.statements) == 1:
+                    return ["10"]
                 return ["9", "10", "9", "42", ""]
 
         runtime = RuntimePersistence.__new__(RuntimePersistence)
@@ -334,12 +419,13 @@ class ProductionContractTests(unittest.TestCase):
         with patch("bbw_web.persistence.session_scope", fake_session_scope):
             peers = runtime.message_policy_allowed_peers(identity)
 
-        self.assertEqual(peers, ["9", "10"])
-        params = {str(value) for value in db.statement.compile().params.values()}
+        self.assertEqual(peers, ["9"])
+        self.assertEqual(len(db.statements), 2)
+        params = {str(value) for value in db.statements[1].compile().params.values()}
         self.assertIn("beibeiwu", params)
         self.assertIn("friend", params)
         self.assertIn("web-policy", params)
-        self.assertIn("conversations.peer_upstream_uid", str(db.statement))
+        self.assertIn("conversations.peer_upstream_uid", str(db.statements[1]))
         self.assertIn("tim", params)
         self.assertIn("direct", params)
 
@@ -624,10 +710,16 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn('$("screen-login").classList.toggle("hide", !show)', show_login)
         self.assertIn('$("screen-app").classList.toggle("hide", show)', show_login)
 
+        restore = js.split("async function restoreSessionAtBoot()", 1)[1].split(
+            "(async function boot()", 1
+        )[0]
         boot = js.split("(async function boot()", 1)[1].split("})();", 1)[0]
-        self.assertIn("await Promise.all([", boot)
+        self.assertIn('api("/api/me"', restore)
+        self.assertIn("while (true)", restore)
+        self.assertIn("await restoreSessionAtBoot()", boot)
+        self.assertIn("await Promise.allSettled([featuresTask])", boot)
         self.assertNotIn("await loadFeatures();", boot)
-        self.assertLess(boot.index('api("/api/me"'), boot.index("showLogin(false)"))
+        self.assertLess(boot.index("await restoreSessionAtBoot()"), boot.index("showLogin(false)"))
         self.assertIn("showLogin(true, true)", boot)
 
     def test_model_and_migration_owner_and_audit_constraints(self) -> None:

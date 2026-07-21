@@ -2480,6 +2480,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         friend_peers=(),
         match_peers=(),
         conversation_peers=(),
+        blocked_peers=(),
         authorizer=None,
     ):
         calls = []
@@ -2506,6 +2507,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
             friend_message_peers=set(friend_peers),
             match_message_peers=set(match_peers),
             conversation_message_peers=set(conversation_peers),
+            blocked_message_peers=set(blocked_peers),
         )
 
         class Harness:
@@ -2618,7 +2620,30 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                 self.assertEqual(response[0], 200)
                 self.assertTrue(response[1]["ok"])
 
-    def test_tim_credentials_are_enabled_for_all_product_users(self) -> None:
+    def test_blacklist_and_persistent_authorizer_override_every_local_grant(self) -> None:
+        granted = {
+            "enabled": True,
+            "friend_peers": {"9"},
+            "match_peers": {"9"},
+            "conversation_peers": {"9"},
+        }
+
+        calls, response = self._run_rest_send(
+            **granted,
+            blocked_peers={"9"},
+            authorizer=lambda _peer: True,
+        )
+        self.assertEqual(calls, [])
+        self.assertEqual(response[0], 403)
+
+        calls, response = self._run_rest_send(
+            **granted,
+            authorizer=lambda _peer: False,
+        )
+        self.assertEqual(calls, [])
+        self.assertEqual(response[0], 403)
+
+    def test_tim_credentials_require_global_proactive_private_message_permission(self) -> None:
         tim_calls = []
         web_user = SimpleNamespace(
             app=SimpleNamespace(session=SimpleNamespace(uid="42")),
@@ -2661,15 +2686,24 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
             harness = Harness("/api/im/tim", enabled)
             bff_server.Handler.do_GET(harness)
 
-            self.assertEqual(harness.response[0], 200)
-            self.assertTrue(harness.response[1]["ok"])
-            self.assertEqual(harness.response[1]["userID"], "42")
-            self.assertEqual(harness.response[1]["userSig"], "server-user-signature")
-            self.assertTrue(harness.response[1]["sig_len"])
-            self.assertTrue(
+            if enabled:
+                self.assertEqual(harness.response[0], 200)
+                self.assertTrue(harness.response[1]["ok"])
+                self.assertEqual(harness.response[1]["userID"], "42")
+                self.assertEqual(harness.response[1]["userSig"], "server-user-signature")
+                self.assertTrue(harness.response[1]["sig_len"])
+            else:
+                self.assertEqual(harness.response[0], 403)
+                self.assertFalse(harness.response[1]["ok"])
+                self.assertEqual(
+                    harness.response[1]["code"],
+                    "IM_DIRECT_CREDENTIALS_DISABLED",
+                )
+            self.assertIs(
                 bff_server.Handler.web_user_capabilities(harness, web_user)[
                     "direct_im_credentials"
-                ]
+                ],
+                enabled,
             )
 
             for path in ("/api/im/rong", "/api/im/bootstrap"):
@@ -2682,24 +2716,24 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                         harness.response[1]["code"],
                         "IM_DIRECT_CREDENTIALS_DISABLED",
                     )
-                    self.assertTrue(
-                        harness.response[1]["capabilities"]["direct_im_credentials"]
+                    self.assertIs(
+                        harness.response[1]["capabilities"]["direct_im_credentials"],
+                        enabled,
                     )
 
         self.assertEqual(
             tim_calls,
-            [
-                {"prefer": "server", "allow_local_fallback": False},
-                {"prefer": "server", "allow_local_fallback": False},
-            ],
+            [{"prefer": "server", "allow_local_fallback": False}],
         )
 
-    def test_message_policy_restores_durable_match_peers(self) -> None:
+    def test_message_policy_restores_grants_but_removes_blocked_peers(self) -> None:
         web_user = SimpleNamespace(
             app=SimpleNamespace(session=SimpleNamespace(uid="42")),
             match_pool_online_list_enabled=False,
             friend_message_peers={"11"},
             match_message_peers={"9"},
+            conversation_message_peers={"12"},
+            blocked_message_peers={"11"},
         )
 
         class Harness:
@@ -2709,6 +2743,8 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                 self.response = None
                 self._request_match_pool_online_list_enabled = False
                 self._request_message_policy_match_peers = ("10", "42")
+                self._request_message_policy_allowed_peers = ("10", "13")
+                self._request_message_policy_blocked_peers = ("10",)
 
             def _check_api_origin(self):
                 return True
@@ -2727,8 +2763,9 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         bff_server.Handler.do_GET(harness)
 
         self.assertEqual(harness.response[0], 200)
-        self.assertEqual(harness.response[1]["match_peers"], ["10", "9"])
-        self.assertEqual(harness.response[1]["allowed_peers"], ["10", "11", "9"])
+        self.assertEqual(harness.response[1]["match_peers"], ["9"])
+        self.assertEqual(harness.response[1]["allowed_peers"], ["12", "13", "9"])
+        self.assertEqual(harness.response[1]["blocked_peers"], ["10", "11"])
         self.assertFalse(
             harness.response[1]["capabilities"]["proactive_private_message"]
         )
@@ -2786,24 +2823,29 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                 bff_server.Handler.do_GET(harness)
 
                 self.assertEqual(harness.response[0], 200)
-                self.assertTrue(harness.response[1]["tim"]["ok"])
-                self.assertEqual(harness.response[1]["tim"]["userID"], "42")
-                self.assertEqual(
-                    harness.response[1]["tim"]["userSig"],
-                    "server-user-signature",
-                )
-                self.assertTrue(
-                    harness.response[1]["capabilities"]["direct_im_credentials"]
+                if enabled:
+                    self.assertTrue(harness.response[1]["tim"]["ok"])
+                    self.assertEqual(harness.response[1]["tim"]["userID"], "42")
+                    self.assertEqual(
+                        harness.response[1]["tim"]["userSig"],
+                        "server-user-signature",
+                    )
+                else:
+                    self.assertFalse(harness.response[1]["tim"]["ok"])
+                    self.assertEqual(
+                        harness.response[1]["tim"]["code"],
+                        "IM_DIRECT_CREDENTIALS_DISABLED",
+                    )
+                self.assertIs(
+                    harness.response[1]["capabilities"]["direct_im_credentials"],
+                    enabled,
                 )
                 self.assertNotIn("txim", harness.response[1]["batch"])
 
         self.assertEqual(bootstrap_calls, [False, False])
         self.assertEqual(
             credential_calls,
-            [
-                {"prefer": "server", "allow_local_fallback": False},
-                {"prefer": "server", "allow_local_fallback": False},
-            ],
+            [{"prefer": "server", "allow_local_fallback": False}],
         )
 
 
@@ -3200,23 +3242,32 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("proactivePrivateMessageEnabled: false", app_js)
         self.assertIn("privateMessagePeers: new Set()", app_js)
         self.assertIn("matchMessagePeers: new Set()", app_js)
+        self.assertIn("blockedPrivateMessagePeers: new Set()", app_js)
         self.assertIn("S.proactivePrivateMessageEnabled", can_start_private_chat)
         self.assertIn("S.privateMessagePeers.has(target)", can_start_private_chat)
         self.assertIn("S.matchMessagePeers.has(target)", can_start_private_chat)
         self.assertIn("hasExistingConversation(target)", can_start_private_chat)
+        self.assertIn("S.blockedPrivateMessagePeers.has(target)", can_start_private_chat)
         self.assertIn("function canOpenPrivateChatEntry(uid, origin", app_js)
-        self.assertIn('String(origin || "").trim() === "match"', app_js)
-        self.assertIn("S.matchMessagePeers.has(target)", app_js)
+        self.assertIn("void origin", app_js)
+        self.assertIn("return Boolean(target && canStartPrivateChat(target))", app_js)
         self.assertIn("function ensurePrivateChatEntryPermission(uid, origin", app_js)
         self.assertIn("function rememberMatchMessagePeers(data)", app_js)
         self.assertIn("function rememberMessagePolicyAllowedPeers(values)", app_js)
         self.assertIn("function rememberMessagePolicyMatchPeers(values)", app_js)
+        self.assertIn("function replaceMessagePolicyAllowedPeers(values)", app_js)
+        self.assertIn("function replaceMessagePolicyMatchPeers(values)", app_js)
+        self.assertIn("function replaceBlockedPrivateMessagePeers(values)", app_js)
         self.assertIn(
-            "rememberMessagePolicyAllowedPeers(data.allowed_peers)",
+            "replaceMessagePolicyAllowedPeers(data.allowed_peers)",
             app_js,
         )
-        self.assertIn("rememberMessagePolicyMatchPeers(data.match_peers)", app_js)
+        self.assertIn("replaceMessagePolicyMatchPeers(data.match_peers)", app_js)
+        self.assertIn("replaceBlockedPrivateMessagePeers(data.blocked_peers)", app_js)
+        self.assertIn('chatOrigin: "friends"', app_js)
         self.assertIn('chatOrigin: "match"', app_js)
+        self.assertIn("rememberMessagePolicyAllowedPeers(friends)", app_js)
+        self.assertIn('if (tab === "black") return userCard(item, { chat: false', app_js)
         self.assertIn("const renderChatAction = options.chat !== false", user_card)
         self.assertIn("const chatAllowed = canOpenPrivateChatEntry(id, chatOrigin)", user_card)
         self.assertIn('aria-disabled="${String(!chatAllowed)}"', user_card)
@@ -3224,6 +3275,7 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("button.hidden = !allowed", app_js)
         self.assertIn("button.dataset.chatOrigin", app_js)
         self.assertIn("ensurePrivateChatEntryPermission(uid, button.dataset.chatOrigin)", app_js)
+        self.assertIn("button.disabled = !S.conversationBatchMode && !allowed", app_js)
         self.assertIn(
             "const chatAllowed = !isSelf && canOpenPrivateChatEntry(profileUid, normalizedChatOrigin)",
             open_profile,
@@ -3242,12 +3294,14 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('if path == "/api/im/message-policy"', bff_server_py)
         self.assertIn('"match_peers": sorted(match_peers)[:5000]', bff_server_py)
         self.assertIn('"allowed_peers": sorted(allowed_peers)[:5000]', bff_server_py)
+        self.assertIn('"blocked_peers": sorted(blocked_peers)[:5000]', bff_server_py)
         self.assertIn("app.bootstrap(include_im=False)", bff_server_py)
         self.assertIn("Handler.can_message_peer(self, u, to_uid)", bff_server_py)
         self.assertIn("Handler.can_message_peer(self, u, target_id)", bff_server_py)
         self.assertIn("IM_DIRECT_CREDENTIALS_DISABLED", bff_server_py)
-        self.assertIn('"direct_im_credentials": True', bff_server_py)
+        self.assertIn('"direct_im_credentials": enabled', bff_server_py)
         self.assertIn('if path == "/api/im/tim"', bff_server_py)
+        self.assertIn('if not capabilities.get("direct_im_credentials")', bff_server_py)
         self.assertIn('prefer="server"', bff_server_py)
         self.assertIn("allow_local_fallback=False", bff_server_py)
         tim_connect = app_js.split("async function ensureTimConnected", 1)[1].split(
@@ -3258,6 +3312,19 @@ class SocialFrontendContractTests(unittest.TestCase):
             tim_connect,
         )
         self.assertIn("persistence.can_message_peer(", api_py)
+        self.assertIn("persistence.message_policy_blocked_peers(identity)", api_py)
+        self.assertIn("SOCIAL_DM_POLICY_PERSISTENCE_FAILED", api_py)
+
+        send_text = app_js.split("async function sendTextMessage", 1)[1].split(
+            "function progressRatio", 1
+        )[0]
+        self.assertIn("await ensurePrivateChatPermission(target)", send_text)
+        composer_panel = app_js.split("function chatComposerPanelHtml()", 1)[1].split(
+            "function chatComposerQuoteHtml", 1
+        )[0]
+        self.assertIn("const directMediaActions = S.directImCredentialsEnabled", composer_panel)
+        self.assertIn("const stickerAction = S.directImCredentialsEnabled", composer_panel)
+        self.assertIn('data-kind="flash"', composer_panel)
 
     def test_moments_and_social_tabs_update_only_their_content_panels(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -3938,6 +4005,23 @@ class RichMessageFrontendContractTests(unittest.TestCase):
             open_chat.index("refreshMessageConversationRegion({"),
         )
 
+    def test_sdk_conversation_updates_are_authoritative_for_unread_count(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+
+        tim_handlers = self._app_fragment(
+            app_js,
+            "function attachTimHandlers(chat, TIM, credential)",
+            "function isCurrentAuthenticatedSession",
+        )
+
+        self.assertNotIn("currentUnread + 1", tim_handlers)
+        self.assertNotIn("shouldIncrementUnread", tim_handlers)
+        self.assertIn('unreadCount: entry.type !== "mine" && active ? 0 : undefined', tim_handlers)
+        self.assertIn("TIM.EVENT?.CONVERSATION_LIST_UPDATED", tim_handlers)
+        self.assertIn(".map(normalizeTimConversation)", tim_handlers)
+        self.assertIn("S.conversations = mergeConversationSources(S.conversations, updated)", tim_handlers)
+
     def test_incoming_message_toast_prefers_the_sender_nickname(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
@@ -4535,7 +4619,11 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("panel-dom-cache", css_version)
         self.assertIn("private-message-policy-recheck", css_version)
         self.assertIn("private-message-entry-scope", css_version)
-        self.assertTrue(css_version.endswith("-voice-url-renewal-imcloud-revoke-replay-v2"))
+        self.assertTrue(
+            css_version.endswith(
+                "-voice-url-renewal-imcloud-revoke-replay-v2-unread-authoritative-private-message-policy-hardening"
+            )
+        )
 
 
 class FlashPhotoBffContractTests(unittest.TestCase):

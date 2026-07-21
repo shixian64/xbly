@@ -105,9 +105,11 @@ class WebUser:
     persist_sessions: bool = False
     match_pool_online_list_enabled: bool = False
     nearby_custom_city_enabled: bool = False
+    friend_message_peers: set[str] = field(default_factory=set, repr=False)
     match_message_peers: set[str] = field(default_factory=set, repr=False)
     match_history: list[Dict[str, Any]] = field(default_factory=list, repr=False)
     conversation_message_peers: set[str] = field(default_factory=set, repr=False)
+    blocked_message_peers: set[str] = field(default_factory=set, repr=False)
     # Voice matching and Rong credentials are intentionally session-memory
     # only.  They must never be written into persisted browser sessions.
     voice_match_state: Dict[str, Any] = field(default_factory=dict, repr=False)
@@ -219,7 +221,7 @@ class WebUser:
         return {
             "match_pool_online_list": True,
             "proactive_private_message": enabled,
-            "direct_im_credentials": True,
+            "direct_im_credentials": enabled,
             "nearby_custom_city": bool(self.nearby_custom_city_enabled),
         }
 
