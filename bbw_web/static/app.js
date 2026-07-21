@@ -2915,27 +2915,29 @@ function peerPresence(uid, entity = {}) {
   return S.presenceByUid.get(target) || fromEntity;
 }
 
-function presenceBadgeHtml(uid, entity = {}, extraClass = "") {
+function presenceBadgeHtml(uid, entity = {}, extraClass = "", unknownVisible = false) {
   const target = String(uid || "").trim();
   if (!target) return "";
   const presence = peerPresence(target, entity);
   if (presence.status === "hidden") return "";
   const unknown = presence.status === "unknown";
+  const concealed = unknown && !unknownVisible;
   return `<span class="presence-badge presence-${esc(presence.status)}${extraClass ? ` ${esc(extraClass)}` : ""}" data-presence-uid="${esc(
     target
-  )}"${unknown ? " hidden" : ` aria-label="在线状态：${esc(presence.label)}"`}>${unknown ? "" : esc(
-    presence.label
-  )}</span>`;
+  )}"${unknownVisible ? ' data-presence-unknown-visible="true"' : ""}${
+    concealed ? " hidden" : ` aria-label="在线状态：${esc(presence.label)}"`
+  }>${concealed ? "" : esc(presence.label)}</span>`;
 }
 
 function updatePeerPresenceDom() {
   document.querySelectorAll("[data-presence-uid]").forEach((element) => {
     const presence = S.presenceByUid.get(String(element.dataset.presenceUid || ""));
     if (!presence) return;
-    const unknown = presence.status === "unknown" || presence.status === "hidden";
-    element.hidden = unknown;
-    element.textContent = unknown ? "" : presence.label;
-    if (unknown) element.removeAttribute("aria-label");
+    const hideUnknown = presence.status === "unknown" && element.dataset.presenceUnknownVisible !== "true";
+    const concealed = presence.status === "hidden" || hideUnknown;
+    element.hidden = concealed;
+    element.textContent = concealed ? "" : presence.label;
+    if (concealed) element.removeAttribute("aria-label");
     else element.setAttribute("aria-label", `在线状态：${presence.label}`);
     ["online", "offline", "away", "hidden", "unknown"].forEach((status) => {
       element.classList.toggle(`presence-${status}`, presence.status === status);
@@ -2943,25 +2945,57 @@ function updatePeerPresenceDom() {
   });
 }
 
+function presenceUidFromRow(item) {
+  return String(
+    item?.uid || item?.userID || item?.userId || item?.UserID || item?.To_Account || item?.to_account || ""
+  ).trim();
+}
+
+function presenceFromRow(item) {
+  const rawStatus = item?.status ?? item?.Status ?? item?.state ?? item?.online;
+  let presence = normalizePeerPresence(rawStatus);
+  if (presence.status === "unknown" && Object.prototype.hasOwnProperty.call(item || {}, "statusType")) {
+    const statusType = Number(item.statusType);
+    if (statusType === 1) presence = normalizePeerPresence(true);
+    else if (statusType === 2 || statusType === 3) presence = normalizePeerPresence(false);
+  }
+  if (
+    presence.status === "unknown" &&
+    Object.prototype.hasOwnProperty.call(item || {}, "is_online") &&
+    item.is_online != null
+  ) {
+    presence = normalizePeerPresence(Boolean(item.is_online));
+  }
+  return presence;
+}
+
 function rememberPeerPresence(items, source = "rest") {
+  const resolvedUids = new Set();
   (Array.isArray(items) ? items : []).forEach((item) => {
     if (!item || typeof item !== "object") return;
-    const uid = String(item.uid || item.userID || item.UserID || item.To_Account || item.to_account || "").trim();
+    const uid = presenceUidFromRow(item);
     if (!uid) return;
-    let presence = normalizePeerPresence(item.status ?? item.Status ?? item.state ?? item.online);
-    if (presence.status === "unknown" && Object.prototype.hasOwnProperty.call(item, "is_online") && item.is_online != null) {
-      presence = normalizePeerPresence(Boolean(item.is_online));
-    }
+    const presence = presenceFromRow(item);
     S.presenceByUid.set(uid, { ...presence, source, updatedAt: Date.now() });
+    if (presence.status !== "unknown") resolvedUids.add(uid);
   });
   updatePeerPresenceDom();
+  return resolvedUids;
 }
 
 function timPresenceRows(result) {
   const data = result?.data ?? result;
   if (Array.isArray(data)) return data;
   if (!data || typeof data !== "object") return [];
-  for (const key of ["userStatusList", "statusList", "QueryResult", "items", "list"]) {
+  for (const key of [
+    "successUserList",
+    "SuccessUserList",
+    "userStatusList",
+    "statusList",
+    "QueryResult",
+    "items",
+    "list",
+  ]) {
     if (Array.isArray(data[key])) return data[key];
   }
   return [];
@@ -3013,10 +3047,7 @@ async function refreshVisiblePeerPresence({ force = false } = {}) {
           result.status === "fulfilled" ? timPresenceRows(result.value) : []
         );
         if (rows.length) {
-          rememberPeerPresence(rows, "tim");
-          const resolvedUids = new Set(
-            rows.map((item) => String(item?.uid || item?.userID || item?.UserID || item?.To_Account || ""))
-          );
+          const resolvedUids = rememberPeerPresence(rows, "tim");
           remaining = stale.filter((uid) => !resolvedUids.has(uid));
         }
       } catch {
@@ -3984,7 +4015,9 @@ function conversationCard(item) {
     : chatAllowed
       ? `打开与 ${name} 的聊天`
       : `当前无法打开与 ${name} 的聊天`;
-  const presence = peer ? presenceBadgeHtml(peer, { ...nestedUser, ...conversation }, "presence-compact") : "";
+  const presence = peer
+    ? presenceBadgeHtml(peer, { ...nestedUser, ...conversation }, "presence-compact", true)
+    : "";
   const selectionControl = S.conversationBatchMode
     ? `<label class="conversation-select-control"><input type="checkbox" data-action="toggle-conversation-selection" data-uid="${esc(
         peer
