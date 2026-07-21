@@ -413,7 +413,23 @@ def normalize_user(item: Any) -> Optional[Dict[str, Any]]:
     city = str(_first(item, ["city", "region", "real_region", "area", "address"], ""))
     sign = str(_first(item, ["signature", "sign", "desc", "description"], ""))
     dist = str(_first(item, ["distance", "dist", "juli", "location"], ""))
-    visit_time = str(_first(item, ["visit_time", "visited_at", "time"], ""))
+    visit_time = str(
+        _first(
+            item,
+            [
+                "visit_time",
+                "visitTime",
+                "visited_at",
+                "visitedAt",
+                "view_time",
+                "viewTime",
+                "time",
+                "created_at",
+                "createdAt",
+            ],
+            "",
+        )
+    )
     letter = str(_first(item, ["letters", "letter", "initial", "first_letter"], ""))
     apply_id = str(
         _first(
@@ -446,7 +462,7 @@ def normalize_user(item: Any) -> Optional[Dict[str, Any]]:
             _first(item, ["hide_online", "hideOnline", "is_hide_online"], "0")
         ),
         "visit_time": visit_time,
-        "custom_time": str(_first(item, ["custom_time"], "")),
+        "custom_time": str(_first(item, ["custom_time", "customTime"], "")),
         "friend_remark": str(_first(item, ["friendsremark", "friend_remark", "remark"], "")),
         "friend_tag": str(_first(item, ["friendstag", "friend_tag"], "")),
         "letters": letter,

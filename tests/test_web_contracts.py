@@ -3282,6 +3282,27 @@ class ImRevokeBffContractTests(unittest.TestCase):
 
 
 class SocialFrontendContractTests(unittest.TestCase):
+    def test_visitor_lists_show_exact_directional_visit_times(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        formatter = app_js.split("function formatVisitorTime(value)", 1)[1].split(
+            "function formatBottleTime", 1
+        )[0]
+        visitor_card = app_js.split("function visitorCard(item, visitType", 1)[1].split(
+            "function friendListHtml", 1
+        )[0]
+        visitor_panel = app_js.split('} else if (activeTab === "visitors") {', 1)[1].split(
+            "} else {", 1
+        )[0]
+
+        self.assertIn("date.getFullYear()", formatter)
+        self.assertIn("date.getMonth() + 1", formatter)
+        self.assertIn("date.getHours()", formatter)
+        self.assertIn("date.getMinutes()", formatter)
+        self.assertIn('visitType === "seen_by_me" ? "访问时间" : "来访时间"', visitor_card)
+        self.assertIn("user.custom_time", visitor_card)
+        self.assertIn("(item) => visitorCard(item, type)", visitor_panel)
+
     def test_boot_retries_transient_session_restore_failures_before_showing_login(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")

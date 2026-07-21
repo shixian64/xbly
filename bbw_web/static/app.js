@@ -3273,6 +3273,24 @@ function formatSocialTime(value) {
   return date.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" });
 }
 
+function formatVisitorTime(value) {
+  if (value == null || value === "") return "";
+  const raw = String(value).trim();
+  let date;
+  if (/^\d{10,13}$/.test(raw)) {
+    const numeric = Number(raw);
+    date = new Date(raw.length === 10 ? numeric * 1000 : numeric);
+  } else {
+    date = new Date(raw);
+    if (Number.isNaN(date.getTime())) date = new Date(raw.replace(/-/g, "/"));
+  }
+  if (Number.isNaN(date.getTime())) return raw;
+  const pad = (part) => String(part).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(
+    date.getMinutes()
+  )}`;
+}
+
 function formatBottleTime(value) {
   if (value == null || value === "") return "";
   const raw = String(value).trim();
@@ -4002,11 +4020,24 @@ function conversationCard(item) {
   </div>`;
 }
 
-function visitorCard(item) {
+function visitorCard(item, visitType = "seen_me") {
   const user = item && typeof item === "object" ? item : {};
-  const visitTime = formatSocialTime(user.visited_at || user.visit_time || user.time || user.created_at);
+  const visitTime = formatVisitorTime(
+    user.visit_time ||
+      user.visitTime ||
+      user.visited_at ||
+      user.visitedAt ||
+      user.view_time ||
+      user.viewTime ||
+      user.time ||
+      user.created_at ||
+      user.createdAt ||
+      user.custom_time ||
+      user.customTime
+  );
   const copy = { ...user };
-  if (visitTime) copy.subtitle = [user.subtitle, visitTime].filter(Boolean).join(" · ");
+  const timeLabel = visitType === "seen_by_me" ? "访问时间" : "来访时间";
+  if (visitTime) copy.subtitle = [user.subtitle, `${timeLabel} ${visitTime}`].filter(Boolean).join(" · ");
   return userCard(copy, { chat: true, profile: true });
 }
 
@@ -11233,7 +11264,7 @@ async function loadSocialTab(tab, signal) {
       )
       .join("")}</div><div class="section-head visitor-heading"><div><h2>${title}</h2><p>${detail}</p></div><button type="button" class="btn secondary small" data-action="refresh-route">刷新</button></div>${envelopeHtml(
       data,
-      visitorCard,
+      (item) => visitorCard(item, type),
       type === "seen_me" ? "暂时还没有访客" : "还没有浏览记录",
       detail
     )}</section>`;

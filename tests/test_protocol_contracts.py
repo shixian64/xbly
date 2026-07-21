@@ -272,6 +272,7 @@ class NormalizerContractTests(unittest.TestCase):
                     "location": "2.4",
                     "online": "在线",
                     "time": "1710000000",
+                    "customTime": "2024-03-10 00:00",
                     "friendsremark": "同学",
                     "friendstag": "熟人",
                     "letters": "N",
@@ -284,6 +285,7 @@ class NormalizerContractTests(unittest.TestCase):
         self.assertEqual(user["city"], "上海")
         self.assertEqual(user["distance"], "2.4")
         self.assertEqual(user["visit_time"], "1710000000")
+        self.assertEqual(user["custom_time"], "2024-03-10 00:00")
         self.assertEqual(user["friend_remark"], "同学")
         self.assertEqual(user["friend_tag"], "熟人")
         self.assertEqual(user["letters"], "N")
@@ -291,6 +293,11 @@ class NormalizerContractTests(unittest.TestCase):
         self.assertEqual(user["apply_id"], "apply-1")
         self.assertEqual(user["relation_id"], "relation-1")
         self.assertTrue(user["is_friend"])
+
+        visit_alias = normalize_users(
+            [{"id": "10", "nickname": "V", "visitedAt": "1710000100"}]
+        )[0]
+        self.assertEqual(visit_alias["visit_time"], "1710000100")
 
         relation = normalize_users([{"id": "relation-row", "uid": "9", "nickname": "N"}])[0]
         self.assertEqual(relation["id"], "9")
