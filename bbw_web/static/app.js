@@ -1354,7 +1354,7 @@ function applyCapabilities(
   capabilities,
   { deferMessageReconnect = false } = {}
 ) {
-  if (!capabilities || typeof capabilities !== "object") return;
+  if (!capabilities || typeof capabilities !== "object") return false;
   const previousProactive = S.proactivePrivateMessageEnabled;
   const previousDirectCredentials = S.directImCredentialsEnabled;
   const previousNearbyCustomCity = S.nearbyCustomCityEnabled;
@@ -1371,7 +1371,10 @@ function applyCapabilities(
   const directCredentialsChanged =
     previousDirectCredentials !== S.directImCredentialsEnabled;
   const nearbyCustomCityChanged = previousNearbyCustomCity !== S.nearbyCustomCityEnabled;
-  if (!proactiveChanged && !directCredentialsChanged && !nearbyCustomCityChanged) return;
+  if (!proactiveChanged && !directCredentialsChanged && !nearbyCustomCityChanged) {
+    return false;
+  }
+  const messageCapabilitiesChanged = proactiveChanged || directCredentialsChanged;
   if (proactiveChanged) {
     clearAllViewCaches();
     syncPrivateMessageControls();
@@ -1380,11 +1383,11 @@ function applyCapabilities(
     clearViewCacheKey("nearby");
     clearViewCachePrefix("nearby:");
   }
-  if (proactiveChanged || directCredentialsChanged) {
+  if (messageCapabilitiesChanged) {
     S.messagePolicyGeneration += 1;
   }
   if (
-    (proactiveChanged || directCredentialsChanged) &&
+    messageCapabilitiesChanged &&
     S.authenticated &&
     (S.imMode ||
       S.chat ||
@@ -1404,6 +1407,7 @@ function applyCapabilities(
       resumeMessageChannelAfterPolicyReady();
     });
   }
+  return messageCapabilitiesChanged;
 }
 
 function setLoginMode(mode) {
@@ -1594,7 +1598,9 @@ function refreshMessagePolicy() {
         if (!S.messagePolicyReady) setMessagePolicyReady(false);
         return {};
       }
-      applyCapabilities(data.capabilities, { deferMessageReconnect: true });
+      const messageCapabilitiesChanged = applyCapabilities(data.capabilities, {
+        deferMessageReconnect: true,
+      });
       replaceMessagePolicyAllowedPeers(data.allowed_peers);
       replaceMessagePolicyMatchPeers(data.match_peers);
       replaceBlockedPrivateMessagePeers(data.blocked_peers);
@@ -1602,7 +1608,11 @@ function refreshMessagePolicy() {
         true,
         currentMessagePolicyFingerprint()
       );
-      if (transition.readyChanged || transition.policyChanged) {
+      if (
+        messageCapabilitiesChanged ||
+        transition.readyChanged ||
+        transition.policyChanged
+      ) {
         resumeMessageChannelAfterPolicyReady();
       }
       return data.capabilities || {};

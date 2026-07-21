@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import threading
 import time
 import unittest
@@ -3605,6 +3607,9 @@ class SocialFrontendContractTests(unittest.TestCase):
         open_profile = app_js.split("async function openProfile", 1)[1].split(
             "async function refreshMatchStats", 1
         )[0]
+        apply_capabilities = app_js.split("function applyCapabilities", 1)[1].split(
+            "function setLoginMode", 1
+        )[0]
 
         self.assertIn("proactivePrivateMessageEnabled: false", app_js)
         self.assertIn("privateMessagePeers: new Set()", app_js)
@@ -3664,25 +3669,27 @@ class SocialFrontendContractTests(unittest.TestCase):
         )
         self.assertIn("currentMessagePolicyFingerprint()", app_js)
         self.assertIn(
-            "applyCapabilities(data.capabilities, { deferMessageReconnect: true })",
+            "const messageCapabilitiesChanged = applyCapabilities(data.capabilities, {",
             app_js,
         )
+        self.assertIn("deferMessageReconnect: true", app_js)
         self.assertIn("function queueMessagePolicyCleanup()", app_js)
-        self.assertIn("if (proactiveChanged || directCredentialsChanged)", app_js)
+        self.assertIn(
+            "const messageCapabilitiesChanged = proactiveChanged || directCredentialsChanged",
+            apply_capabilities,
+        )
         self.assertIn("const previous = S.messagePolicyCleanupPromise", app_js)
         self.assertIn("Promise.resolve(previous)", app_js)
         self.assertIn("S.messagePolicyCleanupPromise = tracked", app_js)
-        apply_capabilities = app_js.split("function applyCapabilities", 1)[1].split(
-            "function setLoginMode", 1
-        )[0]
         self.assertIn(
             "S._imConnecting ||\n      S.messagePolicyCleanupPromise",
             apply_capabilities,
         )
         self.assertIn("deferMessageReconnect ||", app_js)
         self.assertIn("S.messagePolicyCleanupPromise", app_js)
+        self.assertIn("return messageCapabilitiesChanged", apply_capabilities)
         self.assertIn(
-            "if (transition.readyChanged || transition.policyChanged)",
+            "messageCapabilitiesChanged ||\n        transition.readyChanged ||",
             app_js,
         )
         self.assertIn("proactive_private_message", app_js)
@@ -3732,6 +3739,136 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("persistence.can_message_peer(", api_py)
         self.assertIn("persistence.message_policy_blocked_peers(identity)", api_py)
         self.assertIn("SOCIAL_DM_POLICY_PERSISTENCE_FAILED", api_py)
+
+    def test_deferred_policy_cleanup_reconnects_after_capability_rollback(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for the frontend race test")
+
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        apply_capabilities = app_js.split("function applyCapabilities", 1)[1].split(
+            "function setLoginMode", 1
+        )[0]
+        policy_functions = app_js.split("function currentMessagePolicyFingerprint", 1)[
+            1
+        ].split("function messageSyncAccountId", 1)[0]
+        script = (
+            "function applyCapabilities"
+            + apply_capabilities
+            + "\nfunction currentMessagePolicyFingerprint"
+            + policy_functions
+            + r"""
+const cleanupResolvers = [];
+let reconnectAttempts = 0;
+const S = {
+  proactivePrivateMessageEnabled: false,
+  directImCredentialsEnabled: true,
+  nearbyCustomCityEnabled: false,
+  authenticated: true,
+  imMode: "sdk",
+  chat: {},
+  imConnecting: false,
+  _imConnecting: null,
+  imConnected: true,
+  imNextReconnectAt: 0,
+  messagePolicyCleanupPromise: null,
+  messagePolicyCleanupGeneration: 0,
+  messagePolicyGeneration: 0,
+  messagePolicyReady: true,
+  messagePolicyFingerprint: "",
+  privateMessagePeers: new Set(["7"]),
+  matchMessagePeers: new Set(),
+  blockedPrivateMessagePeers: new Set(),
+  sessionGeneration: 1,
+};
+function clearAllViewCaches() {}
+function clearViewCacheKey() {}
+function clearViewCachePrefix() {}
+function syncPrivateMessageControls() {}
+function updateImConnectionStatus() {}
+function cleanupIM() {
+  S.imMode = "";
+  S.chat = null;
+  S.imConnected = false;
+  return new Promise((resolve) => cleanupResolvers.push(resolve));
+}
+function isCurrentAuthenticatedSession(generation) {
+  return S.authenticated && generation === S.sessionGeneration;
+}
+function ensureTimConnected() {
+  reconnectAttempts += 1;
+  S.imConnected = true;
+  return Promise.resolve(true);
+}
+function replaceMessagePolicyAllowedPeers(values) {
+  S.privateMessagePeers = new Set(values || []);
+}
+function replaceMessagePolicyMatchPeers(values) {
+  S.matchMessagePeers = new Set(values || []);
+}
+function replaceBlockedPrivateMessagePeers(values) {
+  S.blockedPrivateMessagePeers = new Set(values || []);
+}
+function api() {
+  return Promise.resolve({
+    data: {
+      ok: true,
+      capabilities: {
+        proactive_private_message: false,
+        direct_im_credentials: true,
+      },
+      allowed_peers: ["7"],
+      match_peers: [],
+      blocked_peers: [],
+    },
+  });
+}
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+(async () => {
+  S.messagePolicyFingerprint = currentMessagePolicyFingerprint();
+  applyCapabilities({ proactive_private_message: true });
+  await flush();
+  if (cleanupResolvers.length !== 1) {
+    throw new Error(`first cleanup did not start: ${cleanupResolvers.length}`);
+  }
+
+  await refreshMessagePolicy();
+  if (S.proactivePrivateMessageEnabled !== false) {
+    throw new Error("policy refresh did not roll the capability back");
+  }
+  if (reconnectAttempts !== 0) {
+    throw new Error("reconnected before queued cleanup completed");
+  }
+
+  cleanupResolvers.shift()();
+  await flush();
+  await flush();
+  if (cleanupResolvers.length !== 1) {
+    throw new Error(`deferred cleanup did not start: ${cleanupResolvers.length}`);
+  }
+  cleanupResolvers.shift()();
+  await flush();
+  await flush();
+  if (reconnectAttempts !== 1) {
+    throw new Error(`expected one final reconnect, got ${reconnectAttempts}`);
+  }
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exitCode = 1;
+});
+"""
+        )
+        result = subprocess.run(
+            [node, "-e", script],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
         send_text = app_js.split("async function sendTextMessage", 1)[1].split(
             "function progressRatio", 1
@@ -5052,7 +5189,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("private-message-entry-scope", css_version)
         self.assertTrue(
             css_version.endswith(
-                "-voice-url-renewal-imcloud-revoke-replay-v2-unread-authoritative-private-message-policy-hardening-unread-tie-fix-message-policy-refresh-race-fix-message-policy-cleanup-queue-fix-message-policy-latest-reconnect-fix"
+                "-voice-url-renewal-imcloud-revoke-replay-v2-unread-authoritative-private-message-policy-hardening-unread-tie-fix-message-policy-refresh-race-fix-message-policy-cleanup-queue-fix-message-policy-latest-reconnect-fix-message-policy-deferred-reconnect-fix"
             )
         )
 
