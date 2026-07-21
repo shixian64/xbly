@@ -3417,7 +3417,13 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("reusableRouteDomEntry(cacheKey", activate_route)
         self.assertIn("restoreRouteDomSnapshot(cacheKey, routeDom)", activate_route)
         self.assertIn("allowWithoutPageCache: target === \"msg\"", activate_route)
-        self.assertIn("refreshMessageConversationRegion({ refreshList: true, refreshPane: false })", activate_route)
+        restored_message_route = activate_route.split("if (routeDomRestored)", 1)[1].split(
+            "if (!force && cached?.fresh) return", 1
+        )[0]
+        self.assertIn(
+            "refreshMessageConversationRegion({ refreshList: true, refreshPane: true })",
+            restored_message_route,
+        )
         self.assertIn('root().classList.add("is-refreshing")', activate_route)
         self.assertNotIn("permissionSensitiveRoute", activate_route)
         self.assertIn("minePanelCacheKey(target)", switch_mine)
@@ -5189,7 +5195,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("private-message-entry-scope", css_version)
         self.assertTrue(
             css_version.endswith(
-                "-voice-url-renewal-imcloud-revoke-replay-v2-unread-authoritative-private-message-policy-hardening-unread-tie-fix-message-policy-refresh-race-fix-message-policy-cleanup-queue-fix-message-policy-latest-reconnect-fix-message-policy-deferred-reconnect-fix"
+                "-voice-url-renewal-imcloud-revoke-replay-v2-unread-authoritative-private-message-policy-hardening-unread-tie-fix-message-policy-refresh-race-fix-message-policy-cleanup-queue-fix-message-policy-latest-reconnect-fix-message-policy-deferred-reconnect-fix-contact-chat-route-restore-fix"
             )
         )
 

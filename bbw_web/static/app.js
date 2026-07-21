@@ -2697,7 +2697,10 @@ async function activateRoute(id, { force = false } = {}) {
         S.activePeerName = active.nickname || active.peer_name || active.user?.nickname || `用户 ${S.activePeer}`;
       }
       if (S.activePeer) void loadConversationMessages(S.activePeer);
-      refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
+      // The cached message DOM may contain the empty placeholder from a
+      // previous visit. Rebuild the pane from the current activePeer so a
+      // contact/profile chat action opens the selected conversation.
+      refreshMessageConversationRegion({ refreshList: true, refreshPane: true });
       void loadArchivedConversationSummary();
       void runMessageSyncCycle();
       if (!S.imConnected) {
