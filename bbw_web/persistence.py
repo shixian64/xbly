@@ -82,6 +82,11 @@ MESSAGE_POLICY_CONVERSATION_KIND = "message_peer"
 SOCIAL_RELATIONSHIP_PROVIDER = "beibeiwu"
 SOCIAL_FRIEND_KIND = "friend"
 SOCIAL_BLACKLIST_KIND = "blacklist"
+SOCIAL_BLACKLISTED_BY_KIND = "blacklisted_by"
+SOCIAL_MESSAGE_BLOCK_KINDS = (
+    SOCIAL_BLACKLIST_KIND,
+    SOCIAL_BLACKLISTED_BY_KIND,
+)
 
 
 def _message_peer_uid(value: Any) -> str:
@@ -1078,7 +1083,11 @@ class RuntimePersistence:
         BFF send is denied because the background ingestion job has not run.
         """
 
-        if kind not in {SOCIAL_FRIEND_KIND, SOCIAL_BLACKLIST_KIND}:
+        if kind not in {
+            SOCIAL_FRIEND_KIND,
+            SOCIAL_BLACKLIST_KIND,
+            SOCIAL_BLACKLISTED_BY_KIND,
+        }:
             raise ValueError("unsupported social message relationship kind")
         normalized = list(
             dict.fromkeys(
@@ -1206,7 +1215,7 @@ class RuntimePersistence:
                     Relationship.owner_user_id == identity.user_id,
                     Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
                     Relationship.subject_upstream_uid == target,
-                    Relationship.kind == SOCIAL_BLACKLIST_KIND,
+                    Relationship.kind.in_(SOCIAL_MESSAGE_BLOCK_KINDS),
                     Relationship.status == "active",
                     Relationship.ended_at.is_(None),
                 )
@@ -1256,7 +1265,7 @@ class RuntimePersistence:
                     select(Relationship.subject_upstream_uid).where(
                         Relationship.owner_user_id == identity.user_id,
                         Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
-                        Relationship.kind == SOCIAL_BLACKLIST_KIND,
+                        Relationship.kind.in_(SOCIAL_MESSAGE_BLOCK_KINDS),
                         Relationship.status == "active",
                         Relationship.ended_at.is_(None),
                     )
@@ -1324,7 +1333,7 @@ class RuntimePersistence:
                     select(Relationship.subject_upstream_uid).where(
                         Relationship.owner_user_id == identity.user_id,
                         Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
-                        Relationship.kind == SOCIAL_BLACKLIST_KIND,
+                        Relationship.kind.in_(SOCIAL_MESSAGE_BLOCK_KINDS),
                         Relationship.status == "active",
                         Relationship.ended_at.is_(None),
                     )
@@ -1361,7 +1370,7 @@ class RuntimePersistence:
                 .where(
                     Relationship.owner_user_id == identity.user_id,
                     Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
-                    Relationship.kind == SOCIAL_BLACKLIST_KIND,
+                    Relationship.kind.in_(SOCIAL_MESSAGE_BLOCK_KINDS),
                     Relationship.status == "active",
                     Relationship.ended_at.is_(None),
                 )
@@ -1392,14 +1401,15 @@ class RuntimePersistence:
         if method_upper == "GET" and path in {
             "/api/social/friends",
             "/api/social/blacklist",
+            "/api/social/blacklist-me",
         }:
             if not _response_has_item_list(response_data):
                 return []
-            kind = (
-                SOCIAL_FRIEND_KIND
-                if path == "/api/social/friends"
-                else SOCIAL_BLACKLIST_KIND
-            )
+            kind = {
+                "/api/social/friends": SOCIAL_FRIEND_KIND,
+                "/api/social/blacklist": SOCIAL_BLACKLIST_KIND,
+                "/api/social/blacklist-me": SOCIAL_BLACKLISTED_BY_KIND,
+            }[path]
             peers = [_item_peer_uid(item) for item in _response_items(response_data)]
             return self.replace_social_message_relationships(
                 identity=identity,

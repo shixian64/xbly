@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1104,6 +1105,10 @@ class SocialBffRoutingTests(unittest.TestCase):
             app=app,
             profile_cache={},
             conversation_message_peers={"9"} if authorized_peer else set(),
+            blocked_message_peers=set(),
+            blocked_by_message_peers=set(),
+            blocked_message_peers_snapshot_at=time.monotonic(),
+            blocked_by_message_peers_snapshot_at=time.monotonic(),
             native=SimpleNamespace(
                 tim_rest=SimpleNamespace(
                     recent_contacts=lambda user_id, **_kwargs: calls.append(
@@ -2481,6 +2486,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         match_peers=(),
         conversation_peers=(),
         blocked_peers=(),
+        blocked_by_peers=(),
         authorizer=None,
     ):
         calls = []
@@ -2508,6 +2514,9 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
             match_message_peers=set(match_peers),
             conversation_message_peers=set(conversation_peers),
             blocked_message_peers=set(blocked_peers),
+            blocked_by_message_peers=set(blocked_by_peers),
+            blocked_message_peers_snapshot_at=time.monotonic(),
+            blocked_by_message_peers_snapshot_at=time.monotonic(),
         )
 
         class Harness:
@@ -2554,6 +2563,10 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
             friend_message_peers=allowed_peers,
             match_message_peers=set(),
             conversation_message_peers=set(),
+            blocked_message_peers=set(),
+            blocked_by_message_peers=set(),
+            blocked_message_peers_snapshot_at=time.monotonic(),
+            blocked_by_message_peers_snapshot_at=time.monotonic(),
         )
 
         class Harness:
@@ -2638,10 +2651,206 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
 
         calls, response = self._run_rest_send(
             **granted,
+            blocked_by_peers={"9"},
+            authorizer=lambda _peer: True,
+        )
+        self.assertEqual(calls, [])
+        self.assertEqual(response[0], 403)
+
+        calls, response = self._run_rest_send(
+            **granted,
             authorizer=lambda _peer: False,
         )
         self.assertEqual(calls, [])
         self.assertEqual(response[0], 403)
+
+    def test_first_private_message_check_loads_both_blacklist_directions(self) -> None:
+        calls = []
+        recorded = []
+        empty = ApiResult(False, 200, "false", data=False)
+        blocked_by = ApiResult(
+            True,
+            200,
+            '[{"uid":"9","nickname":"对方"}]',
+            data=[{"uid": "9", "nickname": "对方"}],
+        )
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(
+                session=SimpleNamespace(uid="42"),
+                social=SimpleNamespace(
+                    my_blacklist=lambda: calls.append("blacklist") or empty,
+                    blacklist_me=lambda: calls.append("blacklist-me") or blocked_by,
+                ),
+            ),
+            blocked_message_peers=set(),
+            blocked_by_message_peers=set(),
+            blocked_message_peers_snapshot_at=0.0,
+            blocked_by_message_peers_snapshot_at=0.0,
+            message_blocks_retry_at=0.0,
+        )
+        harness = SimpleNamespace(
+            _request_message_peer_authorizer=lambda _peer: True,
+            _request_message_block_snapshot_recorder=lambda path, peers: recorded.append(
+                (path, set(peers))
+            ),
+        )
+
+        self.assertFalse(bff_server.Handler.can_message_peer(harness, web_user, "9"))
+        self.assertEqual(calls, ["blacklist", "blacklist-me"])
+        self.assertEqual(
+            recorded,
+            [
+                ("/api/social/blacklist", set()),
+                ("/api/social/blacklist-me", {"9"}),
+            ],
+        )
+        self.assertEqual(web_user.blocked_by_message_peers, {"9"})
+
+    def test_blacklist_read_failure_preserves_previous_snapshot(self) -> None:
+        results = [
+            ApiResult(False, 503, "upstream unavailable", message="upstream unavailable"),
+            ApiResult(False, 200, "false", data=False),
+        ]
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(
+                session=SimpleNamespace(uid="42"),
+                social=SimpleNamespace(my_blacklist=lambda: results.pop(0)),
+            ),
+            blocked_message_peers={"9"},
+            blocked_message_peers_snapshot_at=time.monotonic(),
+        )
+
+        class Harness:
+            path = "/api/social/blacklist"
+
+            def __init__(self):
+                self.response = None
+
+            def _check_api_origin(self):
+                return True
+
+            def sid(self):
+                return "sid"
+
+            def user(self, _sid):
+                return web_user
+
+            def ok(self, obj, status=200, **_kwargs):
+                self.response = (status, obj)
+                return self.response
+
+        failed = Harness()
+        bff_server.Handler.do_GET(failed)
+        self.assertFalse(failed.response[1]["ok"])
+        self.assertEqual(web_user.blocked_message_peers, {"9"})
+
+        empty_snapshot = Harness()
+        bff_server.Handler.do_GET(empty_snapshot)
+        self.assertTrue(empty_snapshot.response[1]["ok"])
+        self.assertEqual(web_user.blocked_message_peers, set())
+
+    def test_new_block_is_enforced_when_snapshot_persistence_fails(self) -> None:
+        previous_snapshot_at = time.monotonic() - (
+            bff_server.MESSAGE_BLOCK_SNAPSHOT_TTL_SEC + 1
+        )
+        blocked = ApiResult(
+            True,
+            200,
+            '[{"uid":"9","nickname":"对方"}]',
+            data=[{"uid": "9", "nickname": "对方"}],
+        )
+        empty = ApiResult(False, 200, "false", data=False)
+        authorizer_calls = []
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(
+                session=SimpleNamespace(uid="42"),
+                social=SimpleNamespace(
+                    my_blacklist=lambda: blocked,
+                    blacklist_me=lambda: empty,
+                ),
+            ),
+            blocked_message_peers=set(),
+            blocked_by_message_peers=set(),
+            blocked_message_peers_snapshot_at=previous_snapshot_at,
+            blocked_by_message_peers_snapshot_at=previous_snapshot_at,
+            message_blocks_retry_at=0.0,
+        )
+
+        def fail_snapshot_write(_path, _peers):
+            raise RuntimeError("database unavailable")
+
+        harness = SimpleNamespace(
+            _request_message_peer_authorizer=lambda peer: authorizer_calls.append(peer)
+            or True,
+            _request_message_block_snapshot_recorder=fail_snapshot_write,
+        )
+
+        self.assertFalse(bff_server.Handler.can_message_peer(harness, web_user, "9"))
+        self.assertEqual(web_user.blocked_message_peers, {"9"})
+        self.assertEqual(authorizer_calls, [])
+        self.assertEqual(
+            web_user.blocked_message_peers_snapshot_at,
+            0.0,
+        )
+
+    def test_message_policy_fails_closed_when_initial_block_snapshots_are_unavailable(self) -> None:
+        failed = ApiResult(
+            False,
+            503,
+            "upstream unavailable",
+            message="upstream unavailable",
+        )
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(
+                session=SimpleNamespace(uid="42"),
+                social=SimpleNamespace(
+                    my_blacklist=lambda: failed,
+                    blacklist_me=lambda: failed,
+                ),
+            ),
+            match_pool_online_list_enabled=True,
+            friend_message_peers={"9"},
+            match_message_peers={"9"},
+            conversation_message_peers={"9"},
+            blocked_message_peers=set(),
+            blocked_by_message_peers=set(),
+            blocked_message_peers_snapshot_at=0.0,
+            blocked_by_message_peers_snapshot_at=0.0,
+            message_blocks_retry_at=0.0,
+        )
+
+        class Harness:
+            path = "/api/im/message-policy"
+
+            def __init__(self):
+                self.response = None
+                self._request_match_pool_online_list_enabled = True
+                self._request_message_policy_allowed_peers = ("9",)
+                self._request_message_policy_match_peers = ("9",)
+                self._request_message_policy_blocked_peers = ()
+
+            def _check_api_origin(self):
+                return True
+
+            def sid(self):
+                return "sid"
+
+            def user(self, _sid):
+                return web_user
+
+            def ok(self, obj, status=200, **_kwargs):
+                self.response = (status, obj)
+                return self.response
+
+        harness = Harness()
+        bff_server.Handler.do_GET(harness)
+
+        self.assertEqual(harness.response[0], 503)
+        self.assertFalse(harness.response[1]["ok"])
+        self.assertEqual(
+            harness.response[1]["code"],
+            "MESSAGE_BLOCK_POLICY_UNAVAILABLE",
+        )
 
     def test_tim_credentials_require_global_proactive_private_message_permission(self) -> None:
         tim_calls = []
@@ -2728,12 +2937,26 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
 
     def test_message_policy_restores_grants_but_removes_blocked_peers(self) -> None:
         web_user = SimpleNamespace(
-            app=SimpleNamespace(session=SimpleNamespace(uid="42")),
+            app=SimpleNamespace(
+                session=SimpleNamespace(uid="42"),
+                social=SimpleNamespace(
+                    my_blacklist=lambda: ApiResult(
+                        False, 503, "upstream unavailable", message="upstream unavailable"
+                    ),
+                    blacklist_me=lambda: ApiResult(
+                        False, 503, "upstream unavailable", message="upstream unavailable"
+                    ),
+                ),
+            ),
             match_pool_online_list_enabled=False,
-            friend_message_peers={"11"},
+            friend_message_peers={"11", "14"},
             match_message_peers={"9"},
             conversation_message_peers={"12"},
             blocked_message_peers={"11"},
+            blocked_by_message_peers={"14"},
+            blocked_message_peers_snapshot_at=1.0,
+            blocked_by_message_peers_snapshot_at=1.0,
+            message_blocks_retry_at=0.0,
         )
 
         class Harness:
@@ -2765,7 +2988,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         self.assertEqual(harness.response[0], 200)
         self.assertEqual(harness.response[1]["match_peers"], ["9"])
         self.assertEqual(harness.response[1]["allowed_peers"], ["12", "13", "9"])
-        self.assertEqual(harness.response[1]["blocked_peers"], ["10", "11"])
+        self.assertEqual(harness.response[1]["blocked_peers"], ["10", "11", "14"])
         self.assertFalse(
             harness.response[1]["capabilities"]["proactive_private_message"]
         )

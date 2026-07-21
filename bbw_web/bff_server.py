@@ -55,6 +55,8 @@ MAX_JSON_BODY_BYTES = 256 * 1024
 COOKIE_SECURE = False
 PROFILE_CACHE_TTL_SEC = 15 * 60.0
 PROFILE_CACHE_ERROR_TTL_SEC = 30.0
+MESSAGE_BLOCK_SNAPSHOT_TTL_SEC = 60.0
+MESSAGE_BLOCK_SNAPSHOT_RETRY_SEC = 10.0
 FRIEND_APPLICATION_PAGE_SIZE = 15
 FRIEND_APPLICATION_SCAN_PAGES = 5
 MOMENT_ID_CURSOR_TABS = frozenset({"推荐", "招募令", "关注"})
@@ -2164,6 +2166,117 @@ class Handler(BaseHTTPRequestHandler):
             ),
         )
 
+    def _store_message_block_snapshot(
+        self,
+        user: Any,
+        *,
+        path: str,
+        result: Any,
+        peer_attribute: str,
+        timestamp_attribute: str,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        payload = empty_list_envelope(result, RL(result), "黑名单为空")
+        if payload.get("ok") is not True:
+            return False, payload
+        session = getattr(getattr(user, "app", None), "session", None)
+        current_uid = str(getattr(session, "uid", "") or "")
+        peers = {
+            peer
+            for peer in _message_peer_ids(payload)
+            if peer != current_uid
+        }
+        # Enforce a newly observed block in this process even when the durable
+        # snapshot write fails.  Mark that direction incomplete so subsequent
+        # policy reads cannot disagree with the durable authorizer.
+        setattr(user, peer_attribute, peers)
+        recorder = getattr(self, "_request_message_block_snapshot_recorder", None)
+        if callable(recorder):
+            try:
+                recorder(path, peers)
+            except Exception:
+                setattr(user, timestamp_attribute, 0.0)
+                return False, {
+                    "ok": False,
+                    "code": "MESSAGE_BLOCK_POLICY_PERSISTENCE_FAILED",
+                    "error": "黑名单已读取，但私聊阻断状态保存失败，请稍后重试",
+                }
+        setattr(user, timestamp_attribute, time.monotonic())
+        return True, payload
+
+    def ensure_message_blocks_loaded(self, user: Any) -> bool:
+        """Load both blacklist directions before authorizing any private message."""
+
+        now = time.monotonic()
+        own_snapshot_at = float(
+            getattr(user, "blocked_message_peers_snapshot_at", 0.0) or 0.0
+        )
+        incoming_snapshot_at = float(
+            getattr(user, "blocked_by_message_peers_snapshot_at", 0.0) or 0.0
+        )
+        own_fresh = own_snapshot_at > 0 and now - own_snapshot_at < MESSAGE_BLOCK_SNAPSHOT_TTL_SEC
+        incoming_fresh = (
+            incoming_snapshot_at > 0
+            and now - incoming_snapshot_at < MESSAGE_BLOCK_SNAPSHOT_TTL_SEC
+        )
+        if own_fresh and incoming_fresh:
+            return True
+        if now < float(getattr(user, "message_blocks_retry_at", 0.0) or 0.0):
+            return own_snapshot_at > 0 and incoming_snapshot_at > 0
+
+        app = getattr(user, "app", None)
+        social = getattr(app, "social", None)
+        own_ok = own_snapshot_at > 0
+        incoming_ok = incoming_snapshot_at > 0
+        refresh_failed = False
+        if not own_fresh:
+            try:
+                loaded, _payload = Handler._store_message_block_snapshot(
+                    self,
+                    user,
+                    path="/api/social/blacklist",
+                    result=social.my_blacklist(),
+                    peer_attribute="blocked_message_peers",
+                    timestamp_attribute="blocked_message_peers_snapshot_at",
+                )
+                refresh_failed = refresh_failed or not loaded
+                own_ok = loaded or own_snapshot_at > 0
+            except Exception:
+                refresh_failed = True
+                own_ok = own_snapshot_at > 0
+        if not incoming_fresh:
+            try:
+                loaded, _payload = Handler._store_message_block_snapshot(
+                    self,
+                    user,
+                    path="/api/social/blacklist-me",
+                    result=social.blacklist_me(),
+                    peer_attribute="blocked_by_message_peers",
+                    timestamp_attribute="blocked_by_message_peers_snapshot_at",
+                )
+                refresh_failed = refresh_failed or not loaded
+                incoming_ok = loaded or incoming_snapshot_at > 0
+            except Exception:
+                refresh_failed = True
+                incoming_ok = incoming_snapshot_at > 0
+        if refresh_failed:
+            setattr(user, "message_blocks_retry_at", now + MESSAGE_BLOCK_SNAPSHOT_RETRY_SEC)
+        else:
+            setattr(user, "message_blocks_retry_at", 0.0)
+        return own_ok and incoming_ok
+
+    def message_block_snapshots_fresh(self, user: Any) -> bool:
+        now = time.monotonic()
+        return all(
+            timestamp > 0 and now - timestamp < MESSAGE_BLOCK_SNAPSHOT_TTL_SEC
+            for timestamp in (
+                float(getattr(user, "blocked_message_peers_snapshot_at", 0.0) or 0.0),
+                float(
+                    getattr(user, "blocked_by_message_peers_snapshot_at", 0.0)
+                    or 0.0
+                ),
+            )
+        )
+
     def can_message_peer(self, user: Any, peer: Any) -> bool:
         target = str(peer or "").strip()
         session = getattr(getattr(user, "app", None), "session", None)
@@ -2175,7 +2288,12 @@ class Handler(BaseHTTPRequestHandler):
             or target == current_uid
         ):
             return False
-        if target in set(getattr(user, "blocked_message_peers", set()) or set()):
+        if not Handler.ensure_message_blocks_loaded(self, user):
+            return False
+        if target in (
+            set(getattr(user, "blocked_message_peers", set()) or set())
+            | set(getattr(user, "blocked_by_message_peers", set()) or set())
+        ):
             return False
         authorizer = getattr(self, "_request_message_peer_authorizer", None)
         if callable(authorizer):
@@ -2632,20 +2750,36 @@ class Handler(BaseHTTPRequestHandler):
             return self.ok(payload)
         if path == "/api/social/blacklist":
             result = app.social.my_blacklist()
-            payload = empty_list_envelope(result, RL(result), "黑名单为空")
-            setattr(
+            _stored, payload = Handler._store_message_block_snapshot(
+                self,
                 u,
-                "blocked_message_peers",
-                {
-                    peer
-                    for peer in _message_peer_ids(payload)
-                    if peer != str(app.session.uid or "")
-                },
+                path=path,
+                result=result,
+                peer_attribute="blocked_message_peers",
+                timestamp_attribute="blocked_message_peers_snapshot_at",
             )
-            return self.ok(payload)
+            status = (
+                503
+                if payload.get("code") == "MESSAGE_BLOCK_POLICY_PERSISTENCE_FAILED"
+                else 200
+            )
+            return self.ok(payload, status)
         if path == "/api/social/blacklist-me":
             result = app.social.blacklist_me()
-            return self.ok(empty_list_envelope(result, RL(result), "黑名单为空"))
+            _stored, payload = Handler._store_message_block_snapshot(
+                self,
+                u,
+                path=path,
+                result=result,
+                peer_attribute="blocked_by_message_peers",
+                timestamp_attribute="blocked_by_message_peers_snapshot_at",
+            )
+            status = (
+                503
+                if payload.get("code") == "MESSAGE_BLOCK_POLICY_PERSISTENCE_FAILED"
+                else 200
+            )
+            return self.ok(payload, status)
 
         # ---- match ----
         if path == "/api/match/history":
@@ -2867,14 +3001,29 @@ class Handler(BaseHTTPRequestHandler):
 
         # ---- im ----
         if path == "/api/im/message-policy":
+            if not Handler.ensure_message_blocks_loaded(self, u):
+                return self.ok(
+                    {
+                        "ok": False,
+                        "code": "MESSAGE_BLOCK_POLICY_UNAVAILABLE",
+                        "error": "黑名单状态暂时无法确认，私聊功能已临时关闭",
+                    },
+                    503,
+                )
+            durable_blocked_peers = (
+                ()
+                if Handler.message_block_snapshots_fresh(self, u)
+                else (
+                    getattr(self, "_request_message_policy_blocked_peers", ())
+                    or ()
+                )
+            )
             blocked_peers = {
                 str(peer).strip()
                 for peer in (
                     list(getattr(u, "blocked_message_peers", set()) or set())
-                    + list(
-                        getattr(self, "_request_message_policy_blocked_peers", ())
-                        or ()
-                    )
+                    + list(getattr(u, "blocked_by_message_peers", set()) or set())
+                    + list(durable_blocked_peers)
                 )
                 if str(peer).strip()
                 and str(peer).strip().lower() not in {"0", "none", "null"}

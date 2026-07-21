@@ -171,6 +171,9 @@ class CapturingHandler(legacy.Handler):
         message_policy_allowed_peers: Iterable[str] = (),
         message_policy_match_peers: Iterable[str] = (),
         message_policy_blocked_peers: Iterable[str] = (),
+        message_block_snapshot_recorder: Optional[
+            Callable[[str, Iterable[str]], None]
+        ] = None,
         match_history_loader: Optional[Callable[[int], dict[str, Any]]] = None,
         match_history_recorder: Optional[Callable[[str, dict[str, Any]], None]] = None,
         conversation_summary_loader: Optional[
@@ -191,6 +194,7 @@ class CapturingHandler(legacy.Handler):
         self._request_message_policy_allowed_peers = tuple(message_policy_allowed_peers)
         self._request_message_policy_match_peers = tuple(message_policy_match_peers)
         self._request_message_policy_blocked_peers = tuple(message_policy_blocked_peers)
+        self._request_message_block_snapshot_recorder = message_block_snapshot_recorder
         self._request_match_history_loader = match_history_loader
         self._request_match_history_recorder = match_history_recorder
         self._request_conversation_summary_loader = conversation_summary_loader
@@ -493,6 +497,21 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
         if restored is not None:
             legacy.STORE.put(restored)
 
+    conversation_message_peers_before: set[str] | None = None
+    if (
+        identity is not None
+        and request.method == "GET"
+        and path == "/api/im/conversations"
+        and sid
+        and legacy.STORE is not None
+    ):
+        web_user = legacy.STORE.get(sid)
+        if web_user is not None:
+            with web_user.lock:
+                conversation_message_peers_before = set(
+                    web_user.conversation_message_peers
+                )
+
     if request.method == "POST" and path == "/api/auth/sms-send":
         phone = str(request_json.get("phone") or "").strip()
         try:
@@ -633,6 +652,32 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
 
         match_history_recorder = persist_match_history
 
+    message_block_snapshot_recorder: Optional[
+        Callable[[str, Iterable[str]], None]
+    ] = None
+    if identity is not None:
+        def persist_message_block_snapshot(
+            snapshot_path: str,
+            peers: Iterable[str],
+            *,
+            request_identity: Any = identity,
+        ) -> None:
+            kind = {
+                "/api/social/blacklist": "blacklist",
+                "/api/social/blacklist-me": "blacklisted_by",
+            }.get(snapshot_path)
+            if kind is None:
+                raise ValueError("unsupported message block snapshot")
+            persistence.replace_social_message_relationships(
+                identity=request_identity,
+                peers=set(peers),
+                kind=kind,
+                deactivate_missing=True,
+                source_path=snapshot_path,
+            )
+
+        message_block_snapshot_recorder = persist_message_block_snapshot
+
     handler = CapturingHandler(
         method=request.method,
         path=_request_path(request),
@@ -657,6 +702,7 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
         message_policy_allowed_peers=message_policy_allowed_peers,
         message_policy_match_peers=message_policy_match_peers,
         message_policy_blocked_peers=message_policy_blocked_peers,
+        message_block_snapshot_recorder=message_block_snapshot_recorder,
         match_history_loader=match_history_loader,
         match_history_recorder=match_history_recorder,
         conversation_summary_loader=conversation_summary_loader,
@@ -689,7 +735,6 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
         "/api/social/friends",
         "/api/social/agree-friend",
         "/api/social/delete-friend",
-        "/api/social/blacklist",
         "/api/social/blacklist-add",
         "/api/social/blacklist-del",
         "/api/match/online",
@@ -717,7 +762,6 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
                     "/api/social/friends",
                     "/api/social/agree-friend",
                     "/api/social/delete-friend",
-                    "/api/social/blacklist",
                     "/api/social/blacklist-add",
                     "/api/social/blacklist-del",
                 }
@@ -729,6 +773,34 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
                         "ok": False,
                         "code": "SOCIAL_DM_POLICY_PERSISTENCE_FAILED",
                         "error": "关系状态已返回，但私聊权限同步失败，请刷新后重试",
+                    },
+                    status_code=503,
+                )
+            if (
+                path == "/api/im/conversations"
+                and status < 400
+                and response_data.get("ok") is True
+            ):
+                web_user = (
+                    legacy.STORE.get(sid)
+                    if sid and legacy.STORE is not None
+                    else None
+                )
+                if web_user is not None:
+                    response_peers = legacy._message_peer_ids(response_data)
+                    if conversation_message_peers_before is not None:
+                        response_peers.difference_update(
+                            conversation_message_peers_before
+                        )
+                    with web_user.lock:
+                        web_user.conversation_message_peers.difference_update(
+                            response_peers
+                        )
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "code": "CONVERSATION_DM_GRANT_PERSISTENCE_FAILED",
+                        "error": "会话已读取，但私聊权限保存失败，请稍后重试",
                     },
                     status_code=503,
                 )

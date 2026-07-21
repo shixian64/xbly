@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -159,7 +160,13 @@ class FlashBffRoutingTests(unittest.TestCase):
         bff_server.STORE = self.old_store
 
     def _run(self, path, data, app, upload=None, permission=None, match_peers=None):
-        values = {"app": app}
+        values = {
+            "app": app,
+            "blocked_message_peers": set(),
+            "blocked_by_message_peers": set(),
+            "blocked_message_peers_snapshot_at": time.monotonic(),
+            "blocked_by_message_peers_snapshot_at": time.monotonic(),
+        }
         if permission is not None:
             values["match_pool_online_list_enabled"] = bool(permission)
         if match_peers is not None:

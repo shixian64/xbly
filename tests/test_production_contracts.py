@@ -211,6 +211,8 @@ class ProductionContractTests(unittest.TestCase):
             'SOCIAL_RELATIONSHIP_PROVIDER = "beibeiwu"',
             'SOCIAL_FRIEND_KIND = "friend"',
             'SOCIAL_BLACKLIST_KIND = "blacklist"',
+            'SOCIAL_BLACKLISTED_BY_KIND = "blacklisted_by"',
+            "SOCIAL_MESSAGE_BLOCK_KINDS = (",
             "def grant_message_peers(",
             "def replace_social_message_relationships(",
             "def set_social_message_relationship(",
@@ -238,6 +240,8 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn("persistence.message_policy_blocked_peers(identity)", api)
         self.assertIn("MATCH_DM_GRANT_PERSISTENCE_FAILED", api)
         self.assertIn("SOCIAL_DM_POLICY_PERSISTENCE_FAILED", api)
+        self.assertIn("CONVERSATION_DM_GRANT_PERSISTENCE_FAILED", api)
+        self.assertIn('"/api/social/blacklist-me": "blacklisted_by"', api)
         self.assertIn("persistence.remember_message_policy_response(", api)
 
     def test_archived_direct_conversation_authorizes_private_message_peer(self) -> None:
@@ -315,7 +319,7 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn("beibeiwu", params)
         self.assertIn("friend", params)
 
-    def test_active_blacklist_overrides_global_private_message_permission(self) -> None:
+    def test_both_blacklist_directions_override_global_private_message_permission(self) -> None:
         try:
             from bbw_web.persistence import RuntimePersistence, UserIdentity
         except ImportError as exc:
@@ -347,7 +351,49 @@ class ProductionContractTests(unittest.TestCase):
 
         self.assertEqual(len(db.statements), 1)
         params = {str(value) for value in db.statements[0].compile().params.values()}
-        self.assertIn("blacklist", params)
+        param_text = " ".join(params)
+        self.assertIn("blacklist", param_text)
+        self.assertIn("blacklisted_by", param_text)
+
+    def test_blacklisted_by_snapshot_is_persisted_as_a_message_block(self) -> None:
+        try:
+            from bbw_web.persistence import RuntimePersistence, UserIdentity
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        runtime = RuntimePersistence.__new__(RuntimePersistence)
+        identity = UserIdentity(
+            user_id=uuid.uuid4(),
+            external_account_id=uuid.uuid4(),
+            upstream_uid="42",
+        )
+
+        with patch.object(
+            runtime,
+            "replace_social_message_relationships",
+            return_value=["9"],
+        ) as replace_snapshot:
+            result = runtime.remember_message_policy_response(
+                identity=identity,
+                method="GET",
+                path="/api/social/blacklist-me",
+                request_data={},
+                response_data={
+                    "ok": True,
+                    "items": [{"uid": "9"}],
+                    "list": [{"uid": "9"}],
+                },
+                status=200,
+            )
+
+        self.assertEqual(result, ["9"])
+        replace_snapshot.assert_called_once_with(
+            identity=identity,
+            peers=["9"],
+            kind="blacklisted_by",
+            deactivate_missing=True,
+            source_path="/api/social/blacklist-me",
+        )
 
     def test_friend_summary_response_does_not_revoke_full_friend_snapshot(self) -> None:
         try:

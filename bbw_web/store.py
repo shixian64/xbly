@@ -110,6 +110,10 @@ class WebUser:
     match_history: list[Dict[str, Any]] = field(default_factory=list, repr=False)
     conversation_message_peers: set[str] = field(default_factory=set, repr=False)
     blocked_message_peers: set[str] = field(default_factory=set, repr=False)
+    blocked_by_message_peers: set[str] = field(default_factory=set, repr=False)
+    blocked_message_peers_snapshot_at: float = field(default=0.0, repr=False)
+    blocked_by_message_peers_snapshot_at: float = field(default=0.0, repr=False)
+    message_blocks_retry_at: float = field(default=0.0, repr=False)
     # Voice matching and Rong credentials are intentionally session-memory
     # only.  They must never be written into persisted browser sessions.
     voice_match_state: Dict[str, Any] = field(default_factory=dict, repr=False)
