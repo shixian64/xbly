@@ -4009,12 +4009,19 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
 
+        local_conversation = self._app_fragment(
+            app_js,
+            "function ensureConversationForPeer(peer",
+            "function updateConversationActivity(",
+        )
         tim_handlers = self._app_fragment(
             app_js,
             "function attachTimHandlers(chat, TIM, credential)",
             "function isCurrentAuthenticatedSession",
         )
 
+        self.assertIn("unread_observed_at: 0", local_conversation)
+        self.assertIn("unread_authoritative: false", local_conversation)
         self.assertNotIn("currentUnread + 1", tim_handlers)
         self.assertNotIn("shouldIncrementUnread", tim_handlers)
         self.assertIn('unreadCount: entry.type !== "mine" && active ? 0 : undefined', tim_handlers)
@@ -4621,7 +4628,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("private-message-entry-scope", css_version)
         self.assertTrue(
             css_version.endswith(
-                "-voice-url-renewal-imcloud-revoke-replay-v2-unread-authoritative-private-message-policy-hardening"
+                "-voice-url-renewal-imcloud-revoke-replay-v2-unread-authoritative-private-message-policy-hardening-unread-tie-fix"
             )
         )
 

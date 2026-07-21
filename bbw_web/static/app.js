@@ -7048,8 +7048,11 @@ function ensureConversationForPeer(peer, { name = "", avatar = "", replaceName =
     preview_authoritative: false,
     preview_timestamp_inferred: false,
     unread_count: 0,
-    unread_observed_at: Date.now(),
-    unread_authoritative: true,
+    // A locally-created placeholder has not observed the provider's unread
+    // state yet. Marking zero as authoritative can beat an SDK unread update
+    // emitted in the same millisecond and hide the new-message badge.
+    unread_observed_at: 0,
+    unread_authoritative: false,
   };
   S.conversations.unshift(created);
   recalculateUnreadTotal();
