@@ -3560,6 +3560,7 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("directImCredentialsEnabled: false", app_js)
         self.assertIn("messagePolicyReady: false", app_js)
         self.assertIn('messagePolicyFingerprint: ""', app_js)
+        self.assertIn("messagePolicyCleanupGeneration: 0", app_js)
         self.assertIn('["online", "在线列表"]', nearby)
         self.assertIn('["nearby", "附近的人"]', nearby)
         self.assertIn('data-form="nearby-filter"', nearby)
@@ -3666,8 +3667,13 @@ class SocialFrontendContractTests(unittest.TestCase):
             "applyCapabilities(data.capabilities, { deferMessageReconnect: true })",
             app_js,
         )
-        self.assertIn("S.messagePolicyCleanupPromise = cleanup", app_js)
-        self.assertIn("if (!S.authenticated || deferMessageReconnect) return", app_js)
+        self.assertIn("function queueMessagePolicyCleanup()", app_js)
+        self.assertIn("if (proactiveChanged || directCredentialsChanged)", app_js)
+        self.assertIn("const previous = S.messagePolicyCleanupPromise", app_js)
+        self.assertIn("Promise.resolve(previous)", app_js)
+        self.assertIn("S.messagePolicyCleanupPromise = tracked", app_js)
+        self.assertIn("deferMessageReconnect ||", app_js)
+        self.assertIn("S.messagePolicyCleanupPromise", app_js)
         self.assertIn(
             "if (transition.readyChanged || transition.policyChanged)",
             app_js,
@@ -3697,8 +3703,21 @@ class SocialFrontendContractTests(unittest.TestCase):
         tim_connect = app_js.split("async function ensureTimConnected", 1)[1].split(
             "async function cleanupIM", 1
         )[0]
+        self.assertIn("while (S.messagePolicyCleanupPromise)", tim_connect)
+        self.assertIn("await Promise.resolve(cleanup)", tim_connect)
+        self.assertIn(
+            "S.messagePolicyCleanupGeneration === cleanupGeneration",
+            tim_connect,
+        )
+        self.assertIn("!S.messagePolicyCleanupPromise", tim_connect)
         self.assertIn("const policyIsCurrent = () =>", tim_connect)
         self.assertIn("if (!policyIsCurrent()) return false;", tim_connect)
+        self.assertIn("const ok = await connectTIM(", tim_connect)
+        connect_tim = app_js.split("async function connectTIM", 1)[1].split(
+            "async function diagnoseTimConnectionFailure", 1
+        )[0]
+        self.assertIn("connectionIsCurrent = null", connect_tim)
+        self.assertIn("if (!connectionCurrent()) return false;", connect_tim)
         self.assertNotIn(
             "if (!S.proactivePrivateMessageEnabled) return false;",
             tim_connect,
@@ -5026,7 +5045,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("private-message-entry-scope", css_version)
         self.assertTrue(
             css_version.endswith(
-                "-voice-url-renewal-imcloud-revoke-replay-v2-unread-authoritative-private-message-policy-hardening-unread-tie-fix-message-policy-refresh-race-fix"
+                "-voice-url-renewal-imcloud-revoke-replay-v2-unread-authoritative-private-message-policy-hardening-unread-tie-fix-message-policy-refresh-race-fix-message-policy-cleanup-queue-fix"
             )
         )
 

@@ -101,6 +101,7 @@ const S = {
   messagePolicyGeneration: 0,
   messagePolicyFingerprint: "",
   messagePolicyCleanupPromise: null,
+  messagePolicyCleanupGeneration: 0,
   nearbyCustomCityEnabled: false,
   privateMessagePeers: new Set(),
   matchMessagePeers: new Set(),
@@ -1379,19 +1380,23 @@ function applyCapabilities(
     clearViewCacheKey("nearby");
     clearViewCachePrefix("nearby:");
   }
+  if (proactiveChanged || directCredentialsChanged) {
+    S.messagePolicyGeneration += 1;
+  }
   if (
     (proactiveChanged || directCredentialsChanged) &&
     S.authenticated &&
     (S.imMode || S.chat || S.imConnecting || S._imConnecting)
   ) {
-    const cleanup = cleanupIM();
-    S.messagePolicyCleanupPromise = cleanup;
-    void cleanup.finally(() => {
-      if (S.messagePolicyCleanupPromise === cleanup) {
-        S.messagePolicyCleanupPromise = null;
+    const cleanup = queueMessagePolicyCleanup();
+    void cleanup.then(() => {
+      if (
+        !S.authenticated ||
+        deferMessageReconnect ||
+        S.messagePolicyCleanupPromise
+      ) {
+        return;
       }
-      updateImConnectionStatus();
-      if (!S.authenticated || deferMessageReconnect) return;
       resumeMessageChannelAfterPolicyReady();
     });
   }
@@ -1515,6 +1520,24 @@ function currentMessagePolicyFingerprint() {
   });
 }
 
+function queueMessagePolicyCleanup() {
+  S.messagePolicyCleanupGeneration += 1;
+  const previous = S.messagePolicyCleanupPromise;
+  const cleanup = Promise.resolve(previous)
+    .catch(() => {})
+    .then(() => cleanupIM())
+    .catch(() => {});
+  let tracked;
+  tracked = cleanup.finally(() => {
+    if (S.messagePolicyCleanupPromise === tracked) {
+      S.messagePolicyCleanupPromise = null;
+    }
+    updateImConnectionStatus();
+  });
+  S.messagePolicyCleanupPromise = tracked;
+  return tracked;
+}
+
 function setMessagePolicyReady(ready, fingerprint = "") {
   const next = ready === true;
   const nextFingerprint = next ? String(fingerprint || "") : "";
@@ -1531,34 +1554,33 @@ function setMessagePolicyReady(ready, fingerprint = "") {
     return { readyChanged, policyChanged };
   }
   S.imLastError = "私聊安全策略暂时不可用，消息通道已暂停";
-  const cleanup = cleanupIM();
-  S.messagePolicyCleanupPromise = cleanup;
-  void cleanup.finally(() => {
-    if (S.messagePolicyCleanupPromise === cleanup) {
-      S.messagePolicyCleanupPromise = null;
-    }
-    updateImConnectionStatus();
-  });
+  queueMessagePolicyCleanup();
   return { readyChanged, policyChanged };
 }
 
 function resumeMessageChannelAfterPolicyReady() {
   const sessionGeneration = S.sessionGeneration;
   const policyGeneration = S.messagePolicyGeneration;
-  const pending = [S.messagePolicyCleanupPromise, S._imConnecting].filter(Boolean);
-  void Promise.allSettled(pending).then(() => {
-    if (
-      !isCurrentAuthenticatedSession(sessionGeneration) ||
-      !S.messagePolicyReady ||
-      S.messagePolicyGeneration !== policyGeneration ||
-      S.imConnected ||
-      S.imConnecting
-    ) {
+  void (async () => {
+    while (true) {
+      const pending = [S.messagePolicyCleanupPromise, S._imConnecting].filter(
+        Boolean
+      );
+      if (pending.length) await Promise.allSettled(pending);
+      if (
+        !isCurrentAuthenticatedSession(sessionGeneration) ||
+        !S.messagePolicyReady ||
+        S.messagePolicyGeneration !== policyGeneration
+      ) {
+        return;
+      }
+      if (S.messagePolicyCleanupPromise || S._imConnecting) continue;
+      if (S.imConnected || S.imConnecting) return;
+      S.imNextReconnectAt = 0;
+      void ensureTimConnected({ force: true, background: true });
       return;
     }
-    S.imNextReconnectAt = 0;
-    void ensureTimConnected({ force: true, background: true });
-  });
+  })();
 }
 
 function refreshMessagePolicy() {
@@ -12807,8 +12829,15 @@ function isCurrentAuthenticatedSession(generation) {
   return Boolean(S.authenticated && Number(generation) === Number(S.sessionGeneration));
 }
 
-async function connectTIM(credential, sessionGeneration = S.sessionGeneration) {
-  if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
+async function connectTIM(
+  credential,
+  sessionGeneration = S.sessionGeneration,
+  connectionIsCurrent = null
+) {
+  const connectionCurrent = () =>
+    isCurrentAuthenticatedSession(sessionGeneration) &&
+    (!connectionIsCurrent || connectionIsCurrent());
+  if (!connectionCurrent()) return false;
   const TIM = resolveTimApi();
   if (!TIM) {
     const msg = "实时消息组件未加载，请刷新页面后重试。";
@@ -12825,8 +12854,9 @@ async function connectTIM(credential, sessionGeneration = S.sessionGeneration) {
 
   // Always tear down previous singleton before a new login attempt.
   await cleanupIM();
-  if (!isCurrentAuthenticatedSession(sessionGeneration)) return false;
+  if (!connectionCurrent()) return false;
   await destroyTimInstance(S.chat, TIM);
+  if (!connectionCurrent()) return false;
 
   const sdkAppId = Number(credential.SDKAppID) || credential.SDKAppID;
   let chat;
@@ -12845,7 +12875,7 @@ async function connectTIM(credential, sessionGeneration = S.sessionGeneration) {
     S.imLastError = msg;
     return false;
   }
-  if (!isCurrentAuthenticatedSession(sessionGeneration)) {
+  if (!connectionCurrent()) {
     await destroyTimInstance(chat, TIM);
     return false;
   }
@@ -12941,7 +12971,7 @@ async function connectTIM(credential, sessionGeneration = S.sessionGeneration) {
     if (raceTimer) clearTimeout(raceTimer);
     stopReadyPoll();
 
-    if (!isCurrentAuthenticatedSession(sessionGeneration)) {
+    if (!connectionCurrent()) {
       await destroyTimInstance(chat, TIM);
       if (S.chat === chat) S.chat = null;
       return false;
@@ -12981,7 +13011,7 @@ async function connectTIM(credential, sessionGeneration = S.sessionGeneration) {
   } catch (error) {
     if (raceTimer) clearTimeout(raceTimer);
     stopReadyPoll();
-    if (!isCurrentAuthenticatedSession(sessionGeneration)) {
+    if (!connectionCurrent()) {
       await destroyTimInstance(chat, TIM);
       if (S.chat === chat) S.chat = null;
       return false;
@@ -13032,10 +13062,21 @@ async function diagnoseTimConnectionFailure() {
 async function ensureTimConnected({ force = false, background = false } = {}) {
   const sessionGeneration = S.sessionGeneration;
   const policyGeneration = S.messagePolicyGeneration;
-  const policyIsCurrent = () =>
+  const basePolicyIsCurrent = () =>
     isCurrentAuthenticatedSession(sessionGeneration) &&
     S.messagePolicyReady &&
     S.messagePolicyGeneration === policyGeneration;
+  if (!basePolicyIsCurrent()) return false;
+  while (S.messagePolicyCleanupPromise) {
+    const cleanup = S.messagePolicyCleanupPromise;
+    await Promise.resolve(cleanup).catch(() => {});
+    if (!basePolicyIsCurrent()) return false;
+  }
+  const cleanupGeneration = S.messagePolicyCleanupGeneration;
+  const policyIsCurrent = () =>
+    basePolicyIsCurrent() &&
+    S.messagePolicyCleanupGeneration === cleanupGeneration &&
+    !S.messagePolicyCleanupPromise;
   if (!policyIsCurrent()) return false;
   if (S.imConnected && S.chat && !force) return true;
   if (S._imConnecting && S.imConnectingGeneration === sessionGeneration) return S._imConnecting;
@@ -13108,7 +13149,11 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
             `凭证就绪 source=${cred.source || prefer} uid=${cred.userID} sig_len=${cred.sig_len || String(cred.userSig).length}`,
             "system"
           );
-          const ok = await connectTIM(cred, sessionGeneration);
+          const ok = await connectTIM(
+            cred,
+            sessionGeneration,
+            policyIsCurrent
+          );
           if (!policyIsCurrent()) {
             await cleanupIM();
             return false;
