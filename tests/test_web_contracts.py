@@ -4231,6 +4231,51 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn(".chat-voice-transcript", app_css)
         self.assertIn(".chat-message-actions", app_css)
 
+    def test_voice_playback_refreshes_expired_tencent_media_urls(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        audio_url = self._app_fragment(
+            app_js,
+            "function isUnauthenticatedTencentRichMediaUrl",
+            "function normalizeMessageKind",
+        )
+        audio_render = self._app_fragment(
+            app_js, "function chatMessageBodyHtml", "function chatMessageContentHtml"
+        )
+        audio_refresh = self._app_fragment(
+            app_js, "function chatAudioIdentity", "function syncChatAudioPlaybackUi"
+        )
+        audio_toggle = self._app_fragment(
+            app_js, "async function toggleChatAudioPlayback", "function ensureChatMediaViewer"
+        )
+        playback_error = self._app_fragment(
+            app_js, "function handleChatPlaybackError", "function openChatMediaViewer"
+        )
+        cleanup = self._app_fragment(app_js, "async function cleanupIM", "function stopPresenceTimer")
+
+        self.assertIn("imAudioSourceRefreshes: new Map()", app_js)
+        self.assertIn("imrich\\.qcloud\\.com", audio_url)
+        self.assertIn('String(key).toLowerCase() === "authkey"', audio_url)
+        self.assertLess(audio_url.index('"url"'), audio_url.index('"remoteAudioUrl"'))
+        self.assertIn("!isUnauthenticatedTencentRichMediaUrl(url)", audio_url)
+        self.assertIn('data-audio-message-random="${esc(', audio_render)
+        self.assertIn('data-audio-message-sequence="${esc(', audio_render)
+        self.assertIn('data-audio-peer="${esc(entry.peer)}"', audio_render)
+        self.assertIn('data-audio-source-needs-refresh="${sourceNeedsRefresh ? "1" : "0"}"', audio_render)
+        self.assertIn('sourceNeedsRefresh ? "" : ` src=', audio_render)
+        self.assertIn("while (true)", audio_refresh)
+        self.assertIn("options.nextReqMessageID = nextReqMessageID", audio_refresh)
+        self.assertIn("data.isCompleted", audio_refresh)
+        self.assertIn("updateRefreshedChatAudioEntry", audio_refresh)
+        self.assertIn("archiveMessageBestEffort(next", audio_refresh)
+        self.assertIn("await refreshChatAudioSource(audio, { resumePlayback: true })", audio_toggle)
+        self.assertLess(
+            playback_error.index("refreshChatAudioSource(media"),
+            playback_error.index("chatMediaRetryState(source)"),
+        )
+        self.assertIn("语音播放地址已失效，请等待实时消息连接后重试", app_js)
+        self.assertIn("S.imAudioSourceRefreshes.clear()", cleanup)
+
     def test_profile_and_structured_fields_use_chinese_display_labels(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")

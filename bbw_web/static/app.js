@@ -212,6 +212,7 @@ const S = {
   imLocalObjectUrls: new Set(),
   imMediaReconcileTimers: new Map(),
   imMediaRetryState: new Map(),
+  imAudioSourceRefreshes: new Map(),
   imVoiceTranscriptLoading: new Set(),
   presenceByUid: new Map(),
   presenceLoadingUids: new Set(),
@@ -5511,25 +5512,61 @@ function isRemoteMessageMediaUrl(url) {
   return /^https?:\/\//i.test(String(url || ""));
 }
 
-function preferredMessageMediaUrl(objects, preferredKeys, fallbackKeys = []) {
-  const collect = (keys) => {
-    const values = [];
-    for (const object of objects) {
-      if (!object || typeof object !== "object") continue;
-      for (const key of keys) {
-        const url = mediaUrl(object[key]);
-        if (url && !values.includes(url)) values.push(url);
-      }
+function messageMediaUrlCandidates(objects, keys) {
+  const values = [];
+  for (const object of objects) {
+    if (!object || typeof object !== "object") continue;
+    for (const key of keys) {
+      const url = mediaUrl(object[key]);
+      if (url && !values.includes(url)) values.push(url);
     }
-    return values;
-  };
-  const preferred = collect(preferredKeys);
-  const fallback = collect(fallbackKeys);
+  }
+  return values;
+}
+
+function preferredMessageMediaUrl(objects, preferredKeys, fallbackKeys = []) {
+  const preferred = messageMediaUrlCandidates(objects, preferredKeys);
+  const fallback = messageMediaUrlCandidates(objects, fallbackKeys);
   return (
     preferred.find(isRemoteMessageMediaUrl) ||
     fallback.find(isRemoteMessageMediaUrl) ||
     preferred[0] ||
     fallback[0] ||
+    ""
+  );
+}
+
+function isUnauthenticatedTencentRichMediaUrl(value) {
+  const url = mediaUrl(value);
+  if (!isRemoteMessageMediaUrl(url)) return false;
+  try {
+    const parsed = new URL(url);
+    if (!/(?:^|\.)imrich\.qcloud\.com$/i.test(parsed.hostname)) return false;
+    const authKey = [...parsed.searchParams.entries()].find(
+      ([key]) => String(key).toLowerCase() === "authkey"
+    );
+    return !String(authKey?.[1] || "").trim();
+  } catch {
+    return /^(?:https?:)?\/\/[^/?#]*\bimrich\.qcloud\.com\b/i.test(url) && !/[?&]authKey=[^&#]+/i.test(url);
+  }
+}
+
+function preferredAudioMessageUrl(objects) {
+  const candidates = messageMediaUrlCandidates(objects, [
+    "url",
+    "audioUrl",
+    "audio_url",
+    "soundUrl",
+    "sound_url",
+    "fileUrl",
+    "file_url",
+    "remoteAudioUrl",
+    "remote_audio_url",
+  ]);
+  return (
+    candidates.find((url) => isRemoteMessageMediaUrl(url) && !isUnauthenticatedTencentRichMediaUrl(url)) ||
+    candidates.find((url) => !isUnauthenticatedTencentRichMediaUrl(url)) ||
+    candidates[0] ||
     ""
   );
 }
@@ -5624,11 +5661,9 @@ function normalizeEntryMedia(kind, payload, message) {
   if (kind === "audio") {
     const sdkObjects = [payload, message, message?.media];
     return {
-      url: preferredMessageMediaUrl(
-        sdkObjects,
-        ["remoteAudioUrl", "remote_audio_url"],
-        ["audioUrl", "audio_url", "soundUrl", "sound_url", "url", "fileUrl", "file_url"]
-      ),
+      // preferredAudioMessageUrl checks SDK "url" before "remoteAudioUrl" so
+      // an authenticated/proxied source wins over Tencent's bare media URL.
+      url: preferredAudioMessageUrl(sdkObjects),
       duration: numericMessageValue(firstMessageValue(sdkObjects, ["second", "duration", "audioSecond", "audio_second"], 0)),
       size: numericMessageValue(firstMessageValue(sdkObjects, ["size", "fileSize", "file_size"], 0)),
       uuid: String(firstMessageValue(sdkObjects, ["UUID", "uuid"], "")),
@@ -6264,6 +6299,7 @@ function chatMessageBodyHtml(entry) {
       )} 秒</span>${chatVoiceTranscriptHtml(entry)}`;
     }
     const duration = Math.max(1, Math.round(Number(media.duration) || 1));
+    const sourceNeedsRefresh = isUnauthenticatedTencentRichMediaUrl(media.url);
     return `<div class="chat-audio${played ? " is-played" : ""}" data-playback-wrap style="--chat-audio-width:${voiceBubbleWidth(
       duration
     )}rem"><button type="button" class="chat-audio-button" data-action="toggle-chat-audio" aria-label="播放语音，${esc(
@@ -6272,9 +6308,13 @@ function chatMessageBodyHtml(entry) {
       duration
     )} 秒</span>${played ? "" : '<span class="chat-audio-unplayed">未听</span>'}<span class="chat-audio-progress" aria-hidden="true"><span data-audio-progress></span></span></button><audio preload="metadata" data-audio-message-id="${esc(
       entry.id
-    )}" data-media-playback data-media-source="${esc(media.url)}" src="${esc(
+    )}" data-audio-message-random="${esc(
+      entry.messageRandom || timMessageRandom(entry)
+    )}" data-audio-message-sequence="${esc(
+      entry.sequence || timMessageSequence(entry)
+    )}" data-audio-peer="${esc(entry.peer)}" data-audio-source-needs-refresh="${sourceNeedsRefresh ? "1" : "0"}" data-media-playback data-media-source="${esc(
       media.url
-    )}"></audio><div class="chat-playback-fallback" data-playback-fallback hidden><span>语音加载失败</span><button type="button" data-action="retry-chat-playback">重试</button></div>${chatVoiceTranscriptHtml(
+    )}"${sourceNeedsRefresh ? "" : ` src="${esc(media.url)}"`}></audio><div class="chat-playback-fallback" data-playback-fallback hidden><span>语音加载失败</span><button type="button" data-action="retry-chat-playback">重试</button></div>${chatVoiceTranscriptHtml(
       entry
     )}</div>`;
   }
@@ -9136,6 +9176,199 @@ function finishVoiceRecording(pointer, cancel = false) {
   else if (state.stream) state.stream.getTracks().forEach((track) => track.stop());
 }
 
+function chatAudioIdentity(audio) {
+  return {
+    id: String(audio?.dataset?.audioMessageId || "").trim(),
+    messageRandom: String(audio?.dataset?.audioMessageRandom || "").trim(),
+    messageSequence: String(audio?.dataset?.audioMessageSequence || "").trim(),
+    peer: String(audio?.dataset?.audioPeer || S.activePeer || "").trim(),
+  };
+}
+
+function chatAudioRefreshKey(identity) {
+  return [identity.peer, identity.messageRandom, identity.messageSequence, identity.id].join("|");
+}
+
+function chatAudioEntryMatchesIdentity(entry, identity) {
+  if (!entry || entry.kind !== "audio" || String(entry.peer || "") !== identity.peer) return false;
+  if (identity.id && String(entry.id || "") === identity.id) return true;
+  if (
+    identity.messageRandom &&
+    String(entry.messageRandom || timMessageRandom(entry) || "") === identity.messageRandom
+  ) {
+    return true;
+  }
+  return Boolean(
+    identity.messageSequence &&
+      String(entry.sequence || timMessageSequence(entry) || "") === identity.messageSequence
+  );
+}
+
+async function findSdkAudioMessage(identity) {
+  const conversationID = `C2C${identity.peer}`;
+  const me = String(S.user?.uid || S.user?.id || "");
+  const seenCursors = new Set();
+  let nextReqMessageID = "";
+  while (true) {
+    const options = { conversationID, count: 30 };
+    if (nextReqMessageID) options.nextReqMessageID = nextReqMessageID;
+    const result = await withTimeout(S.chat.getMessageList(options), 10000, "刷新语音播放地址");
+    const data = result?.data && typeof result.data === "object" ? result.data : result || {};
+    const messages = Array.isArray(data.messageList) ? data.messageList : [];
+    for (const message of messages) {
+      const entry = timMessageEntry(message, identity.peer, me);
+      if (chatAudioEntryMatchesIdentity(entry, identity)) return { message, entry };
+    }
+    const completed = data.isCompleted === true || String(data.isCompleted || "").toLowerCase() === "true";
+    const cursor = String(data.nextReqMessageID || "").trim();
+    if (completed || !cursor || seenCursors.has(cursor)) return null;
+    seenCursors.add(cursor);
+    nextReqMessageID = cursor;
+  }
+}
+
+function updateRefreshedChatAudioEntry(identity, sdkMessage, sdkEntry) {
+  const current = findChatMessageByIdentity(
+    identity.id,
+    identity.messageRandom,
+    identity.messageSequence,
+    identity.peer
+  );
+  if (!current) throw new Error("这条语音已不在当前聊天记录中");
+  const refreshedUrl = mediaUrl(sdkEntry?.media?.url);
+  if (!refreshedUrl || isUnauthenticatedTencentRichMediaUrl(refreshedUrl)) {
+    throw new Error("语音播放地址仍未更新，请稍后重试");
+  }
+  const next = {
+    ...current,
+    ...sdkEntry,
+    id: sdkEntry.id || current.id,
+    msgKey: sdkEntry.msgKey || current.msgKey || "",
+    sequence: sdkEntry.sequence || current.sequence || "",
+    messageRandom: sdkEntry.messageRandom || current.messageRandom || "",
+    peer: identity.peer,
+    media: { ...(current.media || {}), ...(sdkEntry.media || {}), url: refreshedUrl },
+    rawMessage: sdkMessage,
+    voiceText: sdkEntry.voiceText || current.voiceText || "",
+    voiceTextStatus:
+      sdkEntry.voiceText || Number(sdkEntry.voiceTextStatus)
+        ? Number(sdkEntry.voiceTextStatus || 0)
+        : Number(current.voiceTextStatus || 0),
+  };
+  const index = S.imMessages.indexOf(current);
+  if (index < 0) throw new Error("这条语音已不在当前聊天记录中");
+  S.imMessages[index] = next;
+  archiveMessageBestEffort(next, next.type === "mine" ? "outgoing" : "incoming");
+  return next;
+}
+
+function applyRefreshedChatAudioSource(audio, entry) {
+  if (!audio?.isConnected) return;
+  const source = mediaUrl(entry?.media?.url);
+  if (!source) return;
+  clearChatMediaRetryState(audio.dataset.mediaSource);
+  audio.dataset.audioMessageId = String(entry.id || audio.dataset.audioMessageId || "");
+  audio.dataset.audioMessageRandom = String(
+    entry.messageRandom || timMessageRandom(entry) || audio.dataset.audioMessageRandom || ""
+  );
+  audio.dataset.audioMessageSequence = String(
+    entry.sequence || timMessageSequence(entry) || audio.dataset.audioMessageSequence || ""
+  );
+  audio.dataset.audioPeer = String(entry.peer || audio.dataset.audioPeer || "");
+  audio.dataset.audioSourceNeedsRefresh = "0";
+  audio.dataset.audioSourceRefreshAttempted = source;
+  audio.dataset.mediaSource = source;
+  audio.dataset.mediaRetryCount = "0";
+  audio.dataset.mediaFailed = "0";
+  audio.dataset.mediaRetryPending = "1";
+  audio.hidden = false;
+  setChatPlaybackFallback(audio, "", false);
+  audio.src = source;
+  try {
+    audio.load();
+  } finally {
+    audio.dataset.mediaRetryPending = "0";
+  }
+}
+
+function setChatAudioRefreshFailure(audio, error) {
+  if (!audio?.isConnected) return;
+  const detail = localizedSystemText(error?.message || error, "语音播放地址刷新失败，请稍后重试");
+  audio.dataset.mediaRetryPending = "0";
+  audio.dataset.mediaFailed = "1";
+  audio.hidden = true;
+  setChatPlaybackFallback(audio, detail || "语音播放地址刷新失败，请稍后重试", true);
+}
+
+async function refreshChatAudioSource(audio, { resumePlayback = false } = {}) {
+  const identity = chatAudioIdentity(audio);
+  if (!identity.peer || (!identity.id && !identity.messageRandom && !identity.messageSequence)) {
+    const error = new Error("无法定位这条语音消息");
+    setChatAudioRefreshFailure(audio, error);
+    throw error;
+  }
+  if (!(S.imConnected && S.imMode === "sdk" && S.chat && typeof S.chat.getMessageList === "function")) {
+    const error = new Error("语音播放地址已失效，请等待实时消息连接后重试");
+    setChatAudioRefreshFailure(audio, error);
+    throw error;
+  }
+  try {
+    if (typeof S.chat.isReady === "function" && !S.chat.isReady()) {
+      throw new Error("语音播放地址已失效，请等待实时消息连接后重试");
+    }
+  } catch (error) {
+    setChatAudioRefreshFailure(audio, error);
+    throw error;
+  }
+
+  const key = chatAudioRefreshKey(identity);
+  let pending = S.imAudioSourceRefreshes.get(key);
+  if (!pending) {
+    const generation = S.sessionGeneration;
+    const chat = S.chat;
+    pending = (async () => {
+      let found;
+      try {
+        found = await findSdkAudioMessage(identity);
+      } catch (error) {
+        if (error instanceof AuthExpiredError) throw error;
+        throw new Error("语音播放地址刷新失败，请稍后重试");
+      }
+      if (generation !== S.sessionGeneration || chat !== S.chat) {
+        throw new Error("实时消息连接已变化，请重新尝试播放");
+      }
+      if (!found) throw new Error("未能从实时消息记录中找到这条语音，请稍后重试");
+      return updateRefreshedChatAudioEntry(identity, found.message, found.entry);
+    })().finally(() => {
+      if (S.imAudioSourceRefreshes.get(key) === pending) S.imAudioSourceRefreshes.delete(key);
+    });
+    S.imAudioSourceRefreshes.set(key, pending);
+  }
+
+  let entry;
+  try {
+    entry = await pending;
+    applyRefreshedChatAudioSource(audio, entry);
+  } catch (error) {
+    setChatAudioRefreshFailure(audio, error);
+    throw error;
+  }
+  if (resumePlayback && audio.isConnected) {
+    audio.dataset.playbackRequested = "1";
+    try {
+      await audio.play();
+      syncChatAudioPlaybackUi(audio);
+    } catch (error) {
+      audio.dataset.playbackRequested = "0";
+      if (error?.name === "NotAllowedError") {
+        throw new Error("语音地址已刷新，请再次点击播放");
+      }
+      throw error;
+    }
+  }
+  return entry;
+}
+
 function syncChatAudioPlaybackUi(audio) {
   const wrap = audio?.closest?.(".chat-audio");
   const button = wrap?.querySelector("[data-audio-control], .chat-audio-button");
@@ -9159,15 +9392,22 @@ function syncChatAudioPlaybackUi(audio) {
 async function toggleChatAudioPlayback(button) {
   const audio = button?.closest("[data-playback-wrap]")?.querySelector("audio[data-audio-message-id]");
   if (!audio) throw new Error("语音播放控件不可用");
-  if (audio.dataset.mediaFailed === "1") {
-    reloadChatPlayback(audio, { manual: true });
+  const source = String(audio.dataset.mediaSource || "").trim();
+  if (
+    audio.dataset.mediaFailed === "1" ||
+    audio.dataset.audioSourceNeedsRefresh === "1" ||
+    isUnauthenticatedTencentRichMediaUrl(source)
+  ) {
+    await refreshChatAudioSource(audio, { resumePlayback: true });
     return;
   }
   if (!audio.paused) {
+    audio.dataset.playbackRequested = "0";
     audio.pause();
     syncChatAudioPlaybackUi(audio);
     return;
   }
+  audio.dataset.playbackRequested = "1";
   await audio.play();
   syncChatAudioPlaybackUi(audio);
 }
@@ -9318,6 +9558,10 @@ function handleChatPlaybackLoaded(media) {
   media.dataset.mediaFailed = "0";
   media.hidden = false;
   setChatPlaybackFallback(media, "", false);
+  if (media.matches?.("audio[data-audio-message-id]")) {
+    media.dataset.audioSourceNeedsRefresh = "0";
+    media.dataset.audioSourceRefreshAttempted = "";
+  }
 }
 
 function isMomentVideo(media) {
@@ -9594,6 +9838,24 @@ function handleChatPlaybackError(media) {
   }
   const source = String(media.dataset.mediaSource || "").trim();
   if (!source) return;
+  if (media.matches?.("audio[data-audio-message-id]")) {
+    if (media.dataset.audioSourceRefreshAttempted !== source) {
+      media.dataset.audioSourceRefreshAttempted = source;
+      media.dataset.mediaRetryPending = "1";
+      media.hidden = true;
+      setChatPlaybackFallback(media, "正在刷新语音播放地址…", true);
+      void refreshChatAudioSource(media, {
+        resumePlayback: media.dataset.playbackRequested === "1",
+      }).catch(() => {
+        /* refreshChatAudioSource exposes a localized playback fallback. */
+      });
+      return;
+    }
+    if (isUnauthenticatedTencentRichMediaUrl(source)) {
+      setChatAudioRefreshFailure(media, new Error("语音播放地址已失效，请等待实时消息连接后重试"));
+      return;
+    }
+  }
   const mediaErrorCode = Number(media.error?.code || 0);
   if (
     isMomentVideo(media) &&
@@ -12505,6 +12767,7 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
 async function cleanupIM() {
   const chat = S.chat;
   const TIM = resolveTimApi();
+  S.imAudioSourceRefreshes.clear();
   S.chat = null;
   S.imConnected = false;
   S.imMode = "";
@@ -12681,6 +12944,7 @@ async function logout() {
     S.imStickersLoaded = false;
     S.imRecordingState = null;
     S.imMediaRetryState.clear();
+    S.imAudioSourceRefreshes.clear();
     S.imVoiceTranscriptLoading.clear();
     S.imConnecting = false;
     S._imConnecting = null;
@@ -13073,6 +13337,10 @@ async function handleAction(action, button) {
   if (action === "retry-chat-playback") {
     const media = button.closest("[data-playback-wrap]")?.querySelector("[data-media-playback]");
     if (!media) throw new Error("媒体重试控件不可用");
+    if (media.matches?.("audio[data-audio-message-id]")) {
+      await refreshChatAudioSource(media, { resumePlayback: true });
+      return;
+    }
     if (
       isMomentVideo(media) &&
       media.dataset.mediaMode === "compat" &&
@@ -13710,6 +13978,7 @@ function completeBrowserLogin(data) {
   S.imArchiveLoadedPeers.clear();
   S.imMessageOlderLoadingPeers.clear();
   S.imMessageHistoryExhaustedPeers.clear();
+  S.imAudioSourceRefreshes.clear();
   S.imVoiceTranscriptLoading.clear();
   S.conversations = [];
   S.conversationRefreshPromise = null;
@@ -14270,6 +14539,7 @@ window.addEventListener("pagehide", (event) => {
     closeMessageSyncChannel();
     revokeAllChatObjectUrls();
     S.imMediaRetryState.clear();
+    S.imAudioSourceRefreshes.clear();
     S.imVoiceTranscriptLoading.clear();
     if (S.loginStage === "invite") {
       void fetch("/api/auth/invite/cancel", {
