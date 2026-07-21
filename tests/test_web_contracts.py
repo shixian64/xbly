@@ -2554,16 +2554,28 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         bff_server.Handler.do_POST(harness)
         return calls, harness.response
 
-    def _run_mark_read(self, *, authorized=True, peers=None):
-        calls = []
-        result = SimpleNamespace(ok=True)
+    def _run_mark_read(self, *, authorized=True, peers=None, receipt_ok=True):
+        conversation_calls = []
+        receipt_calls = []
+        conversation_result = SimpleNamespace(ok=True)
+        receipt_result = SimpleNamespace(
+            ok=receipt_ok,
+            error_code=0 if receipt_ok else 90001,
+            data={"receipt_count": 2} if receipt_ok else {"stage": "receipt"},
+        )
         allowed_peers = set(peers or ["9"]) if authorized else set()
         web_user = SimpleNamespace(
             app=SimpleNamespace(session=SimpleNamespace(uid="42")),
             native=SimpleNamespace(
                 tim_rest=SimpleNamespace(
-                    mark_c2c_read=lambda account, peer: calls.append((account, peer))
-                    or result
+                    mark_c2c_read=lambda account, peer: conversation_calls.append(
+                        (account, peer)
+                    )
+                    or conversation_result,
+                    sync_c2c_message_read_receipts=lambda account, peer, **kwargs: receipt_calls.append(
+                        (account, peer, kwargs.get("messages"))
+                    )
+                    or receipt_result,
                 )
             ),
             match_pool_online_list_enabled=False,
@@ -2587,7 +2599,22 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                 return True
 
             def body(self):
-                return {"peers": peers} if peers is not None else {"peer": "9"}
+                return (
+                    {"peers": peers}
+                    if peers is not None
+                    else {
+                        "peer": "9",
+                        "receipt_messages": [
+                            {
+                                "from": "9",
+                                "to": "42",
+                                "sequence": 101,
+                                "random": 202,
+                                "time": 1710000000,
+                            }
+                        ],
+                    }
+                )
 
             def sid(self):
                 return "sid"
@@ -2601,7 +2628,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
 
         harness = Harness()
         bff_server.Handler.do_POST(harness)
-        return calls, harness.response
+        return conversation_calls, receipt_calls, harness.response
 
     def test_non_match_new_private_message_is_denied_before_rest_send(self) -> None:
         calls, response = self._run_rest_send()
@@ -2611,20 +2638,36 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         self.assertEqual(response[1]["code"], "PRIVATE_MESSAGE_PERMISSION_REQUIRED")
 
     def test_rest_mode_read_report_uses_authenticated_account(self) -> None:
-        calls, response = self._run_mark_read()
+        calls, receipt_calls, response = self._run_mark_read()
 
         self.assertEqual(calls, [("42", "9")])
+        self.assertEqual(receipt_calls[0][:2], ("42", "9"))
+        self.assertEqual(receipt_calls[0][2][0]["sequence"], 101)
         self.assertEqual(response[0], 200)
         self.assertTrue(response[1]["read"])
+        self.assertEqual(response[1]["receipt_count"], 2)
 
-        calls, response = self._run_mark_read(authorized=False)
+        calls, receipt_calls, response = self._run_mark_read(authorized=False)
         self.assertEqual(calls, [])
+        self.assertEqual(receipt_calls, [])
         self.assertEqual(response[0], 403)
 
-        calls, response = self._run_mark_read(peers=["9", "10", "9"])
+        calls, receipt_calls, response = self._run_mark_read(peers=["9", "10", "9"])
         self.assertCountEqual(calls, [("42", "9"), ("42", "10")])
+        self.assertCountEqual(
+            [(account, peer) for account, peer, _messages in receipt_calls],
+            [("42", "9"), ("42", "10")],
+        )
+        self.assertTrue(all(messages is None for _account, _peer, messages in receipt_calls))
         self.assertEqual(response[0], 200)
         self.assertEqual(response[1]["read_peers"], ["9", "10"])
+
+        calls, receipt_calls, response = self._run_mark_read(receipt_ok=False)
+        self.assertEqual(calls, [("42", "9")])
+        self.assertEqual(receipt_calls[0][:2], ("42", "9"))
+        self.assertEqual(response[0], 502)
+        self.assertEqual(response[1]["conversation_read_peers"], ["9"])
+        self.assertEqual(response[1]["receipt_failed_peers"], ["9"])
 
     def test_match_existing_conversation_and_live_authorizer_are_allowed(self) -> None:
         for kwargs in (
@@ -4372,6 +4415,8 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
         self.assertIn("function reportConversationsRead(peers)", app_js)
         self.assertIn("function scheduleConversationReadReport(peer", app_js)
         self.assertIn("function reportSdkMessageReadReceipts(peer)", app_js)
+        self.assertIn("function sdkMessageReadReceiptReport(entry)", app_js)
+        self.assertIn("receipt_messages: conversationReadReceiptReports(target)", app_js)
         self.assertIn("S.chat.sendMessageReadReceipt(entries.map((entry) => entry.rawMessage))", app_js)
         self.assertIn("scheduleSdkMessageReadReceipts(target);", app_js)
         self.assertIn("width: fit-content", app_css)

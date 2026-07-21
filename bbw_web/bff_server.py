@@ -3655,7 +3655,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self.ok({"ok": False, "error": "缺少对方 UID"}, 400)
                 return self.ok(R(app.social.record_profile_view(target_uid)))
 
-            # TIM REST fallback (when browser TIM.login hangs)
+            # Keep both the conversation unread counter and TUIKit's explicit
+            # per-message read receipts in sync. The latter is required for the
+            # sender's "已读/未读" indicator and is not covered by
+            # openim/admin_set_msg_read.
             if path == "/api/im/read":
                 raw_peers = data.get("peers")
                 if isinstance(raw_peers, list):
@@ -3678,18 +3681,62 @@ class Handler(BaseHTTPRequestHandler):
                 for peer_uid in peer_uids:
                     if not Handler.can_message_peer(self, u, peer_uid):
                         return Handler.deny_private_message(self, capabilities)
+                supplied_receipts = data.get("receipt_messages")
+                receipt_messages = (
+                    [
+                        dict(item)
+                        for item in supplied_receipts[:300]
+                        if isinstance(item, Mapping)
+                    ]
+                    if len(peer_uids) == 1 and isinstance(supplied_receipts, list)
+                    else []
+                )
                 read_peers: List[str] = []
+                conversation_read_peers: List[str] = []
+                receipt_synced_peers: List[str] = []
                 failed_peers: List[str] = []
-                def mark_peer_read(peer_uid: str) -> Tuple[str, Any]:
-                    return peer_uid, u.native.tim_rest.mark_c2c_read(account_uid, peer_uid)
+                conversation_failed_peers: List[str] = []
+                receipt_failed_peers: List[str] = []
+                receipt_counts: Dict[str, int] = {}
+
+                def mark_peer_read(peer_uid: str) -> Tuple[str, Any, Any]:
+                    conversation_result = u.native.tim_rest.mark_c2c_read(
+                        account_uid,
+                        peer_uid,
+                    )
+                    receipt_result = u.native.tim_rest.sync_c2c_message_read_receipts(
+                        account_uid,
+                        peer_uid,
+                        messages=receipt_messages if len(peer_uids) == 1 and receipt_messages else None,
+                    )
+                    return peer_uid, conversation_result, receipt_result
 
                 if len(peer_uids) == 1:
                     read_results = [mark_peer_read(peer_uids[0])]
                 else:
                     with ThreadPoolExecutor(max_workers=min(5, len(peer_uids))) as executor:
                         read_results = list(executor.map(mark_peer_read, peer_uids))
-                for peer_uid, result in read_results:
-                    if result.ok:
+                for peer_uid, conversation_result, receipt_result in read_results:
+                    conversation_ok = bool(getattr(conversation_result, "ok", False))
+                    receipt_ok = bool(getattr(receipt_result, "ok", False))
+                    if conversation_ok:
+                        conversation_read_peers.append(peer_uid)
+                    else:
+                        conversation_failed_peers.append(peer_uid)
+                    if receipt_ok:
+                        receipt_synced_peers.append(peer_uid)
+                    else:
+                        receipt_failed_peers.append(peer_uid)
+                    receipt_data = getattr(receipt_result, "data", None)
+                    receipt_data = receipt_data if isinstance(receipt_data, Mapping) else {}
+                    try:
+                        receipt_counts[peer_uid] = max(
+                            0,
+                            int(receipt_data.get("receipt_count") or 0),
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        receipt_counts[peer_uid] = 0
+                    if conversation_ok and receipt_ok:
                         read_peers.append(peer_uid)
                     else:
                         failed_peers.append(peer_uid)
@@ -3701,6 +3748,12 @@ class Handler(BaseHTTPRequestHandler):
                             "error": "消息已读状态暂时无法同步",
                             "read_peers": read_peers,
                             "failed_peers": failed_peers,
+                            "conversation_read_peers": conversation_read_peers,
+                            "conversation_failed_peers": conversation_failed_peers,
+                            "receipt_synced_peers": receipt_synced_peers,
+                            "receipt_failed_peers": receipt_failed_peers,
+                            "receipt_counts": receipt_counts,
+                            "receipt_count": sum(receipt_counts.values()),
                         },
                         502,
                     )
@@ -3710,6 +3763,10 @@ class Handler(BaseHTTPRequestHandler):
                         "read": True,
                         "read_peers": read_peers,
                         "count": len(read_peers),
+                        "conversation_read_peers": conversation_read_peers,
+                        "receipt_synced_peers": receipt_synced_peers,
+                        "receipt_counts": receipt_counts,
+                        "receipt_count": sum(receipt_counts.values()),
                     }
                 )
 

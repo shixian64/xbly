@@ -8206,6 +8206,57 @@ function sdkMessageNeedsReadReceipt(entry) {
   ) === true;
 }
 
+function sdkMessageReadReceiptReport(entry) {
+  if (!sdkMessageNeedsReadReceipt(entry)) return null;
+  const message = entry.rawMessage;
+  const from = String(
+    message.from ?? message.from_user_id ?? message.fromUserId ?? message.From_Account ?? ""
+  ).trim();
+  const to = String(
+    message.to ?? message.to_user_id ?? message.toUserId ?? message.To_Account ?? ""
+  ).trim();
+  const sequence = Number(message.sequence ?? message.MsgSeq ?? message.msgSeq ?? entry.sequence ?? 0);
+  const random = Number(
+    message.random ??
+      message.MsgRandom ??
+      message.msgRandom ??
+      message.messageRandom ??
+      entry.messageRandom ??
+      timMessageRandom(message) ??
+      0
+  );
+  const receiptEpoch = (value) => {
+    const numeric = Number(value || 0);
+    if (!Number.isFinite(numeric) || numeric <= 0) return 0;
+    return numeric >= 1e12 ? Math.trunc(numeric / 1000) : Math.trunc(numeric);
+  };
+  const time = receiptEpoch(message.time ?? message.MsgTime ?? message.MsgTimeStamp ?? entry.timestamp);
+  const clientTime = receiptEpoch(
+    message.clientTime ?? message.MsgClientTime ?? message.client_time ?? time
+  );
+  if (!from || !to || !Number.isInteger(sequence) || sequence <= 0 || !Number.isInteger(random) || random <= 0 || !time) {
+    return null;
+  }
+  return {
+    from,
+    to,
+    sequence,
+    random,
+    time,
+    client_time: clientTime || time,
+  };
+}
+
+function conversationReadReceiptReports(peer) {
+  const target = String(peer || "").trim();
+  if (!target) return [];
+  return S.imMessages
+    .filter((entry) => String(entry?.peer || "") === target)
+    .map(sdkMessageReadReceiptReport)
+    .filter(Boolean)
+    .slice(-300);
+}
+
 async function reportSdkMessageReadReceipts(peer) {
   // Android TUIKit enables explicit per-message receipts by default. Clearing
   // the conversation unread count alone only emits the legacy C2C read report,
@@ -8267,8 +8318,11 @@ function reportConversationRead(peer) {
   if (!target) return Promise.resolve(false);
   return api("/api/im/read", {
     method: "POST",
-    body: JSON.stringify({ peer: target }),
-    timeout: 8000,
+    body: JSON.stringify({
+      peer: target,
+      receipt_messages: conversationReadReceiptReports(target),
+    }),
+    timeout: 15000,
   }).then(({ data }) => data?.ok === true);
 }
 

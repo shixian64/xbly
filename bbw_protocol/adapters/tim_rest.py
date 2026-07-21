@@ -9,11 +9,12 @@ from __future__ import annotations
 import json
 import random
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from .. import sign
 
@@ -264,6 +265,298 @@ class TimRestClient:
             {
                 "Report_Account": account,
                 "Peer_Account": peer,
+            },
+        )
+
+    @staticmethod
+    def _c2c_receipt_message(
+        message: Mapping[str, Any],
+        *,
+        operator_account: str,
+        peer_account: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Normalize one Tencent C2C message into the explicit receipt shape."""
+
+        sender = str(
+            message.get("From_Account")
+            or message.get("from_account")
+            or message.get("from")
+            or ""
+        ).strip()
+        recipient = str(
+            message.get("To_Account")
+            or message.get("to_account")
+            or message.get("to")
+            or ""
+        ).strip()
+        if sender != peer_account or recipient != operator_account:
+            return None
+
+        need_receipt = message.get("IsNeedReadReceipt")
+        if need_receipt is None:
+            need_receipt = message.get("needReadReceipt")
+        if need_receipt is None:
+            need_receipt = message.get("need_read_receipt")
+        if need_receipt is not None and str(need_receipt).strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+        }:
+            return None
+
+        peer_read = message.get("IsPeerRead")
+        if peer_read is None:
+            peer_read = message.get("isPeerRead")
+        if peer_read is None:
+            peer_read = message.get("is_peer_read")
+        if str(peer_read or "").strip().lower() in {"1", "true", "yes"}:
+            return None
+
+        def positive_int(*values: Any) -> int:
+            for value in values:
+                try:
+                    parsed = int(value)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if parsed > 0:
+                    return parsed
+            return 0
+
+        sequence = positive_int(
+            message.get("MsgSeq"),
+            message.get("sequence"),
+            message.get("msg_sequence"),
+        )
+        random_value = positive_int(
+            message.get("MsgRandom"),
+            message.get("random"),
+            message.get("message_random"),
+        )
+        message_time = positive_int(
+            message.get("MsgTime"),
+            message.get("MsgTimeStamp"),
+            message.get("time"),
+            message.get("timestamp"),
+        )
+        client_time = positive_int(
+            message.get("MsgClientTime"),
+            message.get("clientTime"),
+            message.get("client_time"),
+            message_time,
+        )
+        if not sequence or not random_value or not message_time:
+            return None
+        return {
+            "From_Account": sender,
+            "To_Account": recipient,
+            "MsgSeq": sequence,
+            "MsgRandom": random_value,
+            "MsgTime": message_time,
+            "MsgClientTime": client_time,
+        }
+
+    def mark_c2c_message_read_receipts(
+        self,
+        operator_account: str,
+        peer_account: str,
+        messages: List[Mapping[str, Any]],
+    ) -> RestResult:
+        """Send explicit per-message receipts used by TUIKit C2C messages."""
+
+        operator = str(operator_account or "").strip()
+        peer = str(peer_account or "").strip()
+        action = "openim/c2c_msg_read_receipt"
+        if not operator or not peer or operator == peer:
+            return RestResult(
+                ok=False,
+                action=action,
+                error_code=-2,
+                error_info="invalid operator/peer account",
+            )
+        normalized: List[Dict[str, Any]] = []
+        seen = set()
+        for message in messages:
+            if not isinstance(message, Mapping):
+                continue
+            item = self._c2c_receipt_message(
+                message,
+                operator_account=operator,
+                peer_account=peer,
+            )
+            if not item:
+                continue
+            identity = (
+                item["From_Account"],
+                item["To_Account"],
+                item["MsgSeq"],
+                item["MsgRandom"],
+                item["MsgTime"],
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            normalized.append(item)
+        if not normalized:
+            return RestResult(
+                ok=True,
+                action=action,
+                data={"ActionStatus": "OK", "ErrorCode": 0, "receipt_count": 0},
+            )
+        return self.call(
+            action,
+            {
+                "Operator_Account": operator,
+                "Peer_Account": peer,
+                "C2CMsgInfo": normalized,
+            },
+        )
+
+    def sync_c2c_message_read_receipts(
+        self,
+        operator_account: str,
+        peer_account: str,
+        *,
+        messages: Optional[List[Mapping[str, Any]]] = None,
+        max_messages: int = 300,
+        batch_size: int = 30,
+        retention_days: int = 180,
+    ) -> RestResult:
+        """Discover and send missing explicit C2C receipts for one conversation.
+
+        Browser SDK messages may be supplied directly. REST/history mode falls
+        back to administrator roaming history and therefore remains capable of
+        updating TUIKit's per-message ``isPeerRead`` state.
+        """
+
+        operator = str(operator_account or "").strip()
+        peer = str(peer_account or "").strip()
+        action = "openim/c2c_msg_read_receipt"
+        if not operator or not peer or operator == peer:
+            return RestResult(
+                ok=False,
+                action=action,
+                error_code=-2,
+                error_info="invalid operator/peer account",
+            )
+
+        maximum = max(1, min(int(max_messages), 500))
+        receipt_batch_size = max(1, min(int(batch_size), 30))
+        candidates: List[Mapping[str, Any]] = []
+        page_count = 0
+        source = "browser"
+        supplied = [item for item in (messages or []) if isinstance(item, Mapping)]
+        if supplied:
+            candidates.extend(supplied[-maximum:])
+        else:
+            source = "history"
+            now_epoch = int(time.time())
+            min_time = max(0, now_epoch - max(1, int(retention_days)) * 86400)
+            max_time = now_epoch + 60
+            last_msg_key = ""
+            seen_pages = set()
+            while len(candidates) < maximum:
+                result = self.roaming_messages(
+                    peer,
+                    operator,
+                    min_time=min_time,
+                    max_time=max_time,
+                    max_count=min(100, maximum - len(candidates)),
+                    last_msg_key=last_msg_key,
+                )
+                page_count += 1
+                if not result.ok:
+                    return RestResult(
+                        ok=False,
+                        action=action,
+                        error_code=result.error_code,
+                        error_info=result.error_info or "failed to load C2C receipt messages",
+                        data={
+                            "stage": "history",
+                            "source": source,
+                            "page_count": page_count,
+                            "upstream": result.data,
+                        },
+                    )
+                data = result.data if isinstance(result.data, Mapping) else {}
+                rows = data.get("MsgList")
+                rows = rows if isinstance(rows, list) else []
+                candidates.extend(item for item in rows if isinstance(item, Mapping))
+                next_key = str(data.get("LastMsgKey") or "").strip()[:256]
+                try:
+                    next_time = int(data.get("LastMsgTime") or 0)
+                except (TypeError, ValueError, OverflowError):
+                    next_time = 0
+                complete = str(data.get("Complete") or "0").strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                }
+                cursor = (next_key, next_time)
+                if complete or not rows or not next_key or next_time <= 0 or cursor in seen_pages:
+                    break
+                seen_pages.add(cursor)
+                last_msg_key = next_key
+                max_time = min(max_time, next_time)
+
+        normalized: List[Dict[str, Any]] = []
+        seen_messages = set()
+        for message in candidates:
+            item = self._c2c_receipt_message(
+                message,
+                operator_account=operator,
+                peer_account=peer,
+            )
+            if not item:
+                continue
+            identity = (
+                item["From_Account"],
+                item["To_Account"],
+                item["MsgSeq"],
+                item["MsgRandom"],
+                item["MsgTime"],
+            )
+            if identity in seen_messages:
+                continue
+            seen_messages.add(identity)
+            normalized.append(item)
+
+        receipt_count = 0
+        batch_count = 0
+        for offset in range(0, len(normalized), receipt_batch_size):
+            batch = normalized[offset : offset + receipt_batch_size]
+            result = self.mark_c2c_message_read_receipts(operator, peer, batch)
+            batch_count += 1
+            if not result.ok:
+                return RestResult(
+                    ok=False,
+                    action=action,
+                    error_code=result.error_code,
+                    error_info=result.error_info or "failed to send C2C message read receipts",
+                    data={
+                        "stage": "receipt",
+                        "source": source,
+                        "scanned_count": len(candidates),
+                        "pending_count": len(normalized),
+                        "receipt_count": receipt_count,
+                        "page_count": page_count,
+                        "batch_count": batch_count,
+                        "upstream": result.data,
+                    },
+                )
+            receipt_count += len(batch)
+
+        return RestResult(
+            ok=True,
+            action=action,
+            data={
+                "ActionStatus": "OK",
+                "ErrorCode": 0,
+                "source": source,
+                "scanned_count": len(candidates),
+                "pending_count": len(normalized),
+                "receipt_count": receipt_count,
+                "page_count": page_count,
+                "batch_count": batch_count,
             },
         )
 

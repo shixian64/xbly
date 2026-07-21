@@ -261,6 +261,42 @@ class TimRestMediaContractTests(unittest.TestCase):
             },
         )
 
+        receipt = client.mark_c2c_message_read_receipts(
+            "42",
+            "9",
+            [
+                {
+                    "From_Account": "9",
+                    "To_Account": "42",
+                    "MsgSeq": 101,
+                    "MsgRandom": 202,
+                    "MsgTimeStamp": 1710000000,
+                    "MsgClientTime": 1709999999,
+                    "IsNeedReadReceipt": 1,
+                    "IsPeerRead": 0,
+                }
+            ],
+        )
+        self.assertTrue(receipt.ok)
+        self.assertEqual(client.calls[-1][0], "openim/c2c_msg_read_receipt")
+        self.assertEqual(
+            client.calls[-1][1],
+            {
+                "Operator_Account": "42",
+                "Peer_Account": "9",
+                "C2CMsgInfo": [
+                    {
+                        "From_Account": "9",
+                        "To_Account": "42",
+                        "MsgSeq": 101,
+                        "MsgRandom": 202,
+                        "MsgTime": 1710000000,
+                        "MsgClientTime": 1709999999,
+                    }
+                ],
+            },
+        )
+
         roaming = client.roaming_messages(
             "42",
             "9",
@@ -291,7 +327,163 @@ class TimRestMediaContractTests(unittest.TestCase):
         self.assertFalse(client.roaming_messages("", "9").ok)
         self.assertFalse(client.c2c_unread_counts("42", []).ok)
         self.assertFalse(client.mark_c2c_read("42", "42").ok)
+        self.assertFalse(client.mark_c2c_message_read_receipts("42", "42", []).ok)
         self.assertEqual(client.calls, [])
+
+    def test_c2c_receipt_sync_filters_read_messages_and_batches_pending_rows(self) -> None:
+        class ReceiptClient(TimRestClient):
+            def __init__(self) -> None:
+                self.calls = []
+
+            def call(self, command, body, *, admin=None):
+                self.calls.append((command, body, admin))
+                if command == "openim/admin_getroammsg":
+                    rows = [
+                        {
+                            "From_Account": "9",
+                            "To_Account": "42",
+                            "MsgSeq": index,
+                            "MsgRandom": 1000 + index,
+                            "MsgTimeStamp": 1710000000 + index,
+                            "MsgClientTime": 1710000000 + index,
+                            "IsNeedReadReceipt": 1,
+                            "IsPeerRead": 0,
+                        }
+                        for index in range(1, 32)
+                    ]
+                    rows.extend(
+                        [
+                            {
+                                "From_Account": "9",
+                                "To_Account": "42",
+                                "MsgSeq": 40,
+                                "MsgRandom": 1040,
+                                "MsgTimeStamp": 1710000040,
+                                "IsNeedReadReceipt": 1,
+                                "IsPeerRead": 1,
+                            },
+                            {
+                                "From_Account": "9",
+                                "To_Account": "42",
+                                "MsgSeq": 41,
+                                "MsgRandom": 1041,
+                                "MsgTimeStamp": 1710000041,
+                                "IsNeedReadReceipt": 0,
+                                "IsPeerRead": 0,
+                            },
+                        ]
+                    )
+                    return RestResult(
+                        ok=True,
+                        action=command,
+                        data={"Complete": 1, "MsgList": rows},
+                    )
+                return RestResult(ok=True, action=command, data={"ErrorCode": 0})
+
+        client = ReceiptClient()
+        result = client.sync_c2c_message_read_receipts("42", "9")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["source"], "history")
+        self.assertEqual(result.data["pending_count"], 31)
+        self.assertEqual(result.data["receipt_count"], 31)
+        receipt_calls = [
+            call for call in client.calls if call[0] == "openim/c2c_msg_read_receipt"
+        ]
+        self.assertEqual(len(receipt_calls), 2)
+        self.assertEqual(len(receipt_calls[0][1]["C2CMsgInfo"]), 30)
+        self.assertEqual(len(receipt_calls[1][1]["C2CMsgInfo"]), 1)
+        self.assertEqual(receipt_calls[0][1]["Operator_Account"], "42")
+        self.assertEqual(receipt_calls[0][1]["Peer_Account"], "9")
+
+    def test_c2c_receipt_sync_uses_supplied_sdk_messages_without_history_fetch(self) -> None:
+        client = CapturingTimRestClient()
+
+        result = client.sync_c2c_message_read_receipts(
+            "42",
+            "9",
+            messages=[
+                {
+                    "from": "9",
+                    "to": "42",
+                    "sequence": 101,
+                    "random": 202,
+                    "time": 1710000000,
+                    "client_time": 1709999999,
+                }
+            ],
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["source"], "browser")
+        self.assertEqual(result.data["receipt_count"], 1)
+        self.assertEqual(
+            [call[0] for call in client.calls],
+            ["openim/c2c_msg_read_receipt"],
+        )
+
+    def test_c2c_receipt_history_pagination_moves_before_oldest_message(self) -> None:
+        class PagingReceiptClient(TimRestClient):
+            def __init__(self) -> None:
+                self.calls = []
+                self.history_pages = 0
+
+            def call(self, command, body, *, admin=None):
+                self.calls.append((command, body, admin))
+                if command != "openim/admin_getroammsg":
+                    return RestResult(ok=True, action=command, data={"ErrorCode": 0})
+                self.history_pages += 1
+                if self.history_pages == 1:
+                    return RestResult(
+                        ok=True,
+                        action=command,
+                        data={
+                            "Complete": 0,
+                            "LastMsgTime": 1710000100,
+                            "LastMsgKey": "page-one",
+                            "MsgList": [
+                                {
+                                    "From_Account": "9",
+                                    "To_Account": "42",
+                                    "MsgSeq": 2,
+                                    "MsgRandom": 202,
+                                    "MsgTimeStamp": 1710000100,
+                                    "IsNeedReadReceipt": 1,
+                                    "IsPeerRead": 0,
+                                }
+                            ],
+                        },
+                    )
+                return RestResult(
+                    ok=True,
+                    action=command,
+                    data={
+                        "Complete": 1,
+                        "MsgList": [
+                            {
+                                "From_Account": "9",
+                                "To_Account": "42",
+                                "MsgSeq": 1,
+                                "MsgRandom": 201,
+                                "MsgTimeStamp": 1710000090,
+                                "IsNeedReadReceipt": 1,
+                                "IsPeerRead": 0,
+                            }
+                        ],
+                    },
+                )
+
+        client = PagingReceiptClient()
+        result = client.sync_c2c_message_read_receipts("42", "9", max_messages=10)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["receipt_count"], 2)
+        history_calls = [
+            call for call in client.calls if call[0] == "openim/admin_getroammsg"
+        ]
+        self.assertEqual(len(history_calls), 2)
+        self.assertEqual(history_calls[1][1]["MaxTime"], 1710000100)
+        self.assertEqual(history_calls[1][1]["LastMsgKey"], "page-one")
 
     def test_c2c_revoke_uses_authenticated_sender_and_msg_key_shape(self) -> None:
         client = CapturingTimRestClient()
