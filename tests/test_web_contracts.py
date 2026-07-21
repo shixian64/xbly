@@ -3867,6 +3867,11 @@ class RichMessageFrontendContractTests(unittest.TestCase):
             "function applyMessageRevokedEvent(event",
             "function attachTimHandlers",
         )
+        tim_handlers = self._app_fragment(
+            app_js,
+            "function attachTimHandlers(chat, TIM, credential)",
+            "function isCurrentAuthenticatedSession",
+        )
         message_loader = self._app_fragment(
             app_js,
             "async function loadConversationMessages(peer",
@@ -3892,6 +3897,10 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         )
         self.assertIn("!S.imMessageLoadedPeers.has(String(peer))", revoke_handler)
         self.assertIn("queuePendingMessageRevocation(revoked)", revoke_handler)
+        self.assertIn("else if (peer && (revoked.id || revoked.msgKey))", revoke_handler)
+        self.assertIn("if (!peer) return;", tim_handlers)
+        self.assertGreaterEqual(tim_handlers.count("if (deferReplayedMessageRevocation(entry)) return;"), 2)
+        self.assertIn("function deferReplayedMessageRevocation", app_js)
         self.assertIn("mergePendingMessageRevocations(", message_loader)
         self.assertIn('if (!ok || data?.ok === false) throw new Error("服务器聊天记录暂时不可用")', message_loader)
         self.assertIn('if (!ok || data?.ok === false) throw new Error("归档聊天记录暂时不可用")', message_loader)
@@ -3902,7 +3911,32 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         )
         self.assertIn("if (!wasLoaded && S.activePeer === target) refreshChatLog();", message_loader)
         self.assertIn("entries.every((entry) => entry.revoked)", chat_log)
+        self.assertIn('String(entry.peer || "") === activePeer', chat_log)
         self.assertIn("正在加载聊天记录", chat_log)
+
+    def test_conversation_loading_starts_before_the_chat_pane_is_redrawn(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+
+        route_restore = self._app_fragment(
+            app_js,
+            'if (target === "msg") {',
+            "if (!force && cached?.fresh) return;",
+        )
+        open_chat = self._app_fragment(
+            app_js,
+            'if (action === "open-chat" || action === "select-conversation") {',
+            'if (action === "close-conversation") {',
+        )
+
+        self.assertLess(
+            route_restore.index("void loadConversationMessages(S.activePeer)"),
+            route_restore.index("refreshMessageConversationRegion("),
+        )
+        self.assertLess(
+            open_chat.index("void loadConversationMessages(uid)"),
+            open_chat.index("refreshMessageConversationRegion({"),
+        )
 
     def test_incoming_message_toast_prefers_the_sender_nickname(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -4501,7 +4535,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("panel-dom-cache", css_version)
         self.assertIn("private-message-policy-recheck", css_version)
         self.assertIn("private-message-entry-scope", css_version)
-        self.assertTrue(css_version.endswith("-voice-url-renewal-imcloud"))
+        self.assertTrue(css_version.endswith("-voice-url-renewal-imcloud-revoke-replay-v2"))
 
 
 class FlashPhotoBffContractTests(unittest.TestCase):

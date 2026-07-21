@@ -2566,8 +2566,8 @@ async function activateRoute(id, { force = false } = {}) {
       if (active && !S.activePeerName) {
         S.activePeerName = active.nickname || active.peer_name || active.user?.nickname || `用户 ${S.activePeer}`;
       }
-      refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
       if (S.activePeer) void loadConversationMessages(S.activePeer);
+      refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
       void loadArchivedConversationSummary();
       void runMessageSyncCycle();
       if (!S.imConnected) {
@@ -6450,9 +6450,12 @@ function chatHistoryStatusHtml() {
 }
 
 function chatLogHtml() {
-  const entries = S.imMessages.filter(
-    (entry) => entry.type !== "system" && (!entry.peer || !S.activePeer || entry.peer === S.activePeer)
-  );
+  const activePeer = String(S.activePeer || "");
+  const entries = activePeer
+    ? S.imMessages.filter(
+        (entry) => entry.type !== "system" && String(entry.peer || "") === activePeer
+      )
+    : [];
   if (
     entries.length &&
     S.activePeer &&
@@ -12462,6 +12465,15 @@ function mergePendingMessageRevocations(peer, incoming) {
   return merged;
 }
 
+function deferReplayedMessageRevocation(entry) {
+  const peer = String(entry?.peer || "").trim();
+  if (!peer || !entry?.revoked || S.imMessageLoadedPeers.has(peer)) return false;
+  const revoked = mergeRevokedMessage(entry, entry);
+  queuePendingMessageRevocation(revoked);
+  archiveMessageBestEffort(revoked);
+  return true;
+}
+
 function applyMessageRevokedEvent(event, me = String(S.user?.uid || S.user?.id || "")) {
   const changedPeers = new Set();
   timEventRows(event).forEach((message) => {
@@ -12491,7 +12503,7 @@ function applyMessageRevokedEvent(event, me = String(S.user?.uid || S.user?.id |
       // messages arrive. Defer the orphan notice so it never becomes the only
       // visible chat content while the real history is still loading.
       queuePendingMessageRevocation(revoked);
-    } else if (revoked.id || revoked.msgKey) {
+    } else if (peer && (revoked.id || revoked.msgKey)) {
       S.imMessages.push(revoked);
       if (peer) changedPeers.add(String(peer));
     }
@@ -12507,9 +12519,11 @@ function attachTimHandlers(chat, TIM, credential) {
   S.imHandler = (event) => {
     (event.data || []).forEach((message) => {
       const peer = timMessagePeer(message, String(credential.userID));
+      if (!peer) return;
       const active = peer && peer === String(S.activePeer);
       const current = S.conversations.find((item) => conversationPeer(item) === peer);
       const entry = timMessageEntry(message, peer, String(credential.userID));
+      if (deferReplayedMessageRevocation(entry)) return;
       const preview = messagePreview(entry);
       const currentUnread = Number(current?.unread_count || current?.unread || 0);
       const sender =
@@ -12545,6 +12559,7 @@ function attachTimHandlers(chat, TIM, credential) {
         const peer = timMessagePeer(message, String(credential.userID));
         if (!peer) return;
         const entry = timMessageEntry(message, peer, String(credential.userID));
+        if (deferReplayedMessageRevocation(entry)) return;
         mergePeerMessages(peer, [entry]);
         archiveMessageBestEffort(entry, entry.type === "mine" ? "outgoing" : "incoming");
         if (entry.revoked) updateConversationPreviewFromMessages(peer);
@@ -13683,6 +13698,7 @@ async function handleAction(action, button) {
     if (S.route !== "msg") {
       go("msg", { force: true });
     } else {
+      void loadConversationMessages(uid);
       refreshMessageConversationRegion({
         focusComposer: action === "select-conversation" && !usesCoarsePointer(),
         // Selecting an existing card only changes its active/read state. Keep
@@ -13690,7 +13706,6 @@ async function handleAction(action, button) {
         // list reflow on every click; open-chat may still add a new card.
         refreshList: action !== "select-conversation",
       });
-      void loadConversationMessages(uid);
     }
     return;
   }
