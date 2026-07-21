@@ -3672,6 +3672,13 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("const previous = S.messagePolicyCleanupPromise", app_js)
         self.assertIn("Promise.resolve(previous)", app_js)
         self.assertIn("S.messagePolicyCleanupPromise = tracked", app_js)
+        apply_capabilities = app_js.split("function applyCapabilities", 1)[1].split(
+            "function setLoginMode", 1
+        )[0]
+        self.assertIn(
+            "S._imConnecting ||\n      S.messagePolicyCleanupPromise",
+            apply_capabilities,
+        )
         self.assertIn("deferMessageReconnect ||", app_js)
         self.assertIn("S.messagePolicyCleanupPromise", app_js)
         self.assertIn(
@@ -5045,7 +5052,7 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("private-message-entry-scope", css_version)
         self.assertTrue(
             css_version.endswith(
-                "-voice-url-renewal-imcloud-revoke-replay-v2-unread-authoritative-private-message-policy-hardening-unread-tie-fix-message-policy-refresh-race-fix-message-policy-cleanup-queue-fix"
+                "-voice-url-renewal-imcloud-revoke-replay-v2-unread-authoritative-private-message-policy-hardening-unread-tie-fix-message-policy-refresh-race-fix-message-policy-cleanup-queue-fix-message-policy-latest-reconnect-fix"
             )
         )
 

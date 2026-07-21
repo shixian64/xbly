@@ -1386,7 +1386,11 @@ function applyCapabilities(
   if (
     (proactiveChanged || directCredentialsChanged) &&
     S.authenticated &&
-    (S.imMode || S.chat || S.imConnecting || S._imConnecting)
+    (S.imMode ||
+      S.chat ||
+      S.imConnecting ||
+      S._imConnecting ||
+      S.messagePolicyCleanupPromise)
   ) {
     const cleanup = queueMessagePolicyCleanup();
     void cleanup.then(() => {
