@@ -1204,6 +1204,10 @@ function scrubAuthenticatedDom() {
     const dialog = $(id);
     if (!dialog) return;
     if (dialog.open) dialog.close();
+    if (id === "chat-media-viewer") {
+      dialog.remove();
+      return;
+    }
     dialog.replaceChildren();
   });
 }
@@ -7692,6 +7696,31 @@ function closeActiveConversationForRemoval() {
   S.activePeerName = "";
 }
 
+function closeActiveMessageConversation() {
+  if (!S.activePeer) return false;
+  S.conversationListCollapsed = false;
+  closeActiveConversationForRemoval();
+  refreshMessageConversationRegion({ refreshList: false });
+  return true;
+}
+
+function messageConversationUsesSinglePane() {
+  if (S.route !== "msg" || !S.activePeer) return false;
+  const responsiveSinglePane = window.matchMedia(
+    "(max-width: 640px), (max-height: 560px) and (max-width: 960px) and (any-pointer: coarse)"
+  ).matches;
+  if (!responsiveSinglePane) return false;
+  const layout = document.querySelector(".conversation-layout.has-active");
+  const listPane = layout?.querySelector(".conversation-list-pane");
+  const chatPane = layout?.querySelector(".chat-pane");
+  if (!listPane || !chatPane) return false;
+  return window.getComputedStyle(listPane).display === "none" && window.getComputedStyle(chatPane).display !== "none";
+}
+
+function hasOpenDialogSurface() {
+  return Boolean(document.querySelector('dialog[open], dialog.is-open, [role="dialog"].is-open'));
+}
+
 function removeConversationListItems(peers) {
   const targets = new Set(
     (Array.isArray(peers) ? peers : []).map((peer) => String(peer || "").trim()).filter(Boolean)
@@ -10687,7 +10716,8 @@ function closeChatMediaViewer() {
   const dialog = $("chat-media-viewer");
   if (!dialog) return;
   dialog.querySelectorAll("video,audio").forEach((media) => media.pause());
-  dialog.querySelector("[data-viewer-body]").innerHTML = "";
+  const body = dialog.querySelector("[data-viewer-body]");
+  if (body) body.replaceChildren();
   if (dialog.open) dialog.close();
 }
 
@@ -14328,16 +14358,7 @@ async function handleAction(action, button) {
     return;
   }
   if (action === "close-conversation") {
-    finishVoiceRecording(null, true);
-    closeFlashViewer();
-    S.imComposerPanel = "";
-    setChatComposerDraft($("im-text")?.value ?? S.imComposerDraft);
-    S.imVoiceMode = false;
-    S.activePeer = "";
-    restoreChatComposerDraft("");
-    restoreChatMessageQuote("");
-    S.activePeerName = "";
-    refreshMessageConversationRegion({ refreshList: false });
+    closeActiveMessageConversation();
     return;
   }
   if (action === "visitor-tab") {
@@ -15162,7 +15183,31 @@ document.addEventListener("keyup", (event) => {
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
+    if (event.repeat || event.isComposing) return;
+    if (hasOpenDialogSurface()) return;
+    const hadOpenMessageActions = Boolean(document.querySelector(".chat-message-row.is-actions-open"));
     closeChatMessageActions();
+    if (hadOpenMessageActions) {
+      event.preventDefault();
+      return;
+    }
+    const flashViewer = $("chat-flash-viewer");
+    if (
+      event.defaultPrevented ||
+      $("sidebar").classList.contains("open") ||
+      (flashViewer && !flashViewer.classList.contains("hide"))
+    ) {
+      return;
+    }
+    if (S.imComposerPanel) {
+      event.preventDefault();
+      closeChatComposerPanelForKeyboard();
+      return;
+    }
+    if (messageConversationUsesSinglePane()) {
+      event.preventDefault();
+      closeActiveMessageConversation();
+    }
     return;
   }
   if (event.repeat || ![" ", "Enter"].includes(event.key)) return;

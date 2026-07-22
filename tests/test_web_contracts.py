@@ -4752,6 +4752,93 @@ class RichMessageFrontendContractTests(unittest.TestCase):
             open_chat.index("refreshMessageConversationRegion({"),
         )
 
+    def test_escape_returns_single_pane_chat_to_conversation_list(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+
+        close_helpers = self._app_fragment(
+            app_js,
+            "function closeActiveConversationForRemoval()",
+            "function removeConversationListItems(peers)",
+        )
+        close_action = self._app_fragment(
+            app_js,
+            'if (action === "close-conversation") {',
+            'if (action === "visitor-tab") {',
+        )
+        escape_handler = self._app_fragment(
+            app_js,
+            'document.addEventListener("keydown", (event) => {\n  if (event.key === "Escape") {',
+            'document.addEventListener("click", (event) => {',
+        )
+
+        self.assertIn("function closeActiveMessageConversation()", close_helpers)
+        self.assertIn("S.conversationListCollapsed = false", close_helpers)
+        self.assertIn("closeActiveConversationForRemoval()", close_helpers)
+        self.assertIn("refreshMessageConversationRegion({ refreshList: false })", close_helpers)
+        self.assertLess(
+            close_helpers.index("S.conversationListCollapsed = false"),
+            close_helpers.index("refreshMessageConversationRegion({ refreshList: false })"),
+        )
+        self.assertIn("function messageConversationUsesSinglePane()", close_helpers)
+        self.assertIn(
+            '"(max-width: 640px), (max-height: 560px) and (max-width: 960px) and (any-pointer: coarse)"',
+            close_helpers,
+        )
+        self.assertIn('window.getComputedStyle(listPane).display === "none"', close_helpers)
+        self.assertIn('window.getComputedStyle(chatPane).display !== "none"', close_helpers)
+        self.assertIn("function hasOpenDialogSurface()", close_helpers)
+        self.assertIn('dialog[open], dialog.is-open, [role="dialog"].is-open', close_helpers)
+        self.assertIn("closeActiveMessageConversation()", close_action)
+        self.assertIn("hadOpenMessageActions", escape_handler)
+        self.assertIn("hasOpenDialogSurface()", escape_handler)
+        self.assertIn('$("sidebar").classList.contains("open")', escape_handler)
+        self.assertIn("S.imComposerPanel", escape_handler)
+        self.assertIn("closeChatComposerPanelForKeyboard()", escape_handler)
+        self.assertIn("messageConversationUsesSinglePane()", escape_handler)
+        self.assertIn("closeActiveMessageConversation()", escape_handler)
+        self.assertLess(
+            escape_handler.index("hasOpenDialogSurface()"),
+            escape_handler.index("hadOpenMessageActions"),
+        )
+        self.assertLess(
+            escape_handler.index("hadOpenMessageActions"),
+            escape_handler.index("S.imComposerPanel"),
+        )
+        self.assertLess(
+            escape_handler.index("S.imComposerPanel"),
+            escape_handler.index("messageConversationUsesSinglePane()"),
+        )
+        self.assertLess(
+            escape_handler.index("closeChatComposerPanelForKeyboard()"),
+            escape_handler.index("closeActiveMessageConversation()"),
+        )
+
+    def test_conversation_close_tolerates_scrubbed_media_viewer(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+
+        scrub_dom = self._app_fragment(
+            app_js,
+            "function scrubAuthenticatedDom()",
+            "function deleteOriginDatabase(name)",
+        )
+        close_viewer = self._app_fragment(
+            app_js,
+            "function closeChatMediaViewer()",
+            "function confirmFlashPhoto(file)",
+        )
+
+        self.assertIn('if (id === "chat-media-viewer") {', scrub_dom)
+        self.assertIn("dialog.remove()", scrub_dom)
+        self.assertLess(
+            scrub_dom.index('if (id === "chat-media-viewer") {'),
+            scrub_dom.index("dialog.replaceChildren()"),
+        )
+        self.assertIn('const body = dialog.querySelector("[data-viewer-body]")', close_viewer)
+        self.assertIn("if (body) body.replaceChildren()", close_viewer)
+        self.assertNotIn('dialog.querySelector("[data-viewer-body]").innerHTML', close_viewer)
+
     def test_sdk_conversation_updates_are_authoritative_for_unread_count(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
