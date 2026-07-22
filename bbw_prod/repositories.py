@@ -201,6 +201,61 @@ class AuditLogRepository(Repository[AuditLog]):
 class ConversationRepository(Repository[Conversation]):
     model = Conversation
 
+    @staticmethod
+    def _upsert_statement(values: dict[str, Any] | list[dict[str, Any]]):
+        stmt = insert(Conversation).values(values)
+        excluded = stmt.excluded
+        unread_is_newer = and_(
+            excluded.unread_observed_at.is_not(None),
+            or_(
+                Conversation.unread_observed_at.is_(None),
+                excluded.unread_observed_at >= Conversation.unread_observed_at,
+            ),
+        )
+        last_message_is_newer = or_(
+            Conversation.last_message_at.is_(None),
+            and_(
+                excluded.last_message_at.is_not(None),
+                excluded.last_message_at >= Conversation.last_message_at,
+            ),
+        )
+        metadata_without_preview = (
+            excluded.metadata.op("-")("last_message")
+            .op("-")("preview_timestamp")
+            .op("-")("preview_sequence")
+            .op("-")("preview_authoritative")
+            .op("-")("preview_timestamp_inferred")
+            .op("-")("last_source")
+        )
+        return stmt.on_conflict_do_update(
+            constraint="uq_conversations_owner_source",
+            set_={
+                "peer_upstream_uid": excluded.peer_upstream_uid,
+                "kind": excluded.kind,
+                "title": func.coalesce(excluded.title, Conversation.title),
+                "unread_count": case(
+                    (unread_is_newer, excluded.unread_count),
+                    else_=Conversation.unread_count,
+                ),
+                "unread_observed_at": case(
+                    (unread_is_newer, excluded.unread_observed_at),
+                    else_=Conversation.unread_observed_at,
+                ),
+                "last_message_at": case(
+                    (last_message_is_newer, excluded.last_message_at),
+                    else_=Conversation.last_message_at,
+                ),
+                "metadata": case(
+                    (
+                        last_message_is_newer,
+                        Conversation.extra_data.op("||")(excluded.metadata),
+                    ),
+                    else_=Conversation.extra_data.op("||")(metadata_without_preview),
+                ),
+                "updated_at": func.now(),
+            },
+        ).returning(Conversation)
+
     def get_by_peer(
         self,
         owner_user_id: uuid.UUID,
@@ -302,60 +357,37 @@ class ConversationRepository(Repository[Conversation]):
             )
         )
 
+    def list_by_upstream_ids(
+        self,
+        owner_user_id: uuid.UUID,
+        provider: str,
+        upstream_conversation_ids: list[str],
+    ) -> dict[str, Conversation]:
+        ids = list(
+            dict.fromkeys(
+                str(item or "").strip()
+                for item in upstream_conversation_ids
+                if str(item or "").strip()
+            )
+        )
+        if not ids:
+            return {}
+        rows = self.db.scalars(
+            select(Conversation).where(
+                Conversation.owner_user_id == owner_user_id,
+                Conversation.provider == provider,
+                Conversation.upstream_conversation_id.in_(ids[:500]),
+            )
+        )
+        return {row.upstream_conversation_id: row for row in rows}
+
     def upsert(self, **values: Any) -> Conversation:
-        stmt = insert(Conversation).values(**values)
-        excluded = stmt.excluded
-        unread_is_newer = or_(
-            Conversation.unread_observed_at.is_(None),
-            and_(
-                excluded.unread_observed_at.is_not(None),
-                excluded.unread_observed_at >= Conversation.unread_observed_at,
-            ),
-        )
-        last_message_is_newer = or_(
-            Conversation.last_message_at.is_(None),
-            and_(
-                excluded.last_message_at.is_not(None),
-                excluded.last_message_at >= Conversation.last_message_at,
-            ),
-        )
-        metadata_without_preview = (
-            excluded.metadata.op("-")("last_message")
-            .op("-")("preview_timestamp")
-            .op("-")("preview_sequence")
-            .op("-")("preview_authoritative")
-            .op("-")("preview_timestamp_inferred")
-            .op("-")("last_source")
-        )
-        stmt = stmt.on_conflict_do_update(
-            constraint="uq_conversations_owner_source",
-            set_={
-                "peer_upstream_uid": excluded.peer_upstream_uid,
-                "kind": excluded.kind,
-                "title": excluded.title,
-                "unread_count": case(
-                    (unread_is_newer, excluded.unread_count),
-                    else_=Conversation.unread_count,
-                ),
-                "unread_observed_at": case(
-                    (unread_is_newer, excluded.unread_observed_at),
-                    else_=Conversation.unread_observed_at,
-                ),
-                "last_message_at": case(
-                    (last_message_is_newer, excluded.last_message_at),
-                    else_=Conversation.last_message_at,
-                ),
-                "metadata": case(
-                    (
-                        last_message_is_newer,
-                        Conversation.extra_data.op("||")(excluded.metadata),
-                    ),
-                    else_=Conversation.extra_data.op("||")(metadata_without_preview),
-                ),
-                "updated_at": func.now(),
-            },
-        ).returning(Conversation)
-        return self.db.scalars(stmt).one()
+        return self.db.scalars(self._upsert_statement(values)).one()
+
+    def upsert_many(self, values: list[dict[str, Any]]) -> list[Conversation]:
+        if not values:
+            return []
+        return list(self.db.scalars(self._upsert_statement(values)))
 
     def mark_peers_read(
         self,

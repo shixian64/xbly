@@ -330,6 +330,13 @@ class Message(UUIDPrimaryKeyMixin, TimestampMixin, SerializableMixin, Base):
         ),
         Index("ix_messages_owner_occurred", "owner_user_id", "occurred_at"),
         Index("ix_messages_conversation_occurred", "conversation_id", "occurred_at"),
+        Index(
+            "ix_messages_owner_conversation_sequence",
+            "owner_user_id",
+            "conversation_id",
+            "provider",
+            text("(metadata ->> 'message_sequence')"),
+        ),
         Index("ix_messages_retention", "retention_expires_at"),
     )
 

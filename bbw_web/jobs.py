@@ -74,6 +74,16 @@ DEFAULT_MEDIA_HOSTS = (
     "*.myqcloud.com",
     "*.qcloud.com",
 )
+CONVERSATION_PREVIEW_METADATA_KEYS = frozenset(
+    {
+        "last_message",
+        "preview_timestamp",
+        "preview_sequence",
+        "preview_authoritative",
+        "preview_timestamp_inferred",
+        "last_source",
+    }
+)
 MAX_METADATA_STRING = 20_000
 MAX_METADATA_ITEMS = 100
 _TIM_SDK_MESSAGE_ID = re.compile(r"^\d{12,}-(\d{9,13})-(\d{1,20})$")
@@ -299,6 +309,146 @@ def _merge_dict(current: Any, update: Mapping[str, Any]) -> dict[str, Any]:
     return base
 
 
+def _conversation_candidate(
+    *,
+    owner_user_id: uuid.UUID,
+    peer_uid: str,
+    reported_id: Any = "",
+    title: Any = "",
+    unread_count: int | None = None,
+    unread_observed_at: datetime | None = None,
+    last_message_at: datetime | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "owner_user_id": owner_user_id,
+        "provider": CHAT_PROVIDER,
+        "upstream_conversation_id": _canonical_conversation_id(peer_uid, reported_id),
+        "peer_upstream_uid": _bounded(peer_uid, 128) or None,
+        "kind": "direct",
+        "title": _bounded(title, 200) or None,
+        "unread_count": max(0, int(unread_count)) if unread_count is not None else 0,
+        "unread_observed_at": _as_utc(unread_observed_at) if unread_observed_at else None,
+        "last_message_at": _as_utc(last_message_at) if last_message_at else None,
+        "extra_data": _merge_dict({}, metadata or {}),
+    }
+
+
+def _merge_conversation_candidates(
+    current: Mapping[str, Any], incoming: Mapping[str, Any]
+) -> dict[str, Any]:
+    merged = dict(current)
+    merged["peer_upstream_uid"] = incoming.get("peer_upstream_uid") or current.get(
+        "peer_upstream_uid"
+    )
+    merged["kind"] = incoming.get("kind") or current.get("kind") or "direct"
+    merged["title"] = incoming.get("title") or current.get("title")
+
+    current_unread_at = current.get("unread_observed_at")
+    incoming_unread_at = incoming.get("unread_observed_at")
+    if incoming_unread_at is not None and (
+        current_unread_at is None or incoming_unread_at >= current_unread_at
+    ):
+        merged["unread_count"] = incoming.get("unread_count", 0)
+        merged["unread_observed_at"] = incoming_unread_at
+
+    current_last = current.get("last_message_at")
+    incoming_last = incoming.get("last_message_at")
+    last_message_is_newer = current_last is None or (
+        incoming_last is not None and incoming_last >= current_last
+    )
+    metadata = dict(incoming.get("extra_data") or {})
+    if not last_message_is_newer:
+        metadata = {
+            key: value
+            for key, value in metadata.items()
+            if key not in CONVERSATION_PREVIEW_METADATA_KEYS
+        }
+    merged["last_message_at"] = incoming_last if last_message_is_newer else current_last
+    merged["extra_data"] = _merge_dict(current.get("extra_data"), metadata)
+    return merged
+
+
+def _conversation_candidate_changes(
+    existing: Conversation | None, candidate: Mapping[str, Any]
+) -> bool:
+    if existing is None:
+        return True
+    if existing.peer_upstream_uid != candidate.get("peer_upstream_uid"):
+        return True
+    if existing.kind != candidate.get("kind"):
+        return True
+    incoming_title = candidate.get("title")
+    if incoming_title is not None and existing.title != incoming_title:
+        return True
+
+    incoming_unread_at = candidate.get("unread_observed_at")
+    existing_unread_at = (
+        _as_utc(existing.unread_observed_at) if existing.unread_observed_at else None
+    )
+    if incoming_unread_at is not None and (
+        existing_unread_at is None or incoming_unread_at >= existing_unread_at
+    ):
+        if int(existing.unread_count or 0) != int(candidate.get("unread_count") or 0):
+            return True
+        if existing_unread_at != incoming_unread_at:
+            return True
+
+    existing_last = _as_utc(existing.last_message_at) if existing.last_message_at else None
+    incoming_last = candidate.get("last_message_at")
+    last_message_is_newer = existing_last is None or (
+        incoming_last is not None and incoming_last >= existing_last
+    )
+    if last_message_is_newer and existing_last != incoming_last:
+        return True
+    metadata = dict(candidate.get("extra_data") or {})
+    if not last_message_is_newer:
+        metadata = {
+            key: value
+            for key, value in metadata.items()
+            if key not in CONVERSATION_PREVIEW_METADATA_KEYS
+        }
+    return _merge_dict(existing.extra_data, metadata) != dict(existing.extra_data or {})
+
+
+def _upsert_conversations(
+    db: Any,
+    *,
+    owner_user_id: uuid.UUID,
+    candidates: Iterable[Mapping[str, Any]],
+) -> dict[str, Conversation]:
+    deduplicated: dict[str, dict[str, Any]] = {}
+    for raw_candidate in candidates:
+        candidate = dict(raw_candidate)
+        upstream_id = str(candidate.get("upstream_conversation_id") or "").strip()
+        if not upstream_id:
+            continue
+        previous = deduplicated.get(upstream_id)
+        deduplicated[upstream_id] = (
+            _merge_conversation_candidates(previous, candidate) if previous else candidate
+        )
+    if not deduplicated:
+        return {}
+
+    repository = ConversationRepository(db)
+    resolved: dict[str, Conversation] = {}
+    # Keep lock acquisition order stable when live ingestion and reconciliation
+    # touch the same owner's conversations concurrently.
+    upstream_ids = sorted(deduplicated)
+    for start in range(0, len(upstream_ids), 250):
+        chunk_ids = upstream_ids[start : start + 250]
+        existing = repository.list_by_upstream_ids(owner_user_id, CHAT_PROVIDER, chunk_ids)
+        changed = [
+            deduplicated[upstream_id]
+            for upstream_id in chunk_ids
+            if _conversation_candidate_changes(existing.get(upstream_id), deduplicated[upstream_id])
+        ]
+        written = repository.upsert_many(changed)
+        resolved.update(existing)
+        resolved.update({row.upstream_conversation_id: row for row in written})
+    return resolved
+
+
 def _upsert_conversation(
     db: Any,
     *,
@@ -311,39 +461,18 @@ def _upsert_conversation(
     last_message_at: datetime | None = None,
     metadata: Mapping[str, Any] | None = None,
 ):
-    repo = ConversationRepository(db)
-    upstream_id = _canonical_conversation_id(peer_uid, reported_id)
-    existing = repo.get_by_upstream(owner_user_id, CHAT_PROVIDER, upstream_id)
-    previous_last = _as_utc(existing.last_message_at) if existing and existing.last_message_at else None
-    incoming_last = _as_utc(last_message_at) if last_message_at else None
-    if previous_last and incoming_last:
-        effective_last = max(previous_last, incoming_last)
-    else:
-        effective_last = previous_last or incoming_last
-    effective_title = _bounded(title, 200) or (existing.title if existing else None)
-    effective_unread = (
-        max(0, int(unread_count))
-        if unread_count is not None
-        else int(existing.unread_count if existing else 0)
-    )
-    effective_unread_observed_at = (
-        _as_utc(unread_observed_at)
-        if unread_observed_at is not None
-        else existing.unread_observed_at if existing else None
-    )
-    extra = _merge_dict(existing.extra_data if existing else {}, metadata or {})
-    return repo.upsert(
+    candidate = _conversation_candidate(
         owner_user_id=owner_user_id,
-        provider=CHAT_PROVIDER,
-        upstream_conversation_id=upstream_id,
-        peer_upstream_uid=_bounded(peer_uid, 128) or None,
-        kind="direct",
-        title=effective_title,
-        unread_count=effective_unread,
-        unread_observed_at=effective_unread_observed_at,
-        last_message_at=effective_last,
-        extra_data=extra,
+        peer_uid=peer_uid,
+        reported_id=reported_id,
+        title=title,
+        unread_count=unread_count,
+        unread_observed_at=unread_observed_at,
+        last_message_at=last_message_at,
+        metadata=metadata,
     )
+    rows = _upsert_conversations(db, owner_user_id=owner_user_id, candidates=[candidate])
+    return rows[candidate["upstream_conversation_id"]]
 
 
 def _media_spec_from_report(report: Mapping[str, Any], message_type: str) -> dict[str, Any] | None:
@@ -595,6 +724,8 @@ def _ingest_message(
     user: User,
     account: ExternalAccount,
     report: Mapping[str, Any],
+    conversation: Conversation | None = None,
+    occurred_at: datetime | None = None,
 ) -> tuple[Message, bool, uuid.UUID | None]:
     peer_uid = _bounded(report.get("peer_uid"), 128)
     if not peer_uid:
@@ -602,19 +733,21 @@ def _ingest_message(
     direction = _bounded(report.get("direction"), 16).lower()
     if direction not in {"incoming", "outgoing", "unknown"}:
         direction = "unknown"
-    occurred_at = _parse_time(report.get("sent_at") or report.get("observed_at"))
+    if occurred_at is None:
+        occurred_at = _parse_time(report.get("sent_at") or report.get("observed_at"))
     message_type = _normal_message_type(report.get("message_type") or report.get("type"))
-    conversation = _upsert_conversation(
-        db,
-        owner_user_id=user.id,
-        peer_uid=peer_uid,
-        reported_id=report.get("conversation_id"),
-        last_message_at=occurred_at,
-        metadata={
-            "reported_conversation_id": _bounded(report.get("conversation_id"), 256),
-            "last_source": _bounded(report.get("source"), 64) or "browser",
-        },
-    )
+    if conversation is None:
+        conversation = _upsert_conversation(
+            db,
+            owner_user_id=user.id,
+            peer_uid=peer_uid,
+            reported_id=report.get("conversation_id"),
+            last_message_at=occurred_at,
+            metadata={
+                "reported_conversation_id": _bounded(report.get("conversation_id"), 256),
+                "last_source": _bounded(report.get("source"), 64) or "browser",
+            },
+        )
     upstream_uid = _bounded(account.upstream_uid, 128)
     if direction == "outgoing":
         sender_uid, recipient_uid = upstream_uid or None, peer_uid
@@ -1013,6 +1146,7 @@ def ingest_history_response(
         user, account = _load_owner_binding(db, owner_id, account_id)
         if route == "/api/im/conversations":
             items = _envelope_items(response_data, normalize_conversations)
+            conversation_candidates: list[dict[str, Any]] = []
             for item in items[:500]:
                 peer = _bounded(item.get("peer_id") or item.get("conversation_user"), 128)
                 if not peer:
@@ -1040,31 +1174,37 @@ def ingest_history_response(
                         preview_authoritative=item.get("preview_authoritative") is True,
                         preview_timestamp_inferred=item.get("preview_timestamp_inferred") is True,
                     )
-                _upsert_conversation(
-                    db,
-                    owner_user_id=owner_id,
-                    peer_uid=peer,
-                    reported_id=item.get("id"),
-                    title=item.get("nickname"),
-                    unread_count=(
-                        _as_int(item.get("unread_count"), 0)
-                        if unread_authoritative
-                        else None
-                    ),
-                    unread_observed_at=(
-                        _optional_time(
-                            item.get("unread_observed_at")
-                            or item.get("summary_observed_at")
-                            or item.get("observed_at")
-                        )
-                        or utcnow()
-                        if unread_authoritative
-                        else None
-                    ),
-                    last_message_at=_optional_time(item.get("timestamp")),
-                    metadata=conversation_metadata,
+                conversation_candidates.append(
+                    _conversation_candidate(
+                        owner_user_id=owner_id,
+                        peer_uid=peer,
+                        reported_id=item.get("id"),
+                        title=item.get("nickname"),
+                        unread_count=(
+                            _as_int(item.get("unread_count"), 0)
+                            if unread_authoritative
+                            else None
+                        ),
+                        unread_observed_at=(
+                            _optional_time(
+                                item.get("unread_observed_at")
+                                or item.get("summary_observed_at")
+                                or item.get("observed_at")
+                            )
+                            or utcnow()
+                            if unread_authoritative
+                            else None
+                        ),
+                        last_message_at=_optional_time(item.get("timestamp")),
+                        metadata=conversation_metadata,
+                    )
                 )
                 conversations += 1
+            _upsert_conversations(
+                db,
+                owner_user_id=owner_id,
+                candidates=conversation_candidates,
+            )
         elif route == "/api/im/messages":
             requested_peer = ""
             if isinstance(query, Mapping):
@@ -1072,6 +1212,8 @@ def ingest_history_response(
                     query.get("peer") or query.get("uid") or query.get("yourid"), 128
                 )
             items = _envelope_items(response_data, normalize_messages)
+            reports: list[tuple[dict[str, Any], datetime]] = []
+            conversation_candidates = []
             for item in items[:5000]:
                 report = _history_message_report(
                     item,
@@ -1080,8 +1222,44 @@ def ingest_history_response(
                 )
                 if report is None:
                     continue
+                occurred_at = _parse_time(
+                    report.get("sent_at") or report.get("observed_at")
+                )
+                reports.append((report, occurred_at))
+                peer_uid = _bounded(report.get("peer_uid"), 128)
+                conversation_candidates.append(
+                    _conversation_candidate(
+                        owner_user_id=owner_id,
+                        peer_uid=peer_uid,
+                        reported_id=report.get("conversation_id"),
+                        last_message_at=occurred_at,
+                        metadata={
+                            "reported_conversation_id": _bounded(
+                                report.get("conversation_id"), 256
+                            ),
+                            "last_source": _bounded(report.get("source"), 64) or "browser",
+                        },
+                    )
+                )
+            conversation_rows = _upsert_conversations(
+                db,
+                owner_user_id=owner_id,
+                candidates=conversation_candidates,
+            )
+            for report, occurred_at in reports:
+                peer_uid = _bounded(report.get("peer_uid"), 128)
+                upstream_id = _canonical_conversation_id(peer_uid, report.get("conversation_id"))
+                conversation = conversation_rows.get(upstream_id)
+                if conversation is None:
+                    raise RuntimeError("conversation batch did not return the requested row")
                 _message, was_created, outbox_id = _ingest_message(
-                    db, settings=settings, user=user, account=account, report=report
+                    db,
+                    settings=settings,
+                    user=user,
+                    account=account,
+                    report=report,
+                    conversation=conversation,
+                    occurred_at=occurred_at,
                 )
                 if was_created:
                     created += 1
