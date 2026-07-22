@@ -3675,6 +3675,7 @@ summary:focus-visible {
 .chat-image-button img {
   display: block;
   width: auto;
+  height: auto;
   min-width: 110px;
   max-width: min(320px, 58vw);
   max-height: 360px;

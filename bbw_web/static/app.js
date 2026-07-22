@@ -6608,6 +6608,12 @@ function chatVoiceTranscriptHtml(entry) {
   return `<div class="chat-voice-transcript"><span>${esc(text)}</span></div>`;
 }
 
+function chatImageDimensionAttributes(media) {
+  const width = Math.min(100000, Math.max(0, Math.round(Number(media?.width || 0))));
+  const height = Math.min(100000, Math.max(0, Math.round(Number(media?.height || 0))));
+  return width && height ? ` width="${width}" height="${height}"` : "";
+}
+
 function chatMessageBodyHtml(entry) {
   if (entry.revoked) {
     if (canEditRevokedMessage(entry)) {
@@ -6626,7 +6632,9 @@ function chatMessageBodyHtml(entry) {
     if (!url) return `<span class="chat-message-text">图片暂不可用</span>`;
     return `<button type="button" class="chat-image-button" data-action="open-chat-media" data-media-kind="image" data-url="${esc(
       url
-    )}" aria-label="查看原图"><img src="${esc(thumbnail)}" alt="聊天图片" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-media data-media-source="${esc(
+    )}" aria-label="查看原图"><img src="${esc(thumbnail)}"${chatImageDimensionAttributes(
+      media
+    )} alt="聊天图片" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-media data-media-source="${esc(
       thumbnail
     )}" /><span class="chat-media-fallback" data-media-fallback hidden>图片加载失败，点击重试</span></button>`;
   }
@@ -6831,6 +6839,83 @@ function chatLogHtml() {
     .join("")}`;
 }
 
+function chatMediaNodeIdentity(image) {
+  if (!image) return "";
+  const row = image.closest?.(".chat-message-row");
+  const messageIdentity =
+    row?.dataset.messageRandom || row?.dataset.messageSequence || row?.dataset.messageId || "";
+  const source = String(image.dataset.mediaSource || "").trim();
+  return messageIdentity && source ? `${messageIdentity}\u001f${source}` : "";
+}
+
+function captureReusableChatMedia(root) {
+  if (!root) return [];
+  return [...root.querySelectorAll("img[data-media-source]")].map((image) => {
+    const fallback = image.parentElement?.querySelector("[data-media-fallback]");
+    return {
+      image,
+      identity: chatMediaNodeIdentity(image),
+      source: String(image.dataset.mediaSource || "").trim(),
+      fallbackHidden: fallback ? fallback.hidden : true,
+      fallbackText: String(fallback?.textContent || ""),
+    };
+  });
+}
+
+function restoreReusableChatMedia(root, captured) {
+  if (!root || !captured?.length) return;
+  const used = new Set();
+  const byIdentity = new Map();
+  const bySource = new Map();
+  captured.forEach((item) => {
+    const sourceKey = `${item.source}\u001f${item.image.getAttribute("src") || ""}`;
+    if (!bySource.has(sourceKey)) bySource.set(sourceKey, []);
+    bySource.get(sourceKey).push(item);
+    if (item.identity) {
+      const identityKey = `${item.identity}\u001e${sourceKey}`;
+      if (!byIdentity.has(identityKey)) byIdentity.set(identityKey, []);
+      byIdentity.get(identityKey).push(item);
+    }
+  });
+  const takeAvailable = (pool, key) => {
+    const queue = pool.get(key) || [];
+    while (queue.length && used.has(queue[0])) queue.shift();
+    return queue.shift() || null;
+  };
+  root.querySelectorAll("img[data-media-source]").forEach((nextImage) => {
+    const source = String(nextImage.dataset.mediaSource || "").trim();
+    const identity = chatMediaNodeIdentity(nextImage);
+    const sourceKey = `${source}\u001f${nextImage.getAttribute("src") || ""}`;
+    const reusable =
+      (identity ? takeAvailable(byIdentity, `${identity}\u001e${sourceKey}`) : null) ||
+      takeAvailable(bySource, sourceKey);
+    if (!reusable) return;
+    used.add(reusable);
+    const previousImage = reusable.image;
+    for (const attribute of ["width", "height", "style"]) {
+      if (nextImage.hasAttribute(attribute)) previousImage.setAttribute(attribute, nextImage.getAttribute(attribute));
+      else previousImage.removeAttribute(attribute);
+    }
+    previousImage.alt = nextImage.alt;
+    previousImage.className = nextImage.className;
+    previousImage.loading = nextImage.loading;
+    previousImage.decoding = nextImage.decoding;
+    previousImage.referrerPolicy = nextImage.referrerPolicy;
+    const fallback = nextImage.parentElement?.querySelector("[data-media-fallback]");
+    if (fallback) {
+      fallback.hidden = reusable.fallbackHidden;
+      if (reusable.fallbackText) fallback.textContent = reusable.fallbackText;
+    }
+    nextImage.replaceWith(previousImage);
+  });
+}
+
+function renderChatLog(log, html = chatLogHtml(), captured = captureReusableChatMedia(log)) {
+  if (!log) return;
+  log.innerHTML = html;
+  restoreReusableChatMedia(log, captured);
+}
+
 function scrollChatLogToBottom(log = $("im-log")) {
   if (!log) return;
   const scroll = () => {
@@ -6876,7 +6961,7 @@ function addImMessage(text, type = "system", peer = "", meta = {}) {
   const log = $("im-log");
   if (log) {
     const shouldStickToBottom = type === "mine" || chatLogIsNearBottom(log);
-    log.innerHTML = chatLogHtml();
+    renderChatLog(log);
     if (shouldStickToBottom) scrollChatLogToBottom(log);
   }
   return entry;
@@ -6900,7 +6985,7 @@ function refreshChatLog({ forceBottom = false } = {}) {
   const log = $("im-log");
   if (!log) return;
   const shouldStickToBottom = forceBottom || chatLogIsNearBottom(log);
-  log.innerHTML = chatLogHtml();
+  renderChatLog(log);
   if (shouldStickToBottom) scrollChatLogToBottom(log);
 }
 
@@ -7211,7 +7296,7 @@ async function loadOlderConversationMessages(peer, log = $("im-log")) {
       S.imMessageHistoryExhaustedPeers.delete(target);
     }
     if (String(S.activePeer || "") === target && log.isConnected) {
-      log.innerHTML = chatLogHtml();
+      renderChatLog(log);
       const restorePosition = () => {
         if (!log.isConnected || String(S.activePeer || "") !== target) return;
         log.scrollTop = Math.max(0, previousTop + log.scrollHeight - previousHeight);
@@ -8077,6 +8162,7 @@ function refreshMessageConversationRegion({
     ? previousInput.selectionEnd
     : previousSelectionStart;
   const restoreComposerFocus = preserveComposer && document.activeElement === previousInput;
+  const reusableChatMedia = refreshPane ? captureReusableChatMedia(pane.querySelector("#im-log")) : [];
   if (preserveComposer) setChatComposerDraft(previousInput.value);
   page.classList.toggle("conversation-open", Boolean(S.activePeer));
   layout.classList.toggle("has-active", Boolean(S.activePeer));
@@ -8094,6 +8180,7 @@ function refreshMessageConversationRegion({
   }
   if (refreshPane) {
     pane.innerHTML = chatPaneHtml();
+    restoreReusableChatMedia(pane.querySelector("#im-log"), reusableChatMedia);
     const nextInput = $("im-text");
     syncChatComposerInput(nextInput);
     if (nextInput && preserveComposer && previousSelectionStart !== null) {
@@ -8702,7 +8789,7 @@ async function retryFailedChatMessage(id) {
     });
   }
   if (entry.kind === "flash") {
-    return sendFlashPhoto(entry.retryFile, { retryMessageId: entry.id });
+    return sendFlashPhoto(entry.retryFile, { retryMessageId: entry.id, peer: entry.peer });
   }
   if (entry.kind === "face") {
     return sendChatSticker(entry.payload?.index, entry.payload?.data, { retryMessageId: entry.id });
@@ -9041,7 +9128,16 @@ function mergeMediaResult(localMedia, remoteMedia) {
 
 function createLocalMedia(file, kind, meta = {}) {
   const url = meta.localUrl ? trackChatObjectUrl(meta.localUrl) : createChatObjectUrl(file);
-  if (kind === "image") return { url, thumbnail: url, size: file.size, name: file.name };
+  if (kind === "image") {
+    return {
+      url,
+      thumbnail: url,
+      size: file.size,
+      name: file.name,
+      width: Number(meta.width || 0),
+      height: Number(meta.height || 0),
+    };
+  }
   if (kind === "audio") return { url, duration: meta.duration || Number(file.duration || 0) / 1000, size: file.size, name: file.name };
   if (kind === "video") {
     return {
@@ -9194,6 +9290,54 @@ function defineFileMetadata(file, key, value) {
   }
 }
 
+async function readImageMetadata(file) {
+  const url = createChatObjectUrl(file);
+  try {
+    return await new Promise((resolve) => {
+      const image = new Image();
+      let timer = null;
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        image.onload = null;
+        image.onerror = null;
+        image.removeAttribute("src");
+        resolve(value);
+      };
+      image.decoding = "async";
+      image.onload = () =>
+        finish({
+          width: image.naturalWidth || 0,
+          height: image.naturalHeight || 0,
+          localUrl: url,
+        });
+      image.onerror = () =>
+        finish({
+          width: 0,
+          height: 0,
+          localUrl: url,
+          metadataWarning: "当前浏览器无法读取图片尺寸，仍将尝试通过实时消息通道发送",
+        });
+      timer = setTimeout(
+        () =>
+          finish({
+            width: 0,
+            height: 0,
+            localUrl: url,
+            metadataWarning: "读取图片信息超时，仍将尝试通过实时消息通道发送",
+          }),
+        10000
+      );
+      image.src = url;
+    });
+  } catch (error) {
+    revokeChatObjectUrl(url);
+    throw error;
+  }
+}
+
 async function readVideoMetadata(file) {
   const url = createChatObjectUrl(file);
   try {
@@ -9311,9 +9455,9 @@ function validateChatFile(kind, file) {
   }
 }
 
-async function sendFlashPhoto(file, { retryMessageId = "" } = {}) {
+async function sendFlashPhoto(file, { retryMessageId = "", peer: requestedPeer = "" } = {}) {
   validateChatFile("flash", file);
-  const peer = String(S.activePeer || "").trim();
+  const peer = String(requestedPeer || S.activePeer || "").trim();
   if (!peer) throw new Error("请先选择聊天对象");
   if (!(await ensurePrivateChatPermission(peer))) throw new Error("该私信入口仅向管理员授权的用户开放");
   const previous = retryMessageId ? findChatMessage(retryMessageId, peer) : null;
@@ -9383,26 +9527,31 @@ async function sendFlashPhoto(file, { retryMessageId = "" } = {}) {
 async function handleChatUploadInput(input) {
   const kind = String(input.dataset.chatUpload || "file");
   const files = Array.from(input.files || []);
+  const peer = String(S.activePeer || "").trim();
   input.value = "";
   if (!files.length) return;
+  if (!peer) throw new Error("请先选择聊天对象");
   if (kind === "flash") {
     const file = normalizeChatPickerFile("flash", files[0]);
     validateChatFile("flash", file);
     const confirmed = await confirmFlashPhoto(file);
     if (!confirmed) return;
-    await sendFlashPhoto(file);
+    await sendFlashPhoto(file, { peer });
     return;
   }
   for (const selectedFile of files) {
     const file = normalizeChatPickerFile(kind, selectedFile);
     validateChatFile(kind, file);
     let meta = {};
-    if (kind === "video") {
+    if (kind === "image") {
+      meta = await readImageMetadata(file);
+      if (meta.metadataWarning) toast(meta.metadataWarning, "info", 4200);
+    } else if (kind === "video") {
       meta = await readVideoMetadata(file);
       defineFileMetadata(file, "duration", meta.duration);
       if (meta.metadataWarning) toast(meta.metadataWarning, "info", 4200);
     }
-    await sendTimMediaFile(kind, file, meta);
+    await sendTimMediaFile(kind, file, { ...meta, peer });
   }
 }
 

@@ -4962,6 +4962,44 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn(".chat-playback-fallback", app_css)
         self.assertNotIn('matches("img[data-media]")) event.target.hidden = true', app_js)
 
+    def test_chat_images_are_reused_and_keep_stable_dimensions_during_message_refresh(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
+
+        image_body = self._app_fragment(app_js, "function chatMessageBodyHtml(entry)", "function chatMessageContentHtml")
+        media_reuse = self._app_fragment(app_js, "function chatMediaNodeIdentity(image)", "function scrollChatLogToBottom")
+        upload_handler = self._app_fragment(app_js, "async function handleChatUploadInput(input)", "async function sendChatSticker")
+        conversation_refresh = self._app_fragment(
+            app_js,
+            "function refreshMessageConversationRegion({",
+            "function syncChatComposerInput",
+        )
+
+        self.assertIn("function chatImageDimensionAttributes(media)", app_js)
+        self.assertIn("chatImageDimensionAttributes(", image_body)
+        self.assertIn('width="${width}" height="${height}"', app_js)
+        self.assertIn("function captureReusableChatMedia(root)", media_reuse)
+        self.assertIn("function restoreReusableChatMedia(root, captured)", media_reuse)
+        self.assertIn("nextImage.replaceWith(previousImage)", media_reuse)
+        self.assertIn("function renderChatLog(log", media_reuse)
+        self.assertNotIn("log.innerHTML = chatLogHtml()", app_js)
+        self.assertIn('captureReusableChatMedia(pane.querySelector("#im-log"))', conversation_refresh)
+        self.assertIn('restoreReusableChatMedia(pane.querySelector("#im-log"), reusableChatMedia)', conversation_refresh)
+        self.assertIn("async function readImageMetadata(file)", app_js)
+        self.assertIn('if (kind === "image")', upload_handler)
+        self.assertIn("meta = await readImageMetadata(file)", upload_handler)
+        self.assertIn('const peer = String(S.activePeer || "").trim()', upload_handler)
+        self.assertLess(
+            upload_handler.index('const peer = String(S.activePeer || "").trim()'),
+            upload_handler.index("meta = await readImageMetadata(file)"),
+        )
+        self.assertIn("await sendTimMediaFile(kind, file, { ...meta, peer })", upload_handler)
+        self.assertIn("await sendFlashPhoto(file, { peer })", upload_handler)
+        self.assertIn('peer: requestedPeer = ""', app_js)
+        self.assertIn("retryMessageId: entry.id, peer: entry.peer", app_js)
+        self.assertIn("height: auto", app_css.split(".chat-image-button img {", 1)[1].split("}", 1)[0])
+
     def test_media_picker_and_runtime_whitelists_match_tim_2276(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
