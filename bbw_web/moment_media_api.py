@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
@@ -15,9 +16,11 @@ from rq.registry import DeferredJobRegistry, ScheduledJobRegistry, StartedJobReg
 from bbw_web import bff_server as legacy
 from bbw_web.moment_video import (
     COMPAT_PROFILE,
+    TRANSCODE_QUEUE,
     MomentVideoError,
     asset_id_for_url,
     canonical_source_identity,
+    compatibility_profiles_for_cleanup,
     job_id_for_asset,
     object_key_for_asset,
     remember_cached_asset,
@@ -26,6 +29,7 @@ from bbw_web.moment_video import (
 
 
 router = APIRouter(prefix="/api/media/compat-video", tags=["media"])
+LOGGER = logging.getLogger(__name__)
 PENDING_JOB_STATES = {"queued", "started", "deferred", "scheduled"}
 DEFAULT_ORIGIN_PORTS = {"http": 80, "https": 443}
 
@@ -111,11 +115,19 @@ def _require_same_origin(request: Request) -> None:
 
 
 def _queue(request: Request) -> Queue:
-    return Queue("transcode", connection=_persistence(request).redis)
+    return Queue(TRANSCODE_QUEUE, connection=_persistence(request).redis)
+
+
+def _job_for_asset(queue: Queue, asset_id: str) -> tuple[Any | None, str]:
+    for profile in compatibility_profiles_for_cleanup():
+        job = queue.fetch_job(job_id_for_asset(asset_id, profile=profile))
+        if job is not None:
+            return job, profile
+    return None, COMPAT_PROFILE
 
 
 def _job_status(queue: Queue, asset_id: str) -> str:
-    job = queue.fetch_job(job_id_for_asset(asset_id))
+    job, _profile = _job_for_asset(queue, asset_id)
     if job is None:
         return "missing"
     raw = job.get_status(refresh=True)
@@ -152,12 +164,40 @@ def _queue_depth(queue: Queue) -> int:
     )
 
 
-def _public_payload(asset_id: str, status: str, *, size_bytes: int = 0) -> dict[str, Any]:
+PUBLIC_FAILURE_MESSAGES = {
+    "SOURCE_TOO_LARGE": "原视频超过兼容处理大小限制",
+    "SOURCE_EMPTY": "原视频内容为空",
+    "SOURCE_INVALID": "原文件不是可处理的视频",
+    "SOURCE_UNAVAILABLE": "原视频已经不可访问",
+    "SOURCE_DOWNLOAD_FAILED": "原视频下载失败，请稍后重试",
+    "PROBE_FAILED": "无法识别原视频编码信息",
+    "DURATION_EXCEEDED": "原视频时长超过兼容处理限制",
+    "DIMENSION_EXCEEDED": "原视频尺寸超过兼容处理限制",
+    "FPS_EXCEEDED": "原视频帧率超过兼容处理限制",
+    "PROCESSOR_UNAVAILABLE": "视频兼容处理服务暂时不可用",
+    "TRANSCODE_TIMEOUT": "视频兼容处理超时，请稍后重试",
+    "TRANSCODE_FAILED": "视频转换失败",
+    "OUTPUT_TOO_LARGE": "兼容版本超过大小限制",
+    "OUTPUT_INVALID": "兼容版本校验失败",
+    "R2_UPLOAD_FAILED": "兼容视频存储暂时不可用",
+    "R2_OBJECT_CHECK_FAILED": "兼容视频存储暂时不可用",
+}
+
+
+def _public_payload(
+    asset_id: str,
+    status: str,
+    *,
+    size_bytes: int = 0,
+    error_code: str = "VIDEO_COMPAT_FAILED",
+    retryable: bool = True,
+    profile: str = COMPAT_PROFILE,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "ok": status != "failed",
         "asset_id": asset_id,
         "status": status,
-        "profile": COMPAT_PROFILE,
+        "profile": profile,
         "status_url": f"/api/media/compat-video/{asset_id}/status",
     }
     if status == "ready":
@@ -167,26 +207,58 @@ def _public_payload(asset_id: str, status: str, *, size_bytes: int = 0) -> dict[
     elif status == "processing":
         payload["retry_after"] = 3
     else:
-        payload["code"] = "VIDEO_COMPAT_FAILED"
-        payload["message"] = "该视频暂时无法转换为兼容格式"
-        payload["retryable"] = True
+        code = str(error_code or "VIDEO_COMPAT_FAILED")[:64]
+        payload["code"] = code
+        payload["message"] = PUBLIC_FAILURE_MESSAGES.get(
+            code,
+            "该视频暂时无法转换为兼容格式",
+        )
+        payload["retryable"] = bool(retryable)
     return payload
 
 
-def _ready_metadata(request: Request, asset_id: str) -> Mapping[str, Any] | None:
+def _job_failure_details(queue: Queue, asset_id: str) -> tuple[str, bool]:
+    job, _profile = _job_for_asset(queue, asset_id)
+    if job is None:
+        return "VIDEO_COMPAT_FAILED", True
+    try:
+        result = job.return_value(refresh=True)
+    except Exception:
+        result = None
+    if isinstance(result, Mapping) and result.get("ok") is False:
+        return (
+            str(result.get("error_code") or "VIDEO_COMPAT_FAILED")[:64],
+            bool(result.get("retryable", False)),
+        )
+    meta = dict(getattr(job, "meta", {}) or {})
+    return (
+        str(meta.get("error_code") or "VIDEO_COMPAT_FAILED")[:64],
+        bool(meta.get("retryable", True)),
+    )
+
+
+def _ready_metadata(
+    request: Request,
+    asset_id: str,
+) -> tuple[Mapping[str, Any], str] | None:
     try:
         persistence = _persistence(request)
-        metadata = persistence.get_r2_storage().head_object(
-            object_key_for_asset(asset_id)
-        )
-        if metadata is not None:
+        storage = persistence.get_r2_storage()
+        for profile in compatibility_profiles_for_cleanup():
+            metadata = storage.head_object(
+                object_key_for_asset(asset_id, profile=profile)
+            )
+            if metadata is None:
+                continue
             remember_cached_asset(
                 persistence.redis,
                 persistence.settings,
                 asset_id,
                 int(metadata.get("size") or 0),
+                profile=profile,
             )
-        return metadata
+            return metadata, profile
+        return None
     except Exception as exc:
         raise HTTPException(status_code=503, detail="兼容视频存储暂时不可用") from exc
 
@@ -198,22 +270,42 @@ def prepare_moment_video(body: PrepareMomentVideo, request: Request) -> dict[str
     identity = _identity(request)
     persistence = _persistence(request)
     if not persistence.rate_limit(
-        f"moment-video-prepare:{identity.user_id}", limit=6, window_seconds=60
+        f"moment-video-prepare-total:{identity.user_id}",
+        limit=120,
+        window_seconds=60,
     ):
-        raise HTTPException(status_code=429, detail="兼容视频处理请求过于频繁")
+        raise HTTPException(status_code=429, detail="兼容视频请求过于频繁")
     try:
         source_url = canonical_source_identity(body.source_url)
         asset_id = asset_id_for_url(source_url)
     except MomentVideoError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        LOGGER.warning(
+            "moment video source rejected user_id=%s code=%s",
+            identity.user_id,
+            exc.code,
+        )
+        raise HTTPException(status_code=400, detail="视频地址不在允许的动态媒体范围内") from exc
     if not persistence.authorize_moment_video(
-        identity, post_id=body.post_id, asset_id=asset_id
+        identity,
+        post_id=body.post_id,
+        asset_id=asset_id,
+        source_url=source_url,
     ):
         raise HTTPException(status_code=403, detail="该动态视频当前不可访问")
+    if not persistence.rate_limit(
+        f"moment-video-resolve:{identity.user_id}", limit=60, window_seconds=60
+    ):
+        raise HTTPException(status_code=429, detail="兼容视频查询请求过于频繁")
 
-    metadata = _ready_metadata(request, asset_id)
-    if metadata is not None:
-        return _public_payload(asset_id, "ready", size_bytes=int(metadata.get("size") or 0))
+    ready = _ready_metadata(request, asset_id)
+    if ready is not None:
+        metadata, profile = ready
+        return _public_payload(
+            asset_id,
+            "ready",
+            size_bytes=int(metadata.get("size") or 0),
+            profile=profile,
+        )
 
     queue = _queue(request)
     state = _job_status(queue, asset_id)
@@ -221,31 +313,49 @@ def prepare_moment_video(body: PrepareMomentVideo, request: Request) -> dict[str
         # The deterministic RQ job can outlive an R2 object removed by cache
         # retention. Remove the stale successful job so this ordinary prepare
         # request recreates the derivative without requiring a manual retry.
-        finished_job = queue.fetch_job(job_id_for_asset(asset_id))
+        finished_job, _finished_profile = _job_for_asset(queue, asset_id)
         if finished_job is not None:
             try:
                 finished_job.delete()
             except Exception as exc:
                 raise HTTPException(status_code=503, detail="兼容视频暂时无法重新生成") from exc
         state = "missing"
+    manual_retry = False
     if state == "failed":
-        if not body.retry:
-            return _public_payload(asset_id, "failed")
-        if not persistence.rate_limit(
+        error_code, retryable = _job_failure_details(queue, asset_id)
+        rolling_deploy_mismatch = error_code == "SOURCE_IDENTITY_MISMATCH"
+        if rolling_deploy_mismatch:
+            LOGGER.info(
+                "retrying moment video after rolling deploy asset_id=%s",
+                asset_id,
+            )
+        if not body.retry and not rolling_deploy_mismatch:
+            return _public_payload(
+                asset_id,
+                "failed",
+                error_code=error_code,
+                retryable=retryable,
+            )
+        if not rolling_deploy_mismatch and not persistence.rate_limit(
             f"moment-video-retry:{identity.user_id}", limit=2, window_seconds=600
         ):
             raise HTTPException(status_code=429, detail="兼容视频重试过于频繁")
-        failed_job = queue.fetch_job(job_id_for_asset(asset_id))
+        failed_job, _failed_profile = _job_for_asset(queue, asset_id)
         if failed_job is not None:
             try:
                 failed_job.delete()
             except Exception as exc:
                 raise HTTPException(status_code=503, detail="兼容视频暂时无法重试") from exc
         state = "missing"
+        manual_retry = True
     if state == "processing":
         return _public_payload(asset_id, "processing")
     if _queue_depth(queue) >= 50:
         raise HTTPException(status_code=503, detail="兼容视频处理队列繁忙，请稍后重试")
+    if not manual_retry and not persistence.rate_limit(
+        f"moment-video-create:{identity.user_id}", limit=6, window_seconds=60
+    ):
+        raise HTTPException(status_code=429, detail="兼容视频新建任务过于频繁")
 
     try:
         queue.enqueue(
@@ -289,16 +399,30 @@ def moment_video_status(asset_id: str, request: Request) -> dict[str, Any]:
         window_seconds=60,
     ):
         raise HTTPException(status_code=429, detail="兼容视频状态查询过于频繁")
-    state = _job_status(_queue(request), asset_id)
+    queue = _queue(request)
+    state = _job_status(queue, asset_id)
     # Avoid one R2 HEAD on every client poll while a long transcode is known to
     # be active. Once the job leaves a pending state, probe the deterministic
     # object so finished jobs and historical cache entries converge to ready.
     if state == "processing":
-        return _public_payload(asset_id, "processing")
-    metadata = _ready_metadata(request, asset_id)
-    if metadata is not None:
-        return _public_payload(asset_id, "ready", size_bytes=int(metadata.get("size") or 0))
-    return _public_payload(asset_id, "failed")
+        _job, profile = _job_for_asset(queue, asset_id)
+        return _public_payload(asset_id, "processing", profile=profile)
+    ready = _ready_metadata(request, asset_id)
+    if ready is not None:
+        metadata, profile = ready
+        return _public_payload(
+            asset_id,
+            "ready",
+            size_bytes=int(metadata.get("size") or 0),
+            profile=profile,
+        )
+    error_code, retryable = _job_failure_details(queue, asset_id)
+    return _public_payload(
+        asset_id,
+        "failed",
+        error_code=error_code,
+        retryable=retryable,
+    )
 
 
 @router.api_route("/{asset_id}/play", methods=["GET", "HEAD"])
@@ -316,9 +440,10 @@ def play_compatible_moment_video(asset_id: str, request: Request) -> Response:
         raise HTTPException(status_code=404, detail="兼容视频不存在") from exc
     if not persistence.can_access_moment_video(identity, asset_id):
         raise HTTPException(status_code=403, detail="该动态视频当前不可访问")
-    metadata = _ready_metadata(request, asset_id)
-    if metadata is None:
+    ready = _ready_metadata(request, asset_id)
+    if ready is None:
         raise HTTPException(status_code=404, detail="兼容视频尚未就绪")
+    metadata, profile = ready
     if request.method == "HEAD":
         # A 307 preserves HEAD, while the R2 URL below is signed specifically
         # for GET. Answer metadata locally instead of redirecting HEAD with an
@@ -339,7 +464,7 @@ def play_compatible_moment_video(asset_id: str, request: Request) -> Response:
         # URL valid long enough for later Range/seek requests during playback.
         ttl = 900
         signed_url = persistence.get_r2_storage().presigned_get(
-            object_key_for_asset(asset_id), expires_seconds=ttl
+            object_key_for_asset(asset_id, profile=profile), expires_seconds=ttl
         )
     except Exception as exc:
         raise HTTPException(status_code=503, detail="兼容视频存储暂时不可用") from exc

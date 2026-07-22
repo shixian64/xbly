@@ -11,12 +11,15 @@ from bbw_prod.config import get_settings
 from bbw_prod.crypto import CredentialCipher
 
 
+TRANSCODE_ONLY_QUEUES = {"transcode", "transcode-v2"}
+
+
 def main() -> int:
     settings = get_settings()
     # Transcode-only jobs handle already-public CDN URLs and do not need the
     # application credential keyring. Other queues still fail closed before
     # consuming jobs when the active/historical keyring is invalid.
-    if any(name != "transcode" for name in settings.rq_queues):
+    if any(name not in TRANSCODE_ONLY_QUEUES for name in settings.rq_queues):
         CredentialCipher.from_settings(settings)
     connection = Redis.from_url(settings.redis_url)
     queues = [Queue(name, connection=connection) for name in settings.rq_queues]

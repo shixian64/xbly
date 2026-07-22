@@ -80,6 +80,7 @@ const VOICE_TRANSCRIPT_STORAGE_LIMIT = 300;
 const MOMENT_VIDEO_FRAME_CHECK_MS = 2500;
 const MOMENT_VIDEO_INITIAL_FRAME_WAIT_MS = 15000;
 const MOMENT_VIDEO_COMPAT_TIMEOUT_MS = 32 * 60 * 1000;
+const MOMENT_VIDEO_COMPAT_POLL_DELAYS_MS = [2000, 3000, 5000];
 const MOMENT_VIEW_TASK_ASSIST_MAX_RETRIES = 2;
 const MATCH_GENDERS = ["不限", "男", "女"];
 const MATCH_PROPERTIES = ["双", "Z", "B"];
@@ -103,6 +104,7 @@ const S = {
   messagePolicyCleanupPromise: null,
   messagePolicyCleanupGeneration: 0,
   nearbyCustomCityEnabled: false,
+  momentVideoCompatEnabled: false,
   privateMessagePeers: new Set(),
   matchMessagePeers: new Set(),
   blockedPrivateMessagePeers: new Set(),
@@ -149,6 +151,8 @@ const S = {
   momentViewTaskAssistState: "idle",
   momentViewTaskAssistSeq: 0,
   momentViewTaskAssistRetries: 0,
+  momentVideoCompatControllers: new Map(),
+  momentVideoCompatActive: null,
   socialTab: "friends",
   visitorTab: "seen_me",
   activePeer: "",
@@ -1365,6 +1369,7 @@ function applyCapabilities(
   const previousProactive = S.proactivePrivateMessageEnabled;
   const previousDirectCredentials = S.directImCredentialsEnabled;
   const previousNearbyCustomCity = S.nearbyCustomCityEnabled;
+  const previousMomentVideoCompat = S.momentVideoCompatEnabled;
   if (Object.prototype.hasOwnProperty.call(capabilities, "proactive_private_message")) {
     S.proactivePrivateMessageEnabled = capabilities.proactive_private_message === true;
   }
@@ -1374,11 +1379,15 @@ function applyCapabilities(
   if (Object.prototype.hasOwnProperty.call(capabilities, "nearby_custom_city")) {
     S.nearbyCustomCityEnabled = capabilities.nearby_custom_city === true;
   }
+  if (Object.prototype.hasOwnProperty.call(capabilities, "moment_video_compat")) {
+    S.momentVideoCompatEnabled = capabilities.moment_video_compat === true;
+  }
   const proactiveChanged = previousProactive !== S.proactivePrivateMessageEnabled;
   const directCredentialsChanged =
     previousDirectCredentials !== S.directImCredentialsEnabled;
   const nearbyCustomCityChanged = previousNearbyCustomCity !== S.nearbyCustomCityEnabled;
-  if (!proactiveChanged && !directCredentialsChanged && !nearbyCustomCityChanged) {
+  const momentVideoCompatChanged = previousMomentVideoCompat !== S.momentVideoCompatEnabled;
+  if (!proactiveChanged && !directCredentialsChanged && !nearbyCustomCityChanged && !momentVideoCompatChanged) {
     return false;
   }
   const messageCapabilitiesChanged = proactiveChanged || directCredentialsChanged;
@@ -1389,6 +1398,11 @@ function applyCapabilities(
   if (nearbyCustomCityChanged) {
     clearViewCacheKey("nearby");
     clearViewCachePrefix("nearby:");
+  }
+  if (momentVideoCompatChanged && !S.momentVideoCompatEnabled) {
+    cancelMomentVideoCompatibilityWork(document, {
+      message: "当前运行模式不支持视频兼容转换",
+    });
   }
   if (messageCapabilitiesChanged) {
     S.messagePolicyGeneration += 1;
@@ -2669,6 +2683,9 @@ async function activateRoute(id, { force = false } = {}) {
   }
   const cacheKey = routeCacheKey(target);
   const previousDomKey = S.routeDomKey;
+  if (previousDomKey && (previousDomKey !== cacheKey || force)) {
+    suspendMomentVideos(root(), { cancelCompat: true });
+  }
   if (previousDomKey) rememberRouteDomSnapshot(previousDomKey);
   disconnectMomentViewTracking();
   if (S.routeController) S.routeController.abort();
@@ -3441,24 +3458,42 @@ function incomingMessageSenderInfo(message, conversation, peer) {
 function conversationNameIsPlaceholder(name, peer) {
   const value = String(name || "").trim();
   const target = String(peer || "").trim();
-  return !value || value === "用户" || value === target || value === `用户 ${target}`;
+  return (
+    !value ||
+    value === "用户" ||
+    value === "游客" ||
+    value === "乐园用户" ||
+    value === target ||
+    value === `用户 ${target}`
+  );
+}
+
+function conversationEntryDisplayName(conversation, requestedName, peer) {
+  const target = String(peer || "").trim();
+  const currentName = conversationDisplayName(conversation);
+  if (!conversationNameIsPlaceholder(currentName, target)) return currentName;
+  const candidate = String(requestedName || "").trim();
+  if (!conversationNameIsPlaceholder(candidate, target)) return candidate;
+  return target ? `用户 ${target}` : "用户";
 }
 
 function conversationProfileNeedsHydration(item) {
   const peer = conversationPeer(item);
+  const display = applyCachedConversationProfile(item);
   return Boolean(
     peer &&
-      (!conversationAvatar(item) || conversationNameIsPlaceholder(conversationDisplayName(item), peer))
+      (!conversationAvatar(display) ||
+        conversationNameIsPlaceholder(conversationDisplayName(display), peer) ||
+        display.profile_resolved !== true)
   );
 }
 
 function conversationProfileResolved(profile, peer) {
   if (!profile || typeof profile !== "object") return false;
-  if (profile._resolved === true) return true;
-  return Boolean(
-    validAvatarValue(profile.avatar, profile.portrait) ||
-      !conversationNameIsPlaceholder(profile.nickname || profile.name, peer)
-  );
+  if (profile._resolved === false) return false;
+  const avatar = validAvatarValue(profile.avatar, profile.portrait);
+  const name = String(profile.nickname || profile.name || "").trim();
+  return Boolean(avatar && !conversationNameIsPlaceholder(name, peer));
 }
 
 function normalizedConversationProfile(profile, peer) {
@@ -3475,7 +3510,7 @@ function normalizedConversationProfile(profile, peer) {
     name: nickname,
     avatar,
     portrait: avatar,
-    _resolved: true,
+    _resolved: Boolean(nickname && avatar),
   };
 }
 
@@ -3493,7 +3528,7 @@ function rememberConversationProfile(peer, profile) {
     name: nickname,
     avatar,
     portrait: avatar,
-    _resolved: true,
+    _resolved: incoming._resolved === true,
   });
   S.conversationProfileFetchedAt.set(target, Date.now());
   return true;
@@ -3504,9 +3539,11 @@ function preserveConversationDisplayName(preferred, fallback) {
   const peer = conversationPeer(conversation) || conversationPeer(fallback);
   const currentName = conversationDisplayName(conversation);
   const fallbackName = conversationDisplayName(fallback);
+  const currentResolved = conversation.profile_resolved === true;
+  const fallbackResolved = fallback?.profile_resolved === true;
   if (
     !peer ||
-    !conversationNameIsPlaceholder(currentName, peer) ||
+    (!conversationNameIsPlaceholder(currentName, peer) && !(fallbackResolved && !currentResolved)) ||
     conversationNameIsPlaceholder(fallbackName, peer)
   ) {
     return conversation;
@@ -3526,12 +3563,17 @@ function preserveConversationAvatar(preferred, fallback) {
   const fallbackAvatar = conversationAvatar(fallback);
   let avatar = currentAvatar;
   let inherited = Boolean(conversation._avatar_from_fallback);
-  if ((!currentAvatar || inherited) && fallbackAvatar) {
+  const currentResolved = conversation.profile_resolved === true;
+  const fallbackResolved = fallback?.profile_resolved === true;
+  if ((!currentAvatar || inherited || (fallbackResolved && !currentResolved)) && fallbackAvatar) {
     avatar = fallbackAvatar;
-    inherited = true;
+    inherited = !fallbackResolved;
   }
   if (!avatar) return conversation;
-  if (conversation.avatar === avatar && Boolean(conversation._avatar_from_fallback) === inherited) {
+  if (
+    conversation.avatar === avatar &&
+    Boolean(conversation._avatar_from_fallback) === inherited
+  ) {
     return conversation;
   }
   const currentUser = conversation.user && typeof conversation.user === "object" ? conversation.user : {};
@@ -3542,6 +3584,23 @@ function preserveConversationAvatar(preferred, fallback) {
     _avatar_from_fallback: inherited,
     user: { ...fallbackUser, ...currentUser, avatar },
   };
+}
+
+function finalizeConversationProfileResolution(conversation, fallback) {
+  const current = conversation && typeof conversation === "object" ? conversation : {};
+  if (current.profile_resolved === true || fallback?.profile_resolved !== true) return current;
+  const peer = conversationPeer(current) || conversationPeer(fallback);
+  const fallbackName = conversationDisplayName(fallback);
+  const fallbackAvatar = conversationAvatar(fallback);
+  const inheritedCompleteProfile = Boolean(
+    peer &&
+      fallbackAvatar &&
+      !conversationNameIsPlaceholder(fallbackName, peer) &&
+      conversationDisplayName(current) === fallbackName &&
+      conversationAvatar(current) === fallbackAvatar
+  );
+  if (!inheritedCompleteProfile) return current;
+  return { ...current, profile_resolved: true };
 }
 
 function normalizeTimConversation(item) {
@@ -3563,6 +3622,7 @@ function normalizeTimConversation(item) {
     peer_id: peer,
     nickname: profile.nick || profile.name || profile.userID || peer,
     avatar: validAvatarValue(profile.avatar, profile.portrait, profile.faceUrl, profile.face_url),
+    profile_resolved: conversationProfileResolved(profile, peer),
     last_message:
       !sdkPreview || sdkPreview === "自定义消息" || sdkPreview === "[自定义消息]"
         ? messagePreview(lastEntry)
@@ -3779,33 +3839,30 @@ function mergeConversationPair(preferred, fallback) {
   const unreadWinner = [primary, secondary]
     .filter(conversationUnreadAuthoritative)
     .sort((a, b) => conversationUnreadObservedAt(b) - conversationUnreadObservedAt(a))[0];
-  let merged = preserveConversationDisplayName(
-    preserveConversationAvatar(
-      {
-      ...activityFallback,
-      ...activityWinner,
-      timestamp: Math.max(primaryActivity, secondaryActivity),
-      last_message: previewWinner ? conversationPreview(previewWinner) : "",
-      content: previewWinner ? conversationPreview(previewWinner) : "",
-      preview_timestamp: previewWinner ? conversationPreviewTimestamp(previewWinner) : 0,
-      preview_sequence: previewWinner?.preview_sequence || previewWinner?.previewSequence || "",
-      preview_source: previewWinner?.preview_source || previewWinner?.source || "",
-      preview_authoritative: previewWinner ? conversationPreviewAuthoritative(previewWinner) : false,
-      preview_timestamp_inferred: previewWinner?.preview_timestamp_inferred === true,
-      preview_stale: conversationPreviewNeedsRefresh(activityWinner, previewWinner),
-      unread_count: unreadWinner
-        ? Math.max(0, Number(unreadWinner.unread_count || unreadWinner.unread || 0) || 0)
-        : 0,
-      unread: unreadWinner
-        ? Math.max(0, Number(unreadWinner.unread_count || unreadWinner.unread || 0) || 0)
-        : 0,
-      unread_observed_at: unreadWinner?.unread_observed_at || 0,
-      unread_authoritative: Boolean(unreadWinner),
-      },
-      activityFallback
-    ),
-    activityFallback
-  );
+  const mergedBase = {
+    ...activityFallback,
+    ...activityWinner,
+    timestamp: Math.max(primaryActivity, secondaryActivity),
+    last_message: previewWinner ? conversationPreview(previewWinner) : "",
+    content: previewWinner ? conversationPreview(previewWinner) : "",
+    preview_timestamp: previewWinner ? conversationPreviewTimestamp(previewWinner) : 0,
+    preview_sequence: previewWinner?.preview_sequence || previewWinner?.previewSequence || "",
+    preview_source: previewWinner?.preview_source || previewWinner?.source || "",
+    preview_authoritative: previewWinner ? conversationPreviewAuthoritative(previewWinner) : false,
+    preview_timestamp_inferred: previewWinner?.preview_timestamp_inferred === true,
+    preview_stale: conversationPreviewNeedsRefresh(activityWinner, previewWinner),
+    unread_count: unreadWinner
+      ? Math.max(0, Number(unreadWinner.unread_count || unreadWinner.unread || 0) || 0)
+      : 0,
+    unread: unreadWinner
+      ? Math.max(0, Number(unreadWinner.unread_count || unreadWinner.unread || 0) || 0)
+      : 0,
+    unread_observed_at: unreadWinner?.unread_observed_at || 0,
+    unread_authoritative: Boolean(unreadWinner),
+  };
+  let merged = preserveConversationDisplayName(mergedBase, activityFallback);
+  merged = preserveConversationAvatar(merged, activityFallback);
+  merged = finalizeConversationProfileResolution(merged, activityFallback);
   const peer = conversationPeer(merged);
   if (peer) merged = applyConversationReadOverride(peer, merged);
   return merged;
@@ -3848,18 +3905,31 @@ function applyCachedConversationProfile(item) {
   const nestedUser = conversation.user && typeof conversation.user === "object" ? conversation.user : {};
   const currentAvatar = conversationAvatar(conversation);
   const profileAvatar = validAvatarValue(profile.avatar, profile.portrait);
-  const avatar = currentAvatar || profileAvatar;
-  const inherited = currentAvatar
-    ? Boolean(conversation._avatar_from_fallback)
-    : Boolean(profileAvatar);
   const currentName = conversationDisplayName(conversation);
-  const name = conversationNameIsPlaceholder(currentName, peer)
-    ? profile.nickname || profile.name || currentName || `用户 ${peer}`
-    : currentName;
+  const profileName = String(profile.nickname || profile.name || "").trim();
+  const preferCachedProfile = conversation.profile_resolved !== true;
+  const useProfileAvatar = Boolean(
+    profileAvatar &&
+      (preferCachedProfile || !currentAvatar || Boolean(conversation._avatar_from_fallback))
+  );
+  const avatar = useProfileAvatar ? profileAvatar : currentAvatar || profileAvatar;
+  const inherited = useProfileAvatar
+    ? false
+    : currentAvatar
+      ? Boolean(conversation._avatar_from_fallback)
+      : Boolean(profileAvatar);
+  const useProfileName = Boolean(
+    profileName &&
+      !conversationNameIsPlaceholder(profileName, peer) &&
+      (preferCachedProfile || conversationNameIsPlaceholder(currentName, peer))
+  );
+  const name = useProfileName ? profileName : currentName || profileName || `用户 ${peer}`;
+  const profileResolved = conversationProfileResolved(profile, peer);
   if (
     conversation.avatar === avatar &&
     conversation.nickname === name &&
-    Boolean(conversation._avatar_from_fallback) === inherited
+    Boolean(conversation._avatar_from_fallback) === inherited &&
+    conversation.profile_resolved === profileResolved
   ) {
     return conversation;
   }
@@ -3868,7 +3938,8 @@ function applyCachedConversationProfile(item) {
     nickname: name,
     avatar,
     _avatar_from_fallback: inherited,
-    user: { ...profile, ...nestedUser, nickname: name, avatar },
+    profile_resolved: profileResolved,
+    user: { ...nestedUser, ...profile, nickname: name, avatar },
   };
 }
 
@@ -3898,6 +3969,13 @@ function renderHydratedConversationProfiles() {
   const changed = next.some((item, index) => item !== previous[index]);
   S.conversations = next;
   if (changed && S.route === "msg") {
+    const active = next.find((item) => conversationPeer(item) === S.activePeer);
+    const activeName = conversationDisplayName(active);
+    if (activeName && !conversationNameIsPlaceholder(activeName, S.activePeer)) {
+      S.activePeerName = activeName;
+      const heading = document.querySelector(".chat-head h2");
+      if (heading) heading.textContent = activeName;
+    }
     refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
   }
   return changed;
@@ -3933,7 +4011,7 @@ async function waitForConversationProfileSdk() {
 
 function conversationPeerNeedsHydration(peer) {
   return S.conversations.some(
-    (item) => conversationPeer(item) === peer && conversationProfileNeedsHydration(applyCachedConversationProfile(item))
+    (item) => conversationPeer(item) === peer && conversationProfileNeedsHydration(item)
   );
 }
 
@@ -4436,6 +4514,7 @@ function updateMomentCardVisibility(card, visible) {
   const wasVisible = card.dataset.momentViewVisible === "1";
   if (!visible) {
     card.dataset.momentViewVisible = "0";
+    suspendMomentVideos(card, { cancelCompat: true });
     return;
   }
   card.dataset.momentViewVisible = "1";
@@ -4597,13 +4676,11 @@ function momentMediaHtml(post) {
   const video = mediaUrl(post.video);
   const cover = mediaUrl(post.cover);
   const videoHtml = video
-    ? `<div class="moment-video-wrap" data-playback-wrap><video class="moment-video" controls controlslist="nodownload noremoteplayback" disablepictureinpicture disableremoteplayback draggable="false" preload="metadata" playsinline referrerpolicy="no-referrer" data-media-playback data-moment-video="true" data-post-id="${esc(
+    ? `<div class="moment-video-wrap" data-playback-wrap><video class="moment-video" controls controlslist="nodownload noremoteplayback" disablepictureinpicture disableremoteplayback draggable="false" preload="none" playsinline referrerpolicy="no-referrer" data-media-playback data-moment-video="true" data-post-id="${esc(
         post.id || ""
       )}" data-media-mode="original" data-original-source="${esc(video)}" data-media-source="${esc(
         video
-      )}" data-video-frame-required="true" ${cover ? `poster="${esc(cover)}"` : ""} src="${esc(
-         video
-      )}"></video><div class="chat-playback-fallback moment-playback-fallback" data-playback-fallback hidden><span>视频加载失败</span><button type="button" data-action="retry-chat-playback">重试</button></div></div>`
+      )}" data-video-state="poster" data-video-frame-required="true" ${cover ? `poster="${esc(cover)}"` : ""}></video><button type="button" class="moment-video-start" data-action="play-moment-video">播放视频</button><div class="chat-playback-fallback moment-playback-fallback" data-playback-fallback hidden><span>视频加载失败</span><button type="button" data-action="retry-chat-playback">重试</button></div></div>`
     : "";
   return pictureHtml || videoHtml ? `<div class="moment-media">${pictureHtml}${videoHtml}</div>` : "";
 }
@@ -7353,11 +7430,17 @@ function ensureConversationForPeer(peer, { name = "", avatar = "", replaceName =
       resolvedName && (replaceName || conversationNameIsPlaceholder(currentName, target))
     );
     const explicitAvatar = validAvatarValue(avatar);
+    const incomingProfileResolved = Boolean(
+      explicitAvatar && resolvedName && (shouldReplaceName || currentName === resolvedName)
+    );
     const next = {
       ...current,
       nickname: shouldReplaceName ? resolvedName : current.nickname,
       avatar: explicitAvatar || conversationAvatar(current),
       _avatar_from_fallback: explicitAvatar ? false : Boolean(current._avatar_from_fallback),
+      profile_resolved:
+        current.profile_resolved === true ||
+        incomingProfileResolved,
     };
     S.conversations[index] = next;
     return next;
@@ -7370,6 +7453,7 @@ function ensureConversationForPeer(peer, { name = "", avatar = "", replaceName =
     nickname: resolvedName || `用户 ${target}`,
     avatar: validAvatarValue(avatar),
     _avatar_from_fallback: false,
+    profile_resolved: Boolean(resolvedName && validAvatarValue(avatar)),
     last_message: "",
     timestamp: Date.now(),
     activity_sequence: "",
@@ -10349,6 +10433,10 @@ function handleChatPlaybackLoaded(media) {
   media.dataset.mediaFailed = "0";
   media.hidden = false;
   setChatPlaybackFallback(media, "", false);
+  if (isMomentVideo(media)) {
+    setMomentVideoStartVisible(media, false);
+    setMomentVideoState(media, media.dataset.mediaMode === "compat" ? "compat-ready" : "original-ready");
+  }
   if (media.matches?.("audio[data-audio-message-id]")) {
     media.dataset.audioSourceNeedsRefresh = "0";
     media.dataset.audioSourceRefreshAttempted = "";
@@ -10357,6 +10445,96 @@ function handleChatPlaybackLoaded(media) {
 
 function isMomentVideo(media) {
   return Boolean(media?.matches?.('video[data-moment-video="true"]'));
+}
+
+function setMomentVideoState(video, state) {
+  if (video?.dataset) video.dataset.videoState = String(state || "poster");
+}
+
+function setMomentVideoStartVisible(video, visible) {
+  const button = video?.closest?.("[data-playback-wrap]")?.querySelector?.('[data-action="play-moment-video"]');
+  if (button) button.hidden = !visible;
+}
+
+function cancelMomentVideoCompatibility(video, { message = "" } = {}) {
+  if (!isMomentVideo(video)) return;
+  const controller = S.momentVideoCompatControllers.get(video);
+  if (controller) controller.abort();
+  S.momentVideoCompatControllers.delete(video);
+  if (S.momentVideoCompatActive === video) S.momentVideoCompatActive = null;
+  if (video.dataset.compatPending !== "1") return;
+  video.dataset.compatSequence = String((Number(video.dataset.compatSequence || 0) + 1) % 1000000);
+  video.dataset.compatPending = "0";
+  video.dataset.mediaRetryPending = "0";
+  if (message && video.isConnected) {
+    video.dataset.mediaFailed = "1";
+    setMomentVideoState(video, "failed");
+    setMomentVideoFallback(video, message, { retry: true });
+  }
+}
+
+function cancelMomentVideoCompatibilityWork(container = document, { message = "" } = {}) {
+  container?.querySelectorAll?.('video[data-moment-video="true"]').forEach((video) => {
+    cancelMomentVideoCompatibility(video, { message });
+  });
+}
+
+function suspendMomentVideos(container = document, { cancelCompat = false } = {}) {
+  container?.querySelectorAll?.('video[data-moment-video="true"]').forEach((video) => {
+    try {
+      video.pause();
+    } catch {
+      /* Pausing detached media is best effort. */
+    }
+    if (cancelCompat) {
+      cancelMomentVideoCompatibility(video, {
+        message: "兼容版本仍在后台准备，点击后继续查询",
+      });
+    }
+  });
+}
+
+async function startMomentVideoPlayback(video) {
+  if (!isMomentVideo(video) || !video.isConnected) return;
+  const source = String(video.dataset.originalSource || "").trim();
+  if (!source) {
+    failMomentVideoCompatibility(video, "视频地址不可用", { retry: false });
+    return;
+  }
+  cancelMomentVideoCompatibility(video);
+  video.dataset.playbackRequested = "1";
+  video.dataset.mediaMode = "original";
+  video.dataset.mediaSource = source;
+  video.dataset.compatUnavailable = "0";
+  video.dataset.mediaFailed = "0";
+  video.dataset.mediaRetryCount = "0";
+  video.dataset.mediaRetryPending = "1";
+  video.dataset.videoFrameUnsupported = "0";
+  video.dataset.videoFramePresented = "0";
+  video.dataset.videoFrameCheckStartedAt = String(Date.now());
+  setMomentVideoState(video, "original-loading");
+  setMomentVideoStartVisible(video, false);
+  setChatPlaybackFallback(video, "", false);
+  video.hidden = false;
+  video.removeAttribute("src");
+  try {
+    video.load();
+  } catch {
+    /* Reset the poster-only element before attaching the source. */
+  }
+  video.dataset.mediaRetryPending = "0";
+  video.src = source;
+  try {
+    video.load();
+    await video.play();
+  } catch {
+    if (!video.error && video.isConnected) {
+      const button = video.closest?.("[data-playback-wrap]")?.querySelector?.('[data-action="play-moment-video"]');
+      if (button) button.textContent = "再次播放";
+      setMomentVideoStartVisible(video, true);
+      setChatPlaybackFallback(video, "", false);
+    }
+  }
 }
 
 function momentVideoCompatUrl(value, action) {
@@ -10389,8 +10567,9 @@ function cancelPendingVideoFrameCallback(video) {
   }
 }
 
-function failMomentVideoCompatibility(video, text = "视频暂时无法播放") {
+function failMomentVideoCompatibility(video, text = "视频暂时无法播放", { retry = true } = {}) {
   if (!video?.isConnected) return;
+  cancelMomentVideoCompatibility(video);
   cancelPendingVideoFrameCallback(video);
   video.pause();
   video.hidden = true;
@@ -10399,7 +10578,9 @@ function failMomentVideoCompatibility(video, text = "视频暂时无法播放") 
   video.dataset.mediaRetryPending = "0";
   video.dataset.mediaFailed = "1";
   video.dataset.videoFrameUnsupported = "1";
-  setMomentVideoFallback(video, text, { retry: true });
+  setMomentVideoState(video, "failed");
+  setMomentVideoStartVisible(video, false);
+  setMomentVideoFallback(video, text, { retry });
 }
 
 function applyMomentVideoCompatibility(video, data, { resumePlayback = false } = {}) {
@@ -10417,6 +10598,8 @@ function applyMomentVideoCompatibility(video, data, { resumePlayback = false } =
   video.dataset.videoFramePresented = "0";
   video.dataset.videoFrameCheckStartedAt = "0";
   video.dataset.videoFrameUnsupported = "0";
+  setMomentVideoState(video, "compat-loading");
+  setMomentVideoStartVisible(video, false);
   video.hidden = false;
   setMomentVideoFallback(video, "兼容版本已就绪，正在加载…");
   cancelPendingVideoFrameCallback(video);
@@ -10449,9 +10632,39 @@ function applyMomentVideoCompatibility(video, data, { resumePlayback = false } =
   return true;
 }
 
+function momentVideoFailureText(data, fallback = "视频暂时无法播放") {
+  return localizedSystemText(data?.message || data?.detail || fallback, fallback);
+}
+
+function waitForMomentVideoPoll(delay, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, delay);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 async function prepareMomentVideoCompatibility(video, { retry = false } = {}) {
   if (!isMomentVideo(video) || !video.isConnected || video.dataset.mediaMode === "compat") return;
   if (video.dataset.compatPending === "1") return;
+  if (!S.momentVideoCompatEnabled) {
+    failMomentVideoCompatibility(video, "当前运行模式不支持该视频格式转换");
+    return;
+  }
+  if (S.momentVideoCompatActive && S.momentVideoCompatActive !== video) {
+    failMomentVideoCompatibility(video, "另一个视频正在准备兼容版本，请稍后重试");
+    return;
+  }
   const sourceUrl = String(video.dataset.originalSource || "").trim();
   const postId = String(video.dataset.postId || "").trim();
   if (!sourceUrl || !postId) {
@@ -10459,14 +10672,19 @@ async function prepareMomentVideoCompatibility(video, { retry = false } = {}) {
     return;
   }
   const sequence = String((Number(video.dataset.compatSequence || 0) + 1) % 1000000);
-  const resumePlayback = !video.paused && !video.ended;
+  const resumePlayback = video.dataset.playbackRequested === "1";
   const startedAt = Date.now();
+  const controller = new AbortController();
+  S.momentVideoCompatActive = video;
+  S.momentVideoCompatControllers.set(video, controller);
   video.dataset.compatSequence = sequence;
   video.dataset.compatPending = "1";
   video.dataset.compatUnavailable = "0";
   video.dataset.mediaRetryPending = "1";
   video.pause();
   video.hidden = true;
+  setMomentVideoState(video, "compat-processing");
+  setMomentVideoStartVisible(video, false);
   setMomentVideoFallback(video, "正在准备兼容版本…");
   cancelPendingVideoFrameCallback(video);
   video.removeAttribute("src");
@@ -10481,11 +10699,14 @@ async function prepareMomentVideoCompatibility(video, { retry = false } = {}) {
       method: "POST",
       body: JSON.stringify({ source_url: sourceUrl, post_id: postId, retry: Boolean(retry) }),
       timeout: 15000,
+      signal: controller.signal,
     });
     if (!video.isConnected || video.dataset.compatSequence !== sequence) return;
     let data = prepared.data || {};
     if (!prepared.ok || data.status === "failed") {
-      failMomentVideoCompatibility(video);
+      failMomentVideoCompatibility(video, momentVideoFailureText(data), {
+        retry: data?.retryable !== false,
+      });
       return;
     }
     if (data.status === "ready") {
@@ -10500,19 +10721,25 @@ async function prepareMomentVideoCompatibility(video, { retry = false } = {}) {
       return;
     }
 
+    let pollAttempt = 0;
     while (
       video.isConnected &&
       video.dataset.compatSequence === sequence &&
       Date.now() - startedAt < MOMENT_VIDEO_COMPAT_TIMEOUT_MS
     ) {
-      const retryAfter = Math.max(1, Math.min(5, Number(data.retry_after || 2))) * 1000;
-      await new Promise((resolve) => setTimeout(resolve, retryAfter));
+      const retryAfter = MOMENT_VIDEO_COMPAT_POLL_DELAYS_MS[
+        Math.min(pollAttempt, MOMENT_VIDEO_COMPAT_POLL_DELAYS_MS.length - 1)
+      ];
+      pollAttempt += 1;
+      await waitForMomentVideoPoll(retryAfter, controller.signal);
       if (!video.isConnected || video.dataset.compatSequence !== sequence) return;
-      const status = await api(statusUrl, { timeout: 12000 });
+      const status = await api(statusUrl, { timeout: 12000, signal: controller.signal });
       if (!video.isConnected || video.dataset.compatSequence !== sequence) return;
       data = status.data || {};
       if (!status.ok || data.status === "failed") {
-        failMomentVideoCompatibility(video);
+        failMomentVideoCompatibility(video, momentVideoFailureText(data), {
+          retry: data?.retryable !== false,
+        });
         return;
       }
       if (data.status === "ready") {
@@ -10534,7 +10761,13 @@ async function prepareMomentVideoCompatibility(video, { retry = false } = {}) {
   } catch (error) {
     if (!video.isConnected || video.dataset.compatSequence !== sequence) return;
     if (error instanceof AuthExpiredError) return;
+    if (error?.name === "AbortError") return;
     failMomentVideoCompatibility(video);
+  } finally {
+    if (S.momentVideoCompatControllers.get(video) === controller) {
+      S.momentVideoCompatControllers.delete(video);
+    }
+    if (S.momentVideoCompatActive === video) S.momentVideoCompatActive = null;
   }
 }
 
@@ -10629,6 +10862,15 @@ function handleChatPlaybackError(media) {
   }
   const source = String(media.dataset.mediaSource || "").trim();
   if (!source) return;
+  if (isMomentVideo(media) && media.dataset.playbackRequested !== "1") {
+    media.removeAttribute("src");
+    media.dataset.mediaRetryPending = "0";
+    media.dataset.mediaFailed = "0";
+    setMomentVideoState(media, "poster");
+    setMomentVideoStartVisible(media, true);
+    setChatPlaybackFallback(media, "", false);
+    return;
+  }
   if (media.matches?.("audio[data-audio-message-id]")) {
     const mustRefresh =
       media.dataset.audioSourceNeedsRefresh === "1" || isUnauthenticatedTencentRichMediaUrl(source);
@@ -10664,6 +10906,10 @@ function handleChatPlaybackError(media) {
     (mediaErrorCode === 3 || mediaErrorCode === 4)
   ) {
     media.dataset.videoFrameUnsupported = "1";
+    if (!S.momentVideoCompatEnabled) {
+      failMomentVideoCompatibility(media, "当前运行模式不支持该视频格式转换");
+      return;
+    }
     void prepareMomentVideoCompatibility(media);
     return;
   }
@@ -10673,6 +10919,10 @@ function handleChatPlaybackError(media) {
   if (attempt >= CHAT_MEDIA_RETRY_DELAYS_MS.length) {
     retryState.failed = true;
     if (isMomentVideo(media) && media.dataset.mediaMode !== "compat") {
+      if (!S.momentVideoCompatEnabled) {
+        failMomentVideoCompatibility(media, "视频加载失败，当前运行模式不支持兼容转换");
+        return;
+      }
       void prepareMomentVideoCompatibility(media);
       return;
     }
@@ -11532,6 +11782,7 @@ async function switchMomentsTab(tab, { force = false } = {}) {
 
   const previousTab = S.momentsTab;
   const previousCacheKey = routeCacheKey("moments");
+  suspendMomentVideos(panel, { cancelCompat: true });
   rememberPanelDomSnapshot(previousCacheKey, panel);
   discardCurrentRouteDomSnapshot();
   const seq = ++S.momentsFeedSeq;
@@ -12119,6 +12370,7 @@ function closeProfileDialog() {
   S.profileController = null;
   const dialog = $("profile-dialog");
   if (!dialog) return;
+  suspendMomentVideos(dialog, { cancelCompat: true });
   if (typeof dialog.close === "function" && dialog.open) dialog.close();
   dialog.classList.remove("is-open");
 }
@@ -12163,6 +12415,14 @@ async function openProfile(uid, { chatOrigin = "" } = {}) {
   }
   const name = user.nickname || user.name || `用户 ${target}`;
   const profileUid = String(user.id || user.uid || target);
+  if (profileUid === target && rememberConversationProfile(profileUid, user)) {
+    persistConversationProfiles();
+    renderHydratedConversationProfiles();
+    const rememberedName = String(
+      S.conversationProfilesByUid.get(profileUid)?.nickname || ""
+    ).trim();
+    if (S.activePeer === profileUid && rememberedName) S.activePeerName = rememberedName;
+  }
   const isSelf = profileUid === currentUid;
   const normalizedChatOrigin = String(chatOrigin || "").trim();
   const chatAllowed = !isSelf && canOpenPrivateChatEntry(profileUid, normalizedChatOrigin);
@@ -13945,6 +14205,11 @@ async function handleAction(action, button) {
     S.momentsSearch = "";
     return switchMomentsTab(S.momentsTab, { force: true });
   }
+  if (action === "play-moment-video") {
+    const video = button.closest?.("[data-playback-wrap]")?.querySelector?.('video[data-moment-video="true"]');
+    await startMomentVideoPlayback(video);
+    return;
+  }
   if (action === "profile-moments-toggle") return toggleProfileMoments(button);
   if (action === "profile-moment-load-more") return loadMoreProfileMoments(button);
   if (action === "moment-toggle-comments") {
@@ -14250,6 +14515,10 @@ async function handleAction(action, button) {
       await recoverChatAudioPlayback(media, { resumePlayback: true, manual: true });
       return;
     }
+    if (isMomentVideo(media) && !S.momentVideoCompatEnabled) {
+      await startMomentVideoPlayback(media);
+      return;
+    }
     if (
       isMomentVideo(media) &&
       media.dataset.mediaMode === "compat" &&
@@ -14336,11 +14605,14 @@ async function handleAction(action, button) {
     S.activePeer = uid;
     restoreChatComposerDraft(uid);
     restoreChatMessageQuote(uid);
-    S.activePeerName = button.dataset.name || `用户 ${uid}`;
-    ensureConversationForPeer(uid, {
-      name: S.activePeerName,
+    const requestedName = String(button.dataset.name || "").trim();
+    const conversation = ensureConversationForPeer(uid, {
+      name: requestedName,
       avatar: button.dataset.avatar || "",
+      replaceName:
+        action === "open-chat" && !conversationNameIsPlaceholder(requestedName, uid),
     });
+    S.activePeerName = conversationEntryDisplayName(conversation, requestedName, uid);
     markConversationRead(uid);
     closeProfileDialog();
     if (S.route !== "msg") {
@@ -14799,6 +15071,7 @@ async function loadFeatures() {
   try {
     const { data } = await api("/api/features", { authOptional: true, timeout: 6000 });
     const features = data && data.features;
+    applyCapabilities(data?.capabilities);
     S.serverHeartbeat = Boolean(data?.auto_heartbeat);
     S.inviteLoginAvailable = Boolean(data?.capabilities?.invite_login);
     S.labEnabled = Boolean(
@@ -15355,6 +15628,8 @@ document.addEventListener(
   (event) => {
     if (event.target && event.target.matches && event.target.matches('video[data-video-frame-required="true"]')) {
       event.target.dataset.playbackRequested = "1";
+      setMomentVideoState(event.target, "playing");
+      setMomentVideoStartVisible(event.target, false);
       cancelPendingVideoFrameCallback(event.target);
       event.target.dataset.videoFramePresented = "0";
       event.target.dataset.videoFrameCheckStartedAt = String(Date.now());
@@ -15421,6 +15696,7 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     finishVoiceRecording(null, true);
     closeFlashViewer();
+    suspendMomentVideos(document, { cancelCompat: true });
   }
   if (!S.authenticated) return;
   updatePresence(!document.hidden);

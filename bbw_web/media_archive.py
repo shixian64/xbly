@@ -264,10 +264,11 @@ def download_and_prepare(
     allowed_hosts: Iterable[str],
     original_name: str = "",
     settings: Any = None,
+    max_bytes: int | None = None,
 ) -> PreparedMedia:
     """Download one bounded remote object, identify it, and strip image metadata."""
     current = _validate_remote_url(url, allowed_hosts)
-    limit = _limit_for_kind(kind, settings)
+    limit = max(1, int(max_bytes)) if max_bytes is not None else _limit_for_kind(kind, settings)
     fd, filename = tempfile.mkstemp(prefix="bbw-archive-", suffix=".part")
     os.close(fd)
     target = Path(filename)

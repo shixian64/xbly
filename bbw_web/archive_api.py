@@ -143,7 +143,7 @@ def _public_profile_value(data: Any, *keys: str) -> str:
 
 def _conversation_name_is_placeholder(name: Any, peer: str) -> bool:
     value = str(name or "").strip()
-    return not value or value in {"用户", peer, f"用户 {peer}"}
+    return not value or value in {"用户", "游客", peer, f"用户 {peer}"}
 
 
 def _local_public_profile_map(db: Any, peers: list[str]) -> dict[str, dict[str, str]]:
@@ -373,29 +373,39 @@ def archived_conversations(request: Request, limit: int = 100) -> dict[str, Any]
                 else {}
             )
             avatar = str(
-                metadata.get("avatar")
+                local_profiles.get(str(conversation.peer_upstream_uid or "").strip(), {}).get("avatar")
+                or metadata.get("avatar")
                 or user.get("avatar")
                 or user.get("portrait")
-                or local_profiles.get(str(conversation.peer_upstream_uid or "").strip(), {}).get("avatar")
                 or ""
             )
             peer = str(conversation.peer_upstream_uid or "").strip()
             if not peer:
                 continue
             local_profile = local_profiles.get(peer, {})
+            local_profile_name = str(
+                local_profile.get("nickname") or local_profile.get("name") or ""
+            ).strip()
+            local_profile_avatar = str(
+                local_profile.get("avatar") or local_profile.get("portrait") or ""
+            ).strip()
+            local_profile_name_resolved = not _conversation_name_is_placeholder(
+                local_profile_name,
+                peer,
+            )
             nickname = next(
                 (
                     value
                     for value in (
+                        str(local_profile.get("nickname") or "").strip(),
                         str(conversation.title or "").strip(),
                         str(user.get("nickname") or user.get("name") or "").strip(),
-                        str(local_profile.get("nickname") or "").strip(),
                     )
                     if not _conversation_name_is_placeholder(value, peer)
                 ),
                 peer,
             )
-            public_user = {**local_profile, **user, "nickname": nickname}
+            public_user = {**user, **local_profile, "nickname": nickname}
             if avatar:
                 public_user["avatar"] = avatar
             items.append(
@@ -409,6 +419,9 @@ def archived_conversations(request: Request, limit: int = 100) -> dict[str, Any]
                     "nickname": nickname,
                     "avatar": avatar,
                     "user": public_user,
+                    "profile_resolved": bool(
+                        local_profile_name_resolved and local_profile_avatar
+                    ),
                     "last_message": preview,
                     "content": preview,
                     "timestamp": activity_at.isoformat() if activity_at is not None else "",

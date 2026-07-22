@@ -56,6 +56,20 @@ class ConversationBatchTests(unittest.TestCase):
         self.assertEqual(merged["extra_data"]["last_message"], "new")
         self.assertEqual(merged["extra_data"]["avatar"], "new-avatar")
 
+    def test_placeholder_conversation_title_is_not_persisted(self) -> None:
+        owner_id = uuid.uuid4()
+
+        for title in ("游客", "用户", "1001", "用户 1001"):
+            with self.subTest(title=title):
+                candidate = _conversation_candidate(
+                    owner_user_id=owner_id,
+                    peer_uid="1001",
+                    reported_id="C2C1001",
+                    title=title,
+                )
+
+                self.assertIsNone(candidate["title"])
+
     def test_unchanged_candidate_skips_database_update(self) -> None:
         owner_id = uuid.uuid4()
         observed_at = datetime(2026, 7, 22, 10, 0, tzinfo=UTC)

@@ -20,7 +20,7 @@ python -m bbw_web --port 8765
 # http://127.0.0.1:8765/
 ```
 
-该 memory-only 入口没有邀请码数据库，只能查看界面和使用旧 BFF，不能完成两阶段邀请码登录。需要登录用户端时，请按仓库根目录 README 的“Windows 本地测试管理端”章节启动 `bbw_web.api:app`，并准备 PostgreSQL、Redis 和本地 Secret。
+该 memory-only 入口没有邀请码数据库，只能查看界面和使用旧 BFF，不能完成两阶段邀请码登录，也不提供动态视频兼容转换接口。浏览器原生支持的 H.264 视频仍可在用户点击后播放；HEVC 等不兼容格式只显示明确的运行模式提示，不会反复请求不存在的接口。需要完整登录和动态视频兼容播放时，请按仓库根目录 README 的“Windows 本地测试管理端”章节启动 `bbw_web.api:app`，并准备 PostgreSQL、Redis、监听 `transcode-v2,transcode` 队列的 RQ 转码 Worker、ffmpeg/ffprobe、R2 和本地 Secret。
 
 完整入口采用两阶段登录：先验证账号密码或短信验证码，再显示邀请码输入；每次交互式登录成功都会原子消耗邀请码的一次可用次数，后台 Token 重认证不会重复消耗。
 

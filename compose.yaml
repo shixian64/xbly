@@ -47,7 +47,7 @@ x-app-environment: &app-environment
   BBW_R2_SECRET_KEY_FILE: /run/secrets/r2_secret_access_key
   BBW_R2_BUCKET: ${R2_BUCKET:?set R2_BUCKET}
   BBW_R2_REGION: auto
-  BBW_RQ_QUEUES: critical,default,media,sync,transcode
+  BBW_RQ_QUEUES: critical,default,media,sync,transcode-v2,transcode
   BBW_TURNSTILE_SITE_KEY: ${TURNSTILE_SITE_KEY:-}
   BBW_TURNSTILE_SECRET_KEY_FILE: /run/secrets/turnstile_secret_key
   BBW_INVITE_REQUIRED: "true"
@@ -57,6 +57,7 @@ x-app-environment: &app-environment
   BBW_MEDIA_MAX_IMAGE_BYTES: "10485760"
   BBW_MEDIA_MAX_AUDIO_BYTES: "10485760"
   BBW_MEDIA_MAX_VIDEO_BYTES: "52428800"
+  BBW_MOMENT_VIDEO_MAX_SOURCE_BYTES: "157286400"
   BBW_MEDIA_MAX_ATTACHMENT_BYTES: "20971520"
   BBW_MEDIA_ALLOWED_HOSTS: "${MEDIA_ALLOWED_HOSTS:-oss.banghua.xin,*.myqcloud.com,*.qcloud.com}"
   BBW_R2_PRESIGN_TTL_SECONDS: "300"
@@ -412,7 +413,7 @@ services:
     <<: *app-security
     environment:
       <<: *app-environment
-      BBW_RQ_QUEUES: transcode
+      BBW_RQ_QUEUES: transcode-v2,transcode
       BBW_RQ_WITH_SCHEDULER: "true"
       BBW_SKIP_DATABASE_CONFIG: "true"
       BBW_DATABASE_URL: postgresql+psycopg://disabled:disabled@127.0.0.1:1/disabled
@@ -426,6 +427,7 @@ services:
       BBW_TURNSTILE_SITE_KEY: ""
       BBW_TURNSTILE_SECRET_KEY_FILE: ""
       BBW_MOMENT_VIDEO_JOB_TIMEOUT_SECONDS: "1500"
+      BBW_MOMENT_VIDEO_MAX_SOURCE_BYTES: "157286400"
       BBW_MOMENT_VIDEO_MAX_DURATION_SECONDS: "600"
       BBW_MOMENT_VIDEO_MAX_SOURCE_DIMENSION: "4096"
       BBW_MOMENT_VIDEO_MAX_SOURCE_PIXELS: "9000000"

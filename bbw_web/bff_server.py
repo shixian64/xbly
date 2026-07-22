@@ -50,6 +50,7 @@ class ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
 
 LAB_ENABLED = False
 INVITE_LOGIN_ENABLED = False
+MOMENT_VIDEO_COMPAT_ENABLED = False
 CORS_ALLOW_ORIGINS: Set[str] = set()
 MAX_JSON_BODY_BYTES = 256 * 1024
 COOKIE_SECURE = False
@@ -1401,15 +1402,21 @@ def _attach_cached_conversation_profiles(
         if not profile:
             continue
         avatar = str(profile.get("avatar") or profile.get("portrait") or "")
-        if avatar and not item.get("avatar"):
+        if avatar:
             item["avatar"] = avatar
         current_name = str(item.get("nickname") or "").strip()
-        if not current_name or current_name in {"用户", peer, f"用户 {peer}"}:
-            item["nickname"] = str(
-                profile.get("nickname") or profile.get("name") or current_name or peer
-            )
+        profile_name = str(profile.get("nickname") or profile.get("name") or "").strip()
+        profile_name_resolved = bool(
+            profile_name
+            and profile_name not in {"用户", "游客", peer, f"用户 {peer}"}
+        )
+        if profile_name_resolved:
+            item["nickname"] = profile_name
+        elif not current_name or current_name in {"用户", "游客", peer, f"用户 {peer}"}:
+            item["nickname"] = peer
         existing_user = item.get("user") if isinstance(item.get("user"), dict) else {}
-        item["user"] = {**profile, **existing_user}
+        item["user"] = {**existing_user, **profile}
+        item["profile_resolved"] = bool(avatar and profile_name_resolved)
 
 
 def _conversation_summary_time(value: Any) -> float:
@@ -2415,6 +2422,7 @@ class Handler(BaseHTTPRequestHandler):
                     "capabilities": {
                         "roomkit_list": True,
                         "invite_login": INVITE_LOGIN_ENABLED,
+                        "moment_video_compat": MOMENT_VIDEO_COMPAT_ENABLED,
                     },
                     "lab_enabled": LAB_ENABLED,
                 }
@@ -2428,6 +2436,7 @@ class Handler(BaseHTTPRequestHandler):
                     "capabilities": {
                         "roomkit_list": True,
                         "invite_login": INVITE_LOGIN_ENABLED,
+                        "moment_video_compat": MOMENT_VIDEO_COMPAT_ENABLED,
                     },
                     "lab_enabled": LAB_ENABLED,
                     "auto_heartbeat": STORE.auto_heartbeat,
@@ -2465,6 +2474,7 @@ class Handler(BaseHTTPRequestHandler):
                     "capabilities": {
                         "roomkit_list": True,
                         "invite_login": INVITE_LOGIN_ENABLED,
+                        "moment_video_compat": MOMENT_VIDEO_COMPAT_ENABLED,
                         **Handler.web_user_capabilities(self, u),
                     },
                     "lab_enabled": LAB_ENABLED,

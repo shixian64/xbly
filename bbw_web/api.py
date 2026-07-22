@@ -976,6 +976,7 @@ async def lifespan(application: FastAPI):
 
     legacy.LAB_ENABLED = False
     legacy.INVITE_LOGIN_ENABLED = True
+    legacy.MOMENT_VIDEO_COMPAT_ENABLED = True
     legacy.CORS_ALLOW_ORIGINS = set()
     legacy.COOKIE_SECURE = bool(settings.cookie_secure)
     legacy.COOKIE_NAME = str(settings.user_cookie_name)
@@ -999,6 +1000,7 @@ async def lifespan(application: FastAPI):
         yield
     finally:
         legacy.INVITE_LOGIN_ENABLED = False
+        legacy.MOMENT_VIDEO_COMPAT_ENABLED = False
         legacy.PRESENCE_BACKEND = None
         if legacy.STORE is not None:
             legacy.STORE.close()

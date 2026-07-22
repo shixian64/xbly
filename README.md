@@ -84,6 +84,7 @@ python -m bbw_protocol.cli repl
 python -m bbw_web --port 8765
 # http://127.0.0.1:8765/
 # 这是 memory-only 本地入口，没有邀请码数据库，不能完成两阶段登录；
+# 不提供 Redis/RQ/R2 动态视频兼容转换，原生不支持的 HEVC 视频会明确降级；
 # 不注册管理 API，只看管理页面可访问：
 # http://127.0.0.1:8765/static/admin.html
 # 身边·消息·匹配·动态·我的；侧栏按所属主模块展开二级入口
@@ -114,6 +115,7 @@ print(app.native.im.tim_login_payload())   # 给 TIM Web SDK
 
 - 只查看管理界面：`http://127.0.0.1:8765/static/admin.html`
 - 完整测试管理端：必须启动 `bbw_web.api:app`，并准备 PostgreSQL、Redis 和本地 Secret。
+- 完整测试 HEVC 动态播放：除 `bbw_web.api:app` 外，还必须运行 Redis、RQ 转码 Worker、ffmpeg/ffprobe，并配置 R2 或兼容对象存储。转码 Worker 应按 `transcode-v2,transcode` 的顺序监听队列，以兼容滚动部署期间的新旧任务。
 
 以下命令均在仓库根目录的同一个 PowerShell 窗口执行。先停止占用 8765 端口的旧服务。
 

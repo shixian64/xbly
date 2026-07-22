@@ -503,14 +503,19 @@ class BffEnvelopeTests(unittest.TestCase):
 
         self.assertEqual(item["avatar"], "https://oss.banghua.xin/images/users/avatar.jpg")
         self.assertEqual(item["nickname"], "头像用户")
+        self.assertTrue(item["profile_resolved"])
         self.assertEqual(calls, [])
 
-    def test_conversation_list_uses_cached_nickname_when_avatar_already_exists(self) -> None:
+    def test_conversation_list_uses_cached_profile_when_snapshot_already_exists(self) -> None:
         app = SimpleNamespace(profile=SimpleNamespace(get_user=lambda uid: None))
         item = {
             "peer_id": "9",
-            "nickname": "9",
+            "nickname": "旧昵称",
             "avatar": "https://oss.banghua.xin/images/users/existing.jpg",
+            "user": {
+                "nickname": "游客",
+                "avatar": "https://oss.banghua.xin/images/users/existing.jpg",
+            },
         }
         cache = {
             "9": (
@@ -525,8 +530,39 @@ class BffEnvelopeTests(unittest.TestCase):
 
         bff_server._attach_cached_conversation_profiles(app, [item], cache)
 
-        self.assertEqual(item["avatar"], "https://oss.banghua.xin/images/users/existing.jpg")
+        self.assertEqual(item["avatar"], "https://oss.banghua.xin/images/users/cached.jpg")
         self.assertEqual(item["nickname"], "真实昵称")
+        self.assertEqual(item["user"]["nickname"], "真实昵称")
+        self.assertEqual(item["user"]["avatar"], "https://oss.banghua.xin/images/users/cached.jpg")
+        self.assertTrue(item["profile_resolved"])
+
+    def test_partial_cached_conversation_profile_remains_unresolved(self) -> None:
+        app = SimpleNamespace(profile=SimpleNamespace(get_user=lambda uid: None))
+        partial_profiles = (
+            (
+                {"id": "9", "avatar": "https://oss.banghua.xin/images/users/new.jpg"},
+                "旧昵称",
+                "https://oss.banghua.xin/images/users/new.jpg",
+            ),
+            (
+                {"id": "9", "nickname": "新昵称"},
+                "新昵称",
+                "https://oss.banghua.xin/images/users/old.jpg",
+            ),
+        )
+        for profile, expected_name, expected_avatar in partial_profiles:
+            with self.subTest(profile=profile):
+                item = {
+                    "peer_id": "9",
+                    "nickname": "旧昵称",
+                    "avatar": "https://oss.banghua.xin/images/users/old.jpg",
+                    "user": {},
+                }
+                cache = {"9": (bff_server.time.monotonic(), profile)}
+                bff_server._attach_cached_conversation_profiles(app, [item], cache)
+                self.assertEqual(item["nickname"], expected_name)
+                self.assertEqual(item["avatar"], expected_avatar)
+                self.assertFalse(item["profile_resolved"])
 
     def test_archived_conversation_local_profiles_supply_public_name_and_avatar(self) -> None:
         from bbw_web import archive_api
@@ -565,6 +601,7 @@ class BffEnvelopeTests(unittest.TestCase):
         )
         self.assertNotIn("10", profiles)
         self.assertIn("beibeiwu", {str(value) for value in db.statement.compile().params.values()})
+        self.assertTrue(archive_api._conversation_name_is_placeholder("游客", "9"))
 
     def test_message_normalization_keeps_revoke_identity_and_state(self) -> None:
         messages = normalize_messages(
@@ -3404,6 +3441,13 @@ class SocialFrontendContractTests(unittest.TestCase):
             "disconnectMomentViewTracking()",
         ):
             self.assertIn(marker, app_js)
+        visibility_handler = app_js.split("function updateMomentCardVisibility", 1)[1].split(
+            "async function reportMomentView", 1
+        )[0]
+        self.assertIn(
+            "suspendMomentVideos(card, { cancelCompat: true });",
+            visibility_handler,
+        )
         self.assertIn('if path == "/api/moments/view":', server_py)
         self.assertIn("app.social.record_post_view(postid)", server_py)
         self.assertIn('payload["task_assist"] = _assist_moment_view_task(', server_py)
@@ -4268,19 +4312,24 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
         self.assertIn("Boolean(conversation._avatar_from_fallback)", app_js)
         self.assertIn("_avatar_from_fallback: inherited", app_js)
         self.assertIn("function applyCachedConversationProfile(item)", app_js)
-        self.assertIn("const avatar = currentAvatar || profileAvatar;", app_js)
+        self.assertIn("const preferCachedProfile = conversation.profile_resolved !== true;", app_js)
+        self.assertIn("const avatar = useProfileAvatar ? profileAvatar : currentAvatar || profileAvatar;", app_js)
+        self.assertIn('value === "游客"', app_js)
+        self.assertIn("display.profile_resolved !== true", app_js)
+        self.assertIn("rememberConversationProfile(profileUid, user)", app_js)
         self.assertIn("async function hydrateConversationProfiles()", app_js)
         self.assertIn("function conversationProfileForPeer(rows, peer)", app_js)
         self.assertIn("function conversationProfileNeedsHydration(item)", app_js)
         self.assertIn(".filter(conversationProfileNeedsHydration)", app_js)
-        self.assertIn("conversationNameIsPlaceholder(conversationDisplayName(item), peer)", app_js)
+        self.assertIn("conversationNameIsPlaceholder(conversationDisplayName(display), peer)", app_js)
         self.assertIn(".map(applyCachedConversationProfile);", app_js)
         self.assertIn("return profiles.length === 1 && idless.length === 1 ? idless[0] : null;", app_js)
         self.assertNotIn("profiles[0] ||", app_js)
         self.assertIn("function timUserProfileRows(result)", app_js)
         self.assertIn("function rememberTimConversationProfiles(rows)", app_js)
         self.assertIn("function normalizedConversationProfile(profile, peer)", app_js)
-        self.assertIn("_resolved: true", app_js)
+        self.assertIn("_resolved: Boolean(nickname && avatar)", app_js)
+        self.assertIn("_resolved: incoming._resolved === true", app_js)
         self.assertIn("S.chat.getUserProfile({ userIDList })", app_js)
         self.assertIn("await waitForConversationProfileSdk()", app_js)
         self.assertIn("CONVERSATION_PROFILE_SDK_WAIT_MS = 1200", app_js)
@@ -4296,6 +4345,7 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
         self.assertIn("sessionStorage.setItem(key", app_js)
         self.assertIn("syncConversationProfileAccount();", app_js)
         self.assertIn("function preserveConversationDisplayName(preferred, fallback)", app_js)
+        self.assertIn("function finalizeConversationProfileResolution(conversation, fallback)", app_js)
         self.assertIn("void hydrateConversationProfiles();", app_js)
         self.assertNotIn('data-action="im-connect"', app_js)
         self.assertNotIn('id="reload-page"', index_html)
@@ -4303,6 +4353,127 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
         self.assertNotIn("UID ${esc", chat_pane)
         self.assertIn('refreshList: action !== "select-conversation"', select_action)
         self.assertNotIn("refreshList: true", select_action)
+
+    def test_conversation_profile_merge_resolves_after_name_and_avatar_merge(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for the conversation profile merge test")
+
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        merge_functions = "function preserveConversationDisplayName" + app_js.split(
+            "function preserveConversationDisplayName", 1
+        )[1].split("function normalizeTimConversation", 1)[0]
+        script = (
+            r"""
+function conversationPeer(item) { return String(item?.peer_id || ""); }
+function conversationDisplayName(item) { return String(item?.nickname || item?.user?.nickname || ""); }
+function conversationAvatar(item) { return String(item?.avatar || item?.user?.avatar || ""); }
+function conversationNameIsPlaceholder(value, peer) {
+  const name = String(value || "").trim();
+  return !name || name === "用户" || name === "游客" || name === peer || name === `用户 ${peer}`;
+}
+"""
+            + merge_functions
+            + r"""
+const live = {
+  peer_id: "9",
+  nickname: "旧昵称",
+  avatar: "https://example.invalid/old.jpg",
+  profile_resolved: false,
+  user: { nickname: "旧昵称", avatar: "https://example.invalid/old.jpg" },
+};
+const archived = {
+  peer_id: "9",
+  nickname: "新昵称",
+  avatar: "https://example.invalid/new.jpg",
+  profile_resolved: true,
+  user: { nickname: "新昵称", avatar: "https://example.invalid/new.jpg" },
+};
+let merged = preserveConversationDisplayName(live, archived);
+if (merged.profile_resolved === true) throw new Error("name merge resolved too early");
+merged = preserveConversationAvatar(merged, archived);
+if (merged.profile_resolved === true) throw new Error("avatar merge resolved too early");
+merged = finalizeConversationProfileResolution(merged, archived);
+if (merged.nickname !== "新昵称") throw new Error("stale nickname retained");
+if (merged.avatar !== "https://example.invalid/new.jpg") throw new Error("stale avatar retained");
+if (merged.profile_resolved !== true) throw new Error("complete merged profile unresolved");
+"""
+        )
+        result = subprocess.run(
+            [node, "-e", script],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_partial_cached_profile_does_not_stop_hydration(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for the partial profile test")
+
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        profile_functions = "function conversationProfileResolved" + app_js.split(
+            "function conversationProfileResolved", 1
+        )[1].split("function preserveConversationDisplayName", 1)[0]
+        apply_function = "function applyCachedConversationProfile" + app_js.split(
+            "function applyCachedConversationProfile", 1
+        )[1].split("function timUserProfileRows", 1)[0]
+        script = (
+            r"""
+const S = {
+  conversationProfilesByUid: new Map(),
+  conversationProfileFetchedAt: new Map(),
+};
+function validAvatarValue(...values) {
+  return values.map((value) => String(value || "").trim()).find(Boolean) || "";
+}
+function conversationPeer(item) { return String(item?.peer_id || ""); }
+function conversationDisplayName(item) { return String(item?.nickname || item?.user?.nickname || ""); }
+function conversationAvatar(item) { return validAvatarValue(item?.avatar, item?.user?.avatar); }
+function conversationNameIsPlaceholder(value, peer) {
+  const name = String(value || "").trim();
+  return !name || name === "用户" || name === "游客" || name === peer || name === `用户 ${peer}`;
+}
+"""
+            + profile_functions
+            + apply_function
+            + r"""
+S.conversationProfilesByUid.set("9", {
+  id: "9",
+  nickname: "旧昵称",
+  avatar: "https://example.invalid/old.jpg",
+  portrait: "https://example.invalid/old.jpg",
+  _resolved: true,
+});
+rememberConversationProfile("9", { id: "9", nickname: "新昵称" });
+const cached = S.conversationProfilesByUid.get("9");
+if (cached._resolved !== false) throw new Error("partial result marked complete");
+const merged = applyCachedConversationProfile({
+  peer_id: "9",
+  nickname: "旧昵称",
+  avatar: "https://example.invalid/old.jpg",
+  profile_resolved: false,
+  user: {},
+});
+if (merged.nickname !== "新昵称") throw new Error("new nickname not applied");
+if (merged.avatar !== "https://example.invalid/old.jpg") throw new Error("existing avatar lost");
+if (merged.profile_resolved !== false) throw new Error("partial merged profile marked complete");
+"""
+        )
+        result = subprocess.run(
+            [node, "-e", script],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_authenticated_boot_preloads_conversations_and_realtime_unread_state(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -4751,6 +4922,12 @@ class RichMessageFrontendContractTests(unittest.TestCase):
             open_chat.index("void loadConversationMessages(uid)"),
             open_chat.index("refreshMessageConversationRegion({"),
         )
+        self.assertIn("const conversation = ensureConversationForPeer(uid", open_chat)
+        self.assertIn(
+            "S.activePeerName = conversationEntryDisplayName(conversation, requestedName, uid)",
+            open_chat,
+        )
+        self.assertNotIn("S.activePeerName = button.dataset.name", open_chat)
 
     def test_escape_returns_single_pane_chat_to_conversation_list(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -4863,6 +5040,88 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn(".map(normalizeTimConversation)", tim_handlers)
         self.assertIn("S.conversations = mergeConversationSources(S.conversations, updated)", tim_handlers)
 
+    def test_local_conversation_profile_requires_name_and_avatar_from_one_update(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for the local conversation profile test")
+
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        name_functions = "function conversationNameIsPlaceholder" + app_js.split(
+            "function conversationNameIsPlaceholder", 1
+        )[1].split("function conversationProfileNeedsHydration", 1)[0]
+        ensure_function = "function ensureConversationForPeer" + app_js.split(
+            "function ensureConversationForPeer", 1
+        )[1].split("function updateConversationActivity", 1)[0]
+        script = (
+            r"""
+const S = { conversations: [], activePeer: "", unreadTotal: 0 };
+function restoreDismissedConversationPeer() {}
+function recalculateUnreadTotal() {}
+function conversationPeer(item) { return String(item?.peer_id || ""); }
+function conversationDisplayName(item) { return String(item?.nickname || ""); }
+function conversationAvatar(item) { return String(item?.avatar || ""); }
+function validAvatarValue(...values) {
+  return values.map((value) => String(value || "").trim()).find(Boolean) || "";
+}
+"""
+            + name_functions
+            + ensure_function
+            + r"""
+S.conversations = [{
+  peer_id: "9",
+  nickname: "旧昵称",
+  avatar: "https://example.invalid/old.jpg",
+  profile_resolved: false,
+}];
+let updated = ensureConversationForPeer("9", { name: "新昵称", replaceName: true });
+if (updated.profile_resolved !== false) throw new Error("name-only update marked complete");
+S.conversations[0].profile_resolved = false;
+updated = ensureConversationForPeer("9", { avatar: "https://example.invalid/new.jpg" });
+if (updated.profile_resolved !== false) throw new Error("avatar-only update marked complete");
+S.conversations[0].profile_resolved = false;
+updated = ensureConversationForPeer("9", {
+  name: "完整昵称",
+  avatar: "https://example.invalid/complete.jpg",
+  replaceName: true,
+});
+if (updated.profile_resolved !== true) throw new Error("complete update remained unresolved");
+S.conversations = [];
+const created = ensureConversationForPeer("10", { name: "只有昵称" });
+if (created.profile_resolved !== false) throw new Error("partial new conversation marked complete");
+S.conversations = [{
+  peer_id: "11",
+  nickname: "真实昵称",
+  avatar: "https://example.invalid/resolved.jpg",
+  profile_resolved: true,
+}];
+const preserved = ensureConversationForPeer("11", {
+  name: "乐园用户",
+  replaceName: true,
+});
+if (preserved.nickname !== "真实昵称") throw new Error("fallback name replaced resolved nickname");
+if (preserved.profile_resolved !== true) throw new Error("resolved profile was downgraded");
+if (conversationEntryDisplayName(preserved, "乐园用户", "11") !== "真实昵称") {
+  throw new Error("chat heading preferred fallback name");
+}
+S.conversations = [];
+const fallbackOnly = ensureConversationForPeer("12", { name: "乐园用户" });
+if (fallbackOnly.nickname !== "用户 12") throw new Error("fallback name was persisted");
+if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户 12") {
+  throw new Error("fallback heading was not normalized");
+}
+"""
+        )
+        result = subprocess.run(
+            [node, "-e", script],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_incoming_message_toast_prefers_the_sender_nickname(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
@@ -4964,17 +5223,26 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         compose = (root / "compose.yaml").read_text(encoding="utf-8")
         media_url = app_js.split("function mediaUrl(value)", 1)[1].split("function validAvatarValue", 1)[0]
         moment_media = app_js.split("function momentMediaHtml(post)", 1)[1].split("function momentOwnershipMenu", 1)[0]
+        moment_video_markup = moment_media.split("const videoHtml = video", 1)[1]
+        close_profile = app_js.split("function closeProfileDialog()", 1)[1].split(
+            "async function openProfile", 1
+        )[0]
         transcode_service = compose.split("  transcode-worker:", 1)[1].split("  scheduler:", 1)[0]
 
         self.assertIn("moyuanoss\\.oss-cn-shanghai\\.aliyuncs\\.com", app_js)
         self.assertIn("appletattachment\\.oss-cn-beijing\\.aliyuncs\\.com", app_js)
         self.assertLess(media_url.index("APK_MEDIA_ORIGIN_RE"), media_url.index('raw.startsWith("//")'))
         self.assertIn('data-media-playback data-moment-video="true"', moment_media)
+        self.assertIn('preload="none"', moment_media)
+        self.assertNotIn('preload="metadata"', moment_media)
         self.assertIn('data-media-mode="original"', moment_media)
         self.assertIn('data-post-id="${esc(', moment_media)
         self.assertIn('data-original-source="${esc(video)}"', moment_media)
         self.assertIn('data-media-source="${esc(', moment_media)
         self.assertIn('data-video-frame-required="true"', moment_media)
+        self.assertIn('data-video-state="poster"', moment_media)
+        self.assertIn('data-action="play-moment-video"', moment_media)
+        self.assertNotIn(' src="${esc(', moment_video_markup)
         self.assertIn('controlslist="nodownload noremoteplayback"', moment_media)
         self.assertIn("disablepictureinpicture", moment_media)
         self.assertIn("disableremoteplayback", moment_media)
@@ -5003,15 +5271,25 @@ class RichMessageFrontendContractTests(unittest.TestCase):
             "const retryState", 1
         )[0]
         self.assertIn("prepareMomentVideoCompatibility(media)", decode_fallback)
-        self.assertNotIn("playbackRequested", decode_fallback)
+        self.assertIn('media.dataset.playbackRequested !== "1"', playback_error)
+        self.assertLess(
+            playback_error.index('media.dataset.playbackRequested !== "1"'),
+            playback_error.index("const mediaErrorCode"),
+        )
         self.assertNotIn('setMomentVideoFallback(media, "视频加载失败"', decode_fallback)
         self.assertIn("function cancelPendingVideoFrameCallback(video)", app_js)
         self.assertIn("video.cancelVideoFrameCallback(callbackId)", app_js)
         self.assertIn('media.dataset.mediaMode === "compat"', app_js)
         self.assertIn('media.dataset.mediaMode = "original"', app_js)
         self.assertIn("正在准备兼容版本…", app_js)
+        self.assertIn("moment_video_compat", app_js)
+        self.assertIn("MOMENT_VIDEO_COMPAT_POLL_DELAYS_MS", app_js)
         self.assertIn("视频暂时无法播放", app_js)
         self.assertIn("当前浏览器暂时无法播放此视频", app_js)
+        self.assertIn(
+            "suspendMomentVideos(dialog, { cancelCompat: true });",
+            close_profile,
+        )
         self.assertNotIn("可打开原视频或下载后播放", app_js)
         self.assertIn(".moment-video-wrap", app_css)
         self.assertNotIn(".moment-playback-actions", app_css)
@@ -5021,6 +5299,8 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn('video[data-moment-video="true"]', context_menu_guard)
         self.assertIn("event.preventDefault()", context_menu_guard)
         moment_video_css = app_css.split(".moment-video {", 1)[1].split("}", 1)[0]
+        self.assertIn("aspect-ratio: auto 16 / 9", moment_video_css)
+        self.assertNotIn("aspect-ratio: 16 / 9", moment_video_css)
         self.assertIn("-webkit-touch-callout: none", moment_video_css)
         self.assertIn("user-select: none", moment_video_css)
         self.assertIn("stop_grace_period: 32m", transcode_service)

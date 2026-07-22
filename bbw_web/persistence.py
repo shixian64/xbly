@@ -427,6 +427,19 @@ class RuntimePersistence:
             f"{identity.user_id}:{asset_id}"
         )
 
+    def _moment_video_source_grant_key(
+        self,
+        identity: UserIdentity,
+        post_id: str,
+        source_url: str,
+    ) -> str:
+        post_digest = hashlib.sha256(str(post_id).encode("utf-8")).hexdigest()
+        source_digest = hashlib.sha256(str(source_url).encode("utf-8")).hexdigest()
+        return (
+            f"{self.settings.redis_prefix}:moment-video-source-grant:"
+            f"{identity.user_id}:{post_digest}:{source_digest}"
+        )
+
     def remember_moment_video_grants(
         self, identity: UserIdentity, response_data: dict[str, Any]
     ) -> int:
@@ -435,12 +448,13 @@ class RuntimePersistence:
             MomentVideoError,
             asset_id_for_url,
             canonical_source_identity,
+            compatibility_profiles_for_cleanup,
         )
 
         raw_items = response_data.get("items") or response_data.get("list") or []
         if not isinstance(raw_items, list):
             return 0
-        grants: list[tuple[str, str]] = []
+        grants: list[tuple[str, str, tuple[str, ...]]] = []
         for item in raw_items[:200]:
             if not isinstance(item, dict):
                 continue
@@ -452,30 +466,66 @@ class RuntimePersistence:
                 canonical = canonical_source_identity(source)
             except MomentVideoError:
                 continue
-            grants.append((post_id, asset_id_for_url(canonical)))
+            asset_ids = tuple(
+                asset_id_for_url(canonical, profile=profile)
+                for profile in compatibility_profiles_for_cleanup()
+            )
+            grants.append((post_id, canonical, asset_ids))
         if not grants:
             return 0
         pipe = self.redis.pipeline()
-        for post_id, asset_id in grants:
+        for post_id, canonical, asset_ids in grants:
             pipe.set(
-                self._moment_video_feed_grant_key(identity, post_id, asset_id),
+                self._moment_video_source_grant_key(identity, post_id, canonical),
                 b"1",
                 ex=self.MOMENT_VIDEO_GRANT_SECONDS,
             )
+            for asset_id in asset_ids:
+                pipe.set(
+                    self._moment_video_feed_grant_key(identity, post_id, asset_id),
+                    b"1",
+                    ex=self.MOMENT_VIDEO_GRANT_SECONDS,
+                )
         pipe.execute()
         return len(grants)
 
     def authorize_moment_video(
-        self, identity: UserIdentity, *, post_id: str, asset_id: str
+        self,
+        identity: UserIdentity,
+        *,
+        post_id: str,
+        asset_id: str,
+        source_url: str = "",
     ) -> bool:
-        feed_key = self._moment_video_feed_grant_key(identity, post_id, asset_id)
-        if not self.redis.exists(feed_key):
-            return False
-        self.redis.set(
-            self._moment_video_access_key(identity, asset_id),
-            b"1",
-            ex=self.MOMENT_VIDEO_GRANT_SECONDS,
+        from bbw_web.moment_video import (
+            asset_id_for_url,
+            compatibility_profiles_for_cleanup,
         )
+
+        asset_ids = [str(asset_id)]
+        grant_keys = [self._moment_video_feed_grant_key(identity, post_id, asset_id)]
+        if source_url:
+            grant_keys.append(
+                self._moment_video_source_grant_key(identity, post_id, source_url)
+            )
+            asset_ids = [
+                asset_id_for_url(source_url, profile=profile)
+                for profile in compatibility_profiles_for_cleanup()
+            ]
+            grant_keys.extend(
+                self._moment_video_feed_grant_key(identity, post_id, candidate)
+                for candidate in asset_ids
+            )
+        if not any(self.redis.exists(key) for key in dict.fromkeys(grant_keys)):
+            return False
+        pipe = self.redis.pipeline()
+        for candidate in dict.fromkeys(asset_ids):
+            pipe.set(
+                self._moment_video_access_key(identity, candidate),
+                b"1",
+                ex=self.MOMENT_VIDEO_GRANT_SECONDS,
+            )
+        pipe.execute()
         return True
 
     def can_access_moment_video(self, identity: UserIdentity, asset_id: str) -> bool:

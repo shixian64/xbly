@@ -203,6 +203,7 @@ class Settings:
     media_max_image_bytes: int
     media_max_audio_bytes: int
     media_max_video_bytes: int
+    moment_video_max_source_bytes: int
     media_max_attachment_bytes: int
     media_allowed_hosts: tuple[str, ...]
     r2_presign_ttl_seconds: int
@@ -264,7 +265,8 @@ class Settings:
             rq_queues=tuple(
                 item.strip()
                 for item in os.getenv(
-                    "BBW_RQ_QUEUES", "critical,im-ingest,default,media,sync,transcode"
+                    "BBW_RQ_QUEUES",
+                    "critical,im-ingest,default,media,sync,transcode-v2,transcode",
                 ).split(",")
                 if item.strip()
             ),
@@ -282,6 +284,9 @@ class Settings:
             ),
             media_max_video_bytes=_env_int(
                 "BBW_MEDIA_MAX_VIDEO_BYTES", 50 * MEBIBYTE, minimum=1
+            ),
+            moment_video_max_source_bytes=_env_int(
+                "BBW_MOMENT_VIDEO_MAX_SOURCE_BYTES", 150 * MEBIBYTE, minimum=1
             ),
             media_max_attachment_bytes=_env_int(
                 "BBW_MEDIA_MAX_ATTACHMENT_BYTES", 20 * MEBIBYTE, minimum=1

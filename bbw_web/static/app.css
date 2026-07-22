@@ -4916,16 +4916,37 @@ html.flash-viewing body {
 .moment-video {
   display: block;
   width: 100%;
+  aspect-ratio: auto 16 / 9;
   max-height: 620px;
   border-radius: 14px;
   background: #17141c;
+  object-fit: contain;
   -webkit-touch-callout: none;
   -webkit-user-select: none;
   user-select: none;
 }
 
 .moment-video-wrap {
+  position: relative;
   width: min(100%, 560px);
+}
+
+.moment-video-start {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.42);
+  border-radius: 10px;
+  background: rgba(20, 18, 24, 0.82);
+  color: #fff;
+  padding: 0.55rem 0.9rem;
+  font-weight: 750;
+  transform: translate(-50%, -50%);
+}
+
+.moment-video-start[hidden],
+.moment-video-wrap.is-media-failed .moment-video-start {
+  display: none;
 }
 
 .moment-video-wrap .moment-playback-fallback {

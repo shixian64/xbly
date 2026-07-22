@@ -309,6 +309,12 @@ def _merge_dict(current: Any, update: Mapping[str, Any]) -> dict[str, Any]:
     return base
 
 
+def _conversation_name_is_placeholder(name: Any, peer: str) -> bool:
+    value = str(name or "").strip()
+    target = str(peer or "").strip()
+    return not value or value in {"用户", "游客", target, f"用户 {target}"}
+
+
 def _conversation_candidate(
     *,
     owner_user_id: uuid.UUID,
@@ -320,13 +326,17 @@ def _conversation_candidate(
     last_message_at: datetime | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    peer = _bounded(peer_uid, 128)
+    display_title = _bounded(title, 200)
+    if _conversation_name_is_placeholder(display_title, peer):
+        display_title = ""
     return {
         "owner_user_id": owner_user_id,
         "provider": CHAT_PROVIDER,
-        "upstream_conversation_id": _canonical_conversation_id(peer_uid, reported_id),
-        "peer_upstream_uid": _bounded(peer_uid, 128) or None,
+        "upstream_conversation_id": _canonical_conversation_id(peer, reported_id),
+        "peer_upstream_uid": peer or None,
         "kind": "direct",
-        "title": _bounded(title, 200) or None,
+        "title": display_title or None,
         "unread_count": max(0, int(unread_count)) if unread_count is not None else 0,
         "unread_observed_at": _as_utc(unread_observed_at) if unread_observed_at else None,
         "last_message_at": _as_utc(last_message_at) if last_message_at else None,
@@ -2593,28 +2603,54 @@ def cleanup_expired_data() -> dict[str, Any]:
                         )
         try:
             from bbw_web.moment_video import (
+                COMPAT_PROFILE,
                 _cache_index_keys,
                 cached_assets_for_cleanup,
+                clear_empty_cache_index,
+                compatibility_profiles_for_cleanup,
                 forget_cached_asset,
                 object_key_for_asset,
             )
 
             connection = Redis.from_url(settings.redis_url)
             try:
-                compat_assets = cached_assets_for_cleanup(
-                    connection, settings, limit=50
-                )
-                age_key, _size_key, _total_key = _cache_index_keys(settings)
-                for asset_id in compat_assets:
-                    try:
-                        last_access = connection.zscore(age_key, asset_id)
-                        if last_access is not None and time.time() - float(last_access) < 60:
-                            continue
-                        storage.delete(object_key_for_asset(asset_id))
-                        forget_cached_asset(connection, settings, asset_id)
-                        compat_media_deleted += 1
-                    except Exception:
-                        compat_media_errors += 1
+                for compat_profile in compatibility_profiles_for_cleanup():
+                    compat_assets = cached_assets_for_cleanup(
+                        connection,
+                        settings,
+                        limit=50,
+                        profile=compat_profile,
+                    )
+                    age_key, _size_key, _total_key = _cache_index_keys(
+                        settings,
+                        profile=compat_profile,
+                    )
+                    for asset_id in compat_assets:
+                        try:
+                            last_access = connection.zscore(age_key, asset_id)
+                            if last_access is not None and time.time() - float(last_access) < 60:
+                                continue
+                            storage.delete(
+                                object_key_for_asset(
+                                    asset_id,
+                                    profile=compat_profile,
+                                )
+                            )
+                            forget_cached_asset(
+                                connection,
+                                settings,
+                                asset_id,
+                                profile=compat_profile,
+                            )
+                            compat_media_deleted += 1
+                        except Exception:
+                            compat_media_errors += 1
+                    if compat_profile != COMPAT_PROFILE:
+                        clear_empty_cache_index(
+                            connection,
+                            settings,
+                            profile=compat_profile,
+                        )
             finally:
                 connection.close()
         except Exception:

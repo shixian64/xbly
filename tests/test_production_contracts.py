@@ -89,7 +89,10 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn("BBW_RQ_QUEUES: sync", compose)
         self.assertIn("im-ingest-worker:", compose)
         self.assertIn("BBW_RQ_QUEUES: im-ingest", compose)
-        self.assertIn("critical,im-ingest,default,media,sync,transcode", config)
+        self.assertIn(
+            "critical,im-ingest,default,media,sync,transcode-v2,transcode",
+            config,
+        )
         self.assertIn('revision: str = "20260720_0004"', migration)
 
     def test_admin_bootstrap_runs_inside_lifespan_cleanup_scope(self) -> None:
@@ -580,6 +583,142 @@ class ProductionContractTests(unittest.TestCase):
         self.assertEqual(payload["items"][1]["text"], "较新的消息")
         self.assertTrue(payload["items"][1]["is_peer_read"])
         self.assertFalse(payload["has_more"])
+
+    def test_archived_conversation_prefers_current_local_profile_over_snapshot(self) -> None:
+        try:
+            from bbw_web import archive_api
+            from bbw_web.persistence import UserIdentity
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        owner_id = uuid.uuid4()
+        conversation_id = uuid.uuid4()
+        identity = UserIdentity(
+            user_id=owner_id,
+            external_account_id=uuid.uuid4(),
+            upstream_uid="42",
+        )
+        conversation = types.SimpleNamespace(
+            id=conversation_id,
+            upstream_conversation_id="C2C9",
+            peer_upstream_uid="9",
+            title="游客",
+            extra_data={
+                "avatar": "https://example.invalid/old.jpg",
+                "user": {
+                    "nickname": "游客",
+                    "avatar": "https://example.invalid/old.jpg",
+                },
+            },
+            last_message_at=None,
+            unread_count=0,
+            unread_observed_at=None,
+        )
+        unresolved_conversation = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            upstream_conversation_id="C2C10",
+            peer_upstream_uid="10",
+            title="游客",
+            extra_data={"user": {"nickname": "游客"}},
+            last_message_at=None,
+            unread_count=0,
+            unread_observed_at=None,
+        )
+        partial_name_conversation = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            upstream_conversation_id="C2C11",
+            peer_upstream_uid="11",
+            title="旧昵称",
+            extra_data={"avatar": "https://example.invalid/old-11.jpg"},
+            last_message_at=None,
+            unread_count=0,
+            unread_observed_at=None,
+        )
+        partial_avatar_conversation = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            upstream_conversation_id="C2C12",
+            peer_upstream_uid="12",
+            title="旧昵称",
+            extra_data={"avatar": "https://example.invalid/old-12.jpg"},
+            last_message_at=None,
+            unread_count=0,
+            unread_observed_at=None,
+        )
+        persistence = types.SimpleNamespace(
+            require_identity=lambda sid: identity if sid == "sid" else None,
+            rate_limit=lambda *_args, **_kwargs: True,
+        )
+        request = types.SimpleNamespace(
+            cookies={archive_api.legacy.COOKIE_NAME: "sid"},
+            app=types.SimpleNamespace(
+                state=types.SimpleNamespace(persistence=persistence)
+            ),
+        )
+
+        @contextmanager
+        def fake_session_scope():
+            yield object()
+
+        conversation_repo = types.SimpleNamespace(
+            list_for_owner=lambda user_id, limit: [
+                conversation,
+                unresolved_conversation,
+                partial_name_conversation,
+                partial_avatar_conversation,
+            ]
+        )
+        message_repo = types.SimpleNamespace(
+            latest_for_conversations=lambda user_id, conversation_ids: {}
+        )
+        with (
+            patch("bbw_web.archive_api.session_scope", fake_session_scope),
+            patch(
+                "bbw_web.archive_api.ConversationRepository",
+                return_value=conversation_repo,
+            ),
+            patch(
+                "bbw_web.archive_api.MessageRepository",
+                return_value=message_repo,
+            ),
+            patch(
+                "bbw_web.archive_api._local_public_profile_map",
+                return_value={
+                    "9": {
+                        "id": "9",
+                        "nickname": "真实昵称",
+                        "avatar": "https://example.invalid/current.jpg",
+                        "portrait": "https://example.invalid/current.jpg",
+                    },
+                    "11": {"id": "11", "nickname": "新昵称"},
+                    "12": {
+                        "id": "12",
+                        "avatar": "https://example.invalid/current-12.jpg",
+                        "portrait": "https://example.invalid/current-12.jpg",
+                    },
+                },
+            ),
+        ):
+            payload = archive_api.archived_conversations(request, limit=100)
+
+        item = payload["items"][0]
+        self.assertEqual(item["nickname"], "真实昵称")
+        self.assertEqual(item["avatar"], "https://example.invalid/current.jpg")
+        self.assertEqual(item["user"]["nickname"], "真实昵称")
+        self.assertTrue(item["profile_resolved"])
+        unresolved_item = payload["items"][1]
+        self.assertEqual(unresolved_item["nickname"], "10")
+        self.assertFalse(unresolved_item["profile_resolved"])
+        partial_name_item = payload["items"][2]
+        self.assertEqual(partial_name_item["nickname"], "新昵称")
+        self.assertEqual(partial_name_item["avatar"], "https://example.invalid/old-11.jpg")
+        self.assertFalse(partial_name_item["profile_resolved"])
+        partial_avatar_item = payload["items"][3]
+        self.assertEqual(partial_avatar_item["nickname"], "旧昵称")
+        self.assertEqual(
+            partial_avatar_item["avatar"],
+            "https://example.invalid/current-12.jpg",
+        )
+        self.assertFalse(partial_avatar_item["profile_resolved"])
 
     def test_admin_user_detail_race_and_sensitive_field_contracts(self) -> None:
         js = self.read("bbw_web/static/admin.js")
