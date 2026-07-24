@@ -70,6 +70,7 @@ const ADMIN_RELATIONSHIP_KIND_LABELS = Object.freeze({
 
 const ADMIN_STATE = {
   authenticated: false,
+  authGeneration: 0,
   me: null,
   currentView: "overview",
   viewGeneration: 0,
@@ -852,6 +853,7 @@ function clearSensitiveDom({ clearData = true } = {}) {
 }
 
 function resetAdminState() {
+  ADMIN_STATE.authGeneration += 1;
   abortAdminRequests();
   clearSensitiveDom({ clearData: true });
   ADMIN_STATE.authenticated = false;
@@ -945,8 +947,12 @@ function applyAdminMe(data) {
   return true;
 }
 
-async function loadAdminMe({ optional = false } = {}) {
+async function loadAdminMe({
+  optional = false,
+  expectedAuthGeneration = ADMIN_STATE.authGeneration,
+} = {}) {
   const data = await adminApi(ADMIN_ENDPOINTS.me, { authOptional: optional, timeout: 10000 });
+  if (expectedAuthGeneration !== ADMIN_STATE.authGeneration) return false;
   if (!data) return false;
   return applyAdminMe(data);
 }
@@ -2740,21 +2746,34 @@ function privacyClearForHiddenPage({ refreshCurrentView = false } = {}) {
 async function restoreVisiblePage() {
   ADMIN_STATE.pageHidden = false;
   if (!ADMIN_STATE.authenticated) return;
+  const expectedAuthGeneration = ADMIN_STATE.authGeneration;
   try {
-    const valid = await loadAdminMe();
+    const valid = await loadAdminMe({ expectedAuthGeneration });
     if (!valid) throw new AdminApiError("管理员会话不可用");
-    if (ADMIN_STATE.pageHidden) return;
+    if (
+      ADMIN_STATE.pageHidden ||
+      !ADMIN_STATE.authenticated ||
+      expectedAuthGeneration !== ADMIN_STATE.authGeneration
+    ) {
+      return;
+    }
     showApplication();
     if (ADMIN_STATE.visibilityRefreshPending) {
       ADMIN_STATE.visibilityRefreshPending = false;
       await refreshCurrentContext({ validateSession: false });
     }
   } catch (error) {
-    if (ADMIN_STATE.pageHidden) return;
-    if (!(error instanceof AdminAuthExpiredError)) {
-      resetAdminState();
-      showLogin("无法恢复管理员会话，请重新登录。");
+    if (
+      ADMIN_STATE.pageHidden ||
+      !ADMIN_STATE.authenticated ||
+      expectedAuthGeneration !== ADMIN_STATE.authGeneration
+    ) {
+      return;
     }
+    if (error instanceof AdminAuthExpiredError) return;
+    $("admin-session-status").textContent = "会话验证暂时失败";
+    showApplication();
+    toast("会话验证暂时失败，当前数据已保留，可手动刷新后重试", "error", 5000);
   }
 }
 

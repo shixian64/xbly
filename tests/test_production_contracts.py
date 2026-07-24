@@ -1132,8 +1132,15 @@ class ProductionContractTests(unittest.TestCase):
             return js[start:end]
 
         self.assertIn("userDetailGeneration: 0", js)
+        self.assertIn("authGeneration: 0", js)
         self.assertIn("function invalidateUserDetailRequests", js)
         self.assertIn("function isCurrentUserDetailRequest", js)
+        load_admin_me = function_block("loadAdminMe")
+        restore_visible_page = function_block("restoreVisiblePage")
+        self.assertIn("expectedAuthGeneration", load_admin_me)
+        self.assertIn("expectedAuthGeneration !== ADMIN_STATE.authGeneration", load_admin_me)
+        self.assertIn("!ADMIN_STATE.authenticated", restore_visible_page)
+        self.assertIn("expectedAuthGeneration !== ADMIN_STATE.authGeneration", restore_visible_page)
         for name in (
             "loadUserProfile",
             "loadUserConversations",
