@@ -908,6 +908,11 @@ summary:focus-visible {
   gap: 0.65rem;
 }
 
+.discovery-results .people-grid {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr));
+  gap: 0.8rem;
+}
+
 .discovery-page {
   display: grid;
   gap: 0.9rem;
@@ -1206,7 +1211,7 @@ summary:focus-visible {
   z-index: 1;
   display: grid;
   min-width: min(430px, 50%);
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.35rem;
   border: 1px solid rgba(115, 87, 217, 0.16);
   border-radius: 17px;
@@ -1985,6 +1990,93 @@ summary:focus-visible {
 .card-actions > .presence-badge {
   align-self: center;
   margin-top: 0;
+}
+
+.discovery-user-card .card-meta-list {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.28rem;
+  margin-top: 0.35rem;
+}
+
+.discovery-user-card .card-meta-list > .card-meta-item {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  min-height: 22px;
+  align-items: center;
+  overflow: hidden;
+  margin-top: 0;
+  border: 1px solid rgba(115, 87, 217, 0.1);
+  border-radius: 999px;
+  background: rgba(115, 87, 217, 0.055);
+  color: var(--muted);
+  padding: 0.12rem 0.45rem;
+  font-size: 0.68rem;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  word-break: normal;
+}
+
+.discovery-user-card .card-description {
+  display: -webkit-box;
+  margin: 0.38rem 0 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.discovery-user-card:not(.has-avatar) > .card-actions {
+  padding-left: 0;
+}
+
+@media (min-width: 641px) {
+  .discovery-user-card {
+    display: grid;
+    min-height: 122px;
+    grid-template-areas:
+      "copy"
+      "actions";
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: 1fr auto;
+    align-content: stretch;
+    align-items: start;
+    gap: 0.65rem 0.85rem;
+    padding: 0.95rem;
+  }
+
+  .discovery-user-card.has-avatar {
+    grid-template-areas:
+      "avatar copy"
+      ". actions";
+    grid-template-columns: 56px minmax(0, 1fr);
+  }
+
+  .discovery-user-card > .avatar {
+    grid-area: avatar;
+    width: 56px;
+    height: 56px;
+  }
+
+  .discovery-user-card > .card-copy {
+    grid-area: copy;
+    align-self: center;
+  }
+
+  .discovery-user-card > .card-actions {
+    grid-area: actions;
+    width: 100%;
+    flex-wrap: nowrap;
+    justify-content: flex-start;
+    padding-left: 0;
+  }
 }
 
 .badge {

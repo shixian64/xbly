@@ -3572,9 +3572,10 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn(snapshot, fresh_cache_branch)
         self.assertLess(fresh_cache_branch.index(snapshot), fresh_cache_branch.index("return;"))
 
-    def test_voice_room_ui_is_removed_but_voice_matching_is_first_class(self) -> None:
+    def test_voice_matching_is_hidden_without_removing_its_implementation(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        index_html = (root / "bbw_web" / "static" / "index.html").read_text(encoding="utf-8")
 
         for removed in (
             "语音房",
@@ -3588,9 +3589,7 @@ class SocialFrontendContractTests(unittest.TestCase):
             "LEGACY_MATCH_ROUTES",
         ):
             self.assertNotIn(removed, app_js)
-        for marker in (
-            'const MATCH_HUB_TABS = ["match", "voice", "bottle"]',
-            '["voice", "语音匹配"]',
+        for retained in (
             "async function pageVoiceMatch(signal)",
             'data-action="voice-match-start"',
             "async function ensureVoiceCallReady",
@@ -3600,7 +3599,26 @@ class SocialFrontendContractTests(unittest.TestCase):
             "registerUserInfo?.(",
             "session.getRemoteUsers?.()",
         ):
-            self.assertIn(marker, app_js)
+            self.assertIn(retained, app_js)
+        self.assertIn("const VOICE_MATCH_ENABLED = false;", app_js)
+        self.assertIn('const MATCH_HUB_TABS = ["match", "bottle"]', app_js)
+        self.assertIn('if (!VOICE_MATCH_ENABLED) return Promise.reject(new Error("语音匹配已停用"));', app_js)
+        self.assertIn('if (!VOICE_MATCH_ENABLED) throw new Error("语音匹配已停用");', app_js)
+        self.assertIn("S.matchTab = normalizeMatchTab(requestedMatchTab);", app_js)
+        self.assertIn('history.replaceState(null, "", matchRouteHash(S.matchTab));', app_js)
+        self.assertIn("function cleanupDisabledVoiceMatchQueue()", app_js)
+        self.assertIn("voiceMatchDisabledCleanupGeneration: -1", app_js)
+        self.assertIn("S.voiceMatchDisabledCleanupGeneration === S.sessionGeneration", app_js)
+        self.assertIn('api("/api/match/voice/cancel", {', app_js)
+        self.assertIn("if (!VOICE_MATCH_ENABLED) tasks.push(cleanupDisabledVoiceMatchQueue());", app_js)
+        self.assertIn("else await cleanupDisabledVoiceMatchQueue();", app_js)
+        self.assertIn('void fetch("/api/match/voice/cancel", { ...options, body: "{}" })', app_js)
+        match_header = app_js.split("function matchHubHeader", 1)[1].split(
+            "function normalizeMomentsTab", 1
+        )[0]
+        self.assertNotIn('["voice", "语音匹配"]', match_header)
+        self.assertNotIn("语音匹配或漂流瓶", match_header)
+        self.assertNotIn("/static/vendor/rong/", index_html)
 
     def test_match_page_uses_responsive_preference_workbench(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -3617,7 +3635,6 @@ class SocialFrontendContractTests(unittest.TestCase):
             'history.pushState(null, "", matchRouteHash(activeTab))',
             'return switchMatchHubTab(tab);',
             '["match", "匹配"]',
-            '["voice", "语音匹配"]',
             '["bottle", "漂流瓶"]',
             "async function pageVoiceMatch(signal)",
             "async function pageBottle(signal)",
@@ -3631,9 +3648,15 @@ class SocialFrontendContractTests(unittest.TestCase):
             "每次只消耗一次匹配机会",
         ):
             self.assertIn(marker, app_js)
+        match_header = app_js.split("function matchHubHeader", 1)[1].split(
+            "function normalizeMomentsTab", 1
+        )[0]
+        self.assertNotIn('["voice", "语音匹配"]', match_header)
         self.assertIn(".match-stats-grid", app_css)
         self.assertIn(".match-submit", app_css)
         self.assertIn(".match-hub-tabs", app_css)
+        match_tabs_css = app_css.split(".match-hub-tabs {", 1)[1].split("}", 1)[0]
+        self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", match_tabs_css)
         self.assertIn(".match-panel-loading", app_css)
         self.assertIn(".voice-match-control-card", app_css)
         self.assertIn(".voice-call-dialog", app_css)
@@ -3676,6 +3699,10 @@ class SocialFrontendContractTests(unittest.TestCase):
         user_card = app_js.split("function userCard(item, options = {})", 1)[1].split(
             "function formatSocialTime", 1
         )[0]
+        discovery_card_css = app_css.split(".discovery-user-card .card-meta-list > .card-meta-item", 1)[
+            1
+        ].split("}", 1)[0]
+        discovery_desktop_css = app_css.split(".discovery-user-card.has-avatar", 1)[1].split("}", 1)[0]
 
         self.assertIn("proactivePrivateMessageEnabled: false", app_js)
         self.assertIn("directImCredentialsEnabled: false", app_js)
@@ -3702,13 +3729,24 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertNotIn("发布约会邀请", matching)
         self.assertIn("return userCard(user, {", nearby)
         self.assertIn("addFriend: true", nearby)
+        self.assertIn('className: "discovery-user-card"', nearby)
+        self.assertIn("metaItems,", nearby)
+        self.assertIn("description,", nearby)
         self.assertIn("if (options.addFriend && id)", user_card)
         self.assertIn('data-action="add-friend"', user_card)
         self.assertIn('data-action="open-profile"', user_card)
+        self.assertIn('class="card-meta-list"', user_card)
+        self.assertIn('class="card-meta-item"', user_card)
+        self.assertIn('class="card-description"', user_card)
         self.assertIn('"match_pool_online_list": True', bff_server_py)
         self.assertIn('"nearby_custom_city"', bff_server_py)
         self.assertIn(".discovery-tabs", app_css)
         self.assertIn(".discovery-filter-form", app_css)
+        self.assertIn(".discovery-results .people-grid", app_css)
+        self.assertIn(".discovery-user-card.has-avatar", app_css)
+        self.assertIn("grid-template-columns: 56px minmax(0, 1fr)", discovery_desktop_css)
+        self.assertIn(".discovery-user-card .card-meta-list", app_css)
+        self.assertIn("white-space: nowrap", discovery_card_css)
         self.assertNotIn("MATCH_POOL_ONLINE_LIST_FORBIDDEN", bff_server_py)
 
     def test_unprivileged_non_match_users_remain_hidden_in_ui_and_rest_path(self) -> None:
@@ -4143,6 +4181,9 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
         conversation_avatar_renderer = app_js.split("function conversationAvatarHtml(url)", 1)[1].split(
             "function revealLoadedAvatar", 1
         )[0]
+        avatar_failure_handler = app_js.split("function discardFailedAvatar(image)", 1)[1].split(
+            "const PEER_PRESENCE_TTL_MS", 1
+        )[0]
         conversation_list_renderer = app_js.split("function renderConversationList(list)", 1)[1].split(
             "function refreshMessageConversationRegion", 1
         )[0]
@@ -4171,6 +4212,8 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
         self.assertNotIn("onerror=", avatar_renderer)
         self.assertIn("function revealLoadedAvatar(image)", app_js)
         self.assertIn("function discardFailedAvatar(image)", app_js)
+        self.assertIn('classList?.contains("user-card")', avatar_failure_handler)
+        self.assertIn('card.classList.remove("has-avatar")', avatar_failure_handler)
         self.assertIn('matches("img[data-avatar-image]")', app_js)
         self.assertIn("const previousAvatars = new Map();", conversation_list_renderer)
         self.assertIn('image?.getAttribute("src")', conversation_list_renderer)
@@ -4198,7 +4241,7 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
         self.assertIn('id: "social"', app_js)
         self.assertIn('const SOCIAL_TABS = ["friends", "apply", "follows", "fans", "visitors", "black"]', app_js)
         self.assertIn('name: "关系中心"', app_js)
-        self.assertIn('const MATCH_HUB_TABS = ["match", "voice", "bottle"]', app_js)
+        self.assertIn('const MATCH_HUB_TABS = ["match", "bottle"]', app_js)
         self.assertNotIn("LEGACY_MATCH_ROUTES", app_js)
         self.assertNotIn('["room", "语音房"]', app_js)
         self.assertNotIn("function pageRoom", app_js)
@@ -4503,7 +4546,8 @@ if (merged.profile_resolved !== false) throw new Error("partial merged profile m
         self.assertIn("startMessageSyncTimer();", start_services)
         self.assertIn("loadArchivedConversationSummary()", start_services)
         self.assertIn("runMessageSyncCycle({ force: true })", start_services)
-        self.assertIn("return Promise.allSettled([", start_services)
+        self.assertIn("const tasks = [", start_services)
+        self.assertIn("return Promise.allSettled(tasks);", start_services)
         self.assertNotIn(".then(() => runMessageSyncCycle", start_services)
         self.assertIn("refreshConversationSummary({ force })", summary_sync)
         self.assertIn("ensureTimConnected({ background: true })", background_sync)
@@ -4522,7 +4566,7 @@ if (merged.profile_resolved !== false) throw new Error("partial merged profile m
         self.assertIn("if (shouldLoadArchive)", app_js)
         self.assertIn("S.imArchiveLoadedPeers.add(target)", app_js)
         self.assertIn("function chatLogIsNearBottom", app_js)
-        self.assertIn("const shouldStickToBottom = forceBottom || chatLogIsNearBottom(log)", app_js)
+        self.assertIn("const shouldStickToBottom = forceBottom || chatLogShouldFollowBottom(log)", app_js)
         self.assertIn("function conversationMessageRevision", app_js)
         self.assertIn("nextRevision !== previousRevision", app_js)
         self.assertIn("void loadConversationMessages(activePeer, { force: true })", app_js)
@@ -4550,11 +4594,64 @@ if (merged.profile_resolved !== false) throw new Error("partial merged profile m
         self.assertIn("navigator.locks.request", app_js)
         self.assertIn("updateUnreadBadges();", unread_recalculation)
         self.assertIn("data-unread-badge", app_js)
-
         tim_conversation_sync = app_js.split(
             'if (typeof chat.getConversationList !== "function") return;', 1
         )[1].split("void refreshVisiblePeerPresence", 1)[0]
         self.assertIn("recalculateUnreadTotal();", tim_conversation_sync)
+
+    def test_mobile_chat_keeps_following_the_bottom_while_layout_settles(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+
+        viewport_sync = self._app_fragment(
+            app_js,
+            "function syncVisualViewport()",
+            "function waitForVisualViewportRecovery",
+        )
+        scrolling = self._app_fragment(
+            app_js,
+            "function cancelChatLogAutoScroll",
+            "function closeChatMessageActions",
+        )
+        media_loading = self._app_fragment(
+            app_js,
+            "function handleChatMediaLoad(image)",
+            "function isMomentVideo(media)",
+        )
+        quoted_jump = self._app_fragment(
+            app_js,
+            "async function jumpToQuotedMessage(quote)",
+            "async function retryFailedChatMessage",
+        )
+        scroll_listener = app_js.split(
+            'document.addEventListener(\n  "scroll",', 1
+        )[1].split("document.addEventListener(\"focusin\"", 1)[0]
+
+        self.assertIn("const CHAT_LOG_BOTTOM_FOLLOW = new WeakMap()", app_js)
+        self.assertIn("const CHAT_LOG_USER_SCROLL_INTENT_UNTIL = new WeakMap()", app_js)
+        self.assertIn("const CHAT_LOG_LAST_SCROLL_TOP = new WeakMap()", app_js)
+        self.assertIn("CHAT_LOG_BOTTOM_FOLLOW.set(log, false)", scrolling)
+        self.assertIn("CHAT_LOG_BOTTOM_FOLLOW.set(log, true)", scrolling)
+        self.assertIn("if (!preserveUserIntent) CHAT_LOG_USER_SCROLL_INTENT_UNTIL.delete(log)", scrolling)
+        self.assertIn("CHAT_LOG_BOTTOM_SETTLE_DELAYS_MS.forEach", scrolling)
+        self.assertIn("function chatLogShouldFollowBottom", scrolling)
+        self.assertIn("function chatLogHasRecentUserScrollIntent", scrolling)
+        self.assertIn("function scheduleChatLogBottomMaintenance", scrolling)
+        self.assertIn("composerFocused || chatLogShouldFollowBottom(chatLog)", viewport_sync)
+        self.assertGreaterEqual(media_loading.count("scheduleChatLogBottomMaintenance("), 2)
+        self.assertIn('!["PageUp", "PageDown", "Home", "End", "ArrowUp", "ArrowDown", " "].includes(event.key)', app_js)
+        self.assertIn("const movedUp = hasPreviousTop && currentTop < previousTop - 1", scroll_listener)
+        self.assertIn("if (hasUserIntent && movedUp)", scroll_listener)
+        self.assertIn("cancelChatLogAutoScroll(log, { preserveUserIntent: true })", scroll_listener)
+        near_bottom_branch = scroll_listener.split("} else if (chatLogIsNearBottom(log)) {", 1)[1].split(
+            "} else if (hasUserIntent || movedUp)", 1
+        )[0]
+        self.assertIn("CHAT_LOG_BOTTOM_FOLLOW.set(log, true)", near_bottom_branch)
+        self.assertIn("CHAT_LOG_USER_SCROLL_INTENT_UNTIL.delete(log)", scroll_listener)
+        self.assertNotIn("CHAT_LOG_BOTTOM_FOLLOW.get(log) !== false", near_bottom_branch)
+        self.assertIn("cancelChatLogAutoScroll(log, { preserveUserIntent: hasUserIntent })", scroll_listener)
+        self.assertIn('cancelChatLogAutoScroll(target.closest("#im-log"))', quoted_jump)
+        self.assertGreaterEqual(app_js.count("noteChatLogUserScrollIntent(chatLog)"), 3)
 
     def test_message_read_receipts_and_peer_presence_are_rendered(self) -> None:
         root = Path(__file__).resolve().parents[1]

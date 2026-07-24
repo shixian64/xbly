@@ -29,7 +29,10 @@ const MINE_NAV = [
 const LAB_NAV = { id: "lab", name: "协议台", desc: "仅限已启用的调试环境" };
 const LEGACY_RELATION_ROUTES = { friends: "friends", visitors: "visitors" };
 const SOCIAL_TABS = ["friends", "apply", "follows", "fans", "visitors", "black"];
-const MATCH_HUB_TABS = ["match", "voice", "bottle"];
+// Keep the voice matching implementation and vendor files for later reuse, but
+// do not expose or initialize the feature while this switch is disabled.
+const VOICE_MATCH_ENABLED = false;
+const MATCH_HUB_TABS = ["match", "bottle"];
 const RONG_IM_SDK_SRC = "/static/vendor/rong/rong-imlib-5.9.5.js";
 const RONG_RTC_SDK_SRC = "/static/vendor/rong/rong-rtc-5.7.2.js";
 const RONG_CALL_SDK_SRC = "/static/vendor/rong/rong-call-5.2.10.js";
@@ -76,6 +79,10 @@ const MESSAGE_REVOKE_DEFAULT_WINDOW_MS = 2 * 60 * 1000;
 const MESSAGE_PENDING_REVOKE_LIMIT = 50;
 const MESSAGE_SEARCH_DEBOUNCE_MS = 500;
 const CHAT_LOG_AUTO_SCROLL_GENERATIONS = new WeakMap();
+const CHAT_LOG_BOTTOM_FOLLOW = new WeakMap();
+const CHAT_LOG_USER_SCROLL_INTENT_UNTIL = new WeakMap();
+const CHAT_LOG_LAST_SCROLL_TOP = new WeakMap();
+const CHAT_LOG_BOTTOM_SETTLE_DELAYS_MS = [80, 240, 600];
 const MESSAGE_SEARCH_FILTERS = [
   { id: "all", label: "全部" },
   { id: "media", label: "图片与视频" },
@@ -146,6 +153,8 @@ const S = {
   voiceMatchCallStartedAt: 0,
   voiceMatchTimer: null,
   voiceMatchFinalizing: false,
+  voiceMatchDisabledCleanupPromise: null,
+  voiceMatchDisabledCleanupGeneration: -1,
   nearbyTab: "online",
   nearbyFilters: {
     online: { gender: "不限", property: "不限", age: "不限", city: "" },
@@ -349,6 +358,10 @@ function syncVisualViewport() {
     const viewportWidth = Math.max(0, Number(viewport?.width || window.innerWidth || 0));
     const viewportOffsetTop = Math.max(0, Number(viewport?.offsetTop || 0));
     const composerFocused = document.activeElement?.matches?.("#im-text") === true;
+    const chatLog = $("im-log");
+    const shouldMaintainChatBottom = Boolean(
+      chatLog && (composerFocused || chatLogShouldFollowBottom(chatLog))
+    );
     const viewportWidthChanged = Math.abs(viewportWidth - stableVisualViewportWidth) > 40;
 
     if (viewportWidthChanged || !composerFocused) {
@@ -372,8 +385,12 @@ function syncVisualViewport() {
       usesCoarsePointer() && composerFocused && Math.max(layoutViewportInset, stableViewportInset) > 120;
     document.documentElement.classList.toggle("keyboard-visible", keyboardVisible);
 
-    if (composerFocused && S.route === "msg" && S.activePeer) {
-      requestAnimationFrame(() => scrollChatLogToBottom());
+    if (shouldMaintainChatBottom && S.route === "msg" && S.activePeer) {
+      requestAnimationFrame(() => {
+        if (composerFocused || chatLogShouldFollowBottom(chatLog)) {
+          scrollChatLogToBottom(chatLog);
+        }
+      });
     }
   });
 }
@@ -551,6 +568,7 @@ function loadVoiceVendorScript(src, globalName) {
 }
 
 function ensureVoiceMatchSdk() {
+  if (!VOICE_MATCH_ENABLED) return Promise.reject(new Error("语音匹配已停用"));
   if (window.RongIMLib && window.RCRTC && window.RCCall) {
     return Promise.resolve({ RongIMLib: window.RongIMLib, RCRTC: window.RCRTC, RCCall: window.RCCall });
   }
@@ -799,7 +817,7 @@ async function api(path, options = {}) {
       S.imConnectingGeneration = -1;
       scrubAuthenticatedDom();
       applyUser(null);
-      void cleanupVoiceMatch({ disconnect: true });
+      if (VOICE_MATCH_ENABLED) void cleanupVoiceMatch({ disconnect: true });
       void cleanupIM().finally(() => clearSensitiveBrowserStorage());
       showLogin(true, true);
       toast("登录已失效，请重新登录", "error");
@@ -2172,10 +2190,12 @@ function startMessageSyncTimer() {
 function startMessageServices() {
   startMessageSyncTimer();
   restorePendingFlashAcknowledgements();
-  return Promise.allSettled([
+  const tasks = [
     runMessageSyncCycle({ force: true }),
     loadArchivedConversationSummary(),
-  ]);
+  ];
+  if (!VOICE_MATCH_ENABLED) tasks.push(cleanupDisabledVoiceMatchQueue());
+  return Promise.allSettled(tasks);
 }
 
 function scheduleAuthenticatedServices(delay = 250) {
@@ -2703,7 +2723,7 @@ function hydrateRenderedRoute(route, signal, seq) {
       }
     });
   }
-  if (route === "match" && S.matchTab === "voice") {
+  if (VOICE_MATCH_ENABLED && route === "match" && S.matchTab === "voice") {
     void hydrateVoiceMatchPanel().catch((error) => {
       if (error?.name !== "AbortError" && seq === S.routeSeq && S.route === "match" && S.matchTab === "voice") {
         console.info("[voice-match]", error?.message || error);
@@ -2745,7 +2765,11 @@ async function activateRoute(id, { force = false } = {}) {
       go("match", { replace: true, force: true, matchTab: S.matchTab });
       return;
     }
-    S.matchTab = normalizeMatchTab(params.get("tab"));
+    const requestedMatchTab = params.get("tab");
+    S.matchTab = normalizeMatchTab(requestedMatchTab);
+    if (requestedMatchTab !== S.matchTab) {
+      history.replaceState(null, "", matchRouteHash(S.matchTab));
+    }
   }
   const cacheKey = routeCacheKey(target);
   const previousDomKey = S.routeDomKey;
@@ -2949,7 +2973,10 @@ function revealLoadedAvatar(image) {
 }
 
 function discardFailedAvatar(image) {
-  image?.closest?.(".avatar")?.remove();
+  const avatar = image?.closest?.(".avatar");
+  const card = avatar?.parentElement?.classList?.contains("user-card") ? avatar.parentElement : null;
+  avatar?.remove();
+  if (card && !card.querySelector(".avatar")) card.classList.remove("has-avatar");
 }
 
 const PEER_PRESENCE_TTL_MS = 60 * 1000;
@@ -3337,6 +3364,10 @@ function userCard(item, options = {}) {
   const id = String(user.user_id || user.uid || user.id || "");
   const name = user.nickname || user.name || "乐园用户";
   const subtitle = user.subtitle || [id && `UID ${id}`, user.city, user.signature].filter(Boolean).join(" · ") || "等待一次友好的相遇";
+  const metaItems = Array.isArray(options.metaItems)
+    ? options.metaItems.map((value) => String(value || "").trim()).filter(Boolean)
+    : [];
+  const description = String(options.description || "").trim();
   const actions = [];
   if (options.accept && id) {
     const applyId = String(user.apply_id || user.relation_id || id);
@@ -3383,10 +3414,23 @@ function userCard(item, options = {}) {
   }
   const titleMetaHtml = String(options.titleMetaHtml || "");
   const presence = options.presence && id ? presenceBadgeHtml(id, user, "", true) : "";
-  const cardClass = ["user-card", String(options.className || "").trim()].filter(Boolean).join(" ");
+  const avatar = avatarHtml(user.avatar || user.portrait);
+  const cardClass = ["user-card", avatar ? "has-avatar" : "", String(options.className || "").trim()]
+    .filter(Boolean)
+    .join(" ");
+  const detailsHtml =
+    metaItems.length || description
+      ? `${
+          metaItems.length
+            ? `<div class="card-meta-list">${metaItems
+                .map((value) => `<span class="card-meta-item">${esc(value)}</span>`)
+                .join("")}</div>`
+            : ""
+        }${description ? `<p class="card-description">${esc(description)}</p>` : ""}`
+      : `<span>${esc(subtitle)}</span>`;
   return `<article class="${esc(cardClass)}">
-    ${avatarHtml(user.avatar || user.portrait)}
-    <div class="card-copy"><div class="card-title-line"><strong>${esc(name)}</strong>${titleMetaHtml}</div><span>${esc(subtitle)}</span></div>
+    ${avatar}
+    <div class="card-copy"><div class="card-title-line"><strong>${esc(name)}</strong>${titleMetaHtml}</div>${detailsHtml}</div>
     ${actions.length || presence ? `<div class="card-actions">${presence}${actions.join("")}</div>` : ""}
   </article>`;
 }
@@ -7063,10 +7107,12 @@ function renderChatLog(log, html = chatLogHtml(), captured = captureReusableChat
   restoreReusableChatMedia(log, captured);
 }
 
-function cancelChatLogAutoScroll(log = $("im-log")) {
+function cancelChatLogAutoScroll(log = $("im-log"), { preserveUserIntent = false } = {}) {
   if (!log) return false;
   const generation = Number(CHAT_LOG_AUTO_SCROLL_GENERATIONS.get(log) || 0) + 1;
   CHAT_LOG_AUTO_SCROLL_GENERATIONS.set(log, generation);
+  CHAT_LOG_BOTTOM_FOLLOW.set(log, false);
+  if (!preserveUserIntent) CHAT_LOG_USER_SCROLL_INTENT_UNTIL.delete(log);
   return true;
 }
 
@@ -7074,6 +7120,7 @@ function scrollChatLogToBottom(log = $("im-log")) {
   if (!log) return;
   const generation = Number(CHAT_LOG_AUTO_SCROLL_GENERATIONS.get(log) || 0) + 1;
   CHAT_LOG_AUTO_SCROLL_GENERATIONS.set(log, generation);
+  CHAT_LOG_BOTTOM_FOLLOW.set(log, true);
   const scroll = () => {
     if (
       !log.isConnected ||
@@ -7082,6 +7129,7 @@ function scrollChatLogToBottom(log = $("im-log")) {
       return false;
     }
     log.scrollTop = log.scrollHeight;
+    CHAT_LOG_LAST_SCROLL_TOP.set(log, Number(log.scrollTop || 0));
     return true;
   };
   scroll();
@@ -7089,11 +7137,37 @@ function scrollChatLogToBottom(log = $("im-log")) {
     if (!scroll()) return;
     requestAnimationFrame(scroll);
   });
+  CHAT_LOG_BOTTOM_SETTLE_DELAYS_MS.forEach((delay) => setTimeout(scroll, delay));
 }
 
 function chatLogIsNearBottom(log = $("im-log"), threshold = 96) {
   if (!log) return true;
   return log.scrollHeight - log.scrollTop - log.clientHeight <= threshold;
+}
+
+function chatLogShouldFollowBottom(log = $("im-log")) {
+  if (!log) return false;
+  const tracked = CHAT_LOG_BOTTOM_FOLLOW.get(log);
+  return tracked === undefined ? chatLogIsNearBottom(log) : tracked;
+}
+
+function noteChatLogUserScrollIntent(log = $("im-log"), duration = 1200) {
+  if (!log) return false;
+  CHAT_LOG_USER_SCROLL_INTENT_UNTIL.set(log, Date.now() + Math.max(0, Number(duration) || 0));
+  return true;
+}
+
+function chatLogHasRecentUserScrollIntent(log = $("im-log")) {
+  return Boolean(log && Number(CHAT_LOG_USER_SCROLL_INTENT_UNTIL.get(log) || 0) >= Date.now());
+}
+
+function scheduleChatLogBottomMaintenance(node = $("im-log")) {
+  const log = node?.id === "im-log" ? node : node?.closest?.("#im-log");
+  if (!log || !chatLogShouldFollowBottom(log)) return false;
+  requestAnimationFrame(() => {
+    if (log.isConnected && chatLogShouldFollowBottom(log)) scrollChatLogToBottom(log);
+  });
+  return true;
 }
 
 function addImMessage(text, type = "system", peer = "", meta = {}) {
@@ -7123,7 +7197,7 @@ function addImMessage(text, type = "system", peer = "", meta = {}) {
   }
   const log = $("im-log");
   if (log) {
-    const shouldStickToBottom = type === "mine" || chatLogIsNearBottom(log);
+    const shouldStickToBottom = type === "mine" || chatLogShouldFollowBottom(log);
     renderChatLog(log);
     if (shouldStickToBottom) scrollChatLogToBottom(log);
   }
@@ -7148,7 +7222,7 @@ function refreshChatLog({ forceBottom = false, suppressBottom = false } = {}) {
   const log = $("im-log");
   if (!log) return;
   if (suppressBottom) cancelChatLogAutoScroll(log);
-  const shouldStickToBottom = forceBottom || chatLogIsNearBottom(log);
+  const shouldStickToBottom = forceBottom || chatLogShouldFollowBottom(log);
   renderChatLog(log);
   if (!suppressBottom && shouldStickToBottom) scrollChatLogToBottom(log);
 }
@@ -9723,6 +9797,7 @@ async function jumpToQuotedMessage(quote) {
     return Boolean(normalized.message_sequence && row.dataset.messageSequence === normalized.message_sequence);
   });
   if (!target) return false;
+  cancelChatLogAutoScroll(target.closest("#im-log"));
   target.classList.remove("is-quote-target");
   void target.offsetWidth;
   target.classList.add("is-quote-target");
@@ -11201,6 +11276,7 @@ function handleChatMediaLoad(image) {
   image.dataset.mediaFailed = "0";
   image.hidden = false;
   setChatMediaFallback(image, "", false);
+  scheduleChatLogBottomMaintenance(image);
 }
 
 function handleChatMediaError(image) {
@@ -11288,6 +11364,7 @@ function handleChatPlaybackLoaded(media) {
     media.dataset.audioSourceNeedsRefresh = "0";
     media.dataset.audioSourceRefreshAttempted = "";
   }
+  scheduleChatLogBottomMaintenance(media);
 }
 
 function isMomentVideo(media) {
@@ -12240,22 +12317,26 @@ function discoveryTabsHtml(tab) {
 function discoveryUserCard(item, tab) {
   const user = item && typeof item === "object" ? { ...item } : { nickname: String(item || "用户") };
   const id = String(user.user_id || user.uid || user.id || "");
-  user.subtitle = [
+  const metaItems = [
     id && `UID ${id}`,
     user.sex || user.gender,
     user.property,
     user.age && `${user.age} 岁`,
     user.city,
     user.distance,
-    String(user.signature || "").slice(0, 24),
   ]
     .filter(Boolean)
-    .join(" · ");
+    .map((value) => String(value));
+  const description = String(user.signature || "").trim().slice(0, 48);
+  user.subtitle = [...metaItems, description].filter(Boolean).join(" · ");
   return userCard(user, {
     chat: true,
     profile: true,
     addFriend: true,
     chatOrigin: tab === "nearby" ? "nearby" : "online_list",
+    className: "discovery-user-card",
+    metaItems,
+    description,
   });
 }
 
@@ -12727,10 +12808,9 @@ function matchHubHeader(tab) {
   const activeTab = normalizeMatchTab(tab);
   const tabs = [
     ["match", "匹配"],
-    ["voice", "语音匹配"],
     ["bottle", "漂流瓶"],
   ];
-  return `<section class="match-hub-header"><div class="match-hub-copy"><span>相遇方式</span><strong>选择匹配、语音匹配或漂流瓶</strong><p>切换标签，只更新下方内容。</p></div><nav class="match-hub-tabs" role="tablist" aria-label="相遇方式">${tabs
+  return `<section class="match-hub-header"><div class="match-hub-copy"><span>相遇方式</span><strong>选择匹配或漂流瓶</strong><p>切换标签，只更新下方内容。</p></div><nav class="match-hub-tabs" role="tablist" aria-label="相遇方式">${tabs
     .map(
       ([id, label]) => `<button type="button" id="match-hub-tab-${id}" role="tab" class="match-hub-tab${activeTab === id ? " on" : ""}" aria-selected="${
         activeTab === id
@@ -13168,7 +13248,7 @@ async function switchSocialTab(tab, { visitorTab = S.visitorTab, force = false }
 
 async function loadMatchHubTab(tab, signal) {
   const activeTab = normalizeMatchTab(tab);
-  if (activeTab === "voice") return pageVoiceMatch(signal);
+  if (VOICE_MATCH_ENABLED && activeTab === "voice") return pageVoiceMatch(signal);
   if (activeTab === "bottle") return pageBottle(signal);
   return pageMatching(signal);
 }
@@ -13243,7 +13323,7 @@ async function switchMatchHubTab(tab) {
     : false;
   if (cached) {
     if (!panelDomRestored) panel.innerHTML = cached.html;
-    if (activeTab === "voice") void hydrateVoiceMatchPanel();
+    if (VOICE_MATCH_ENABLED && activeTab === "voice") void hydrateVoiceMatchPanel();
     if (!force && cached.fresh) {
       rememberPanelDomSnapshot(cacheKey, panel);
       rememberCurrentPageSnapshot(cacheKey);
@@ -13263,7 +13343,7 @@ async function switchMatchHubTab(tab) {
     rememberPanelSnapshot(cacheKey, content);
     rememberPanelDomSnapshot(cacheKey, panel);
     rememberCurrentPageSnapshot(cacheKey);
-    if (activeTab === "voice") void hydrateVoiceMatchPanel();
+    if (VOICE_MATCH_ENABLED && activeTab === "voice") void hydrateVoiceMatchPanel();
   } catch (error) {
     if (error?.name === "AbortError" || seq !== S.routeSeq || S.route !== "match") return;
     if (error instanceof AuthExpiredError) return;
@@ -13840,6 +13920,7 @@ function handleIncomingVoiceSession(session) {
 }
 
 async function ensureVoiceCallReady({ force = false } = {}) {
+  if (!VOICE_MATCH_ENABLED) throw new Error("语音匹配已停用");
   const availability = voiceCallAvailability();
   if (!availability.available) throw new Error(availability.reason);
   if (!force && S.voiceMatchConnected && S.voiceMatchCaller) return true;
@@ -13934,6 +14015,7 @@ async function refreshVoiceMatchStats() {
 }
 
 async function hydrateVoiceMatchPanel() {
+  if (!VOICE_MATCH_ENABLED) return;
   if (S.route !== "match" || S.matchTab !== "voice") return;
   updateVoiceMatchPanel();
   try {
@@ -14040,6 +14122,37 @@ async function cancelVoiceMatch({ quiet = false, refresh = true } = {}) {
   updateVoiceMatchPanel();
   if (!quiet) toastEnv(data, data?.remote_ok ? "已取消语音匹配" : "已结束当前等待");
   if (refresh) await refreshVoiceMatchStats();
+}
+
+function cleanupDisabledVoiceMatchQueue() {
+  if (VOICE_MATCH_ENABLED || !S.authenticated) return Promise.resolve(false);
+  if (S.voiceMatchDisabledCleanupGeneration === S.sessionGeneration) return Promise.resolve(true);
+  if (S.voiceMatchDisabledCleanupPromise) return S.voiceMatchDisabledCleanupPromise;
+  const generation = S.sessionGeneration;
+  const request = api("/api/match/voice/cancel", {
+    method: "POST",
+    body: "{}",
+    timeout: 6000,
+    authOptional: true,
+  })
+    .then(({ data, ok }) => {
+      const cleaned = Boolean(ok && data?.ok !== false && data?.remote_ok !== false);
+      if (cleaned && generation === S.sessionGeneration && S.authenticated) {
+        S.voiceMatchDisabledCleanupGeneration = generation;
+        S.voiceMatchServerState = voiceMatchServerState({ state: "idle", active: false });
+        S.voiceMatchPeer = null;
+        S.voiceMatchPhase = "idle";
+      }
+      return cleaned;
+    })
+    .catch(() => false)
+    .finally(() => {
+      if (S.voiceMatchDisabledCleanupPromise === request) {
+        S.voiceMatchDisabledCleanupPromise = null;
+      }
+    });
+  S.voiceMatchDisabledCleanupPromise = request;
+  return request;
 }
 
 async function finishVoiceMatchServerState() {
@@ -15126,7 +15239,8 @@ function updatePresence(active) {
 
 async function logout() {
   try {
-    await cleanupVoiceMatch({ cancelQueue: true, disconnect: true });
+    if (VOICE_MATCH_ENABLED) await cleanupVoiceMatch({ cancelQueue: true, disconnect: true });
+    else await cleanupDisabledVoiceMatchQueue();
     await api("/api/auth/logout", { method: "POST", body: "{}", timeout: 7000, authOptional: true });
   } catch (error) {
     toast(`服务端退出未确认：${error.message || error}`, "error", 3600);
@@ -15920,16 +16034,16 @@ async function handleAction(action, button) {
   if (action === "match-history-load-more") {
     return loadMatchHistory(button.dataset.page, { append: true });
   }
-  if (action === "voice-match-start") return startVoiceMatch();
-  if (action === "voice-match-cancel") return cancelVoiceMatch();
-  if (action === "voice-match-call-target") {
+  if (VOICE_MATCH_ENABLED && action === "voice-match-start") return startVoiceMatch();
+  if (VOICE_MATCH_ENABLED && action === "voice-match-cancel") return cancelVoiceMatch();
+  if (VOICE_MATCH_ENABLED && action === "voice-match-call-target") {
     const target = S.voiceMatchPeer || voiceMatchServerState().target;
     return startRongVoiceCall(button.dataset.uid || voiceMatchPeerId(target), target);
   }
-  if (action === "voice-call-accept") return acceptVoiceCall();
-  if (action === "voice-call-reject") return hangupVoiceCall("已拒绝语音来电");
-  if (action === "voice-call-hangup") return hangupVoiceCall();
-  if (action === "voice-call-mute") return toggleVoiceCallMute();
+  if (VOICE_MATCH_ENABLED && action === "voice-call-accept") return acceptVoiceCall();
+  if (VOICE_MATCH_ENABLED && action === "voice-call-reject") return hangupVoiceCall("已拒绝语音来电");
+  if (VOICE_MATCH_ENABLED && action === "voice-call-hangup") return hangupVoiceCall();
+  if (VOICE_MATCH_ENABLED && action === "voice-call-mute") return toggleVoiceCallMute();
   if (action === "receive-task") {
     const id = button.dataset.id;
     if (!id) throw new Error("缺少任务编号");
@@ -16299,6 +16413,7 @@ function completeBrowserLogin(data) {
   S.meStatsAt = 0;
   applyCapabilities(data.capabilities);
   applyUser(data.user);
+  if (!VOICE_MATCH_ENABLED) void cleanupDisabledVoiceMatchQueue();
   showLogin(false, true);
   buildNav();
   S.authenticatedServicesPending = true;
@@ -16443,11 +16558,46 @@ document.addEventListener("input", (event) => {
 });
 
 document.addEventListener(
+  "keydown",
+  (event) => {
+    if (
+      event.defaultPrevented ||
+      event.isComposing ||
+      event.altKey ||
+      event.ctrlKey ||
+      event.metaKey ||
+      !["PageUp", "PageDown", "Home", "End", "ArrowUp", "ArrowDown", " "].includes(event.key)
+    ) {
+      return;
+    }
+    const chatLog = event.target.closest && event.target.closest("#im-log");
+    if (chatLog) noteChatLogUserScrollIntent(chatLog);
+  },
+  true
+);
+
+document.addEventListener(
   "scroll",
   (event) => {
     const log = event.target;
-    if (log?.id !== "im-log" || Number(log.scrollTop || 0) > 72) return;
-    void loadOlderConversationMessages(S.activePeer, log);
+    if (log?.id !== "im-log") return;
+    const currentTop = Number(log.scrollTop || 0);
+    const previousTop = Number(CHAT_LOG_LAST_SCROLL_TOP.get(log));
+    const hasPreviousTop = Number.isFinite(previousTop);
+    const hasUserIntent = chatLogHasRecentUserScrollIntent(log);
+    const movedUp = hasPreviousTop && currentTop < previousTop - 1;
+    CHAT_LOG_LAST_SCROLL_TOP.set(log, currentTop);
+    if (hasUserIntent && movedUp) {
+      cancelChatLogAutoScroll(log, { preserveUserIntent: true });
+    } else if (chatLogIsNearBottom(log)) {
+      CHAT_LOG_BOTTOM_FOLLOW.set(log, true);
+      CHAT_LOG_USER_SCROLL_INTENT_UNTIL.delete(log);
+    } else if (hasUserIntent || movedUp) {
+      cancelChatLogAutoScroll(log, { preserveUserIntent: hasUserIntent });
+    }
+    if (currentTop <= 72) {
+      void loadOlderConversationMessages(S.activePeer, log);
+    }
   },
   { passive: true, capture: true }
 );
@@ -16558,10 +16708,20 @@ document.addEventListener("pointerdown", (event) => {
 document.addEventListener(
   "pointermove",
   (event) => {
+    const chatLog = event.target.closest && event.target.closest("#im-log");
+    if (chatLog) noteChatLogUserScrollIntent(chatLog);
     moveConversationSwipe(event);
     moveVoiceRecording(event);
   },
   { passive: false }
+);
+document.addEventListener(
+  "wheel",
+  (event) => {
+    const chatLog = event.target.closest && event.target.closest("#im-log");
+    if (chatLog) noteChatLogUserScrollIntent(chatLog);
+  },
+  { passive: true, capture: true }
 );
 document.addEventListener("pointerup", (event) => {
   finishConversationSwipe(event);
@@ -16809,11 +16969,13 @@ $("profile-dialog").addEventListener("cancel", (event) => {
 $("profile-dialog").addEventListener("click", (event) => {
   if (event.target === event.currentTarget) closeProfileDialog();
 });
-$("voice-call-dialog").addEventListener("cancel", (event) => {
-  event.preventDefault();
-  if (S.voiceMatchPhase === "incoming") void hangupVoiceCall("已拒绝语音来电");
-  else if (S.voiceMatchSession) void hangupVoiceCall();
-});
+if (VOICE_MATCH_ENABLED) {
+  $("voice-call-dialog").addEventListener("cancel", (event) => {
+    event.preventDefault();
+    if (S.voiceMatchPhase === "incoming") void hangupVoiceCall("已拒绝语音来电");
+    else if (S.voiceMatchSession) void hangupVoiceCall();
+  });
+}
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && $("sidebar").classList.contains("open")) closeDrawer(true);
@@ -16833,6 +16995,7 @@ window.visualViewport?.addEventListener("scroll", syncVisualViewport, { passive:
 window.addEventListener("online", () => {
   if (S.authenticated) restorePendingFlashAcknowledgements();
   if (!S.authenticated || document.hidden) return;
+  if (!VOICE_MATCH_ENABLED) void cleanupDisabledVoiceMatchQueue();
   S.imNextReconnectAt = 0;
   S.messageLastPeerSyncAt = 0;
   startMessageSyncTimer();
@@ -16924,21 +17087,25 @@ window.addEventListener("pagehide", (event) => {
     if (S.serverHeartbeat) {
       void fetch("/api/heartbeat/stop", { ...options, body: "{}" }).catch(() => {});
     }
-    const voiceState = voiceMatchServerState();
-    if (!event.persisted && !S.voiceMatchSession && voiceState.state !== "idle") {
+    if (!event.persisted && !VOICE_MATCH_ENABLED) {
       void fetch("/api/match/voice/cancel", { ...options, body: "{}" }).catch(() => {});
-    } else if (!event.persisted && S.voiceMatchSession) {
-      void fetch("/api/match/voice/finish", { ...options, body: "{}" }).catch(() => {});
+    } else if (VOICE_MATCH_ENABLED) {
+      const voiceState = voiceMatchServerState();
+      if (!event.persisted && !S.voiceMatchSession && voiceState.state !== "idle") {
+        void fetch("/api/match/voice/cancel", { ...options, body: "{}" }).catch(() => {});
+      } else if (!event.persisted && S.voiceMatchSession) {
+        void fetch("/api/match/voice/finish", { ...options, body: "{}" }).catch(() => {});
+      }
     }
   }
-  if (!event.persisted && S.voiceMatchSession) {
+  if (VOICE_MATCH_ENABLED && !event.persisted && S.voiceMatchSession) {
     try {
       void S.voiceMatchSession.hungup?.();
     } catch {
       // Page is leaving; the SDK will also close its media tracks.
     }
   }
-  if (!event.persisted && window.RongIMLib?.disconnect) {
+  if (VOICE_MATCH_ENABLED && !event.persisted && window.RongIMLib?.disconnect) {
     try {
       void window.RongIMLib.disconnect();
     } catch {
@@ -16990,6 +17157,7 @@ async function restoreSessionAtBoot() {
     S.authenticated = true;
     applyCapabilities(data.capabilities);
     applyUser(data.user);
+    if (!VOICE_MATCH_ENABLED) void cleanupDisabledVoiceMatchQueue();
     showLogin(false);
     S.serverHeartbeat = Boolean(data.auto_heartbeat ?? S.serverHeartbeat);
     S.authenticatedServicesPending = true;
