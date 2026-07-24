@@ -13,6 +13,7 @@
 - `credential_keyring`
 - `phone_hmac_key`
 - `session_hmac_key`
+- `deployment_control_token`
 - `admin_initial_password`
 - `txim_secret_key`
 - `roomkit_business_token`

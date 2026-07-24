@@ -487,8 +487,14 @@ class SessionStore:
 
     def stats(self) -> Dict[str, Any]:
         with self._lock:
+            now = time.time()
             return {
                 "active_web_sessions": len(self.users),
+                "pending_logins": sum(
+                    1
+                    for user in self.users.values()
+                    if user.pending_until is not None and user.pending_until > now
+                ),
                 "ttl_sec": self.ttl_sec,
                 "auto_heartbeat": self.auto_heartbeat,
                 "persist_sessions": self.persist_sessions,

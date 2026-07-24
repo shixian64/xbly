@@ -58,6 +58,8 @@ Docker 网络划分：
 
 ```dotenv
 APP_UPSTREAM=100.83.127.12:18000
+# 没有第二台后端时可省略；蓝绿跨主机时填写待命后端地址。
+APP_STANDBY_UPSTREAM=100.83.127.13:18000
 ```
 
 后端机 `.env` 设置自己的稳定 Tailscale IPv4 和监听端口：
@@ -89,6 +91,7 @@ App、Scheduler 和全部 Worker，再生成最终 PostgreSQL/Redis 快照；禁
 | `Dockerfile` | Python 3.12 非 root 应用镜像，只复制运行时所需文件 |
 | `.dockerignore` | 默认全部排除，再显式允许源码；APK、Git、Session、Secret 永不进入上下文 |
 | `compose.yaml` | 完整单机服务拓扑、健康检查、资源限制和 Docker secrets |
+| `compose.blue-green.yaml` | 可选的 App 绿色槽位；与 `app` 蓝色槽位配合完成单活切换 |
 | `compose.backend.yaml` | 后端机覆盖配置：关闭公网 Caddy，并只在 Tailscale 地址发布 App |
 | `compose.edge.yaml` | 入口机独立 Caddy，只把 Cloudflare 流量转发到 Tailscale 后端 |
 | `Caddyfile` | HTTPS、Cloudflare 来源限制、可信客户端 IP 和安全响应头 |
@@ -156,8 +159,8 @@ chmod 600 .env
 - `TURNSTILE_SITE_KEY`，暂未配置时可留空
 - `BBW_DATA_ROOT`，默认 `/var/lib/bbw`
 
-`.env` 不能保存数据库密码、主密钥、管理员密码、R2 Secret 或 Turnstile Secret。
-生产配置会主动拒绝把凭据主密钥、HMAC 密钥、腾讯 IM Secret 或 RoomKit Token 直接放进容器环境变量，必须使用对应的 `*_FILE` Docker Secret；这样这些值不会出现在 `docker inspect` 的环境块中。
+`.env` 不能保存数据库密码、主密钥、部署控制令牌、管理员密码、R2 Secret 或 Turnstile Secret。
+生产配置会主动拒绝把凭据主密钥、HMAC 密钥、部署控制令牌、腾讯 IM Secret 或 RoomKit Token 直接放进容器环境变量，必须使用对应的 `*_FILE` Docker Secret；这样这些值不会出现在 `docker inspect` 的环境块中。
 
 ### 5.2 生成和录入 Secret
 
@@ -172,6 +175,7 @@ bash docker/init-secrets.sh
 - 32 字节凭据加密主密钥。
 - 空的版本化凭据旧密钥 keyring；后续轮换会把旧主密钥写入该文件。
 - 独立手机号 HMAC 密钥和 Session HMAC 密钥。
+- 独立的蓝绿排空/恢复控制令牌；内部接口只接受该 Bearer 凭据，不信任客户端地址或代理头。
 - 随机初始管理员密码。
 
 录入的 R2 API Token 必须限制到目标 Bucket，并选择 **Object Read &
@@ -226,6 +230,8 @@ docker compose logs --tail 100 postgres redis migrate app worker transcode-worke
 
 ```bash
 curl -fsS "https://你的域名/api/health"
+curl -fsS "https://你的域名/livez"
+curl -fsS "https://你的域名/readyz"
 docker compose exec app python /app/docker/healthcheck.py
 docker compose exec postgres sh -c 'pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 docker compose exec redis redis-cli ping
@@ -348,22 +354,85 @@ docker system df
 
 ### 8.1 更新
 
-```bash
-git pull --ff-only
-docker compose config --quiet
-docker compose build --pull app
-docker compose up -d
-docker compose ps
-docker compose logs --tail 100 migrate app worker transcode-worker scheduler
-```
+生产更新必须使用蓝绿单活流程，不能直接执行不带服务名的
+`docker compose up -d`。后者会先停止唯一 App 再创建新容器，在 Caddy 与新 App
+之间留下数秒没有可用上游的窗口。
 
 每次发布先在 `.env` 中把 `APP_IMAGE` 改为新的不可变版本标签，例如
-`bbw-app:2026.07.17-4`，再只构建 `app`。不要为共用该标签的每个服务分别构建，
-也不要使用无服务名的全量构建命令；否则可能在镜像导出阶段遇到上述并发冲突。
-如果误执行全量构建并在最后报错，线上旧容器通常仍未受影响；确认新标签后，
-重新执行 `docker compose build app`，成功后再运行 `docker compose up -d`。
+`bbw-app:2026.07.24-1`。镜像由服务器管理员构建或拉取后，先运行向前兼容迁移：
 
-数据库迁移必须向前兼容正在运行的旧代码。涉及删除列、重写大量数据或密钥轮换时，应拆为多次发布，不能在单次启动迁移中长时间锁表。
+```bash
+git pull --ff-only
+docker compose -f compose.yaml -f compose.blue-green.yaml config --quiet
+docker compose -f compose.yaml -f compose.blue-green.yaml up --no-deps --no-build --force-recreate --abort-on-container-exit --exit-code-from migrate migrate
+```
+
+`app` 是蓝色槽位，`app-green` 是绿色槽位。Caddy 同时配置两个地址并使用
+`first` 策略，但发布切换不能等待主动健康检查发现旧槽位未就绪。必须在两个槽位
+都返回 200 时先热加载有序上游，把新槽位放到第一位，再排空旧槽位。这样配置替换
+是原子的，切换请求不会命中旧槽位的 503；主动健康检查只负责运行期故障兜底。
+
+当前由蓝色槽位提供服务时，启动绿色槽位并验证：
+
+```bash
+docker compose -f compose.yaml -f compose.blue-green.yaml --profile blue-green up -d --no-deps --no-build app-green
+docker compose -f compose.yaml -f compose.blue-green.yaml --profile blue-green exec app-green python /app/docker/healthcheck.py
+```
+
+绿色槽位健康后，先把 `.env` 持久化为
+`APP_UPSTREAM=app-green:8000`、`APP_STANDBY_UPSTREAM=app:8000`，再用相同顺序
+校验并热加载运行中的 Caddy。`docker compose exec -e` 是必要的，因为只修改
+`.env` 不会改变既有 Caddy 容器的进程环境；热加载本身不会关闭监听端口：
+
+```bash
+docker compose exec -e APP_UPSTREAM=app-green:8000 -e APP_STANDBY_UPSTREAM=app:8000 caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+docker compose exec -e APP_UPSTREAM=app-green:8000 -e APP_STANDBY_UPSTREAM=app:8000 caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+```
+
+确认 Caddy 已把绿色槽位放在第一位后，再排空蓝色槽位。排空的第一次调用会原子
+关闭蓝色槽位的密码登录、短信登录和验证码发送入口，然后等待已进入的登录请求结束；
+存在执行中登录或邀请码待确认登录时返回 409，并给出对应计数。重复调用会保持登录
+入口关闭，同时允许已有邀请码流程完成；全部归零后才把 `/readyz` 改为 503：
+
+```bash
+until docker compose exec app python /app/docker/healthcheck.py drain; do sleep 3; done
+sleep 3
+curl -fsS "https://你的域名/readyz"
+docker compose stop -t 30 app
+```
+
+下一次从绿色切回蓝色时，使用新镜像启动 `app`。蓝色槽位健康后，先把 `.env`
+持久化为 `APP_UPSTREAM=app:8000`、`APP_STANDBY_UPSTREAM=app-green:8000`，热加载
+这个顺序，再排空并停止绿色槽位：
+
+```bash
+docker compose up -d --no-deps --no-build app
+docker compose exec app python /app/docker/healthcheck.py
+docker compose exec -e APP_UPSTREAM=app:8000 -e APP_STANDBY_UPSTREAM=app-green:8000 caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+docker compose exec -e APP_UPSTREAM=app:8000 -e APP_STANDBY_UPSTREAM=app-green:8000 caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+until docker compose -f compose.yaml -f compose.blue-green.yaml --profile blue-green exec app-green python /app/docker/healthcheck.py drain; do sleep 3; done
+sleep 3
+curl -fsS "https://你的域名/readyz"
+docker compose -f compose.yaml -f compose.blue-green.yaml --profile blue-green stop -t 30 app-green
+```
+
+最后只更新明确列出的 Worker；不要用全量 `up -d` 意外启动已停用的 App 槽位：
+
+```bash
+docker compose up -d --no-deps --no-build worker im-ingest-worker sync-worker transcode-worker scheduler
+docker compose ps
+docker compose -f compose.yaml -f compose.blue-green.yaml --profile blue-green logs --tail 100 migrate app app-green worker transcode-worker scheduler
+```
+
+首次引入本蓝绿配置时，旧 App 尚没有 `/internal/drain`，只能先启动新槽位，再停止
+旧槽位；从下一次发布起即可完整排空。已经登录的 Session 保存在 PostgreSQL/Redis
+中，可由新槽位恢复；邀请码确认前的上游运行态仍在单个进程内，因此排空会拒绝
+切换，避免这类登录被跨实例中断。
+
+不要为共用同一标签的每个服务分别构建，也不要使用无服务名的全量构建命令；
+否则可能在镜像导出阶段遇到并发冲突。数据库迁移必须向前兼容正在运行的旧代码。
+涉及删除列、重写大量数据或密钥轮换时，应拆为多次发布，不能在单次启动迁移中
+长时间锁表。
 
 ### 8.2 进程和队列
 
@@ -391,7 +460,7 @@ chmod 600 backups/*.dump
 
 1. PostgreSQL 数据和 R2 对象元数据。
 2. R2 中的实际私有对象或其独立版本副本。
-3. 全部 Docker Secret，特别是当前主密钥、版本化旧密钥 keyring、两个 HMAC 密钥、协议密钥和 R2 凭据；必须单独加密保存。
+3. 全部 Docker Secret，特别是当前主密钥、版本化旧密钥 keyring、两个 HMAC 密钥、部署控制令牌、协议密钥和 R2 凭据；必须单独加密保存。
 4. `.env` 中的非敏感部署参数和使用中的镜像版本。
 
 只有实际在隔离环境完成恢复并抽样读取消息、媒体、账号密文后，备份才可视为有效。R2 不是数据库备份，单独复制 R2 对象也无法恢复对象归属和聊天关系。

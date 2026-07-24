@@ -85,6 +85,8 @@ value="$(openssl rand -base64 32 | tr -d '\n')"
 write_if_missing session_hmac_key "$value"
 value="$(openssl rand -base64 24 | tr -d '\n' | tr '+/' '-_')"
 write_if_missing admin_initial_password "$value"
+value="$(openssl rand -hex 32)"
+write_if_missing deployment_control_token "$value"
 
 if [[ ! -s "${SECRETS_DIR}/txim_secret_key" ]]; then
     value="$(read_required_secret TXIM_SECRET_KEY '请输入腾讯 IM Secret Key: ')"
@@ -119,7 +121,7 @@ write_optional_secret turnstile_secret_key TURNSTILE_SECRET_KEY \
 
 for secret_name in \
     postgres_password app_master_key credential_keyring phone_hmac_key session_hmac_key \
-    admin_initial_password txim_secret_key roomkit_business_token \
+    admin_initial_password deployment_control_token txim_secret_key roomkit_business_token \
     r2_access_key_id r2_secret_access_key \
     turnstile_secret_key; do
     if [[ -e "${SECRETS_DIR}/${secret_name}" ]]; then

@@ -263,8 +263,14 @@ class MomentVideoCompatibilityContracts(unittest.TestCase):
         self.assertNotIn("connection.hget(", forget)
         self.assertNotIn("connection.pipeline(", forget)
 
+        bookkeeping = source.split(
+            "def _remember_cached_asset_after_upload", 1
+        )[1].split("def transcode_job", 1)[0]
         transcode = source.split("def transcode_job", 1)[1]
-        self.assertGreaterEqual(transcode.count("trim_cached_assets_after_write("), 2)
+        self.assertIn("trim_cached_assets_after_write(", bookkeeping)
+        self.assertGreaterEqual(
+            transcode.count("_remember_cached_asset_after_upload("), 2
+        )
 
     def test_legacy_compat_cache_namespace_remains_cleanup_reachable(self) -> None:
         from bbw_web.moment_video import (
@@ -514,7 +520,10 @@ class MomentVideoCompatibilityContracts(unittest.TestCase):
             'return Response(status_code=200, media_type="video/mp4", headers=headers)',
             'result = job.return_value(refresh=True)',
             'if state == "finished"',
-            'detail="兼容视频暂时无法重新生成"',
+            'class MomentVideoServiceError(RuntimeError)',
+            '"VIDEO_COMPAT_REGENERATE_UNAVAILABLE"',
+            '"VIDEO_COMPAT_ENQUEUE_FAILED"',
+            '"request_id": str(getattr(request.state, "request_id", ""))[:64]',
             "def _queue_depth(queue: Queue)",
             "StartedJobRegistry, ScheduledJobRegistry, DeferredJobRegistry",
             "return Queue(TRANSCODE_QUEUE, connection=_persistence(request).redis)",
@@ -542,9 +551,20 @@ class MomentVideoCompatibilityContracts(unittest.TestCase):
         prepare_handler = source.split("def prepare_moment_video", 1)[1].split(
             '@router.get("/{asset_id}/status")', 1
         )[0]
+        failed_branch = prepare_handler.split('if state == "failed":', 1)[1].split(
+            'if state == "processing":', 1
+        )[0]
+        self.assertEqual(prepare_handler.count("_ready_metadata(request, asset_id)"), 1)
+        self.assertIn("ready = _ready_metadata(request, asset_id)", failed_branch)
         self.assertLess(
-            prepare_handler.index("ready = _ready_metadata"),
-            prepare_handler.index('f"moment-video-create:{identity.user_id}"'),
+            failed_branch.index("ready = _ready_metadata(request, asset_id)"),
+            failed_branch.index("if not body.retry"),
+        )
+        self.assertIn("Do not synchronously probe R2", prepare_handler)
+        self.assertIn("finished_job.delete()", prepare_handler)
+        self.assertLess(
+            prepare_handler.index("finished_job.delete()"),
+            prepare_handler.index("queue.enqueue("),
         )
         self.assertLess(
             prepare_handler.index('f"moment-video-prepare-total:{identity.user_id}"'),
@@ -598,6 +618,8 @@ class MomentVideoCompatibilityContracts(unittest.TestCase):
         self.assertIn("LEGACY_TRANSCODE_QUEUES = (\"transcode\",)", moment_video)
         self.assertIn("verified_source_identity(source_url, asset_id)", moment_video)
         self.assertIn("profile=compat_profile", moment_video)
+        self.assertIn("def _remember_cached_asset_after_upload(", moment_video)
+        self.assertIn("Do not turn an already uploaded playable", moment_video)
         self.assertIn("Worker(queues, connection=connection)", worker)
         self.assertIn('TRANSCODE_ONLY_QUEUES = {"transcode", "transcode-v2"}', worker)
         self.assertIn("name not in TRANSCODE_ONLY_QUEUES", worker)

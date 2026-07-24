@@ -804,6 +804,39 @@ def _conversation_public(row: Conversation) -> dict[str, Any]:
     }
 
 
+def _media_conversation_map(
+    db: Any,
+    rows: list[MediaObject],
+) -> dict[uuid.UUID, Conversation]:
+    message_ids = list(
+        dict.fromkeys(row.message_id for row in rows if row.message_id is not None)
+    )
+    if not message_ids:
+        return {}
+    owner_user_ids = list(dict.fromkeys(row.owner_user_id for row in rows))
+    conversations_by_message: dict[uuid.UUID, Conversation] = {}
+    statement = (
+        select(Message.id, Conversation)
+        .select_from(Message)
+        .join(
+            Conversation,
+            (Conversation.id == Message.conversation_id)
+            & (Conversation.owner_user_id == Message.owner_user_id),
+        )
+        .where(
+            Message.id.in_(message_ids),
+            Message.owner_user_id.in_(owner_user_ids),
+        )
+    )
+    for message_id, conversation in db.execute(statement):
+        conversations_by_message[message_id] = conversation
+    return {
+        row.id: conversations_by_message[row.message_id]
+        for row in rows
+        if row.message_id in conversations_by_message
+    }
+
+
 def _message_public(row: Message) -> dict[str, Any]:
     body = str(row.body or "")
     return {
@@ -826,10 +859,21 @@ def _message_public(row: Message) -> dict[str, Any]:
     }
 
 
-def _media_public(row: MediaObject) -> dict[str, Any]:
+def _media_public(
+    row: MediaObject,
+    conversation: Conversation | None = None,
+) -> dict[str, Any]:
     return {
         "id": str(row.id),
         "message_id": str(row.message_id) if row.message_id else None,
+        "conversation_id": str(conversation.id) if conversation else None,
+        "upstream_conversation_id": (
+            conversation.upstream_conversation_id if conversation else None
+        ),
+        "conversation_title": conversation.title if conversation else None,
+        "conversation_peer_upstream_uid": (
+            conversation.peer_upstream_uid if conversation else None
+        ),
         "kind": row.kind,
         "status": row.status,
         "original_filename": row.original_filename,
@@ -849,11 +893,172 @@ def _media_public(row: MediaObject) -> dict[str, Any]:
     }
 
 
-def _relationship_public(row: Relationship) -> dict[str, Any]:
+_RELATIONSHIP_NAME_KEYS = (
+    "subject_display_name",
+    "display_name",
+    "displayName",
+    "nickname",
+    "nick_name",
+    "nickName",
+    "nick",
+    "name",
+    "username",
+    "user_name",
+    "userName",
+    "yournickname",
+    "yourNickname",
+    "friendnickname",
+    "friendNickname",
+    "fansnickname",
+    "fan_nickname",
+    "follownickname",
+    "follow_nickname",
+    "target_nickname",
+    "fromUserNickName",
+    "from_nickname",
+    "toUserNickName",
+    "to_nickname",
+)
+_RELATIONSHIP_PROFILE_KEYS = (
+    "profile",
+    "user",
+    "user_info",
+    "userInfo",
+    "userInfoList",
+    "friend",
+    "followUser",
+    "follow_user",
+    "fansUser",
+    "fans_user",
+    "targetUser",
+    "target_user",
+    "fromUser",
+    "from_user",
+    "toUser",
+    "to_user",
+    "data",
+    "info",
+    "json_obj",
+)
+
+
+def _clean_relationship_name(value: Any, subject_uid: str) -> str | None:
+    if not isinstance(value, (str, int)):
+        return None
+    name = unicodedata.normalize("NFKC", str(value)).strip()
+    if not name:
+        return None
+    compact_name = re.sub(r"\s+", "", name).casefold()
+    compact_uid = re.sub(r"\s+", "", str(subject_uid or "")).casefold()
+    placeholders = {"用户", "未知用户"}
+    if compact_uid:
+        placeholders.update(
+            {
+                compact_uid,
+                f"用户{compact_uid}",
+                f"user{compact_uid}",
+            }
+        )
+    if compact_name in placeholders:
+        return None
+    return name[:160]
+
+
+def _relationship_name_from_payload(
+    value: Any,
+    subject_uid: str,
+    *,
+    depth: int = 0,
+) -> str | None:
+    if depth > 4:
+        return None
+    if isinstance(value, Mapping):
+        for key in _RELATIONSHIP_NAME_KEYS:
+            candidate = _clean_relationship_name(value.get(key), subject_uid)
+            if candidate:
+                return candidate
+        for key in _RELATIONSHIP_PROFILE_KEYS:
+            if key not in value:
+                continue
+            candidate = _relationship_name_from_payload(
+                value.get(key),
+                subject_uid,
+                depth=depth + 1,
+            )
+            if candidate:
+                return candidate
+    elif isinstance(value, (list, tuple)):
+        for item in value[:20]:
+            candidate = _relationship_name_from_payload(
+                item,
+                subject_uid,
+                depth=depth + 1,
+            )
+            if candidate:
+                return candidate
+    return None
+
+
+def _relationship_subject_names(
+    db: Any,
+    rows: list[Relationship],
+) -> dict[str, str]:
+    subject_uids = list(
+        dict.fromkeys(
+            str(row.subject_upstream_uid or "").strip()
+            for row in rows
+            if str(row.subject_upstream_uid or "").strip()
+        )
+    )
+    if not subject_uids:
+        return {}
+    statement = (
+        select(ExternalAccount.upstream_uid, User.display_name, User.profile)
+        .join(User, User.id == ExternalAccount.user_id)
+        .where(
+            ExternalAccount.provider == "beibeiwu",
+            ExternalAccount.upstream_uid.in_(subject_uids),
+        )
+    )
+    names: dict[str, str] = {}
+    for upstream_uid, display_name, profile in db.execute(statement):
+        subject_uid = str(upstream_uid or "").strip()
+        name = _clean_relationship_name(display_name, subject_uid)
+        if name is None:
+            name = _relationship_name_from_payload(profile, subject_uid)
+        if subject_uid and name:
+            names[subject_uid] = name
+    owner_user_ids = list(dict.fromkeys(row.owner_user_id for row in rows))
+    conversation_statement = (
+        select(Conversation.peer_upstream_uid, Conversation.title)
+        .where(
+            Conversation.owner_user_id.in_(owner_user_ids),
+            Conversation.peer_upstream_uid.in_(subject_uids),
+            Conversation.title.is_not(None),
+        )
+        .order_by(Conversation.updated_at.desc())
+    )
+    for upstream_uid, title in db.execute(conversation_statement):
+        subject_uid = str(upstream_uid or "").strip()
+        name = _clean_relationship_name(title, subject_uid)
+        if subject_uid and name:
+            names.setdefault(subject_uid, name)
+    return names
+
+
+def _relationship_public(
+    row: Relationship,
+    subject_display_name: str | None = None,
+) -> dict[str, Any]:
+    display_name = _relationship_name_from_payload(
+        row.extra_data,
+        row.subject_upstream_uid,
+    ) or _clean_relationship_name(subject_display_name, row.subject_upstream_uid)
     return {
         "id": str(row.id),
         "provider": row.provider,
         "subject_upstream_uid": row.subject_upstream_uid,
+        "subject_display_name": display_name,
         "kind": row.kind,
         "status": row.status,
         "started_at": _iso(row.started_at),
@@ -1942,7 +2147,11 @@ def list_user_media(
                 resource_type="media_object",
                 details={"page": page, "limit": limit, "state": state},
             )
-            items = [_media_public(row) for row in rows]
+            conversation_map = _media_conversation_map(db, rows)
+            items = [
+                _media_public(row, conversation_map.get(row.id))
+                for row in rows
+            ]
     except Exception as exc:
         if isinstance(exc, ServiceError):
             _raise_service_error(exc)
@@ -1989,7 +2198,8 @@ def access_user_media(
                 resource_id=str(media.id),
                 details={"kind": media.kind, "size_bytes": int(media.size_bytes), "ttl": ttl},
             )
-            item = _media_public(media)
+            conversation_map = _media_conversation_map(db, [media])
+            item = _media_public(media, conversation_map.get(media.id))
     except Exception as exc:
         if isinstance(exc, ServiceError):
             _raise_service_error(exc)
@@ -2035,7 +2245,14 @@ def list_user_relationships(
                 resource_type="relationship",
                 details={"page": page, "limit": limit, "kind": kind.strip(), "state": state.strip()},
             )
-            items = [_relationship_public(row) for row in rows]
+            subject_names = _relationship_subject_names(db, rows)
+            items = [
+                _relationship_public(
+                    row,
+                    subject_names.get(str(row.subject_upstream_uid or "")),
+                )
+                for row in rows
+            ]
     except Exception as exc:
         if isinstance(exc, ServiceError):
             _raise_service_error(exc)

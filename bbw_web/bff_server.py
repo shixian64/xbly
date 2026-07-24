@@ -2474,8 +2474,6 @@ class Handler(BaseHTTPRequestHandler):
             if not u:
                 return self.ok({"ok": False, "logged_in": False}, 401)
             with u.lock:
-                if str(u.app.session.nickname or "").strip() in {"", "用户", "游客"}:
-                    _enrich_session_profile(u)
                 pub = u.public()
                 user_dto = N.session_user_dto(u.app.whoami())
             return self.ok(

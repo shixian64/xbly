@@ -64,6 +64,204 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn('job_id=f"archive-media-', jobs)
         self.assertIn('job_id=f"sync-history-', jobs)
 
+    def test_message_archival_is_batched_across_http_rq_and_database_work(self) -> None:
+        archive_api = self.read("bbw_web/archive_api.py")
+        persistence = self.read("bbw_web/persistence.py")
+        jobs = self.read("bbw_web/jobs.py")
+        app_js = self.read("bbw_web/static/app.js")
+        frontend_archive = app_js.split("function rememberArchivedMessageKey", 1)[
+            1
+        ].split("async function withPending", 1)[0]
+
+        self.assertIn("class MessageReportBatch(BaseModel):", archive_api)
+        self.assertIn('items: list[MessageReport] = Field(min_length=1, max_length=20)', archive_api)
+        self.assertIn('@router.post("/messages/batch"', archive_api)
+        self.assertIn("persistence.enqueue_message_archive_batch(", archive_api)
+        self.assertIn("def enqueue_message_archive_batch(", persistence)
+        self.assertIn('"bbw_web.jobs.archive_message_batch_job"', persistence)
+        self.assertIn('job_id = f"archive-message-batch-', persistence)
+        self.assertIn("def archive_message_batch_job(", jobs)
+        self.assertIn("conversations = _upsert_conversations(", jobs)
+        self.assertIn("with session_scope() as db:", jobs)
+        self.assertIn("_dispatch_media_outboxes(outbox_ids, limit=len(outbox_ids))", jobs)
+        self.assertIn("const MESSAGE_ARCHIVE_BATCH_SIZE = 16;", app_js)
+        self.assertIn("const MESSAGE_ARCHIVE_BATCH_DELAY_MS = 75;", app_js)
+        self.assertIn("const MESSAGE_ARCHIVE_KEEPALIVE_MAX_BYTES = 48 * 1024;", app_js)
+        self.assertIn('fetch("/api/archive/messages/batch"', frontend_archive)
+        self.assertIn("items.map((item) => item.payload)", frontend_archive)
+        self.assertIn("nextMessageArchiveBatch(now)", frontend_archive)
+        self.assertIn("messageArchiveRequestByteLength(body)", frontend_archive)
+        self.assertIn("messageArchiveBatchBody([...items, item])", frontend_archive)
+        self.assertIn("if (response.status === 422)", frontend_archive)
+        self.assertIn("items.slice(0, midpoint)", frontend_archive)
+        self.assertIn("items.slice(midpoint)", frontend_archive)
+        self.assertNotIn('fetch("/api/archive/messages",', frontend_archive)
+
+    def test_product_events_leave_requests_through_a_bounded_batch_queue(self) -> None:
+        persistence = self.read("bbw_web/persistence.py")
+        jobs = self.read("bbw_web/jobs.py")
+        capture = persistence.split("def capture_product_response", 1)[1]
+        worker = persistence.split("def _product_event_worker", 1)[1].split(
+            "def health", 1
+        )[0]
+
+        self.assertIn("PRODUCT_EVENT_QUEUE_MAX = 1024", persistence)
+        self.assertIn("PRODUCT_EVENT_BATCH_SIZE = 32", persistence)
+        self.assertIn("self._product_event_queue.put_nowait(", persistence)
+        self.assertIn("grouped.setdefault(item.owner_user_id", worker)
+        self.assertIn('"bbw_web.jobs.record_product_events_batch"', worker)
+        self.assertIn('job_id=f"product-event-batch-', worker)
+        self.assertIn("self._queue_product_event(", capture)
+        self.assertNotIn('"bbw_web.jobs.record_product_event"', capture)
+        self.assertNotIn("self.mark_conversations_read(", capture)
+        self.assertIn("def record_product_events_batch(", jobs)
+        self.assertIn("relationship_cache: dict[tuple[str, str]", jobs)
+        self.assertIn('path == "/api/im/read"', jobs)
+        self.assertIn("ConversationRepository(db).mark_peers_read(", jobs)
+        self.assertIn("with session_scope() as db:", jobs)
+
+    def test_history_responses_leave_requests_through_a_bounded_batch_queue(self) -> None:
+        persistence = self.read("bbw_web/persistence.py")
+        jobs = self.read("bbw_web/jobs.py")
+        capture = persistence.split("def capture_product_response", 1)[1]
+        worker = persistence.split("def _history_response_worker", 1)[1].split(
+            "def health", 1
+        )[0]
+
+        self.assertIn("HISTORY_RESPONSE_QUEUE_MAX = 64", persistence)
+        self.assertIn("HISTORY_RESPONSE_BATCH_SIZE = 8", persistence)
+        self.assertIn("HISTORY_CONVERSATION_REFRESH_SECONDS = 120", persistence)
+        self.assertIn("self._history_response_queue.put_nowait(", persistence)
+        self.assertIn("_history_response_digest(path, query, response_data)", capture)
+        self.assertIn("self._queue_history_response(", capture)
+        self.assertNotIn('"bbw_web.jobs.ingest_history_response"', capture)
+        self.assertIn('"bbw_web.jobs.ingest_history_responses_batch"', worker)
+        self.assertIn('job_id=(\n                            f"history-response-batch-', worker)
+        self.assertIn("def ingest_history_responses_batch(", jobs)
+        self.assertIn("_ingest_history_response_in_session(", jobs)
+        self.assertIn("with session_scope() as db:", jobs)
+        self.assertIn('"history_response_queue": {', persistence)
+
+    def test_authenticated_identity_uses_one_joined_binding_lookup(self) -> None:
+        persistence = self.read("bbw_web/persistence.py")
+        repositories = self.read("bbw_prod/repositories.py")
+        jobs = self.read("bbw_web/jobs.py")
+        require_identity = persistence.split("def require_identity", 1)[1].split(
+            "def grant_message_peers", 1
+        )[0]
+        owner_binding = jobs.split("def _load_owner_binding", 1)[1].split(
+            "def _merge_dict", 1
+        )[0]
+
+        self.assertIn("def get_user_binding(", repositories)
+        self.assertIn("select(User, ExternalAccount)", repositories)
+        self.assertIn("ExternalAccount.id == external_account_id", repositories)
+        self.assertIn("get_user_binding(", require_identity)
+        self.assertNotIn("UserRepository(db).get", require_identity)
+        self.assertNotIn("get_for_user", require_identity)
+        self.assertIn("get_user_binding(", owner_binding)
+
+    def test_http_responses_expose_timing_and_warn_on_slow_api_requests(self) -> None:
+        api = self.read("bbw_web/api.py")
+        middleware = api.split("async def security_headers", 1)[1].split(
+            '@app.get("/livez"', 1
+        )[0]
+
+        self.assertIn("SLOW_HTTP_REQUEST_MS = 1000.0", api)
+        self.assertIn('response.headers["Server-Timing"]', middleware)
+        self.assertIn('"event": "slow_http_request"', middleware)
+        self.assertIn('request.url.path.startswith(("/api/", "/admin"))', middleware)
+        self.assertIn('"threshold_ms": SLOW_HTTP_REQUEST_MS', middleware)
+
+    def test_static_assets_bypass_session_and_legacy_dispatch(self) -> None:
+        source = self.read("bbw_web/api.py")
+        direct_static = source.split("def _static_asset_path", 1)[1].split(
+            '@app.get("/admin"', 1
+        )[0]
+
+        self.assertIn('@app.api_route("/", methods=["GET", "HEAD"]', direct_static)
+        self.assertIn('"/static/{asset_path:path}"', direct_static)
+        self.assertIn("candidate.relative_to(STATIC_DIR.resolve())", direct_static)
+        self.assertIn('"public, max-age=31536000, immutable"', direct_static)
+        self.assertIn('"public, max-age=300"', direct_static)
+        self.assertIn('"no-cache"', direct_static)
+        self.assertIn("return FileResponse(", direct_static)
+        self.assertNotIn("require_identity", direct_static)
+        self.assertNotIn("_legacy_dispatch", direct_static)
+
+        try:
+            from fastapi import HTTPException
+            from bbw_web import api
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        versioned_request = types.SimpleNamespace(query_params={"v": "content-hash"})
+        plain_request = types.SimpleNamespace(query_params={})
+        versioned = api.static_asset(versioned_request, "app.js")
+        unversioned = api.static_asset(plain_request, "app.js")
+        vendor = api.static_asset(
+            plain_request,
+            "vendor/tencent-cloud-chat-3.6.6.js",
+        )
+        image = api.static_asset(plain_request, "tuiemoji/emoji_3.png")
+
+        self.assertEqual(
+            versioned.headers["cache-control"],
+            "public, max-age=31536000, immutable",
+        )
+        self.assertEqual(unversioned.headers["cache-control"], "no-cache")
+        self.assertEqual(
+            vendor.headers["cache-control"],
+            "public, max-age=31536000, immutable",
+        )
+        self.assertEqual(image.headers["cache-control"], "public, max-age=300")
+        with self.assertRaises(HTTPException):
+            api.static_asset(plain_request, "../api.py")
+
+    def test_conversation_summary_joins_latest_message_in_one_query(self) -> None:
+        repositories = self.read("bbw_prod/repositories.py")
+        persistence = self.read("bbw_web/persistence.py")
+        summary = persistence.split("def conversation_summary_map", 1)[1].split(
+            "def mark_conversations_read", 1
+        )[0]
+
+        self.assertIn("def list_for_peers_with_latest(", repositories)
+        self.assertIn('Message.__table__.alias("latest_conversation_message")', repositories)
+        self.assertIn(".correlate(Conversation)", repositories)
+        self.assertIn("select(Conversation, Message)", repositories)
+        self.assertIn("list_for_peers_with_latest(", summary)
+        self.assertNotIn("latest_for_conversations(", summary)
+        self.assertNotIn("MessageRepository", summary)
+
+        try:
+            from bbw_prod.repositories import ConversationRepository
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        conversation = types.SimpleNamespace(id=uuid.uuid4())
+        message = types.SimpleNamespace(id=uuid.uuid4())
+
+        class FakeDb:
+            def __init__(self) -> None:
+                self.statements: list[object] = []
+
+            def execute(self, statement: object) -> list[tuple[object, object]]:
+                self.statements.append(statement)
+                return [(conversation, message)]
+
+        db = FakeDb()
+        rows = ConversationRepository(db).list_for_peers_with_latest(
+            uuid.uuid4(),
+            ["9", "9", "", "10"],
+        )
+
+        self.assertEqual(rows, [(conversation, message)])
+        self.assertEqual(len(db.statements), 1)
+        statement = str(db.statements[0])
+        self.assertIn("latest_conversation_message", statement)
+        self.assertIn("LEFT OUTER JOIN messages", statement)
+        self.assertIn("conversations.peer_upstream_uid", statement)
+
     def test_conversation_freshness_jobs_and_schema_are_wired(self) -> None:
         models = self.read("bbw_prod/models.py")
         repositories = self.read("bbw_prod/repositories.py")
@@ -222,6 +420,7 @@ class ProductionContractTests(unittest.TestCase):
             "def replace_social_message_relationships(",
             "def set_social_message_relationship(",
             "def can_message_peer(",
+            "def message_policy_snapshot(",
             "def message_policy_allowed_peers(",
             "def message_policy_match_peers(",
             "def message_policy_blocked_peers(",
@@ -235,14 +434,13 @@ class ProductionContractTests(unittest.TestCase):
             self.assertIn(marker, persistence)
         self.assertIn("identity.match_pool_online_list_enabled", persistence)
         self.assertIn("metadata[\"server_owned\"] = True", persistence)
-        self.assertIn("ConversationRepository(db).exists_for_peer(", persistence)
+        self.assertIn("conversation_exists = (", persistence)
+        self.assertIn("or_(grant_exists, conversation_exists)", persistence)
         self.assertIn("def exists_for_peer(", repositories)
         self.assertIn("Conversation.peer_upstream_uid == peer_upstream_uid", repositories)
         self.assertIn('Conversation.kind == kind', repositories)
         self.assertIn("persistence.can_message_peer(", api)
-        self.assertIn("persistence.message_policy_allowed_peers(identity)", api)
-        self.assertIn("persistence.message_policy_match_peers(identity)", api)
-        self.assertIn("persistence.message_policy_blocked_peers(identity)", api)
+        self.assertIn("persistence.message_policy_snapshot(identity)", api)
         self.assertIn("MATCH_DM_GRANT_PERSISTENCE_FAILED", api)
         self.assertIn("SOCIAL_DM_POLICY_PERSISTENCE_FAILED", api)
         self.assertIn("CONVERSATION_DM_GRANT_PERSISTENCE_FAILED", api)
@@ -253,6 +451,190 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn("with guard_factory(path):", bff_server)
         self.assertIn("persistence.remember_message_policy_response(", api)
 
+    def test_message_peer_grants_use_one_lookup_and_one_batch_upsert(self) -> None:
+        try:
+            from bbw_web.persistence import RuntimePersistence, UserIdentity
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        unchanged_started_at = object()
+        reactivated_started_at = object()
+        existing_rows = [
+            types.SimpleNamespace(
+                subject_upstream_uid="9",
+                status="active",
+                ended_at=None,
+                started_at=unchanged_started_at,
+                extra_data={
+                    "source_path": "/api/im/conversations",
+                    "grant_reason": "upstream_conversation",
+                    "server_owned": True,
+                },
+            ),
+            types.SimpleNamespace(
+                subject_upstream_uid="10",
+                status="inactive",
+                ended_at=object(),
+                started_at=reactivated_started_at,
+                extra_data={"legacy_evidence": True},
+            ),
+        ]
+
+        class FakeDb:
+            def __init__(self) -> None:
+                self.statements: list[object] = []
+
+            def scalars(self, statement: object) -> list[object]:
+                self.statements.append(statement)
+                return existing_rows
+
+        class FakeRelationshipRepository:
+            def __init__(self) -> None:
+                self.batches: list[list[dict[str, object]]] = []
+
+            def upsert_many(self, rows: list[dict[str, object]]) -> None:
+                self.batches.append(rows)
+
+        runtime = RuntimePersistence.__new__(RuntimePersistence)
+        identity = UserIdentity(
+            user_id=uuid.uuid4(),
+            external_account_id=uuid.uuid4(),
+            upstream_uid="42",
+        )
+        db = FakeDb()
+        repository = FakeRelationshipRepository()
+
+        @contextmanager
+        def fake_session_scope():
+            yield db
+
+        with (
+            patch("bbw_web.persistence.session_scope", fake_session_scope),
+            patch(
+                "bbw_web.persistence.RelationshipRepository",
+                return_value=repository,
+            ),
+        ):
+            peers = runtime.grant_message_peers(
+                identity=identity,
+                peers=["9", "10", "11", "9", "42", ""],
+                kind="message_peer",
+                evidence={
+                    "source_path": "/api/im/conversations",
+                    "grant_reason": "upstream_conversation",
+                },
+            )
+
+        self.assertEqual(peers, ["9", "10", "11"])
+        self.assertEqual(len(db.statements), 1)
+        self.assertEqual(len(repository.batches), 1)
+        self.assertEqual(
+            [row["subject_upstream_uid"] for row in repository.batches[0]],
+            ["10", "11"],
+        )
+        reactivated = repository.batches[0][0]
+        self.assertIs(reactivated["started_at"], reactivated_started_at)
+        self.assertEqual(reactivated["status"], "active")
+        self.assertIsNone(reactivated["ended_at"])
+        self.assertEqual(
+            reactivated["extra_data"],
+            {
+                "legacy_evidence": True,
+                "source_path": "/api/im/conversations",
+                "grant_reason": "upstream_conversation",
+                "server_owned": True,
+            },
+        )
+
+    def test_social_message_snapshot_skips_unchanged_rows_and_batches_deactivation(self) -> None:
+        try:
+            from bbw_web.persistence import RuntimePersistence, UserIdentity
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        kept_started_at = object()
+        removed_started_at = object()
+        existing_rows = [
+            types.SimpleNamespace(
+                subject_upstream_uid="9",
+                status="active",
+                ended_at=None,
+                started_at=kept_started_at,
+                extra_data={
+                    "server_owned": True,
+                    "message_policy_source": "/api/social/friends",
+                },
+            ),
+            types.SimpleNamespace(
+                subject_upstream_uid="10",
+                status="active",
+                ended_at=None,
+                started_at=removed_started_at,
+                extra_data={"legacy_evidence": True},
+            ),
+        ]
+
+        class FakeDb:
+            def __init__(self) -> None:
+                self.statements: list[object] = []
+
+            def scalars(self, statement: object) -> list[object]:
+                self.statements.append(statement)
+                return existing_rows
+
+        class FakeRelationshipRepository:
+            def __init__(self) -> None:
+                self.batches: list[list[dict[str, object]]] = []
+
+            def upsert_many(self, rows: list[dict[str, object]]) -> None:
+                self.batches.append(rows)
+
+        runtime = RuntimePersistence.__new__(RuntimePersistence)
+        identity = UserIdentity(
+            user_id=uuid.uuid4(),
+            external_account_id=uuid.uuid4(),
+            upstream_uid="42",
+        )
+        db = FakeDb()
+        repository = FakeRelationshipRepository()
+
+        @contextmanager
+        def fake_session_scope():
+            yield db
+
+        with (
+            patch("bbw_web.persistence.session_scope", fake_session_scope),
+            patch(
+                "bbw_web.persistence.RelationshipRepository",
+                return_value=repository,
+            ),
+        ):
+            peers = runtime.replace_social_message_relationships(
+                identity=identity,
+                peers=["9"],
+                kind="friend",
+                deactivate_missing=True,
+                source_path="/api/social/friends",
+            )
+
+        self.assertEqual(peers, ["9"])
+        self.assertEqual(len(db.statements), 1)
+        self.assertEqual(len(repository.batches), 1)
+        self.assertEqual(len(repository.batches[0]), 1)
+        removed = repository.batches[0][0]
+        self.assertEqual(removed["subject_upstream_uid"], "10")
+        self.assertEqual(removed["status"], "inactive")
+        self.assertIs(removed["started_at"], removed_started_at)
+        self.assertIsNotNone(removed["ended_at"])
+        self.assertEqual(
+            removed["extra_data"],
+            {
+                "legacy_evidence": True,
+                "server_owned": True,
+                "message_policy_source": "/api/social/friends",
+            },
+        )
+
     def test_archived_direct_conversation_authorizes_private_message_peer(self) -> None:
         try:
             from bbw_web.persistence import RuntimePersistence, UserIdentity
@@ -260,13 +642,13 @@ class ProductionContractTests(unittest.TestCase):
             self.skipTest(f"production dependencies are not installed: {exc}")
 
         class FakeDb:
-            def __init__(self, scalar_values: list[object | None]) -> None:
-                self.scalar_values = list(scalar_values)
+            def __init__(self, allowed: bool) -> None:
+                self.allowed = allowed
                 self.statements: list[object] = []
 
-            def scalar(self, statement: object) -> object | None:
+            def scalar(self, statement: object) -> bool:
                 self.statements.append(statement)
-                return self.scalar_values.pop(0)
+                return self.allowed
 
         runtime = RuntimePersistence.__new__(RuntimePersistence)
         identity = UserIdentity(
@@ -275,12 +657,9 @@ class ProductionContractTests(unittest.TestCase):
             upstream_uid="42",
         )
 
-        for scalar_values, expected in (
-            ([None, None, object()], True),
-            ([None, None, None], False),
-        ):
+        for expected in (True, False):
             with self.subTest(archived_conversation=expected):
-                db = FakeDb(scalar_values)
+                db = FakeDb(expected)
 
                 @contextmanager
                 def fake_session_scope():
@@ -288,7 +667,10 @@ class ProductionContractTests(unittest.TestCase):
 
                 with patch("bbw_web.persistence.session_scope", fake_session_scope):
                     self.assertIs(runtime.can_message_peer(identity, "9"), expected)
-                self.assertEqual(len(db.statements), 3)
+                self.assertEqual(len(db.statements), 1)
+                statement = str(db.statements[0])
+                self.assertIn("conversations", statement)
+                self.assertIn("relationships", statement)
 
     def test_active_friend_relationship_authorizes_private_message_peer(self) -> None:
         try:
@@ -299,11 +681,10 @@ class ProductionContractTests(unittest.TestCase):
         class FakeDb:
             def __init__(self) -> None:
                 self.statements: list[object] = []
-                self.scalar_values = [None, object()]
 
-            def scalar(self, statement: object) -> object:
+            def scalar(self, statement: object) -> bool:
                 self.statements.append(statement)
-                return self.scalar_values.pop(0)
+                return True
 
         runtime = RuntimePersistence.__new__(RuntimePersistence)
         identity = UserIdentity(
@@ -320,11 +701,11 @@ class ProductionContractTests(unittest.TestCase):
         with patch("bbw_web.persistence.session_scope", fake_session_scope):
             self.assertTrue(runtime.can_message_peer(identity, "9"))
 
-        self.assertEqual(len(db.statements), 2)
-        statement = str(db.statements[1])
+        self.assertEqual(len(db.statements), 1)
+        statement = str(db.statements[0])
         self.assertIn("relationships.provider", statement)
         self.assertIn("relationships.kind", statement)
-        params = {str(value) for value in db.statements[1].compile().params.values()}
+        params = {str(value) for value in db.statements[0].compile().params.values()}
         self.assertIn("beibeiwu", params)
         self.assertIn("friend", params)
 
@@ -338,9 +719,9 @@ class ProductionContractTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.statements: list[object] = []
 
-            def scalar(self, statement: object) -> object:
+            def scalar(self, statement: object) -> bool:
                 self.statements.append(statement)
-                return object()
+                return False
 
         runtime = RuntimePersistence.__new__(RuntimePersistence)
         identity = UserIdentity(
@@ -443,7 +824,7 @@ class ProductionContractTests(unittest.TestCase):
             )
             replace_snapshot.assert_called_once()
 
-    def test_message_policy_allowed_peers_restores_friend_and_match_grants(self) -> None:
+    def test_message_policy_snapshot_loads_all_lists_in_one_database_round_trip(self) -> None:
         try:
             from bbw_web.persistence import RuntimePersistence, UserIdentity
         except ImportError as exc:
@@ -453,11 +834,17 @@ class ProductionContractTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.statements: list[object] = []
 
-            def scalars(self, statement: object) -> list[str]:
+            def execute(self, statement: object) -> list[tuple[str, str]]:
                 self.statements.append(statement)
-                if len(self.statements) == 1:
-                    return ["10"]
-                return ["9", "10", "9", "42", ""]
+                return [
+                    ("allowed_peers", "9"),
+                    ("allowed_peers", "10"),
+                    ("allowed_peers", "42"),
+                    ("match_peers", "9"),
+                    ("match_peers", "10"),
+                    ("blocked_peers", "10"),
+                    ("blocked_peers", ""),
+                ]
 
         runtime = RuntimePersistence.__new__(RuntimePersistence)
         identity = UserIdentity(
@@ -472,15 +859,22 @@ class ProductionContractTests(unittest.TestCase):
             yield db
 
         with patch("bbw_web.persistence.session_scope", fake_session_scope):
-            peers = runtime.message_policy_allowed_peers(identity)
+            snapshot = runtime.message_policy_snapshot(identity)
 
-        self.assertEqual(peers, ["9"])
-        self.assertEqual(len(db.statements), 2)
-        params = {str(value) for value in db.statements[1].compile().params.values()}
+        self.assertEqual(
+            snapshot,
+            {
+                "allowed_peers": ["9"],
+                "match_peers": ["9"],
+                "blocked_peers": ["10"],
+            },
+        )
+        self.assertEqual(len(db.statements), 1)
+        params = {str(value) for value in db.statements[0].compile().params.values()}
         self.assertIn("beibeiwu", params)
         self.assertIn("friend", params)
         self.assertIn("web-policy", params)
-        self.assertIn("conversations.peer_upstream_uid", str(db.statements[1]))
+        self.assertIn("conversations.peer_upstream_uid", str(db.statements[0]))
         self.assertIn("tim", params)
         self.assertIn("direct", params)
 
@@ -897,6 +1291,7 @@ class ProductionContractTests(unittest.TestCase):
             f'/static/app.js?v={hashlib.sha256((ROOT / "bbw_web" / "static" / "app.js").read_bytes()).hexdigest()[:16]}',
             html,
         )
+        self.assertIn('<script defer src="/static/app.js?v=', html)
 
         show_login = js.split("function showLogin", 1)[1].split("function applyUser", 1)[0]
         self.assertIn('bootScreen.classList.add("hide")', show_login)
@@ -905,16 +1300,142 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn('$("screen-app").classList.toggle("hide", show)', show_login)
 
         restore = js.split("async function restoreSessionAtBoot()", 1)[1].split(
+            "async function recoverSessionAfterBoot", 1
+        )[0]
+        classifier = js.split("function classifyBootSessionAttempt", 1)[1].split(
+            "function completeRestoredSession", 1
+        )[0]
+        recovery = js.split("async function recoverSessionAfterBoot", 1)[1].split(
             "(async function boot()", 1
         )[0]
         boot = js.split("(async function boot()", 1)[1].split("})();", 1)[0]
         self.assertIn('api("/api/me"', restore)
-        self.assertIn("while (true)", restore)
+        self.assertIn("BOOT_SESSION_TIMEOUT_MS", restore)
+        self.assertIn("classifyBootSessionAttempt(result, error)", restore)
+        self.assertIn("status === 429", classifier)
+        self.assertIn('["offline", "network", "timeout"].includes(error.kind)', classifier)
+        self.assertIn("transient: true", classifier)
+        self.assertIn("while (token === bootSessionRecoveryToken", recovery)
+        self.assertIn("waitForBootSessionRecovery", recovery)
         self.assertIn("await restoreSessionAtBoot()", boot)
-        self.assertIn("await Promise.allSettled([featuresTask])", boot)
+        self.assertIn("scheduleDeferredFeatureLoad()", boot)
+        self.assertGreater(boot.index("scheduleDeferredFeatureLoad()"), boot.index("completeRestoredSession(data)"))
+        self.assertNotIn("void Promise.resolve(loadFeatures())", boot)
         self.assertNotIn("await loadFeatures();", boot)
-        self.assertLess(boot.index("await restoreSessionAtBoot()"), boot.index("showLogin(false)"))
-        self.assertIn("showLogin(true, true)", boot)
+        self.assertIn("completeRestoredSession(data)", boot)
+        restored = js.split("function completeRestoredSession", 1)[1].split(
+            "async function restoreSessionAtBoot", 1
+        )[0]
+        self.assertIn("showLogin(false)", restored)
+        self.assertIn("showLogin(true, !recovery)", boot)
+        self.assertIn('id="session-recovery-retry"', html)
+        self.assertIn("class ApiRequestError extends Error", js)
+        self.assertIn("responseRetryAfterMs(response)", js)
+        nearby = js.split("async function pageNearby", 1)[1].split(
+            "async function pageMessages", 1
+        )[0]
+        self.assertNotIn('api("/api/home"', nearby)
+        restored = js.split("function completeRestoredSession", 1)[1].split(
+            "async function restoreSessionAtBoot", 1
+        )[0]
+        self.assertIn("applyFeatureEnvelope(data)", restored)
+        feature_envelope = js.split("function applyFeatureEnvelope", 1)[1].split(
+            "async function loadFeatures", 1
+        )[0]
+        self.assertIn("data?.lab_enabled === true", feature_envelope)
+        self.assertLess(
+            restored.index("applyFeatureEnvelope(data)"),
+            restored.index("const desired = hashRoute()"),
+        )
+
+    def test_request_observability_health_and_blue_green_contracts(self) -> None:
+        api = self.read("bbw_web/api.py")
+        caddy = self.read("Caddyfile")
+        compose = self.read("compose.yaml")
+        blue_green = self.read("compose.blue-green.yaml")
+        healthcheck = self.read("docker/healthcheck.py")
+        config = self.read("bbw_prod/config.py")
+        init_secrets = self.read("docker/init-secrets.sh")
+        deployment = self.read("docs/14_PRODUCTION_DEPLOYMENT.md")
+        store = self.read("bbw_web/store.py")
+
+        for marker in (
+            '@app.get("/livez"',
+            '@app.get("/readyz"',
+            '@app.post("/internal/drain"',
+            '@app.post("/internal/resume"',
+            'response.headers["X-Request-ID"] = request_id',
+            '"event": "http_request"',
+            'f"session-restore:{limiter_identity}"',
+            '"SESSION_RESTORE_RATE_LIMIT"',
+        ):
+            self.assertIn(marker, api)
+        self.assertIn("def _require_deployment_control", api)
+        self.assertIn("hmac.compare_digest(supplied, expected)", api)
+        self.assertNotIn("def _require_loopback", api)
+        control_guard = api.split("def _require_deployment_control", 1)[1].split(
+            '@app.post("/internal/drain"', 1
+        )[0]
+        self.assertNotIn("request.client", control_guard)
+        self.assertNotIn("X-Forwarded-For", control_guard)
+        self.assertIn('"/api/auth/sms-send"', api)
+        drain = api.split("def begin_drain", 1)[1].split(
+            '@app.post("/internal/resume"', 1
+        )[0]
+        self.assertLess(
+            drain.index("request.app.state.accepting_logins = False"),
+            drain.index("legacy.STORE.stats()"),
+        )
+        self.assertIn("login_starts_in_flight", drain)
+        self.assertIn('"pending_logins": sum(', store)
+        self.assertIn("{$APP_STANDBY_UPSTREAM:app-green:8000}", caddy)
+        self.assertIn("lb_policy first", caddy)
+        self.assertIn("health_uri /readyz", caddy)
+        self.assertIn("Active health checks are a failure fallback", caddy)
+        self.assertIn("APP_STANDBY_UPSTREAM", compose)
+        self.assertIn("BBW_DEPLOYMENT_CONTROL_TOKEN_FILE", compose)
+        self.assertIn("deployment_control_token:", compose)
+        self.assertIn("--timeout-graceful-shutdown", compose)
+        self.assertIn("app-green:", blue_green)
+        self.assertIn("service: app", blue_green)
+        self.assertIn('request("/readyz")', healthcheck)
+        self.assertIn('{"drain", "resume"}', healthcheck)
+        self.assertIn('headers={"Authorization": f"Bearer {token}"}', healthcheck)
+        self.assertIn("def load_deployment_control_token", config)
+        self.assertIn("write_if_missing deployment_control_token", init_secrets)
+        first_reload = deployment.index(
+            "APP_UPSTREAM=app-green:8000 -e APP_STANDBY_UPSTREAM=app:8000 caddy caddy reload"
+        )
+        first_drain = deployment.index(
+            "docker compose exec app python /app/docker/healthcheck.py drain"
+        )
+        self.assertLess(first_reload, first_drain)
+
+    def test_session_probe_does_not_refresh_profile_upstream(self) -> None:
+        source = self.read("bbw_web/bff_server.py")
+        route = source.split('if path == "/api/me":', 1)[1].split(
+            'if path in ("/api/app/home", "/api/home"):', 1
+        )[0]
+
+        self.assertNotIn("_enrich_session_profile", route)
+        self.assertIn("user_dto = N.session_user_dto(u.app.whoami())", route)
+
+    def test_raw_response_archival_is_bounded_async_and_batched(self) -> None:
+        source = self.read("bbw_web/persistence.py")
+        capture = source.split("def capture_upstream_response", 1)[1].split(
+            "def capture_product_response", 1
+        )[0]
+        worker = source.split("def _raw_response_worker", 1)[1].split(
+            "def health", 1
+        )[0]
+
+        self.assertIn("RAW_RESPONSE_QUEUE_MAX = 64", source)
+        self.assertIn("pending.put_nowait(item)", capture)
+        self.assertIn("except queue_module.Full", capture)
+        self.assertNotIn("with session_scope()", capture)
+        self.assertIn("RAW_RESPONSE_BATCH_SIZE", worker)
+        self.assertIn("self._store_raw_response_batch(batch)", worker)
+        self.assertIn("with session_scope() as db", worker)
 
     def test_model_and_migration_owner_and_audit_constraints(self) -> None:
         models = self.read("bbw_prod/models.py")

@@ -23,6 +23,7 @@ services:
       APP_DOMAIN: ${APP_DOMAIN:?set APP_DOMAIN}
       ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
       APP_UPSTREAM: ${APP_UPSTREAM:?set APP_UPSTREAM}
+      APP_STANDBY_UPSTREAM: ${APP_STANDBY_UPSTREAM:-127.0.0.1:9}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ${BBW_DATA_ROOT:-/var/lib/bbw}/caddy/data:/data

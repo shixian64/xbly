@@ -18,9 +18,11 @@ sticky routing or externalize that pending runtime before scaling out.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import io
 import json
 import logging
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager, contextmanager
@@ -41,6 +43,10 @@ from bbw_web.store import SessionStore
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 LOGGER = logging.getLogger(__name__)
+SLOW_HTTP_REQUEST_MS = 1000.0
+LOGIN_START_PATHS = frozenset(
+    {"/api/auth/login", "/api/auth/sms-login", "/api/auth/sms-send"}
+)
 
 HTML_CSP = (
     "default-src 'self'; "
@@ -478,11 +484,35 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
         limiter_identity = (
             f"user:{identity.user_id}" if identity is not None else f"ip:{client_ip}"
         )
-        if not persistence.rate_limit(
+        if request.method == "GET" and path == "/api/me":
+            # Session restoration must not share the ordinary product API
+            # bucket. A busy authenticated page can otherwise consume all 60
+            # tokens just before a reload and make the browser look logged out.
+            if not persistence.rate_limit(
+                f"session-restore:{limiter_identity}", limit=180, window_seconds=60
+            ):
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "code": "SESSION_RESTORE_RATE_LIMIT",
+                        "error": "登录状态恢复请求过于频繁，请稍后重试",
+                        "retryable": True,
+                        "retry_after": 5,
+                    },
+                    status_code=429,
+                    headers={"Retry-After": "5"},
+                )
+        elif not persistence.rate_limit(
             f"api:{limiter_identity}", limit=60, window_seconds=60
         ):
             return JSONResponse(
-                {"ok": False, "error": "请求过于频繁，请稍后重试"},
+                {
+                    "ok": False,
+                    "code": "API_RATE_LIMIT",
+                    "error": "请求过于频繁，请稍后重试",
+                    "retryable": True,
+                    "retry_after": 60,
+                },
                 status_code=429,
                 headers={"Retry-After": "60"},
             )
@@ -585,23 +615,16 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
     message_policy_blocked_peers: tuple[str, ...] = ()
     if identity is not None and path == "/api/im/message-policy":
         try:
+            message_policy_snapshot = persistence.message_policy_snapshot(identity)
             message_policy_allowed_peers = tuple(
-                persistence.message_policy_allowed_peers(identity)
+                message_policy_snapshot["allowed_peers"]
             )
-        except Exception:
-            LOGGER.exception("message policy allowed peer lookup failed")
-        try:
-            message_policy_match_peers = tuple(
-                persistence.message_policy_match_peers(identity)
-            )
-        except Exception:
-            LOGGER.exception("message policy match peer lookup failed")
-        try:
+            message_policy_match_peers = tuple(message_policy_snapshot["match_peers"])
             message_policy_blocked_peers = tuple(
-                persistence.message_policy_blocked_peers(identity)
+                message_policy_snapshot["blocked_peers"]
             )
         except Exception:
-            LOGGER.exception("message policy blocked peer lookup failed")
+            LOGGER.exception("message policy snapshot lookup failed")
 
     match_history_loader: Optional[Callable[[int], dict[str, Any]]] = None
     if identity is not None and path == "/api/match/history":
@@ -974,9 +997,17 @@ def _load_runtime() -> tuple[Any, Any]:
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
+    application.state.draining = False
+    application.state.accepting_logins = True
+    application.state.login_starts_in_flight = 0
+    application.state.deploy_lock = threading.Lock()
+    application.state.started_at = time.time()
     settings, persistence = _load_runtime()
     application.state.settings = settings
     application.state.persistence = persistence
+    application.state.deployment_control_token = (
+        settings.load_deployment_control_token()
+    )
 
     legacy.LAB_ENABLED = False
     legacy.INVITE_LOGIN_ENABLED = True
@@ -1003,6 +1034,9 @@ async def lifespan(application: FastAPI):
         bootstrap_initial_admin(settings, persistence)
         yield
     finally:
+        with application.state.deploy_lock:
+            application.state.accepting_logins = False
+            application.state.draining = True
         legacy.INVITE_LOGIN_ENABLED = False
         legacy.MOMENT_VIDEO_COMPAT_ENABLED = False
         legacy.PRESENCE_BACKEND = None
@@ -1048,16 +1082,103 @@ async def sanitized_validation_error(
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next: Any) -> Response:
+    request_id = uuid.uuid4().hex
+    request.state.request_id = request_id
+    started_at = time.monotonic()
+    deploy_lock = getattr(request.app.state, "deploy_lock", None)
+    login_start_admitted = False
+    reject_login_start = False
+    if request.method == "POST" and request.url.path in LOGIN_START_PATHS:
+        if deploy_lock is None:
+            reject_login_start = True
+        else:
+            with deploy_lock:
+                if not bool(
+                    getattr(request.app.state, "accepting_logins", False)
+                ):
+                    reject_login_start = True
+                else:
+                    request.app.state.login_starts_in_flight = max(
+                        0,
+                        int(
+                            getattr(
+                                request.app.state,
+                                "login_starts_in_flight",
+                                0,
+                            )
+                            or 0
+                        ),
+                    ) + 1
+                    login_start_admitted = True
+    response: Response
     try:
-        response = await call_next(request)
+        if reject_login_start:
+            response = JSONResponse(
+                {
+                    "ok": False,
+                    "code": "SERVICE_DRAINING",
+                    "error": "服务正在切换，请稍后重试登录",
+                    "retryable": True,
+                    "retry_after": 3,
+                },
+                status_code=503,
+                headers={"Retry-After": "3"},
+            )
+        else:
+            response = await call_next(request)
     except RuntimeError as exc:
         if str(exc) != "No response returned.":
+            LOGGER.exception(
+                json.dumps(
+                    {
+                        "event": "http_request_failed",
+                        "request_id": request_id,
+                        "method": request.method,
+                        "path": request.url.path[:256],
+                        "error_type": type(exc).__name__,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
             raise
         # Starlette raises this exact error when the browser disconnects while
         # a blocking legacy route is still finishing in the thread pool.  The
         # route has no client left to receive a response, so record the common
         # reverse-proxy status instead of emitting an application traceback.
-        return Response(status_code=499)
+        response = Response(status_code=499)
+    except Exception as exc:
+        LOGGER.exception(
+            json.dumps(
+                {
+                    "event": "http_request_failed",
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": request.url.path[:256],
+                    "duration_ms": round((time.monotonic() - started_at) * 1000, 2),
+                    "error_type": type(exc).__name__,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        raise
+    finally:
+        if login_start_admitted and deploy_lock is not None:
+            with deploy_lock:
+                request.app.state.login_starts_in_flight = max(
+                    0,
+                    int(
+                        getattr(
+                            request.app.state,
+                            "login_starts_in_flight",
+                            0,
+                        )
+                        or 0
+                    )
+                    - 1,
+                )
+    response.headers["X-Request-ID"] = request_id
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
@@ -1070,21 +1191,166 @@ async def security_headers(request: Request, call_next: Any) -> Response:
     content_type = str(response.headers.get("Content-Type") or "").lower()
     if "text/html" in content_type:
         response.headers["Content-Security-Policy"] = HTML_CSP
-    if request.url.path.startswith(("/api/", "/admin")):
+    if request.url.path.startswith(("/api/", "/admin", "/internal/")):
         response.headers["Cache-Control"] = "no-store"
         response.headers["Pragma"] = "no-cache"
     if request.url.path.startswith("/admin"):
         response.headers["X-Robots-Tag"] = "noindex, nofollow, noarchive"
+    route = request.scope.get("route")
+    route_path = str(getattr(route, "path", "") or "")
+    if not route_path or route_path == "/{path:path}":
+        route_path = request.url.path[:256]
+    status_code = int(response.status_code)
+    duration_ms = round((time.monotonic() - started_at) * 1000, 2)
+    response.headers["Server-Timing"] = f"app;dur={duration_ms:.2f}"
+    if request.url.path not in {"/livez", "/readyz", "/healthz"} or status_code >= 400:
+        LOGGER.info(
+            json.dumps(
+                {
+                    "event": "http_request",
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": route_path[:256],
+                    "status": status_code,
+                    "duration_ms": duration_ms,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    if (
+        duration_ms >= SLOW_HTTP_REQUEST_MS
+        and request.url.path.startswith(("/api/", "/admin"))
+    ):
+        LOGGER.warning(
+            json.dumps(
+                {
+                    "event": "slow_http_request",
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": route_path[:256],
+                    "status": status_code,
+                    "duration_ms": duration_ms,
+                    "threshold_ms": SLOW_HTTP_REQUEST_MS,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
     return response
 
 
-@app.get("/healthz", include_in_schema=False)
-def healthz(request: Request, response: Response) -> dict[str, Any]:
-    state = request.app.state.persistence.health()
+@app.get("/livez", include_in_schema=False)
+def livez() -> dict[str, bool]:
+    return {"ok": True}
+
+
+def _readiness(request: Request, response: Response) -> dict[str, bool]:
+    if bool(getattr(request.app.state, "draining", False)):
+        response.status_code = 503
+        return {"ok": False}
+    try:
+        state = request.app.state.persistence.health()
+    except Exception:
+        state = {"ok": False}
     if not state.get("ok"):
         response.status_code = 503
     # Keep dependency names and topology out of the public response.
     return {"ok": bool(state.get("ok"))}
+
+
+@app.get("/readyz", include_in_schema=False)
+def readyz(request: Request, response: Response) -> dict[str, bool]:
+    return _readiness(request, response)
+
+
+@app.get("/healthz", include_in_schema=False)
+def healthz(request: Request, response: Response) -> dict[str, bool]:
+    # Backward-compatible readiness alias for existing external monitors.
+    return _readiness(request, response)
+
+
+def _require_deployment_control(request: Request) -> None:
+    expected = bytes(
+        getattr(request.app.state, "deployment_control_token", b"") or b""
+    )
+    authorization = str(request.headers.get("Authorization") or "")
+    scheme, separator, credential = authorization.partition(" ")
+    supplied = (
+        credential.strip().encode("utf-8")
+        if separator and scheme.lower() == "bearer"
+        else b""
+    )
+    if (
+        not expected
+        or len(supplied) > 512
+        or not hmac.compare_digest(supplied, expected)
+    ):
+        raise HTTPException(status_code=404, detail="not found")
+
+
+@app.post("/internal/drain", include_in_schema=False)
+def begin_drain(request: Request, response: Response) -> dict[str, Any]:
+    _require_deployment_control(request)
+    with request.app.state.deploy_lock:
+        request.app.state.accepting_logins = False
+        login_starts_in_flight = max(
+            0,
+            int(getattr(request.app.state, "login_starts_in_flight", 0) or 0),
+        )
+        store_state = legacy.STORE.stats() if legacy.STORE is not None else {}
+        pending_logins = max(0, int(store_state.get("pending_logins") or 0))
+        if login_starts_in_flight == 0 and pending_logins == 0:
+            request.app.state.draining = True
+        draining = bool(getattr(request.app.state, "draining", False))
+    if login_starts_in_flight > 0 or pending_logins > 0:
+        retry_after = 3 if login_starts_in_flight > 0 else 30
+        response.status_code = 409
+        response.headers["Retry-After"] = str(retry_after)
+        return {
+            "ok": False,
+            "draining": draining,
+            "accepting_logins": False,
+            "login_starts_in_flight": login_starts_in_flight,
+            "pending_logins": pending_logins,
+            "retry_after": retry_after,
+        }
+    LOGGER.info(
+        json.dumps(
+            {
+                "event": "application_draining",
+                "request_id": str(getattr(request.state, "request_id", ""))[:64],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return {
+        "ok": True,
+        "draining": True,
+        "accepting_logins": False,
+        "login_starts_in_flight": 0,
+        "pending_logins": 0,
+    }
+
+
+@app.post("/internal/resume", include_in_schema=False)
+def resume_after_drain(request: Request) -> dict[str, bool]:
+    _require_deployment_control(request)
+    with request.app.state.deploy_lock:
+        request.app.state.draining = False
+        request.app.state.accepting_logins = True
+    LOGGER.info(
+        json.dumps(
+            {
+                "event": "application_resumed",
+                "request_id": str(getattr(request.state, "request_id", ""))[:64],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return {"ok": True, "draining": False, "accepting_logins": True}
 
 
 @app.get("/api/health", include_in_schema=False)
@@ -1324,6 +1590,51 @@ async def cancel_pending_invite(request: Request) -> JSONResponse:
     )
 
 
+def _static_asset_path(relative_path: str) -> Path:
+    candidate = (STATIC_DIR / str(relative_path or "")).resolve()
+    try:
+        candidate.relative_to(STATIC_DIR.resolve())
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="static asset not found") from exc
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail="static asset not found")
+    return candidate
+
+
+def _static_asset_cache_control(request: Request, path: Path) -> str:
+    try:
+        relative = path.relative_to(STATIC_DIR.resolve())
+    except ValueError:
+        return "no-cache"
+    if request.query_params.get("v") or "vendor" in relative.parts:
+        return "public, max-age=31536000, immutable"
+    if path.suffix.lower() in {".html", ".js"}:
+        return "no-cache"
+    return "public, max-age=300"
+
+
+@app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+def product_page() -> FileResponse:
+    return FileResponse(
+        _static_asset_path("index.html"),
+        media_type="text/html",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.api_route(
+    "/static/{asset_path:path}",
+    methods=["GET", "HEAD"],
+    include_in_schema=False,
+)
+def static_asset(request: Request, asset_path: str) -> FileResponse:
+    path = _static_asset_path(asset_path)
+    return FileResponse(
+        path,
+        headers={"Cache-Control": _static_asset_cache_control(request, path)},
+    )
+
+
 @app.get("/admin", include_in_schema=False)
 def admin_page() -> FileResponse:
     path = STATIC_DIR / "admin.html"
@@ -1358,7 +1669,45 @@ def admin_requires_javascript() -> JSONResponse:
 from bbw_web.admin_api import router as admin_router  # noqa: E402
 from bbw_web.archive_api import router as archive_router  # noqa: E402
 from bbw_web.media_api import router as media_router  # noqa: E402
-from bbw_web.moment_media_api import router as moment_media_router  # noqa: E402
+from bbw_web.moment_media_api import (  # noqa: E402
+    MomentVideoServiceError,
+    router as moment_media_router,
+)
+
+
+@app.exception_handler(MomentVideoServiceError)
+async def moment_video_service_error(
+    request: Request,
+    exc: MomentVideoServiceError,
+) -> JSONResponse:
+    request_id = str(getattr(request.state, "request_id", ""))[:64]
+    payload: dict[str, Any] = {
+        "ok": False,
+        "code": exc.code,
+        "message": exc.message,
+        "retryable": exc.retryable,
+    }
+    if exc.retry_after > 0:
+        payload["retry_after"] = exc.retry_after
+    if request_id:
+        payload["request_id"] = request_id
+    headers = {"Cache-Control": "no-store"}
+    if exc.retry_after > 0:
+        headers["Retry-After"] = str(exc.retry_after)
+    LOGGER.warning(
+        json.dumps(
+            {
+                "event": "moment_video_service_error",
+                "request_id": request_id,
+                "code": exc.code,
+                "status": exc.status_code,
+                "retryable": exc.retryable,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return JSONResponse(payload, status_code=exc.status_code, headers=headers)
 
 app.include_router(admin_router)
 app.include_router(archive_router)

@@ -315,14 +315,17 @@ def _media_quota_kind(message_type: str, mime: str = "") -> str:
 def _load_owner_binding(
     db: Any,
     owner_user_id: uuid.UUID,
-    external_account_id: uuid.UUID,
+    external_account_id: uuid.UUID | None,
     *,
     require_active: bool = True,
 ) -> tuple[User, ExternalAccount]:
-    user = UserRepository(db).get(owner_user_id)
-    account = ExternalAccountRepository(db).get_for_user(owner_user_id)
-    if user is None or account is None or account.id != external_account_id:
+    binding = ExternalAccountRepository(db).get_user_binding(
+        owner_user_id,
+        external_account_id=external_account_id,
+    )
+    if binding is None:
         raise NotFoundError("user/account binding was not found")
+    user, account = binding
     if require_active and user.status != "active":
         raise NotFoundError("active user was not found")
     return user, account
@@ -1142,6 +1145,96 @@ def archive_message_job(
     }
 
 
+def archive_message_batch_job(
+    owner_user_id: str,
+    external_account_id: str,
+    payloads: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Persist a bounded browser batch in one transaction and dispatch media once."""
+
+    owner_id = _uuid(owner_user_id, field="owner_user_id")
+    account_id = _uuid(external_account_id, field="external_account_id")
+    if (
+        not isinstance(payloads, Sequence)
+        or isinstance(payloads, (bytes, bytearray, str))
+        or not payloads
+        or len(payloads) > 20
+    ):
+        raise ValueError("message payload batch must contain between 1 and 20 objects")
+    reports: list[dict[str, Any]] = []
+    for payload in payloads:
+        if not isinstance(payload, Mapping):
+            raise ValueError("each message payload must be an object")
+        reports.append(dict(payload))
+
+    settings = get_settings()
+    message_ids: list[uuid.UUID] = []
+    created_count = 0
+    outbox_ids: list[uuid.UUID] = []
+    with session_scope() as db:
+        user, account = _load_owner_binding(db, owner_id, account_id)
+        prepared: list[tuple[dict[str, Any], datetime, str]] = []
+        conversation_candidates: list[dict[str, Any]] = []
+        for report in reports:
+            peer_uid = _bounded(report.get("peer_uid"), 128)
+            if not peer_uid:
+                raise ValueError("peer_uid is required")
+            occurred_at = _parse_time(
+                report.get("sent_at") or report.get("observed_at")
+            )
+            candidate = _conversation_candidate(
+                owner_user_id=user.id,
+                peer_uid=peer_uid,
+                reported_id=report.get("conversation_id"),
+                last_message_at=occurred_at,
+                metadata={
+                    "reported_conversation_id": _bounded(
+                        report.get("conversation_id"), 256
+                    ),
+                    "last_source": _bounded(report.get("source"), 64)
+                    or "browser",
+                },
+            )
+            conversation_candidates.append(candidate)
+            prepared.append(
+                (report, occurred_at, candidate["upstream_conversation_id"])
+            )
+
+        conversations = _upsert_conversations(
+            db,
+            owner_user_id=user.id,
+            candidates=conversation_candidates,
+        )
+        for report, occurred_at, conversation_id in prepared:
+            message, created, outbox_id = _ingest_message(
+                db,
+                settings=settings,
+                user=user,
+                account=account,
+                report=report,
+                conversation=conversations[conversation_id],
+                occurred_at=occurred_at,
+            )
+            message_ids.append(message.id)
+            created_count += int(created)
+            if outbox_id is not None and outbox_id not in outbox_ids:
+                outbox_ids.append(outbox_id)
+
+    media_dispatched = (
+        _dispatch_media_outboxes(outbox_ids, limit=len(outbox_ids))
+        if outbox_ids
+        else 0
+    )
+    return {
+        "ok": True,
+        "count": len(message_ids),
+        "created": created_count,
+        "updated": len(message_ids) - created_count,
+        "message_ids": [str(message_id) for message_id in message_ids],
+        "media_dispatched": media_dispatched,
+    }
+
+
 def _envelope_items(payload: Any, normalizer: Any) -> list[dict[str, Any]]:
     if isinstance(payload, Mapping):
         for key in ("items", "list"):
@@ -1259,6 +1352,157 @@ def _history_message_report(
     }
 
 
+def _ingest_history_response_in_session(
+    db: Any,
+    *,
+    settings: Settings,
+    user: User,
+    account: ExternalAccount,
+    owner_id: uuid.UUID,
+    path: str,
+    query: Mapping[str, Any] | None,
+    response_data: Any,
+    outbox_ids: list[uuid.UUID],
+) -> dict[str, Any]:
+    route = str(path or "")
+    if isinstance(response_data, Mapping) and response_data.get("ok") is False:
+        return {"ok": True, "ignored": True, "reason": "upstream response was not successful"}
+    created = 0
+    existing = 0
+    conversations = 0
+    if route == "/api/im/conversations":
+        items = _envelope_items(response_data, normalize_conversations)
+        conversation_candidates: list[dict[str, Any]] = []
+        for item in items[:500]:
+            peer = _bounded(item.get("peer_id") or item.get("conversation_user"), 128)
+            if not peer:
+                continue
+            unread_authoritative = item.get("unread_authoritative") is not False
+            preview = _bounded(
+                item.get("last_message") or item.get("content"),
+                500,
+            )
+            conversation_metadata = {
+                "reported_conversation_id": _bounded(item.get("id"), 256),
+                "object_name": _bounded(item.get("object_name"), 128),
+                "avatar": _bounded(item.get("avatar"), 4096),
+                "user": _json_safe(item.get("user")),
+                "last_source": "history",
+            }
+            if preview:
+                conversation_metadata.update(
+                    last_message=preview,
+                    preview_timestamp=_bounded(
+                        item.get("preview_timestamp"),
+                        80,
+                    ),
+                    preview_sequence=_bounded(item.get("preview_sequence"), 80),
+                    preview_authoritative=item.get("preview_authoritative") is True,
+                    preview_timestamp_inferred=item.get("preview_timestamp_inferred") is True,
+                )
+            conversation_candidates.append(
+                _conversation_candidate(
+                    owner_user_id=owner_id,
+                    peer_uid=peer,
+                    reported_id=item.get("id"),
+                    title=item.get("nickname"),
+                    unread_count=(
+                        _as_int(item.get("unread_count"), 0)
+                        if unread_authoritative
+                        else None
+                    ),
+                    unread_observed_at=(
+                        _optional_time(
+                            item.get("unread_observed_at")
+                            or item.get("summary_observed_at")
+                            or item.get("observed_at")
+                        )
+                        or utcnow()
+                        if unread_authoritative
+                        else None
+                    ),
+                    last_message_at=_optional_time(item.get("timestamp")),
+                    metadata=conversation_metadata,
+                )
+            )
+            conversations += 1
+        _upsert_conversations(
+            db,
+            owner_user_id=owner_id,
+            candidates=conversation_candidates,
+        )
+    elif route == "/api/im/messages":
+        requested_peer = ""
+        if isinstance(query, Mapping):
+            requested_peer = _bounded(
+                query.get("peer") or query.get("uid") or query.get("yourid"), 128
+            )
+        items = _envelope_items(response_data, normalize_messages)
+        reports: list[tuple[dict[str, Any], datetime]] = []
+        conversation_candidates = []
+        for item in items[:5000]:
+            report = _history_message_report(
+                item,
+                account_uid=_bounded(account.upstream_uid, 128),
+                requested_peer=requested_peer,
+            )
+            if report is None:
+                continue
+            occurred_at = _parse_time(
+                report.get("sent_at") or report.get("observed_at")
+            )
+            reports.append((report, occurred_at))
+            peer_uid = _bounded(report.get("peer_uid"), 128)
+            conversation_candidates.append(
+                _conversation_candidate(
+                    owner_user_id=owner_id,
+                    peer_uid=peer_uid,
+                    reported_id=report.get("conversation_id"),
+                    last_message_at=occurred_at,
+                    metadata={
+                        "reported_conversation_id": _bounded(
+                            report.get("conversation_id"), 256
+                        ),
+                        "last_source": _bounded(report.get("source"), 64) or "browser",
+                    },
+                )
+            )
+        conversation_rows = _upsert_conversations(
+            db,
+            owner_user_id=owner_id,
+            candidates=conversation_candidates,
+        )
+        for report, occurred_at in reports:
+            peer_uid = _bounded(report.get("peer_uid"), 128)
+            upstream_id = _canonical_conversation_id(peer_uid, report.get("conversation_id"))
+            conversation = conversation_rows.get(upstream_id)
+            if conversation is None:
+                raise RuntimeError("conversation batch did not return the requested row")
+            _message, was_created, outbox_id = _ingest_message(
+                db,
+                settings=settings,
+                user=user,
+                account=account,
+                report=report,
+                conversation=conversation,
+                occurred_at=occurred_at,
+            )
+            if was_created:
+                created += 1
+            else:
+                existing += 1
+            if outbox_id and outbox_id not in outbox_ids:
+                outbox_ids.append(outbox_id)
+    else:
+        return {"ok": True, "ignored": True, "reason": "unsupported history route"}
+    return {
+        "ok": True,
+        "conversations": conversations,
+        "messages_created": created,
+        "messages_existing": existing,
+    }
+
+
 def ingest_history_response(
     owner_user_id: str,
     external_account_id: str,
@@ -1266,145 +1510,83 @@ def ingest_history_response(
     query: Mapping[str, Any] | None,
     response_data: Any,
 ) -> dict[str, Any]:
-    """Ingest normalized BFF history responses without trusting query ownership."""
+    """Ingest one normalized BFF history response."""
 
     owner_id = _uuid(owner_user_id, field="owner_user_id")
     account_id = _uuid(external_account_id, field="external_account_id")
-    route = str(path or "")
-    if isinstance(response_data, Mapping) and response_data.get("ok") is False:
-        return {"ok": True, "ignored": True, "reason": "upstream response was not successful"}
     settings = get_settings()
     outbox_ids: list[uuid.UUID] = []
-    created = 0
-    existing = 0
-    conversations = 0
     with session_scope() as db:
         user, account = _load_owner_binding(db, owner_id, account_id)
-        if route == "/api/im/conversations":
-            items = _envelope_items(response_data, normalize_conversations)
-            conversation_candidates: list[dict[str, Any]] = []
-            for item in items[:500]:
-                peer = _bounded(item.get("peer_id") or item.get("conversation_user"), 128)
-                if not peer:
-                    continue
-                unread_authoritative = item.get("unread_authoritative") is not False
-                preview = _bounded(
-                    item.get("last_message") or item.get("content"),
-                    500,
-                )
-                conversation_metadata = {
-                    "reported_conversation_id": _bounded(item.get("id"), 256),
-                    "object_name": _bounded(item.get("object_name"), 128),
-                    "avatar": _bounded(item.get("avatar"), 4096),
-                    "user": _json_safe(item.get("user")),
-                    "last_source": "history",
-                }
-                if preview:
-                    conversation_metadata.update(
-                        last_message=preview,
-                        preview_timestamp=_bounded(
-                            item.get("preview_timestamp"),
-                            80,
-                        ),
-                        preview_sequence=_bounded(item.get("preview_sequence"), 80),
-                        preview_authoritative=item.get("preview_authoritative") is True,
-                        preview_timestamp_inferred=item.get("preview_timestamp_inferred") is True,
-                    )
-                conversation_candidates.append(
-                    _conversation_candidate(
-                        owner_user_id=owner_id,
-                        peer_uid=peer,
-                        reported_id=item.get("id"),
-                        title=item.get("nickname"),
-                        unread_count=(
-                            _as_int(item.get("unread_count"), 0)
-                            if unread_authoritative
-                            else None
-                        ),
-                        unread_observed_at=(
-                            _optional_time(
-                                item.get("unread_observed_at")
-                                or item.get("summary_observed_at")
-                                or item.get("observed_at")
-                            )
-                            or utcnow()
-                            if unread_authoritative
-                            else None
-                        ),
-                        last_message_at=_optional_time(item.get("timestamp")),
-                        metadata=conversation_metadata,
-                    )
-                )
-                conversations += 1
-            _upsert_conversations(
-                db,
-                owner_user_id=owner_id,
-                candidates=conversation_candidates,
-            )
-        elif route == "/api/im/messages":
-            requested_peer = ""
-            if isinstance(query, Mapping):
-                requested_peer = _bounded(
-                    query.get("peer") or query.get("uid") or query.get("yourid"), 128
-                )
-            items = _envelope_items(response_data, normalize_messages)
-            reports: list[tuple[dict[str, Any], datetime]] = []
-            conversation_candidates = []
-            for item in items[:5000]:
-                report = _history_message_report(
-                    item,
-                    account_uid=_bounded(account.upstream_uid, 128),
-                    requested_peer=requested_peer,
-                )
-                if report is None:
-                    continue
-                occurred_at = _parse_time(
-                    report.get("sent_at") or report.get("observed_at")
-                )
-                reports.append((report, occurred_at))
-                peer_uid = _bounded(report.get("peer_uid"), 128)
-                conversation_candidates.append(
-                    _conversation_candidate(
-                        owner_user_id=owner_id,
-                        peer_uid=peer_uid,
-                        reported_id=report.get("conversation_id"),
-                        last_message_at=occurred_at,
-                        metadata={
-                            "reported_conversation_id": _bounded(
-                                report.get("conversation_id"), 256
-                            ),
-                            "last_source": _bounded(report.get("source"), 64) or "browser",
-                        },
-                    )
-                )
-            conversation_rows = _upsert_conversations(
-                db,
-                owner_user_id=owner_id,
-                candidates=conversation_candidates,
-            )
-            for report, occurred_at in reports:
-                peer_uid = _bounded(report.get("peer_uid"), 128)
-                upstream_id = _canonical_conversation_id(peer_uid, report.get("conversation_id"))
-                conversation = conversation_rows.get(upstream_id)
-                if conversation is None:
-                    raise RuntimeError("conversation batch did not return the requested row")
-                _message, was_created, outbox_id = _ingest_message(
+        result = _ingest_history_response_in_session(
+            db,
+            settings=settings,
+            user=user,
+            account=account,
+            owner_id=owner_id,
+            path=path,
+            query=query,
+            response_data=response_data,
+            outbox_ids=outbox_ids,
+        )
+    result["media_dispatched"] = (
+        _dispatch_media_outboxes(outbox_ids, limit=min(100, len(outbox_ids)))
+        if outbox_ids
+        else 0
+    )
+    return result
+
+
+def ingest_history_responses_batch(
+    owner_user_id: str,
+    external_account_id: str,
+    responses: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Ingest a bounded history-response batch in one transaction."""
+
+    owner_id = _uuid(owner_user_id, field="owner_user_id")
+    account_id = _uuid(external_account_id, field="external_account_id")
+    if (
+        not isinstance(responses, Sequence)
+        or isinstance(responses, (bytes, bytearray, str))
+        or not responses
+        or len(responses) > 16
+    ):
+        raise ValueError("history response batch must contain between 1 and 16 objects")
+    envelopes: list[dict[str, Any]] = []
+    for response in responses:
+        if not isinstance(response, Mapping):
+            raise ValueError("each history response must be an object")
+        query = response.get("query")
+        if query is not None and not isinstance(query, Mapping):
+            raise ValueError("history response query must be an object")
+        envelopes.append(
+            {
+                "path": str(response.get("path") or ""),
+                "query": dict(query or {}),
+                "response_data": response.get("response_data"),
+            }
+        )
+
+    settings = get_settings()
+    outbox_ids: list[uuid.UUID] = []
+    results: list[dict[str, Any]] = []
+    with session_scope() as db:
+        user, account = _load_owner_binding(db, owner_id, account_id)
+        for envelope in envelopes:
+            results.append(
+                _ingest_history_response_in_session(
                     db,
                     settings=settings,
                     user=user,
                     account=account,
-                    report=report,
-                    conversation=conversation,
-                    occurred_at=occurred_at,
+                    owner_id=owner_id,
+                    path=envelope["path"],
+                    query=envelope["query"],
+                    response_data=envelope["response_data"],
+                    outbox_ids=outbox_ids,
                 )
-                if was_created:
-                    created += 1
-                else:
-                    existing += 1
-                if outbox_id:
-                    outbox_ids.append(outbox_id)
-        else:
-            return {"ok": True, "ignored": True, "reason": "unsupported history route"}
+            )
     media_dispatched = (
         _dispatch_media_outboxes(outbox_ids, limit=min(100, len(outbox_ids)))
         if outbox_ids
@@ -1412,9 +1594,11 @@ def ingest_history_response(
     )
     return {
         "ok": True,
-        "conversations": conversations,
-        "messages_created": created,
-        "messages_existing": existing,
+        "count": len(results),
+        "ignored": sum(1 for result in results if result.get("ignored") is True),
+        "conversations": sum(int(result.get("conversations") or 0) for result in results),
+        "messages_created": sum(int(result.get("messages_created") or 0) for result in results),
+        "messages_existing": sum(int(result.get("messages_existing") or 0) for result in results),
         "media_dispatched": media_dispatched,
     }
 
@@ -1617,48 +1801,82 @@ def _successful_product_event(event_payload: Mapping[str, Any]) -> bool:
     return not (isinstance(response, Mapping) and response.get("ok") is False)
 
 
-def record_product_event(owner_user_id: str, event_payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Record meaningful product actions and maintain current relationship state."""
+def _product_event_read_peers(event_payload: Mapping[str, Any]) -> list[str]:
+    response = event_payload.get("response")
+    request = event_payload.get("request")
+    raw_peers = response.get("read_peers") if isinstance(response, Mapping) else None
+    if not isinstance(raw_peers, list) and isinstance(request, Mapping):
+        raw_peers = request.get("peers")
+        if not isinstance(raw_peers, list):
+            raw_peers = [
+                request.get("peer")
+                or request.get("uid")
+                or request.get("to")
+                or ""
+            ]
+    if not isinstance(raw_peers, list):
+        return []
+    return list(
+        dict.fromkeys(
+            peer
+            for peer in (_bounded(value, 128) for value in raw_peers[:500])
+            if peer
+        )
+    )
 
-    owner_id = _uuid(owner_user_id, field="owner_user_id")
-    if not isinstance(event_payload, Mapping):
-        raise ValueError("event payload must be an object")
+
+PRODUCT_RELATIONSHIP_MAP = {
+    "/api/social/follow": ("follow", "active"),
+    "/api/social/unfollow": ("follow", "inactive"),
+    "/api/social/add-friend": ("friend_request", "active"),
+    "/api/social/agree-friend": ("friend", "active"),
+    "/api/social/delete-friend": ("friend", "inactive"),
+    "/api/social/visit": ("profile_view", "active"),
+    "/api/social/blacklist-add": ("blacklist", "active"),
+    "/api/social/blacklist-del": ("blacklist", "inactive"),
+}
+
+
+def _record_product_event_in_session(
+    db: Any,
+    *,
+    owner_id: uuid.UUID,
+    account: ExternalAccount,
+    event_payload: Mapping[str, Any],
+    event_repo: ActivityEventRepository,
+    relationship_repo: RelationshipRepository,
+    relationship_cache: dict[tuple[str, str], Relationship | None],
+) -> dict[str, Any]:
     path = "/" + str(event_payload.get("path") or "").strip("/")
     event_type = ("api." + path.strip("/").replace("/", "."))[:64]
     request_payload = event_payload.get("request")
     subject_uid = _subject_uid(request_payload) or _subject_uid(event_payload.get("query"))
     now = utcnow()
-    relationship_map = {
-        "/api/social/follow": ("follow", "active"),
-        "/api/social/unfollow": ("follow", "inactive"),
-        "/api/social/add-friend": ("friend_request", "active"),
-        "/api/social/agree-friend": ("friend", "active"),
-        "/api/social/delete-friend": ("friend", "inactive"),
-        "/api/social/visit": ("profile_view", "active"),
-        "/api/social/blacklist-add": ("blacklist", "active"),
-        "/api/social/blacklist-del": ("blacklist", "inactive"),
-    }
-    with session_scope() as db:
-        user = UserRepository(db).get(owner_id)
-        account = ExternalAccountRepository(db).get_for_user(owner_id)
-        if user is None or account is None:
-            raise NotFoundError("user/account binding was not found")
-        explicit_event_id = _bounded(event_payload.get("idempotency_key"), 256) or None
-        event = ActivityEventRepository(db).insert_idempotent(
-            owner_user_id=owner_id,
-            provider=SYNC_SOURCE,
-            upstream_event_id=explicit_event_id,
-            event_type=event_type or "api.unknown",
-            actor_upstream_uid=_bounded(account.upstream_uid, 128) or None,
-            subject_upstream_uid=subject_uid or None,
-            occurred_at=now,
-            details=_json_safe(event_payload),
-        )
-        relationship_id: uuid.UUID | None = None
-        relation = relationship_map.get(path)
-        if relation and subject_uid and _successful_product_event(event_payload):
-            kind, relation_status = relation
-            existing = db.scalar(
+    explicit_event_id = _bounded(event_payload.get("idempotency_key"), 256) or None
+    event = event_repo.insert_idempotent(
+        owner_user_id=owner_id,
+        provider=SYNC_SOURCE,
+        upstream_event_id=explicit_event_id,
+        event_type=event_type or "api.unknown",
+        actor_upstream_uid=_bounded(account.upstream_uid, 128) or None,
+        subject_upstream_uid=subject_uid or None,
+        occurred_at=now,
+        details=_json_safe(event_payload),
+    )
+    conversations_marked_read = 0
+    if path == "/api/im/read" and _successful_product_event(event_payload):
+        read_peers = _product_event_read_peers(event_payload)
+        if read_peers:
+            conversations_marked_read = ConversationRepository(db).mark_peers_read(
+                owner_id,
+                read_peers,
+                observed_at=now,
+            )
+
+    def current_relationship(kind: str) -> Relationship | None:
+        cache_key = (subject_uid, kind)
+        if cache_key not in relationship_cache:
+            relationship_cache[cache_key] = db.scalar(
                 select(Relationship).where(
                     Relationship.owner_user_id == owner_id,
                     Relationship.provider == SYNC_SOURCE,
@@ -1666,52 +1884,125 @@ def record_product_event(owner_user_id: str, event_payload: Mapping[str, Any]) -
                     Relationship.kind == kind,
                 )
             )
-            relationship = RelationshipRepository(db).upsert(
-                owner_user_id=owner_id,
-                provider=SYNC_SOURCE,
-                subject_upstream_uid=subject_uid,
-                kind=kind,
-                status=relation_status,
-                started_at=existing.started_at if existing else now,
-                ended_at=now if relation_status == "inactive" else None,
-                extra_data=_merge_dict(
-                    existing.extra_data if existing else {},
-                    {"last_event_type": event_type, "last_event_at": now.isoformat()},
-                ),
-            )
-            relationship_id = relationship.id
-            if path == "/api/social/agree-friend":
-                request_relation = db.scalar(
-                    select(Relationship).where(
-                        Relationship.owner_user_id == owner_id,
-                        Relationship.provider == SYNC_SOURCE,
-                        Relationship.subject_upstream_uid == subject_uid,
-                        Relationship.kind == "friend_request",
-                    )
+        return relationship_cache[cache_key]
+
+    relationship_id: uuid.UUID | None = None
+    relation = PRODUCT_RELATIONSHIP_MAP.get(path)
+    if relation and subject_uid and _successful_product_event(event_payload):
+        kind, relation_status = relation
+        existing = current_relationship(kind)
+        relationship = relationship_repo.upsert(
+            owner_user_id=owner_id,
+            provider=SYNC_SOURCE,
+            subject_upstream_uid=subject_uid,
+            kind=kind,
+            status=relation_status,
+            started_at=existing.started_at if existing else now,
+            ended_at=now if relation_status == "inactive" else None,
+            extra_data=_merge_dict(
+                existing.extra_data if existing else {},
+                {"last_event_type": event_type, "last_event_at": now.isoformat()},
+            ),
+        )
+        relationship_cache[(subject_uid, kind)] = relationship
+        relationship_id = relationship.id
+        if path == "/api/social/agree-friend":
+            request_relation = current_relationship("friend_request")
+            if request_relation is not None:
+                request_relation = relationship_repo.upsert(
+                    owner_user_id=owner_id,
+                    provider=SYNC_SOURCE,
+                    subject_upstream_uid=subject_uid,
+                    kind="friend_request",
+                    status="inactive",
+                    started_at=request_relation.started_at,
+                    ended_at=now,
+                    extra_data=_merge_dict(
+                        request_relation.extra_data,
+                        {
+                            "resolved_as": "accepted",
+                            "resolved_at": now.isoformat(),
+                            "last_event_type": event_type,
+                        },
+                    ),
                 )
-                if request_relation is not None:
-                    RelationshipRepository(db).upsert(
-                        owner_user_id=owner_id,
-                        provider=SYNC_SOURCE,
-                        subject_upstream_uid=subject_uid,
-                        kind="friend_request",
-                        status="inactive",
-                        started_at=request_relation.started_at,
-                        ended_at=now,
-                        extra_data=_merge_dict(
-                            request_relation.extra_data,
-                            {
-                                "resolved_as": "accepted",
-                                "resolved_at": now.isoformat(),
-                                "last_event_type": event_type,
-                            },
-                        ),
-                    )
-        return {
-            "ok": True,
-            "event_id": str(event.id),
-            "relationship_id": str(relationship_id) if relationship_id else None,
-        }
+                relationship_cache[(subject_uid, "friend_request")] = request_relation
+    return {
+        "ok": True,
+        "event_id": str(event.id),
+        "relationship_id": str(relationship_id) if relationship_id else None,
+        "conversations_marked_read": conversations_marked_read,
+    }
+
+
+def record_product_event(owner_user_id: str, event_payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Record one meaningful product action."""
+
+    owner_id = _uuid(owner_user_id, field="owner_user_id")
+    if not isinstance(event_payload, Mapping):
+        raise ValueError("event payload must be an object")
+    with session_scope() as db:
+        _user, account = _load_owner_binding(db, owner_id, None)
+        return _record_product_event_in_session(
+            db,
+            owner_id=owner_id,
+            account=account,
+            event_payload=event_payload,
+            event_repo=ActivityEventRepository(db),
+            relationship_repo=RelationshipRepository(db),
+            relationship_cache={},
+        )
+
+
+def record_product_events_batch(
+    owner_user_id: str,
+    event_payloads: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Record a bounded product-event batch with one binding load and transaction."""
+
+    owner_id = _uuid(owner_user_id, field="owner_user_id")
+    if (
+        not isinstance(event_payloads, Sequence)
+        or isinstance(event_payloads, (bytes, bytearray, str))
+        or not event_payloads
+        or len(event_payloads) > 64
+    ):
+        raise ValueError("product event batch must contain between 1 and 64 objects")
+    payloads: list[dict[str, Any]] = []
+    for payload in event_payloads:
+        if not isinstance(payload, Mapping):
+            raise ValueError("each product event payload must be an object")
+        payloads.append(dict(payload))
+
+    results: list[dict[str, Any]] = []
+    with session_scope() as db:
+        _user, account = _load_owner_binding(db, owner_id, None)
+        event_repo = ActivityEventRepository(db)
+        relationship_repo = RelationshipRepository(db)
+        relationship_cache: dict[tuple[str, str], Relationship | None] = {}
+        for payload in payloads:
+            results.append(
+                _record_product_event_in_session(
+                    db,
+                    owner_id=owner_id,
+                    account=account,
+                    event_payload=payload,
+                    event_repo=event_repo,
+                    relationship_repo=relationship_repo,
+                    relationship_cache=relationship_cache,
+                )
+            )
+    return {
+        "ok": True,
+        "count": len(results),
+        "event_ids": [result["event_id"] for result in results],
+        "relationship_updates": sum(
+            1 for result in results if result["relationship_id"] is not None
+        ),
+        "conversations_marked_read": sum(
+            int(result.get("conversations_marked_read") or 0) for result in results
+        ),
+    }
 
 
 def _setting_seconds(settings: Settings, attribute: str, env_name: str, default: int) -> int:

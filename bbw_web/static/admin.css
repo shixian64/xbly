@@ -3320,3 +3320,69 @@ h3 {
     grid-template-columns: minmax(84px, 32%) minmax(0, 1fr);
   }
 }
+
+.admin-navigation {
+  gap: 0.18rem;
+}
+
+.admin-media-dialog .admin-dialog-card {
+  display: grid;
+  gap: 1rem;
+}
+
+.admin-media-dialog .admin-dialog-card > header,
+.admin-media-dialog .admin-dialog-actions {
+  margin: 0;
+}
+
+.admin-media-preview {
+  display: grid;
+  min-height: min(52vh, 460px);
+  max-height: 64vh;
+  place-items: center;
+  border: 1px solid var(--admin-border);
+  border-radius: 10px;
+  background: #f6f7f9;
+  overflow: auto;
+}
+
+.admin-media-preview img,
+.admin-media-preview video {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  max-height: 62vh;
+  object-fit: contain;
+}
+
+.admin-media-preview audio {
+  width: calc(100% - 2rem);
+  max-width: 620px;
+}
+
+.admin-media-preview-message {
+  display: grid;
+  max-width: 520px;
+  justify-items: center;
+  gap: 0.8rem;
+  color: var(--admin-muted);
+  padding: 2rem;
+  text-align: center;
+}
+
+.admin-media-preview-message p {
+  margin: 0;
+}
+
+@media (max-width: 620px) {
+  .admin-media-preview {
+    min-height: 42vh;
+    max-height: 58vh;
+  }
+
+  .admin-media-preview img,
+  .admin-media-preview video {
+    max-height: 56vh;
+  }
+}

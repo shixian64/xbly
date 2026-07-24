@@ -55,6 +55,18 @@ const ADMIN_USER_TAB_META = Object.freeze({
   raw: { label: "原始响应", countKey: "raw_responses" },
   credentials: { label: "登录凭据", countKey: "" },
 });
+const ADMIN_RELATIONSHIP_KIND_LABELS = Object.freeze({
+  friend: "好友",
+  friend_request: "好友申请",
+  follow: "关注",
+  follower: "粉丝",
+  blacklist: "黑名单",
+  blacklisted_by: "被加入黑名单",
+  match: "匹配关系",
+  message_peer: "会话联系人",
+  profile_view: "我查看过",
+  visitor: "访客",
+});
 
 const ADMIN_STATE = {
   authenticated: false,
@@ -63,6 +75,7 @@ const ADMIN_STATE = {
   viewGeneration: 0,
   requestControllers: new Set(),
   pageHidden: document.hidden,
+  visibilityRefreshPending: false,
   needsRefresh: false,
   overviewSnapshot: null,
   sidebarCollapsed: false,
@@ -417,6 +430,11 @@ function formatStatus(value) {
   return labels[raw] || textOrDash(value);
 }
 
+function formatRelationshipKind(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  return ADMIN_RELATIONSHIP_KIND_LABELS[raw] || "其他关系";
+}
+
 function statusTone(value) {
   const raw = String(value || "").toLowerCase();
   if (["active", "enabled", "available", "completed", "succeeded", "success", "archived"].includes(raw)) return "success";
@@ -564,7 +582,9 @@ async function withPending(button, task) {
   try {
     return await task();
   } catch (error) {
-    if (!(error instanceof AdminAuthExpiredError)) toast(error?.message || "操作失败", "error", 4200);
+    if (!(error instanceof AdminAuthExpiredError) && !ADMIN_STATE.pageHidden) {
+      toast(error?.message || "操作失败", "error", 4200);
+    }
     return undefined;
   } finally {
     if (button.isConnected) {
@@ -651,6 +671,94 @@ function clearCredentialDisplay() {
   if (dialog.open) dialog.close();
 }
 
+function mediaConversationName(media) {
+  const title = String(firstValue(media, ["conversation_title", "conversation_name"], "")).trim();
+  if (title) return title;
+  const peerUid = String(firstValue(media, ["conversation_peer_upstream_uid", "peer_upstream_uid"], "")).trim();
+  if (peerUid) return `与用户 ${peerUid} 的会话`;
+  if (media?.conversation_id || media?.upstream_conversation_id) return "未命名会话";
+  return "未关联会话";
+}
+
+function closeMediaDialog() {
+  const preview = $("admin-media-preview");
+  if (preview) {
+    preview.querySelectorAll("video, audio").forEach((mediaElement) => mediaElement.pause());
+    preview.querySelectorAll("img, video, audio").forEach((mediaElement) => {
+      mediaElement.removeAttribute("src");
+      if (typeof mediaElement.load === "function") mediaElement.load();
+    });
+    preview.replaceChildren();
+  }
+  const title = $("admin-media-title");
+  const description = $("admin-media-description");
+  if (title) title.textContent = "媒体预览";
+  if (description) description.textContent = "";
+  const dialog = $("admin-media-dialog");
+  if (dialog?.open) dialog.close();
+}
+
+function openMediaDialog(media, url, expiresIn = 0) {
+  closeMediaDialog();
+  const dialog = $("admin-media-dialog");
+  const preview = $("admin-media-preview");
+  const title = $("admin-media-title");
+  const description = $("admin-media-description");
+  const filename = String(firstValue(media, ["original_filename", "filename"], "")).trim();
+  const contentType = String(media?.content_type || "").trim().toLowerCase();
+  const kind = String(media?.kind || "").trim().toLowerCase();
+  const descriptionParts = [`所属会话：${mediaConversationName(media)}`];
+  if (contentType) descriptionParts.push(`内容类型：${contentType}`);
+  if (Number.isFinite(Number(media?.size_bytes))) {
+    descriptionParts.push(`文件大小：${formatBytes(media.size_bytes)}`);
+  }
+  const ttlSeconds = Number(expiresIn);
+  if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+    descriptionParts.push(`临时地址约 ${Math.max(1, Math.ceil(ttlSeconds / 60))} 分钟后失效`);
+  }
+  title.textContent = filename || "媒体预览";
+  description.textContent = descriptionParts.join("；");
+
+  let previewContent;
+  if (contentType.startsWith("image/") || kind === "image") {
+    previewContent = document.createElement("img");
+    previewContent.alt = filename ? `${filename} 预览` : "媒体内容预览";
+    previewContent.referrerPolicy = "no-referrer";
+  } else if (contentType.startsWith("video/") || kind === "video") {
+    previewContent = document.createElement("video");
+    previewContent.controls = true;
+    previewContent.preload = "metadata";
+    previewContent.setAttribute("aria-label", filename ? `${filename} 预览` : "视频内容预览");
+  } else if (contentType.startsWith("audio/") || ["audio", "voice"].includes(kind)) {
+    previewContent = document.createElement("audio");
+    previewContent.controls = true;
+    previewContent.preload = "metadata";
+    previewContent.setAttribute("aria-label", filename ? `${filename} 预览` : "音频内容预览");
+  }
+
+  if (previewContent) {
+    previewContent.addEventListener("error", () => {
+      if (!previewContent.getAttribute("src")) return;
+      preview.replaceChildren(
+        element("p", "admin-media-preview-message", "媒体加载失败，临时地址可能已经失效，请关闭后重试。")
+      );
+    });
+    previewContent.src = url;
+    preview.replaceChildren(previewContent);
+  } else {
+    const fallback = element("div", "admin-media-preview-message");
+    fallback.appendChild(element("p", "", "该文件类型暂不支持直接预览。"));
+    const link = element("a", "admin-button admin-button-secondary", "在新窗口打开文件");
+    link.href = url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.referrerPolicy = "no-referrer";
+    fallback.appendChild(link);
+    preview.replaceChildren(fallback);
+  }
+  if (!dialog.open) dialog.showModal();
+}
+
 function closeUserStatusDialog() {
   ADMIN_STATE.pendingUserStatus = null;
   clearInputValues($("admin-user-status-form"));
@@ -722,6 +830,7 @@ function clearDataViewDom() {
 function clearSensitiveDom({ clearData = true } = {}) {
   clearOneTimeInvite();
   clearTotpEnrollment();
+  closeMediaDialog();
   closeUserStatusDialog();
   closeMatchPoolOnlineListDialog();
   closeNearbyCustomCityDialog();
@@ -730,13 +839,15 @@ function clearSensitiveDom({ clearData = true } = {}) {
   closeUnlockDialog();
   clearInputValues($("admin-password-form"));
   clearInputValues($("admin-totp-start-form"));
-  [
-    "admin-invite-create-form",
-    "admin-invite-filter-form",
-    "admin-user-filter-form",
-    "admin-audit-filter-form",
-  ].forEach((id) => $(id)?.reset());
-  if (clearData) clearDataViewDom();
+  if (clearData) {
+    [
+      "admin-invite-create-form",
+      "admin-invite-filter-form",
+      "admin-user-filter-form",
+      "admin-audit-filter-form",
+    ].forEach((id) => $(id)?.reset());
+    clearDataViewDom();
+  }
   ADMIN_STATE.pendingRawResponse = null;
 }
 
@@ -759,6 +870,7 @@ function resetAdminState() {
   ADMIN_STATE.userPage = 1;
   ADMIN_STATE.auditPage = 1;
   ADMIN_STATE.detailPage = 1;
+  ADMIN_STATE.visibilityRefreshPending = false;
   ADMIN_STATE.needsRefresh = false;
   $("admin-identity").textContent = "管理员";
   $("admin-session-status").textContent = "会话未验证";
@@ -1216,6 +1328,14 @@ function userUpstreamUid(user) {
   );
 }
 
+function userPermissionCell(user) {
+  const permissions = [];
+  if (user?.match_pool_online_list_enabled) permissions.push("非匹配主动私信");
+  if (user?.nearby_custom_city_enabled) permissions.push("自定义城市筛选");
+  if (!permissions.length) return primaryCell("无额外授权", "使用默认功能范围");
+  return primaryCell(permissions.join("、"), "已授权额外功能");
+}
+
 async function loadUsers(page = ADMIN_STATE.userPage) {
   ADMIN_STATE.userPage = Math.max(1, Number(page) || 1);
   const container = $("admin-user-table");
@@ -1245,15 +1365,8 @@ async function loadUsers(page = ADMIN_STATE.userPage) {
         },
         { label: "状态", render: (row) => statusBadge(row.status || (row.disabled_at ? "disabled" : "active")) },
         {
-          label: "同步状态",
-          render: (row) => primaryCell(row.sync_enabled ? "同步已启用" : "同步已暂停", `最近同步 ${formatDate(row.last_sync_at)}`),
-        },
-        {
           label: "功能权限",
-          render: (row) => primaryCell(
-            `主动私信：${row.match_pool_online_list_enabled ? "已授权" : "未授权"}`,
-            `自定义城市：${row.nearby_custom_city_enabled ? "已授权" : "未授权"}`
-          ),
+          render: (row) => userPermissionCell(row),
         },
         {
           label: "媒体使用",
@@ -1810,7 +1923,7 @@ async function loadUserMedia(page = 1) {
     );
     if (!isCurrentUserDetailRequest(requestState)) return;
     const rows = extractItems(data);
-    const shell = detailTableShell(container, "媒体资源", "按归档状态筛选文件，并在可用时打开临时访问地址。" );
+    const shell = detailTableShell(container, "媒体资源", "按归档状态筛选文件，并在弹框内预览可访问的媒体。" );
     const stateSelect = optionSelect(
       [
         ["all", "全部状态"],
@@ -1840,6 +1953,17 @@ async function loadUserMedia(page = 1) {
       shell.region,
       [
         { label: "文件名", render: (row) => row.original_filename || row.filename || "未提供" },
+        {
+          label: "所属会话",
+          render: (row) => {
+            const peerUid = String(firstValue(row, ["conversation_peer_upstream_uid", "peer_upstream_uid"], "")).trim();
+            const conversationId = String(firstValue(row, ["upstream_conversation_id", "conversation_id"], "")).trim();
+            return primaryCell(
+              mediaConversationName(row),
+              peerUid ? `对方用户编号 ${peerUid}` : conversationId ? `会话编号 ${conversationId}` : ""
+            );
+          },
+        },
         { label: "类型", render: (row) => row.kind || row.content_type || "未提供" },
         { label: "大小", render: (row) => formatBytes(row.size_bytes || row.size || 0) },
         { label: "状态", render: (row) => statusBadge(row.status) },
@@ -1883,9 +2007,12 @@ async function accessMedia(media, button) {
     if (!isCurrentUserDetailRequest(requestState)) return;
     const url = safeHttpUrl(firstValue(data, ["url", "access_url", "signed_url", "view_url"], firstValue(data?.data, ["url", "access_url", "signed_url"], "")));
     if (!url) throw new AdminApiError("服务未返回可用的临时访问地址");
-    const opened = window.open(url, "_blank", "noopener,noreferrer");
-    if (opened) opened.opener = null;
-    else toast("浏览器阻止了新窗口，请允许后重试", "error", 4200);
+    const returnedMedia = data?.media || data?.data?.media || {};
+    openMediaDialog(
+      { ...media, ...(returnedMedia && typeof returnedMedia === "object" ? returnedMedia : {}) },
+      url,
+      firstValue(data, ["expires_in"], firstValue(data?.data, ["expires_in"], 0))
+    );
   });
 }
 
@@ -1906,22 +2033,26 @@ async function loadUserRelationships(page = 1) {
     if (!isCurrentUserDetailRequest(requestState)) return;
     const rows = extractItems(data);
     const shell = detailTableShell(container, "关系数据", "可按关系类型和状态精确筛选当前用户的社交关系。" );
-    const kindInput = document.createElement("input");
-    kindInput.id = "admin-user-relationship-kind-filter";
-    kindInput.type = "search";
-    kindInput.maxLength = 32;
-    kindInput.placeholder = "例如 friend 或 follow";
-    kindInput.value = kind;
-    const stateInput = document.createElement("input");
-    stateInput.id = "admin-user-relationship-state-filter";
-    stateInput.type = "search";
-    stateInput.maxLength = 24;
-    stateInput.placeholder = "例如 active";
-    stateInput.value = state;
+    const kindOptions = [
+      ["", "全部类型"],
+      ...Object.entries(ADMIN_RELATIONSHIP_KIND_LABELS),
+    ];
+    if (kind && !ADMIN_RELATIONSHIP_KIND_LABELS[kind]) kindOptions.push([kind, "其他关系"]);
+    const kindSelect = optionSelect(kindOptions, kind);
+    kindSelect.id = "admin-user-relationship-kind-filter";
+    const stateSelect = optionSelect(
+      [
+        ["", "全部状态"],
+        ["active", "正常"],
+        ["inactive", "已结束"],
+      ],
+      state
+    );
+    stateSelect.id = "admin-user-relationship-state-filter";
     const filter = detailFilterForm(
       () => {
-        ADMIN_STATE.detailFilters.relationshipKind = kindInput.value.trim();
-        ADMIN_STATE.detailFilters.relationshipState = stateInput.value.trim();
+        ADMIN_STATE.detailFilters.relationshipKind = kindSelect.value;
+        ADMIN_STATE.detailFilters.relationshipState = stateSelect.value;
         void loadUserRelationships(1);
       },
       () => {
@@ -1930,13 +2061,22 @@ async function loadUserRelationships(page = 1) {
         void loadUserRelationships(1);
       }
     );
-    filter.prepend(detailFilterField("关系类型", kindInput), detailFilterField("关系状态", stateInput));
+    filter.prepend(detailFilterField("关系类型", kindSelect), detailFilterField("关系状态", stateSelect));
     shell.toolbar.appendChild(filter);
     renderTable(
       shell.region,
       [
-        { label: "关系类型", render: (row) => row.kind || "未提供" },
-        { label: "关联用户编号", render: (row) => row.subject_upstream_uid || row.subject_uid || "未提供" },
+        { label: "关系类型", render: (row) => formatRelationshipKind(row.kind) },
+        {
+          label: "关联用户",
+          render: (row) => {
+            const subjectUid = row.subject_upstream_uid || row.subject_uid || "";
+            return primaryCell(
+              row.subject_display_name || row.subject_nickname || "昵称未获取",
+              subjectUid ? `用户编号 ${subjectUid}` : ""
+            );
+          },
+        },
         { label: "状态", render: (row) => statusBadge(row.status) },
         { label: "开始时间", render: (row) => formatDate(row.started_at || row.created_at) },
         { label: "结束时间", render: (row) => formatDate(row.ended_at) },
@@ -2426,10 +2566,15 @@ async function loadSecurity() {
   markPageUpdated();
 }
 
-async function refreshCurrentContext() {
-  await loadAdminMe();
+async function refreshCurrentContext({ validateSession = true } = {}) {
+  if (validateSession) await loadAdminMe();
+  $("admin-page-updated").textContent = "正在更新当前区域";
   if (ADMIN_STATE.currentView !== "users" || !ADMIN_STATE.selectedUserId) {
-    await activateView(ADMIN_STATE.currentView, { force: true, updateHash: false });
+    if (ADMIN_STATE.currentView === "overview") await loadOverview();
+    else if (ADMIN_STATE.currentView === "invites") await loadInvites(ADMIN_STATE.invitePage);
+    else if (ADMIN_STATE.currentView === "users") await loadUsers(ADMIN_STATE.userPage);
+    else if (ADMIN_STATE.currentView === "audit") await loadAudits(ADMIN_STATE.auditPage);
+    else if (ADMIN_STATE.currentView === "security") await loadSecurity();
     return;
   }
   if (ADMIN_STATE.selectedUserTab === "profile") await loadUserProfile();
@@ -2569,19 +2714,25 @@ async function cancelPendingTotpEnrollment({ notifyFailure = false } = {}) {
   return confirmed;
 }
 
-function privacyClearForHiddenPage() {
+function privacyClearForHiddenPage({ refreshCurrentView = false } = {}) {
   clearInputValues($("admin-login-form"));
   if (!ADMIN_STATE.authenticated) {
     clearSensitiveDom({ clearData: true });
     return;
   }
+  if (refreshCurrentView) ADMIN_STATE.visibilityRefreshPending = true;
+  if (ADMIN_STATE.pageHidden) return;
+  const hadPendingRequests = ADMIN_STATE.requestControllers.size > 0;
   ADMIN_STATE.pageHidden = true;
-  ADMIN_STATE.needsRefresh = true;
-  ADMIN_STATE.viewGeneration += 1;
+  if (hadPendingRequests) {
+    ADMIN_STATE.visibilityRefreshPending = true;
+    ADMIN_STATE.viewGeneration += 1;
+    invalidateUserDetailRequests();
+    abortAdminRequests();
+  }
   requestServerSensitiveLockOnHide();
   requestServerTotpCancelOnHide();
-  abortAdminRequests();
-  clearSensitiveDom({ clearData: true });
+  clearSensitiveDom({ clearData: false });
   $("admin-identity").textContent = "管理员";
   $("admin-session-status").textContent = "页面恢复后重新验证会话";
 }
@@ -2592,9 +2743,14 @@ async function restoreVisiblePage() {
   try {
     const valid = await loadAdminMe();
     if (!valid) throw new AdminApiError("管理员会话不可用");
+    if (ADMIN_STATE.pageHidden) return;
     showApplication();
-    await activateView(ADMIN_STATE.currentView || "overview", { force: true });
+    if (ADMIN_STATE.visibilityRefreshPending) {
+      ADMIN_STATE.visibilityRefreshPending = false;
+      await refreshCurrentContext({ validateSession: false });
+    }
   } catch (error) {
+    if (ADMIN_STATE.pageHidden) return;
     if (!(error instanceof AdminAuthExpiredError)) {
       resetAdminState();
       showLogin("无法恢复管理员会话，请重新登录。");
@@ -3025,6 +3181,12 @@ $("admin-credentials-dialog").addEventListener("cancel", (event) => {
   clearCredentialDisplay();
 });
 
+$("admin-media-close").addEventListener("click", closeMediaDialog);
+$("admin-media-dialog").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeMediaDialog();
+});
+
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && ADMIN_STATE.sidebarOpen) closeCompactNavigation();
 });
@@ -3045,16 +3207,15 @@ window.addEventListener("hashchange", () => {
 
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) privacyClearForHiddenPage();
-  else void restoreVisiblePage();
+  else if (ADMIN_STATE.pageHidden) void restoreVisiblePage();
 });
 
-window.addEventListener("pagehide", privacyClearForHiddenPage);
+window.addEventListener("pagehide", () => {
+  privacyClearForHiddenPage({ refreshCurrentView: true });
+});
 
 window.addEventListener("pageshow", (event) => {
-  if (!event.persisted) return;
-  privacyClearForHiddenPage();
-  ADMIN_STATE.pageHidden = false;
-  void restoreVisiblePage();
+  if (event.persisted && ADMIN_STATE.pageHidden) void restoreVisiblePage();
 });
 
 (async function bootAdmin() {

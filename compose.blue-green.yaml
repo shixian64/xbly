@@ -1,0 +1,10 @@
+services:
+  # `app` is the blue slot. The green slot inherits the exact same runtime,
+  # security, secrets, health check and resource limits and is only created
+  # when an operator explicitly targets this profile.
+  app-green:
+    extends:
+      file: compose.yaml
+      service: app
+    profiles:
+      - blue-green

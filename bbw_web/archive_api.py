@@ -94,6 +94,12 @@ class MessageReport(BaseModel):
         return value
 
 
+class MessageReportBatch(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    items: list[MessageReport] = Field(min_length=1, max_length=20)
+
+
 def _sid(request: Request) -> str:
     return str(request.cookies.get(legacy.COOKIE_NAME) or "")
 
@@ -733,3 +739,36 @@ def archive_message(report: MessageReport, request: Request) -> dict[str, Any]:
         client_ip=client_ip,
     )
     return {"ok": True, "accepted": bool(accepted)}
+
+
+@router.post("/messages/batch", status_code=status.HTTP_202_ACCEPTED)
+def archive_message_batch(
+    batch: MessageReportBatch, request: Request
+) -> dict[str, Any]:
+    persistence = request.app.state.persistence
+    sid = _sid(request)
+    identity = persistence.require_identity(sid)
+    if identity is None:
+        raise HTTPException(status_code=401, detail="请先登录")
+
+    client_ip = str(
+        request.headers.get("CF-Connecting-IP")
+        or request.headers.get("X-Real-IP")
+        or (request.client.host if request.client else "unknown")
+    )[:64]
+    if not persistence.rate_limit(
+        f"archive-message:{identity.user_id}", limit=60, window_seconds=60
+    ):
+        raise HTTPException(status_code=429, detail="消息归档请求过于频繁")
+
+    payloads = [item.model_dump(mode="json") for item in batch.items]
+    accepted = persistence.enqueue_message_archive_batch(
+        identity=identity,
+        payloads=payloads,
+        client_ip=client_ip,
+    )
+    return {
+        "ok": True,
+        "accepted": bool(accepted),
+        "count": len(payloads),
+    }

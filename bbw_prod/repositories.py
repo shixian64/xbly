@@ -78,6 +78,29 @@ class UserRepository(Repository[User]):
 class ExternalAccountRepository(Repository[ExternalAccount]):
     model = ExternalAccount
 
+    def get_user_binding(
+        self,
+        user_id: uuid.UUID,
+        *,
+        external_account_id: uuid.UUID | None = None,
+        provider: str = "beibeiwu",
+        for_update: bool = False,
+    ) -> tuple[User, ExternalAccount] | None:
+        stmt = (
+            select(User, ExternalAccount)
+            .join(ExternalAccount, ExternalAccount.user_id == User.id)
+            .where(
+                User.id == user_id,
+                ExternalAccount.provider == provider,
+            )
+        )
+        if external_account_id is not None:
+            stmt = stmt.where(ExternalAccount.id == external_account_id)
+        if for_update:
+            stmt = stmt.with_for_update()
+        row = self.db.execute(stmt).one_or_none()
+        return (row[0], row[1]) if row is not None else None
+
     def get_for_user(
         self, user_id: uuid.UUID, *, provider: str = "beibeiwu", for_update: bool = False
     ) -> ExternalAccount | None:
@@ -363,6 +386,57 @@ class ConversationRepository(Repository[Conversation]):
             )
         )
         return list(self.db.scalars(stmt))
+
+    def list_for_peers_with_latest(
+        self,
+        owner_user_id: uuid.UUID,
+        peer_upstream_uids: list[str],
+    ) -> list[tuple[Conversation, Message | None]]:
+        peers = list(
+            dict.fromkeys(
+                str(peer or "").strip()
+                for peer in peer_upstream_uids
+                if str(peer or "").strip()
+            )
+        )
+        if not peers:
+            return []
+        latest_message = Message.__table__.alias("latest_conversation_message")
+        latest_message_id = (
+            select(latest_message.c.id)
+            .where(
+                latest_message.c.owner_user_id == owner_user_id,
+                latest_message.c.conversation_id == Conversation.id,
+            )
+            .order_by(
+                latest_message.c.occurred_at.desc(),
+                latest_message.c.created_at.desc(),
+            )
+            .limit(1)
+            .correlate(Conversation)
+            .scalar_subquery()
+        )
+        stmt = (
+            select(Conversation, Message)
+            .outerjoin(
+                Message,
+                and_(
+                    Message.id == latest_message_id,
+                    Message.owner_user_id == owner_user_id,
+                ),
+            )
+            .where(
+                Conversation.owner_user_id == owner_user_id,
+                Conversation.provider == "tim",
+                Conversation.kind == "direct",
+                Conversation.peer_upstream_uid.in_(peers[:500]),
+            )
+            .order_by(
+                Conversation.last_message_at.desc().nullslast(),
+                Conversation.updated_at.desc(),
+            )
+        )
+        return [(row[0], row[1]) for row in self.db.execute(stmt)]
 
     def get(self, owner_user_id: uuid.UUID, conversation_id: uuid.UUID) -> Conversation | None:
         return self.db.scalar(
@@ -683,6 +757,23 @@ class RelationshipRepository(Repository[Relationship]):
             },
         ).returning(Relationship)
         return self.db.scalars(stmt).one()
+
+    def upsert_many(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        stmt = insert(Relationship).values(rows)
+        excluded = stmt.excluded
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_relationships_owner_subject",
+            set_={
+                "status": excluded.status,
+                "started_at": excluded.started_at,
+                "ended_at": excluded.ended_at,
+                "metadata": excluded.metadata,
+                "updated_at": func.now(),
+            },
+        )
+        self.db.execute(stmt)
 
 
 class ActivityEventRepository(Repository[ActivityEvent]):

@@ -36,20 +36,36 @@
 	# firewall allowlist enabled as a second layer and refresh these ranges when
 	# Cloudflare publishes changes.
 	@cloudflare remote_ip 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+	@internal path /internal/*
+
+	handle @internal {
+		respond 404
+	}
 
 	handle @cloudflare {
 		request_body {
 			max_size 60MB
 		}
 
-		reverse_proxy {$APP_UPSTREAM:app:8000} {
+		# APP_UPSTREAM is the explicitly selected active slot. Operators hot
+		# reload the ordered pair while both slots are ready, then drain the old
+		# slot. Active health checks are a failure fallback, not the cutover
+		# mechanism, so a drained first upstream is never left preferred here.
+		reverse_proxy {$APP_UPSTREAM:app:8000} {$APP_STANDBY_UPSTREAM:app-green:8000} {
 			header_up CF-Connecting-IP {client_ip}
 			header_up X-Real-IP {client_ip}
 			header_up X-Forwarded-For {client_ip}
 			header_up X-Forwarded-Proto https
 
-			health_uri /healthz
-			health_interval 2s
+			lb_policy first
+			lb_try_duration 5s
+			lb_try_interval 250ms
+			fail_duration 5s
+			max_fails 1
+			unhealthy_status 5xx
+
+			health_uri /readyz
+			health_interval 1s
 			health_timeout 5s
 			health_status 200
 

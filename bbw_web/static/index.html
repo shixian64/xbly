@@ -6,7 +6,8 @@
   <meta name="theme-color" content="#f8f5ff" />
   <meta name="color-scheme" content="light" />
   <title>XBLY</title>
-  <link rel="stylesheet" href="/static/app.css?v=fd8fad1e867593d7" />
+  <link rel="stylesheet" href="/static/app.css?v=fe3815705cc08217" />
+  <script defer src="/static/app.js?v=270360ab1156074c"></script>
 </head>
 <body>
   <div id="toast" class="toast hide" role="status" aria-live="polite" aria-atomic="true"></div>
@@ -76,6 +77,7 @@
           <button type="submit" class="btn primary full login-submit" id="login-submit">登录</button>
         </div>
         <p id="login-message" class="form-message" role="alert"></p>
+        <button type="button" class="btn secondary login-recovery-retry hide" id="session-recovery-retry">重新检查登录状态</button>
       </form>
       <p class="login-note">登录即表示你同意遵守社区礼仪，共同维护友善交流环境。</p>
     </section>
@@ -149,7 +151,5 @@
     </div>
   </dialog>
 
-  <!-- Message services initialize in the background after authentication so unread state is ready on every route. -->
-  <script src="/static/app.js?v=6439e968ce912747"></script>
 </body>
 </html>

@@ -5,7 +5,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
+import queue as queue_module
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -14,7 +17,7 @@ from typing import Any, Mapping, Optional
 from redis import Redis
 from rq import Queue
 from rq.exceptions import InvalidJobOperation
-from sqlalchemy import and_, or_, select, text, union_all
+from sqlalchemy import and_, func, literal, or_, select, text, union_all
 
 from bbw_prod.config import Settings
 from bbw_prod.crypto import CredentialCipher, normalize_phone
@@ -23,7 +26,6 @@ from bbw_prod.models import Conversation, ExternalAccount, Relationship, utcnow
 from bbw_prod.repositories import (
     ConversationRepository,
     ExternalAccountRepository,
-    MessageRepository,
     RelationshipRepository,
     UserRepository,
 )
@@ -45,6 +47,9 @@ from bbw_protocol.session import Session
 from bbw_web.match_history import load_match_history, record_match_history_response
 from bbw_web.store import WebUser
 from bbw_web.turnstile import TurnstileVerifier
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +79,80 @@ class PendingLoginRejected(PermissionError):
 
 class PendingLoginConflict(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class RawResponseArchiveItem:
+    owner_user_id: uuid.UUID
+    endpoint: str
+    request_meta: dict[str, Any]
+    raw_response: str
+    code: str
+    message: str
+    kind: str
+    http_status: int
+
+
+@dataclass(frozen=True, slots=True)
+class ProductEventQueueItem:
+    owner_user_id: uuid.UUID
+    payload: dict[str, Any]
+    digest: str
+    digest_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryResponseQueueItem:
+    owner_user_id: uuid.UUID
+    external_account_id: uuid.UUID
+    path: str
+    query: dict[str, Any]
+    response_data: Any
+    digest: str
+    digest_key: str
+
+
+HISTORY_CONVERSATION_REFRESH_SECONDS = 120
+HISTORY_CONVERSATION_VOLATILE_KEYS = frozenset(
+    {"unread_observed_at", "summary_observed_at"}
+)
+
+
+def _stable_history_response_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _stable_history_response_value(item)
+            for key, item in value.items()
+            if str(key) not in HISTORY_CONVERSATION_VOLATILE_KEYS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stable_history_response_value(item) for item in value]
+    return value
+
+
+def _history_response_digest(
+    path: str,
+    query: Mapping[str, Any] | None,
+    response_data: Any,
+    *,
+    observed_at: float | None = None,
+) -> str:
+    route = "/" + str(path or "").strip("/")
+    digest_response = response_data
+    payload: dict[str, Any] = {
+        "path": route,
+        "query": dict(query or {}),
+    }
+    if route == "/api/im/conversations":
+        digest_response = _stable_history_response_value(response_data)
+        timestamp = time.time() if observed_at is None else float(observed_at)
+        payload["observation_bucket"] = int(
+            timestamp // HISTORY_CONVERSATION_REFRESH_SECONDS
+        )
+    payload["response"] = digest_response
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
 
 
 MESSAGE_POLICY_PROVIDER = "web-policy"
@@ -279,6 +358,18 @@ class RuntimePersistence:
     MOMENT_VIDEO_GRANT_SECONDS = 2 * 60 * 60
     FLASH_REVEAL_TTL_SECONDS = 5 * 60
     FLASH_REVEALED_TTL_SECONDS = 10 * 60
+    RAW_RESPONSE_QUEUE_MAX = 64
+    RAW_RESPONSE_BATCH_SIZE = 16
+    RAW_RESPONSE_BATCH_WAIT_SECONDS = 0.1
+    RAW_RESPONSE_SHUTDOWN_WAIT_SECONDS = 5.0
+    PRODUCT_EVENT_QUEUE_MAX = 1024
+    PRODUCT_EVENT_BATCH_SIZE = 32
+    PRODUCT_EVENT_BATCH_WAIT_SECONDS = 0.1
+    PRODUCT_EVENT_SHUTDOWN_WAIT_SECONDS = 5.0
+    HISTORY_RESPONSE_QUEUE_MAX = 64
+    HISTORY_RESPONSE_BATCH_SIZE = 8
+    HISTORY_RESPONSE_BATCH_WAIT_SECONDS = 0.2
+    HISTORY_RESPONSE_SHUTDOWN_WAIT_SECONDS = 5.0
     FLASH_REVEAL_READ_SCRIPT = """
 local acknowledged = redis.call('EXISTS', KEYS[1])
 if acknowledged == 1 then
@@ -319,17 +410,407 @@ return 1
         self.media_queue = Queue("media", connection=self.redis)
         self.im_ingest_queue = Queue("im-ingest", connection=self.redis)
         self._r2_storage: Any = None
+        self._raw_response_queue: queue_module.Queue[RawResponseArchiveItem] = (
+            queue_module.Queue(maxsize=self.RAW_RESPONSE_QUEUE_MAX)
+        )
+        self._raw_response_stop = threading.Event()
+        self._raw_response_thread: threading.Thread | None = None
+        self._raw_response_accepting = False
+        self._raw_response_stored = 0
+        self._raw_response_dropped = 0
+        self._raw_response_failed = 0
+        self._product_event_queue: queue_module.Queue[ProductEventQueueItem] = (
+            queue_module.Queue(maxsize=self.PRODUCT_EVENT_QUEUE_MAX)
+        )
+        self._product_event_stop = threading.Event()
+        self._product_event_thread: threading.Thread | None = None
+        self._product_event_accepting = False
+        self._product_event_enqueued = 0
+        self._product_event_dropped = 0
+        self._product_event_failed = 0
+        self._history_response_queue: queue_module.Queue[HistoryResponseQueueItem] = (
+            queue_module.Queue(maxsize=self.HISTORY_RESPONSE_QUEUE_MAX)
+        )
+        self._history_response_stop = threading.Event()
+        self._history_response_thread: threading.Thread | None = None
+        self._history_response_accepting = False
+        self._history_response_enqueued = 0
+        self._history_response_dropped = 0
+        self._history_response_failed = 0
 
     def startup(self) -> None:
         with session_scope() as db:
             db.execute(text("SELECT 1"))
         self.redis.ping()
+        self._start_raw_response_worker()
+        self._start_product_event_worker()
+        self._start_history_response_worker()
 
     def close(self) -> None:
+        self._stop_history_response_worker()
+        self._stop_product_event_worker()
+        self._stop_raw_response_worker()
         try:
             self.redis.close()
         except Exception:
             pass
+
+    def _start_raw_response_worker(self) -> None:
+        thread = self._raw_response_thread
+        if thread is not None and thread.is_alive():
+            self._raw_response_accepting = True
+            return
+        self._raw_response_stop.clear()
+        self._raw_response_accepting = True
+        self._raw_response_thread = threading.Thread(
+            target=self._raw_response_worker,
+            name="bbw-raw-response-archive",
+            daemon=True,
+        )
+        self._raw_response_thread.start()
+
+    def _stop_raw_response_worker(self) -> None:
+        self._raw_response_accepting = False
+        stop = getattr(self, "_raw_response_stop", None)
+        if stop is not None:
+            stop.set()
+        thread = getattr(self, "_raw_response_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=self.RAW_RESPONSE_SHUTDOWN_WAIT_SECONDS)
+        pending = getattr(self, "_raw_response_queue", None)
+        if thread is not None and thread.is_alive():
+            LOGGER.warning(
+                "raw response archive worker did not stop before shutdown; pending=%d",
+                pending.qsize() if pending is not None else 0,
+            )
+
+    def _raw_response_worker(self) -> None:
+        pending = self._raw_response_queue
+        stop = self._raw_response_stop
+        while not stop.is_set() or not pending.empty():
+            try:
+                first = pending.get(timeout=self.RAW_RESPONSE_BATCH_WAIT_SECONDS)
+            except queue_module.Empty:
+                continue
+            batch = [first]
+            deadline = time.monotonic() + self.RAW_RESPONSE_BATCH_WAIT_SECONDS
+            while len(batch) < self.RAW_RESPONSE_BATCH_SIZE:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    batch.append(pending.get(timeout=remaining))
+                except queue_module.Empty:
+                    break
+            try:
+                self._store_raw_response_batch(batch)
+                self._raw_response_stored += len(batch)
+            except Exception:
+                self._raw_response_failed += len(batch)
+                LOGGER.exception(
+                    "raw response archive batch failed; batch_size=%d",
+                    len(batch),
+                )
+            finally:
+                for _item in batch:
+                    pending.task_done()
+
+    def _store_raw_response_batch(
+        self,
+        batch: list[RawResponseArchiveItem],
+    ) -> None:
+        if not batch:
+            return
+        with session_scope() as db:
+            service = RawResponseService(db, self.settings, self.cipher)
+            for item in batch:
+                service.store(
+                    owner_user_id=item.owner_user_id,
+                    endpoint=item.endpoint,
+                    payload={
+                        "request": _redact_request(item.request_meta),
+                        "response": _safe_json(item.raw_response),
+                        "code": item.code,
+                        "message": item.message,
+                        "kind": item.kind,
+                    },
+                    http_status=item.http_status,
+                )
+
+    def _start_product_event_worker(self) -> None:
+        thread = self._product_event_thread
+        if thread is not None and thread.is_alive():
+            self._product_event_accepting = True
+            return
+        self._product_event_stop.clear()
+        self._product_event_accepting = True
+        self._product_event_thread = threading.Thread(
+            target=self._product_event_worker,
+            name="bbw-product-event-batch",
+            daemon=True,
+        )
+        self._product_event_thread.start()
+
+    def _stop_product_event_worker(self) -> None:
+        self._product_event_accepting = False
+        self._product_event_stop.set()
+        thread = self._product_event_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=self.PRODUCT_EVENT_SHUTDOWN_WAIT_SECONDS)
+        if thread is not None and thread.is_alive():
+            LOGGER.warning(
+                "product event worker did not stop before shutdown; pending=%d",
+                self._product_event_queue.qsize(),
+            )
+
+    def _product_event_worker(self) -> None:
+        pending = self._product_event_queue
+        stop = self._product_event_stop
+        while not stop.is_set() or not pending.empty():
+            try:
+                first = pending.get(timeout=self.PRODUCT_EVENT_BATCH_WAIT_SECONDS)
+            except queue_module.Empty:
+                continue
+            batch = [first]
+            deadline = time.monotonic() + self.PRODUCT_EVENT_BATCH_WAIT_SECONDS
+            while len(batch) < self.PRODUCT_EVENT_BATCH_SIZE:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    batch.append(pending.get(timeout=remaining))
+                except queue_module.Empty:
+                    break
+            grouped: dict[uuid.UUID, list[ProductEventQueueItem]] = {}
+            for item in batch:
+                grouped.setdefault(item.owner_user_id, []).append(item)
+            for owner_user_id, items in grouped.items():
+                try:
+                    digest = hashlib.sha256(
+                        "\n".join(sorted(item.digest for item in items)).encode(
+                            "utf-8"
+                        )
+                    ).hexdigest()
+                    self.default_queue.enqueue(
+                        "bbw_web.jobs.record_product_events_batch",
+                        str(owner_user_id),
+                        [item.payload for item in items],
+                        job_id=f"product-event-batch-{owner_user_id}-{digest}",
+                        job_timeout=180,
+                        result_ttl=600,
+                        failure_ttl=86400,
+                    )
+                    self._product_event_enqueued += len(items)
+                except InvalidJobOperation:
+                    self._product_event_enqueued += len(items)
+                except Exception as exc:
+                    if "already exists" in str(exc).lower():
+                        self._product_event_enqueued += len(items)
+                        continue
+                    self._product_event_failed += len(items)
+                    pipe = self.redis.pipeline(transaction=False)
+                    for item in items:
+                        pipe.delete(item.digest_key)
+                    try:
+                        pipe.execute()
+                    except Exception:
+                        LOGGER.exception(
+                            "failed to release product event dedupe claims"
+                        )
+                    LOGGER.exception(
+                        "product event batch enqueue failed; batch_size=%d",
+                        len(items),
+                    )
+            for _item in batch:
+                pending.task_done()
+
+    def _queue_product_event(
+        self,
+        *,
+        identity: UserIdentity,
+        payload: dict[str, Any],
+        digest: str,
+    ) -> bool:
+        thread = self._product_event_thread
+        digest_key = self._response_digest_key("product-event", identity, digest)
+        if (
+            not self._product_event_accepting
+            or thread is None
+            or not thread.is_alive()
+        ):
+            self.redis.delete(digest_key)
+            self._product_event_dropped += 1
+            return False
+        try:
+            self._product_event_queue.put_nowait(
+                ProductEventQueueItem(
+                    owner_user_id=identity.user_id,
+                    payload=payload,
+                    digest=digest,
+                    digest_key=digest_key,
+                )
+            )
+            return True
+        except queue_module.Full:
+            self.redis.delete(digest_key)
+            self._product_event_dropped += 1
+            if (
+                self._product_event_dropped == 1
+                or self._product_event_dropped % 100 == 0
+            ):
+                LOGGER.warning(
+                    "product event queue full; dropped=%d queue_max=%d",
+                    self._product_event_dropped,
+                    self.PRODUCT_EVENT_QUEUE_MAX,
+                )
+            return False
+
+    def _start_history_response_worker(self) -> None:
+        thread = self._history_response_thread
+        if thread is not None and thread.is_alive():
+            self._history_response_accepting = True
+            return
+        self._history_response_stop.clear()
+        self._history_response_accepting = True
+        self._history_response_thread = threading.Thread(
+            target=self._history_response_worker,
+            name="bbw-history-response-batch",
+            daemon=True,
+        )
+        self._history_response_thread.start()
+
+    def _stop_history_response_worker(self) -> None:
+        self._history_response_accepting = False
+        self._history_response_stop.set()
+        thread = self._history_response_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=self.HISTORY_RESPONSE_SHUTDOWN_WAIT_SECONDS)
+        if thread is not None and thread.is_alive():
+            LOGGER.warning(
+                "history response worker did not stop before shutdown; pending=%d",
+                self._history_response_queue.qsize(),
+            )
+
+    def _history_response_worker(self) -> None:
+        pending = self._history_response_queue
+        stop = self._history_response_stop
+        while not stop.is_set() or not pending.empty():
+            try:
+                first = pending.get(timeout=self.HISTORY_RESPONSE_BATCH_WAIT_SECONDS)
+            except queue_module.Empty:
+                continue
+            batch = [first]
+            deadline = time.monotonic() + self.HISTORY_RESPONSE_BATCH_WAIT_SECONDS
+            while len(batch) < self.HISTORY_RESPONSE_BATCH_SIZE:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    batch.append(pending.get(timeout=remaining))
+                except queue_module.Empty:
+                    break
+            grouped: dict[
+                tuple[uuid.UUID, uuid.UUID], list[HistoryResponseQueueItem]
+            ] = {}
+            for item in batch:
+                grouped.setdefault(
+                    (item.owner_user_id, item.external_account_id), []
+                ).append(item)
+            for (owner_user_id, external_account_id), items in grouped.items():
+                try:
+                    digest = hashlib.sha256(
+                        "\n".join(sorted(item.digest for item in items)).encode(
+                            "utf-8"
+                        )
+                    ).hexdigest()
+                    self.im_ingest_queue.enqueue(
+                        "bbw_web.jobs.ingest_history_responses_batch",
+                        str(owner_user_id),
+                        str(external_account_id),
+                        [
+                            {
+                                "path": item.path,
+                                "query": item.query,
+                                "response_data": item.response_data,
+                            }
+                            for item in items
+                        ],
+                        job_id=(
+                            f"history-response-batch-{owner_user_id}-{digest}"
+                        ),
+                        job_timeout=600,
+                        result_ttl=600,
+                        failure_ttl=86400,
+                    )
+                    self._history_response_enqueued += len(items)
+                except InvalidJobOperation:
+                    self._history_response_enqueued += len(items)
+                except Exception as exc:
+                    if "already exists" in str(exc).lower():
+                        self._history_response_enqueued += len(items)
+                        continue
+                    self._history_response_failed += len(items)
+                    pipe = self.redis.pipeline(transaction=False)
+                    for item in items:
+                        pipe.delete(item.digest_key)
+                    try:
+                        pipe.execute()
+                    except Exception:
+                        LOGGER.exception(
+                            "failed to release history response dedupe claims"
+                        )
+                    LOGGER.exception(
+                        "history response batch enqueue failed; batch_size=%d",
+                        len(items),
+                    )
+            for _item in batch:
+                pending.task_done()
+
+    def _queue_history_response(
+        self,
+        *,
+        identity: UserIdentity,
+        path: str,
+        query: Mapping[str, Any] | None,
+        response_data: Any,
+        digest: str,
+    ) -> bool:
+        thread = self._history_response_thread
+        digest_key = self._response_digest_key("history", identity, digest)
+        if (
+            not self._history_response_accepting
+            or thread is None
+            or not thread.is_alive()
+        ):
+            self.redis.delete(digest_key)
+            self._history_response_dropped += 1
+            return False
+        try:
+            self._history_response_queue.put_nowait(
+                HistoryResponseQueueItem(
+                    owner_user_id=identity.user_id,
+                    external_account_id=identity.external_account_id,
+                    path=str(path or "")[:256],
+                    query=dict(query or {}),
+                    response_data=response_data,
+                    digest=digest,
+                    digest_key=digest_key,
+                )
+            )
+            return True
+        except queue_module.Full:
+            self.redis.delete(digest_key)
+            self._history_response_dropped += 1
+            if (
+                self._history_response_dropped == 1
+                or self._history_response_dropped % 100 == 0
+            ):
+                LOGGER.warning(
+                    "history response queue full; dropped=%d queue_max=%d",
+                    self._history_response_dropped,
+                    self.HISTORY_RESPONSE_QUEUE_MAX,
+                )
+            return False
 
     def health(self) -> dict[str, Any]:
         database_ok = False
@@ -349,6 +830,36 @@ return 1
             "service": "bbw-web",
             "database": database_ok,
             "redis": redis_ok,
+            "raw_response_archive": {
+                "worker_alive": bool(
+                    self._raw_response_thread
+                    and self._raw_response_thread.is_alive()
+                ),
+                "queue_depth": self._raw_response_queue.qsize(),
+                "stored": self._raw_response_stored,
+                "dropped": self._raw_response_dropped,
+                "failed": self._raw_response_failed,
+            },
+            "product_event_queue": {
+                "worker_alive": bool(
+                    self._product_event_thread
+                    and self._product_event_thread.is_alive()
+                ),
+                "queue_depth": self._product_event_queue.qsize(),
+                "enqueued": self._product_event_enqueued,
+                "dropped": self._product_event_dropped,
+                "failed": self._product_event_failed,
+            },
+            "history_response_queue": {
+                "worker_alive": bool(
+                    self._history_response_thread
+                    and self._history_response_thread.is_alive()
+                ),
+                "queue_depth": self._history_response_queue.qsize(),
+                "enqueued": self._history_response_enqueued,
+                "dropped": self._history_response_dropped,
+                "failed": self._history_response_failed,
+            },
         }
 
     def _limit_key(self, key: str, window_seconds: int) -> str:
@@ -1002,16 +1513,14 @@ return 1
             state = sessions.recover(sid)
             if state is None:
                 return None
-            user = UserRepository(db).get(state.user_id)
-            account = ExternalAccountRepository(db).get_for_user(state.user_id)
-            if (
-                user is None
-                or user.status != "active"
-                or account is None
-                or account.id != state.external_account_id
-            ):
+            binding = ExternalAccountRepository(db).get_user_binding(
+                state.user_id,
+                external_account_id=state.external_account_id,
+            )
+            if binding is None or binding[0].status != "active":
                 sessions.revoke(sid, reason="account_unavailable")
                 return None
+            user, account = binding
             login, _password, token = self._decrypt_account(
                 account, include_password=False
             )
@@ -1108,15 +1617,13 @@ return 1
             ).touch(sid)
             if state is None:
                 return None
-            user = UserRepository(db).get(state.user_id)
-            account = ExternalAccountRepository(db).get_for_user(state.user_id)
-            if (
-                user is None
-                or user.status != "active"
-                or account is None
-                or account.id != state.external_account_id
-            ):
+            binding = ExternalAccountRepository(db).get_user_binding(
+                state.user_id,
+                external_account_id=state.external_account_id,
+            )
+            if binding is None or binding[0].status != "active":
                 return None
+            user, account = binding
             return UserIdentity(
                 user_id=state.user_id,
                 external_account_id=state.external_account_id,
@@ -1144,15 +1651,13 @@ return 1
             ).touch(sid)
             if state is None:
                 return None
-            user = UserRepository(db).get(state.user_id)
-            account = ExternalAccountRepository(db).get_for_user(state.user_id)
-            if (
-                user is None
-                or user.status != "active"
-                or account is None
-                or account.id != state.external_account_id
-            ):
+            binding = ExternalAccountRepository(db).get_user_binding(
+                state.user_id,
+                external_account_id=state.external_account_id,
+            )
+            if binding is None or binding[0].status != "active":
                 return None
+            user, account = binding
             return UserIdentity(
                 user_id=user.id,
                 external_account_id=account.id,
@@ -1198,30 +1703,50 @@ return 1
             for key, value in dict(evidence or {}).items()
             if isinstance(value, (str, int, float, bool)) or value is None
         }
+        now = utcnow()
         with session_scope() as db:
-            repo = RelationshipRepository(db)
-            for peer in normalized:
-                existing = db.scalar(
+            existing_rows = list(
+                db.scalars(
                     select(Relationship).where(
                         Relationship.owner_user_id == identity.user_id,
                         Relationship.provider == MESSAGE_POLICY_PROVIDER,
-                        Relationship.subject_upstream_uid == peer,
+                        Relationship.subject_upstream_uid.in_(normalized),
                         Relationship.kind == kind,
                     )
                 )
+            )
+            existing_by_peer = {
+                _message_peer_uid(row.subject_upstream_uid): row
+                for row in existing_rows
+                if _message_peer_uid(row.subject_upstream_uid)
+            }
+            pending_rows: list[dict[str, Any]] = []
+            for peer in normalized:
+                existing = existing_by_peer.get(peer)
                 metadata = dict(existing.extra_data or {}) if existing else {}
                 metadata.update(safe_evidence)
                 metadata["server_owned"] = True
-                repo.upsert(
-                    owner_user_id=identity.user_id,
-                    provider=MESSAGE_POLICY_PROVIDER,
-                    subject_upstream_uid=peer,
-                    kind=kind,
-                    status="active",
-                    started_at=existing.started_at if existing else utcnow(),
-                    ended_at=None,
-                    extra_data=metadata,
+                if (
+                    existing is not None
+                    and existing.status == "active"
+                    and existing.ended_at is None
+                    and dict(existing.extra_data or {}) == metadata
+                ):
+                    continue
+                pending_rows.append(
+                    {
+                        "owner_user_id": identity.user_id,
+                        "provider": MESSAGE_POLICY_PROVIDER,
+                        "subject_upstream_uid": peer,
+                        "kind": kind,
+                        "status": "active",
+                        "started_at": existing.started_at if existing else now,
+                        "ended_at": None,
+                        "extra_data": metadata,
+                    }
                 )
+            repo = RelationshipRepository(db)
+            repo.upsert_many(pending_rows)
         return normalized
 
     def replace_social_message_relationships(
@@ -1255,22 +1780,27 @@ return 1
             )
         )
         now = utcnow()
+        if not normalized and not deactivate_missing:
+            return []
         with session_scope() as db:
-            existing_rows = list(
-                db.scalars(
-                    select(Relationship).where(
-                        Relationship.owner_user_id == identity.user_id,
-                        Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
-                        Relationship.kind == kind,
-                    )
+            existing_query = select(Relationship).where(
+                Relationship.owner_user_id == identity.user_id,
+                Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                Relationship.kind == kind,
+            )
+            if not deactivate_missing:
+                existing_query = existing_query.where(
+                    Relationship.subject_upstream_uid.in_(normalized)
                 )
+            existing_rows = list(
+                db.scalars(existing_query)
             )
             existing_by_peer = {
                 _message_peer_uid(row.subject_upstream_uid): row
                 for row in existing_rows
                 if _message_peer_uid(row.subject_upstream_uid)
             }
-            repo = RelationshipRepository(db)
+            pending_rows: list[dict[str, Any]] = []
             for peer in normalized:
                 existing = existing_by_peer.get(peer)
                 metadata = dict(existing.extra_data or {}) if existing else {}
@@ -1280,15 +1810,24 @@ return 1
                         "message_policy_source": source_path or "social_snapshot",
                     }
                 )
-                repo.upsert(
-                    owner_user_id=identity.user_id,
-                    provider=SOCIAL_RELATIONSHIP_PROVIDER,
-                    subject_upstream_uid=peer,
-                    kind=kind,
-                    status="active",
-                    started_at=existing.started_at if existing else now,
-                    ended_at=None,
-                    extra_data=metadata,
+                if (
+                    existing is not None
+                    and existing.status == "active"
+                    and existing.ended_at is None
+                    and dict(existing.extra_data or {}) == metadata
+                ):
+                    continue
+                pending_rows.append(
+                    {
+                        "owner_user_id": identity.user_id,
+                        "provider": SOCIAL_RELATIONSHIP_PROVIDER,
+                        "subject_upstream_uid": peer,
+                        "kind": kind,
+                        "status": "active",
+                        "started_at": existing.started_at if existing else now,
+                        "ended_at": None,
+                        "extra_data": metadata,
+                    }
                 )
             if deactivate_missing:
                 normalized_set = set(normalized)
@@ -1302,16 +1841,19 @@ return 1
                             "message_policy_source": source_path or "social_snapshot",
                         }
                     )
-                    repo.upsert(
-                        owner_user_id=identity.user_id,
-                        provider=SOCIAL_RELATIONSHIP_PROVIDER,
-                        subject_upstream_uid=peer,
-                        kind=kind,
-                        status="inactive",
-                        started_at=existing.started_at,
-                        ended_at=now,
-                        extra_data=metadata,
+                    pending_rows.append(
+                        {
+                            "owner_user_id": identity.user_id,
+                            "provider": SOCIAL_RELATIONSHIP_PROVIDER,
+                            "subject_upstream_uid": peer,
+                            "kind": kind,
+                            "status": "inactive",
+                            "started_at": existing.started_at,
+                            "ended_at": now,
+                            "extra_data": metadata,
+                        }
                     )
+            RelationshipRepository(db).upsert_many(pending_rows)
         return normalized
 
     def set_social_message_relationship(
@@ -1368,8 +1910,9 @@ return 1
         if not target or target == _message_peer_uid(identity.upstream_uid):
             return False
         with session_scope() as db:
-            blocked = db.scalar(
-                select(Relationship.id).where(
+            blocked_exists = (
+                select(Relationship.id)
+                .where(
                     Relationship.owner_user_id == identity.user_id,
                     Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
                     Relationship.subject_upstream_uid == target,
@@ -1377,13 +1920,13 @@ return 1
                     Relationship.status == "active",
                     Relationship.ended_at.is_(None),
                 )
+                .exists()
             )
-            if blocked is not None:
-                return False
             if identity.match_pool_online_list_enabled:
-                return True
-            grant = db.scalar(
-                select(Relationship.id).where(
+                return bool(db.scalar(select(~blocked_exists)))
+            grant_exists = (
+                select(Relationship.id)
+                .where(
                     Relationship.owner_user_id == identity.user_id,
                     Relationship.subject_upstream_uid == target,
                     or_(
@@ -1404,142 +1947,194 @@ return 1
                     Relationship.status == "active",
                     Relationship.ended_at.is_(None),
                 )
+                .exists()
             )
-            if grant is not None:
-                return True
-            return ConversationRepository(db).exists_for_peer(
-                identity.user_id,
-                target,
+            conversation_exists = (
+                select(Conversation.id)
+                .where(
+                    Conversation.owner_user_id == identity.user_id,
+                    Conversation.provider == "tim",
+                    Conversation.peer_upstream_uid == target,
+                    Conversation.kind == "direct",
+                )
+                .exists()
             )
+            return bool(
+                db.scalar(
+                    select(
+                        and_(
+                            ~blocked_exists,
+                            or_(grant_exists, conversation_exists),
+                        )
+                    )
+                )
+            )
+
+    def message_policy_snapshot(
+        self, identity: UserIdentity, *, limit: int = 2000
+    ) -> dict[str, list[str]]:
+        """Load all durable private-message policy lists in one DB round trip."""
+
+        bounded_limit = max(1, min(int(limit), 5000))
+        own_peer = _message_peer_uid(identity.upstream_uid)
+        blocked_latest = (
+            select(
+                Relationship.subject_upstream_uid.label("peer"),
+                func.max(Relationship.updated_at).label("observed_at"),
+            )
+            .where(
+                Relationship.owner_user_id == identity.user_id,
+                Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                Relationship.kind.in_(SOCIAL_MESSAGE_BLOCK_KINDS),
+                Relationship.status == "active",
+                Relationship.ended_at.is_(None),
+            )
+            .group_by(Relationship.subject_upstream_uid)
+            .cte("message_policy_blocked_latest")
+        )
+        blocked_peer_ids = select(blocked_latest.c.peer)
+        relationship_allowed = select(
+            Relationship.subject_upstream_uid.label("peer"),
+            Relationship.updated_at.label("observed_at"),
+        ).where(
+            Relationship.owner_user_id == identity.user_id,
+            or_(
+                and_(
+                    Relationship.provider == MESSAGE_POLICY_PROVIDER,
+                    Relationship.kind.in_(
+                        [
+                            MESSAGE_POLICY_MATCH_KIND,
+                            MESSAGE_POLICY_CONVERSATION_KIND,
+                        ]
+                    ),
+                ),
+                and_(
+                    Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                    Relationship.kind == SOCIAL_FRIEND_KIND,
+                ),
+            ),
+            Relationship.status == "active",
+            Relationship.ended_at.is_(None),
+        )
+        conversation_allowed = select(
+            Conversation.peer_upstream_uid.label("peer"),
+            Conversation.updated_at.label("observed_at"),
+        ).where(
+            Conversation.owner_user_id == identity.user_id,
+            Conversation.provider == "tim",
+            Conversation.kind == "direct",
+            Conversation.peer_upstream_uid.is_not(None),
+        )
+        allowed_candidates = union_all(
+            relationship_allowed,
+            conversation_allowed,
+        ).cte("message_policy_allowed_candidates")
+        allowed_latest = (
+            select(
+                allowed_candidates.c.peer,
+                func.max(allowed_candidates.c.observed_at).label("observed_at"),
+            )
+            .where(allowed_candidates.c.peer.is_not(None))
+            .group_by(allowed_candidates.c.peer)
+            .cte("message_policy_allowed_latest")
+        )
+        allowed_limited = (
+            select(allowed_latest.c.peer, allowed_latest.c.observed_at)
+            .where(
+                ~allowed_latest.c.peer.in_(blocked_peer_ids),
+                allowed_latest.c.peer != own_peer,
+            )
+            .order_by(allowed_latest.c.observed_at.desc())
+            .limit(bounded_limit)
+            .cte("message_policy_allowed_limited")
+        )
+        match_latest = (
+            select(
+                Relationship.subject_upstream_uid.label("peer"),
+                func.max(Relationship.updated_at).label("observed_at"),
+            )
+            .where(
+                Relationship.owner_user_id == identity.user_id,
+                Relationship.provider == MESSAGE_POLICY_PROVIDER,
+                Relationship.kind == MESSAGE_POLICY_MATCH_KIND,
+                Relationship.status == "active",
+                Relationship.ended_at.is_(None),
+            )
+            .group_by(Relationship.subject_upstream_uid)
+            .cte("message_policy_match_latest")
+        )
+        match_limited = (
+            select(match_latest.c.peer, match_latest.c.observed_at)
+            .where(
+                ~match_latest.c.peer.in_(blocked_peer_ids),
+                match_latest.c.peer != own_peer,
+            )
+            .order_by(match_latest.c.observed_at.desc())
+            .limit(bounded_limit)
+            .cte("message_policy_match_limited")
+        )
+        blocked_limited = (
+            select(blocked_latest.c.peer, blocked_latest.c.observed_at)
+            .where(blocked_latest.c.peer != own_peer)
+            .order_by(blocked_latest.c.observed_at.desc())
+            .limit(bounded_limit)
+            .cte("message_policy_blocked_limited")
+        )
+        snapshot_rows = union_all(
+            select(
+                literal("allowed_peers").label("category"),
+                allowed_limited.c.peer,
+                allowed_limited.c.observed_at,
+            ),
+            select(
+                literal("match_peers").label("category"),
+                match_limited.c.peer,
+                match_limited.c.observed_at,
+            ),
+            select(
+                literal("blocked_peers").label("category"),
+                blocked_limited.c.peer,
+                blocked_limited.c.observed_at,
+            ),
+        ).subquery()
+        statement = select(snapshot_rows.c.category, snapshot_rows.c.peer).order_by(
+            snapshot_rows.c.category,
+            snapshot_rows.c.observed_at.desc(),
+        )
+        snapshot = {
+            "allowed_peers": [],
+            "match_peers": [],
+            "blocked_peers": [],
+        }
+        with session_scope() as db:
+            rows = db.execute(statement)
+            for category, value in rows:
+                peer = _message_peer_uid(value)
+                if peer and peer != own_peer and category in snapshot:
+                    snapshot[category].append(peer)
+        blocked_peers = set(snapshot["blocked_peers"])
+        snapshot["match_peers"] = [
+            peer for peer in snapshot["match_peers"] if peer not in blocked_peers
+        ]
+        snapshot["allowed_peers"] = [
+            peer for peer in snapshot["allowed_peers"] if peer not in blocked_peers
+        ]
+        return snapshot
 
     def message_policy_allowed_peers(
         self, identity: UserIdentity, *, limit: int = 2000
     ) -> list[str]:
-        """Return durable peers whose existing or matched conversations may continue."""
-
-        with session_scope() as db:
-            blocked_peers = set(
-                db.scalars(
-                    select(Relationship.subject_upstream_uid).where(
-                        Relationship.owner_user_id == identity.user_id,
-                        Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
-                        Relationship.kind.in_(SOCIAL_MESSAGE_BLOCK_KINDS),
-                        Relationship.status == "active",
-                        Relationship.ended_at.is_(None),
-                    )
-                )
-            )
-            relationship_peers = select(
-                Relationship.subject_upstream_uid.label("peer"),
-                Relationship.updated_at.label("observed_at"),
-            ).where(
-                Relationship.owner_user_id == identity.user_id,
-                or_(
-                    and_(
-                        Relationship.provider == MESSAGE_POLICY_PROVIDER,
-                        Relationship.kind.in_(
-                            [
-                                MESSAGE_POLICY_MATCH_KIND,
-                                MESSAGE_POLICY_CONVERSATION_KIND,
-                            ]
-                        ),
-                    ),
-                    and_(
-                        Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
-                        Relationship.kind == SOCIAL_FRIEND_KIND,
-                    ),
-                ),
-                Relationship.status == "active",
-                Relationship.ended_at.is_(None),
-            )
-            conversation_peers = select(
-                Conversation.peer_upstream_uid.label("peer"),
-                Conversation.updated_at.label("observed_at"),
-            ).where(
-                Conversation.owner_user_id == identity.user_id,
-                Conversation.provider == "tim",
-                Conversation.kind == "direct",
-                Conversation.peer_upstream_uid.is_not(None),
-            )
-            allowed_peers = union_all(
-                relationship_peers,
-                conversation_peers,
-            ).subquery()
-            values = db.scalars(
-                select(allowed_peers.c.peer)
-                .order_by(allowed_peers.c.observed_at.desc())
-                .limit(max(1, min(int(limit), 5000)))
-            )
-            return list(
-                dict.fromkeys(
-                    peer
-                    for peer in (_message_peer_uid(value) for value in values)
-                    if peer
-                    and peer != _message_peer_uid(identity.upstream_uid)
-                    and peer not in blocked_peers
-                )
-            )
+        return self.message_policy_snapshot(identity, limit=limit)["allowed_peers"]
 
     def message_policy_match_peers(
         self, identity: UserIdentity, *, limit: int = 2000
     ) -> list[str]:
-        """Return durable match grants for restoring the browser allowlist."""
-
-        with session_scope() as db:
-            blocked_peers = set(
-                db.scalars(
-                    select(Relationship.subject_upstream_uid).where(
-                        Relationship.owner_user_id == identity.user_id,
-                        Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
-                        Relationship.kind.in_(SOCIAL_MESSAGE_BLOCK_KINDS),
-                        Relationship.status == "active",
-                        Relationship.ended_at.is_(None),
-                    )
-                )
-            )
-            values = db.scalars(
-                select(Relationship.subject_upstream_uid)
-                .where(
-                    Relationship.owner_user_id == identity.user_id,
-                    Relationship.provider == MESSAGE_POLICY_PROVIDER,
-                    Relationship.kind == MESSAGE_POLICY_MATCH_KIND,
-                    Relationship.status == "active",
-                    Relationship.ended_at.is_(None),
-                )
-                .order_by(Relationship.updated_at.desc())
-                .limit(max(1, min(int(limit), 5000)))
-            )
-            return [
-                peer
-                for peer in (_message_peer_uid(value) for value in values)
-                if peer
-                and peer != _message_peer_uid(identity.upstream_uid)
-                and peer not in blocked_peers
-            ]
+        return self.message_policy_snapshot(identity, limit=limit)["match_peers"]
 
     def message_policy_blocked_peers(
         self, identity: UserIdentity, *, limit: int = 2000
     ) -> list[str]:
-        """Return active user blocks that must override every message grant."""
-
-        with session_scope() as db:
-            values = db.scalars(
-                select(Relationship.subject_upstream_uid)
-                .where(
-                    Relationship.owner_user_id == identity.user_id,
-                    Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
-                    Relationship.kind.in_(SOCIAL_MESSAGE_BLOCK_KINDS),
-                    Relationship.status == "active",
-                    Relationship.ended_at.is_(None),
-                )
-                .order_by(Relationship.updated_at.desc())
-                .limit(max(1, min(int(limit), 5000)))
-            )
-            return [
-                peer
-                for peer in (_message_peer_uid(value) for value in values)
-                if peer and peer != _message_peer_uid(identity.upstream_uid)
-            ]
+        return self.message_policy_snapshot(identity, limit=limit)["blocked_peers"]
 
     def remember_message_policy_response(
         self,
@@ -1684,20 +2279,17 @@ return 1
         if not targets:
             return {}
         with session_scope() as db:
-            conversations = ConversationRepository(db).list_for_peers(
+            conversations_with_latest = ConversationRepository(
+                db
+            ).list_for_peers_with_latest(
                 identity.user_id,
                 targets,
             )
-            latest = MessageRepository(db).latest_for_conversations(
-                identity.user_id,
-                [conversation.id for conversation in conversations],
-            )
             summaries: dict[str, dict[str, Any]] = {}
-            for conversation in conversations:
+            for conversation, message in conversations_with_latest:
                 peer = str(conversation.peer_upstream_uid or "").strip()
                 if not peer:
                     continue
-                message = latest.get(conversation.id)
                 metadata = dict(conversation.extra_data or {})
                 occurred_at = (
                     message.occurred_at
@@ -1778,6 +2370,41 @@ return 1
                 return False
             raise
 
+    def enqueue_message_archive_batch(
+        self,
+        *,
+        identity: UserIdentity,
+        payloads: list[dict[str, Any]],
+        client_ip: str,
+    ) -> bool:
+        if not payloads:
+            return False
+        idempotency_keys = sorted(
+            str(payload.get("idempotency_key") or "") for payload in payloads
+        )
+        digest = hashlib.sha256(
+            "\n".join(idempotency_keys).encode("utf-8")
+        ).hexdigest()
+        job_id = f"archive-message-batch-{identity.user_id}-{digest}"
+        try:
+            self.default_queue.enqueue(
+                "bbw_web.jobs.archive_message_batch_job",
+                str(identity.user_id),
+                str(identity.external_account_id),
+                payloads,
+                job_id=job_id,
+                job_timeout=180,
+                result_ttl=600,
+                failure_ttl=7 * 86400,
+            )
+            return True
+        except InvalidJobOperation:
+            return False
+        except Exception as exc:
+            if "already exists" in str(exc).lower():
+                return False
+            raise
+
     def capture_upstream_response(
         self,
         *,
@@ -1785,20 +2412,36 @@ return 1
         request_meta: dict[str, Any],
         result: ApiResult,
     ) -> None:
-        payload = {
-            "request": _redact_request(request_meta),
-            "response": _safe_json(result.raw),
-            "code": result.code,
-            "message": result.message,
-            "kind": result.kind,
-        }
-        with session_scope() as db:
-            RawResponseService(db, self.settings, self.cipher).store(
-                owner_user_id=identity.user_id,
-                endpoint=str(request_meta.get("url") or "")[:512],
-                payload=payload,
-                http_status=int(result.status or 0),
-            )
+        pending = getattr(self, "_raw_response_queue", None)
+        thread = getattr(self, "_raw_response_thread", None)
+        if (
+            pending is None
+            or not getattr(self, "_raw_response_accepting", False)
+            or thread is None
+            or not thread.is_alive()
+        ):
+            self._raw_response_dropped = getattr(self, "_raw_response_dropped", 0) + 1
+            return
+        item = RawResponseArchiveItem(
+            owner_user_id=identity.user_id,
+            endpoint=str(request_meta.get("url") or "")[:512],
+            request_meta=dict(request_meta),
+            raw_response=str(result.raw or "")[: 1024 * 1024],
+            code=str(result.code or "")[:256],
+            message=str(result.message or "")[:2000],
+            kind=str(result.kind or "")[:64],
+            http_status=int(result.status or 0),
+        )
+        try:
+            pending.put_nowait(item)
+        except queue_module.Full:
+            self._raw_response_dropped += 1
+            if self._raw_response_dropped == 1 or self._raw_response_dropped % 100 == 0:
+                LOGGER.warning(
+                    "raw response archive queue full; dropped=%d queue_max=%d",
+                    self._raw_response_dropped,
+                    self.RAW_RESPONSE_QUEUE_MAX,
+                )
 
     def capture_product_response(
         self,
@@ -1837,30 +2480,6 @@ return 1
                 "/api/auth/sms-login",
             }:
                 self.set_web_presence(identity.upstream_uid, active=True)
-        if method.upper() == "POST" and path == "/api/im/read":
-            raw_read_peers = response_data.get("read_peers")
-            if isinstance(raw_read_peers, list):
-                read_peers = [str(peer or "").strip() for peer in raw_read_peers]
-            elif response_ok:
-                raw_request_peers = request_data.get("peers")
-                if isinstance(raw_request_peers, list):
-                    read_peers = [str(peer or "").strip() for peer in raw_request_peers]
-                else:
-                    read_peers = [
-                        str(
-                            request_data.get("peer")
-                            or request_data.get("uid")
-                            or request_data.get("to")
-                            or ""
-                        ).strip()
-                    ]
-            else:
-                read_peers = []
-            if read_peers:
-                self.mark_conversations_read(
-                    identity,
-                    [peer for peer in read_peers if peer],
-                )
         if (
             method.upper() == "GET"
             and path == "/api/moments/posts"
@@ -1873,25 +2492,15 @@ return 1
             and path in {"/api/im/messages", "/api/im/conversations"}
             and response_data
         ):
-            digest = hashlib.sha256(
-                json.dumps(response_data, sort_keys=True, ensure_ascii=False).encode("utf-8")
-            ).hexdigest()
+            digest = _history_response_digest(path, query, response_data)
             if self._claim_response_digest("history", identity, digest):
-                try:
-                    self.im_ingest_queue.enqueue(
-                        "bbw_web.jobs.ingest_history_response",
-                        str(identity.user_id),
-                        str(identity.external_account_id),
-                        path,
-                        query,
-                        response_data,
-                        job_id=f"history-response-{identity.user_id}-{digest}",
-                        job_timeout=300,
-                        result_ttl=600,
-                        failure_ttl=86400,
-                    )
-                except Exception:
-                    self.redis.delete(self._response_digest_key("history", identity, digest))
+                self._queue_history_response(
+                    identity=identity,
+                    path=path,
+                    query=query,
+                    response_data=response_data,
+                    digest=digest,
+                )
         social_snapshot_paths = {
             "/api/social/follows",
             "/api/social/fans",
@@ -1982,16 +2591,8 @@ return 1
             ).hexdigest()
             event_payload["idempotency_key"] = digest
             if self._claim_response_digest("product-event", identity, digest):
-                try:
-                    self.default_queue.enqueue(
-                        "bbw_web.jobs.record_product_event",
-                        str(identity.user_id),
-                        event_payload,
-                        job_id=f"product-event-{identity.user_id}-{digest}",
-                        result_ttl=600,
-                        failure_ttl=86400,
-                    )
-                except Exception:
-                    self.redis.delete(
-                        self._response_digest_key("product-event", identity, digest)
-                    )
+                self._queue_product_event(
+                    identity=identity,
+                    payload=event_payload,
+                    digest=digest,
+                )

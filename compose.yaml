@@ -248,6 +248,7 @@ services:
       <<: *app-environment
       BBW_ADMIN_INITIAL_USERNAME: ${ADMIN_INITIAL_USERNAME:-admin}
       BBW_ADMIN_INITIAL_PASSWORD_FILE: /run/secrets/admin_initial_password
+      BBW_DEPLOYMENT_CONTROL_TOKEN_FILE: /run/secrets/deployment_control_token
     secrets:
       - postgres_password
       - app_master_key
@@ -260,6 +261,7 @@ services:
       - r2_secret_access_key
       - turnstile_secret_key
       - admin_initial_password
+      - deployment_control_token
     command:
       - uvicorn
       - bbw_web.api:app
@@ -277,6 +279,8 @@ services:
       - "128"
       - --timeout-keep-alive
       - "10"
+      - --timeout-graceful-shutdown
+      - "25"
       - --no-access-log
     depends_on:
       postgres:
@@ -497,6 +501,7 @@ services:
       APP_DOMAIN: ${APP_DOMAIN:?set APP_DOMAIN}
       ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
       APP_UPSTREAM: ${APP_UPSTREAM:-app:8000}
+      APP_STANDBY_UPSTREAM: ${APP_STANDBY_UPSTREAM:-app-green:8000}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ${BBW_DATA_ROOT:-/var/lib/bbw}/caddy/data:/data
@@ -509,9 +514,6 @@ services:
       - "443:8443/udp"
     networks:
       - public
-    depends_on:
-      app:
-        condition: service_healthy
     mem_limit: 96m
     mem_reservation: 48m
     cpus: 0.25
@@ -558,3 +560,5 @@ secrets:
     file: ./docker/secrets/r2_secret_access_key
   turnstile_secret_key:
     file: ./docker/secrets/turnstile_secret_key
+  deployment_control_token:
+    file: ./docker/secrets/deployment_control_token

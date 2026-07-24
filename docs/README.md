@@ -13,7 +13,8 @@
 3. [10_PROTOCOL_CLIENT](./10_PROTOCOL_CLIENT.md) — 怎么用客户端  
 4. [04_FINDINGS](./04_FINDINGS.md) — 风险清单  
 5. 生产部署：[14](./14_PRODUCTION_DEPLOYMENT.md)
-6. 专题：实名 [08](./08_RP_VERIFY_BYPASS_ANALYSIS.md) / 游客 [09](./09_GUEST_CAPABILITY_MATRIX.md) / 覆盖 [11](./11_FEATURE_REALNAME_AND_COVERAGE.md) / 原生 [12](./12_NATIVE_INTEGRATION.md) / v154 [13](./13_APK_V154_DIFF.md)
+6. 性能优化：[16](./16_PERFORMANCE_OPTIMIZATION.md)
+7. 专题：实名 [08](./08_RP_VERIFY_BYPASS_ANALYSIS.md) / 游客 [09](./09_GUEST_CAPABILITY_MATRIX.md) / 覆盖 [11](./11_FEATURE_REALNAME_AND_COVERAGE.md) / 原生 [12](./12_NATIVE_INTEGRATION.md) / v154 [13](./13_APK_V154_DIFF.md)
 
 ---
 
@@ -37,6 +38,7 @@
 | [13_APK_V154_DIFF.md](./13_APK_V154_DIFF.md) | 148→154 差异 |
 | [14_PRODUCTION_DEPLOYMENT.md](./14_PRODUCTION_DEPLOYMENT.md) | Docker、PostgreSQL、Redis、R2、管理端、安全与运维 |
 | [15_APK_SECURITY_AUDIT.md](./15_APK_SECURITY_AUDIT.md) | APK 安全审计补充记录 |
+| [16_PERFORMANCE_OPTIMIZATION.md](./16_PERFORMANCE_OPTIMIZATION.md) | Web 首屏、数据链路、后台任务与流畅度优化 |
 | [DEEP_DIVE.md](./DEEP_DIVE.md) | 早期深挖（已并入 01/02/04） |
 | [api_catalog.json](./api_catalog.json) | action 目录 |
 

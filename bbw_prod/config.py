@@ -168,6 +168,8 @@ class Settings:
     phone_hmac_key_file: str | None
     session_hmac_key: str | None
     session_hmac_key_file: str | None
+    deployment_control_token: str | None
+    deployment_control_token_file: str | None
     sql_echo: bool
     db_pool_size: int
     db_max_overflow: int
@@ -223,6 +225,10 @@ class Settings:
             phone_hmac_key_file=os.getenv("BBW_PHONE_HMAC_KEY_FILE"),
             session_hmac_key=os.getenv("BBW_SESSION_HMAC_KEY"),
             session_hmac_key_file=os.getenv("BBW_SESSION_HMAC_KEY_FILE"),
+            deployment_control_token=os.getenv("BBW_DEPLOYMENT_CONTROL_TOKEN"),
+            deployment_control_token_file=os.getenv(
+                "BBW_DEPLOYMENT_CONTROL_TOKEN_FILE"
+            ),
             sql_echo=_env_bool("BBW_SQL_ECHO", False),
             db_pool_size=_env_int("BBW_DB_POOL_SIZE", 5, minimum=1),
             db_max_overflow=_env_int("BBW_DB_MAX_OVERFLOW", 2, minimum=0),
@@ -409,6 +415,23 @@ class Settings:
         )
         return decode_32_byte_secret(raw, name="BBW_SESSION_HMAC_KEY")
 
+    def load_deployment_control_token(self) -> bytes:
+        raw = _read_secret_source(
+            self.deployment_control_token,
+            self.deployment_control_token_file,
+            name="BBW_DEPLOYMENT_CONTROL_TOKEN",
+        )
+        token = raw.strip()
+        if not 32 <= len(token) <= 512:
+            raise ConfigurationError(
+                "BBW_DEPLOYMENT_CONTROL_TOKEN must contain 32 to 512 bytes"
+            )
+        if any(value < 0x21 or value > 0x7E for value in token):
+            raise ConfigurationError(
+                "BBW_DEPLOYMENT_CONTROL_TOKEN must contain visible ASCII characters only"
+            )
+        return token
+
     def validate(self) -> None:
         if not self.database_url.startswith(("postgresql://", "postgresql+")):
             raise ConfigurationError("BBW_DATABASE_URL must use PostgreSQL")
@@ -424,6 +447,10 @@ class Settings:
                     ("BBW_CREDENTIAL_KEYS_JSON", self.credential_keys_json),
                     ("BBW_PHONE_HMAC_KEY", self.phone_hmac_key),
                     ("BBW_SESSION_HMAC_KEY", self.session_hmac_key),
+                    (
+                        "BBW_DEPLOYMENT_CONTROL_TOKEN",
+                        self.deployment_control_token,
+                    ),
                 )
                 if value is not None
             ]

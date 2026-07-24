@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
-from typing import Any, Mapping
+from typing import Any, Mapping, NoReturn
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, Request
@@ -40,6 +41,52 @@ class PrepareMomentVideo(BaseModel):
     source_url: str = Field(min_length=1, max_length=4096)
     post_id: str = Field(min_length=1, max_length=128)
     retry: bool = False
+
+
+class MomentVideoServiceError(RuntimeError):
+    """Public-safe operational failure for the compatibility API."""
+
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        *,
+        retryable: bool,
+        retry_after: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = int(status_code)
+        self.code = str(code or "VIDEO_COMPAT_SERVICE_ERROR")[:64]
+        self.message = str(message or "视频兼容服务暂时不可用")[:240]
+        self.retryable = bool(retryable)
+        self.retry_after = max(0, int(retry_after))
+
+
+def _service_error(
+    status_code: int,
+    code: str,
+    message: str,
+    *,
+    retryable: bool = True,
+    retry_after: int = 0,
+) -> NoReturn:
+    raise MomentVideoServiceError(
+        status_code,
+        code,
+        message,
+        retryable=retryable,
+        retry_after=retry_after,
+    )
+
+
+def _log_event(request: Request, event: str, **fields: Any) -> None:
+    payload = {
+        "event": str(event or "moment_video"),
+        "request_id": str(getattr(request.state, "request_id", ""))[:64],
+        **fields,
+    }
+    LOGGER.info(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
 
 def _persistence(request: Request) -> Any:
@@ -260,7 +307,13 @@ def _ready_metadata(
             return metadata, profile
         return None
     except Exception as exc:
-        raise HTTPException(status_code=503, detail="兼容视频存储暂时不可用") from exc
+        raise MomentVideoServiceError(
+            503,
+            "VIDEO_COMPAT_STORAGE_UNAVAILABLE",
+            "兼容视频存储暂时不可用",
+            retryable=True,
+            retry_after=3,
+        ) from exc
 
 
 @router.post("/prepare")
@@ -274,16 +327,17 @@ def prepare_moment_video(body: PrepareMomentVideo, request: Request) -> dict[str
         limit=120,
         window_seconds=60,
     ):
-        raise HTTPException(status_code=429, detail="兼容视频请求过于频繁")
+        _service_error(
+            429,
+            "VIDEO_COMPAT_RATE_LIMIT",
+            "兼容视频请求过于频繁",
+            retry_after=5,
+        )
     try:
         source_url = canonical_source_identity(body.source_url)
         asset_id = asset_id_for_url(source_url)
     except MomentVideoError as exc:
-        LOGGER.warning(
-            "moment video source rejected user_id=%s code=%s",
-            identity.user_id,
-            exc.code,
-        )
+        _log_event(request, "moment_video_source_rejected", code=exc.code)
         raise HTTPException(status_code=400, detail="视频地址不在允许的动态媒体范围内") from exc
     if not persistence.authorize_moment_video(
         identity,
@@ -295,33 +349,57 @@ def prepare_moment_video(body: PrepareMomentVideo, request: Request) -> dict[str
     if not persistence.rate_limit(
         f"moment-video-resolve:{identity.user_id}", limit=60, window_seconds=60
     ):
-        raise HTTPException(status_code=429, detail="兼容视频查询请求过于频繁")
-
-    ready = _ready_metadata(request, asset_id)
-    if ready is not None:
-        metadata, profile = ready
-        return _public_payload(
-            asset_id,
-            "ready",
-            size_bytes=int(metadata.get("size") or 0),
-            profile=profile,
+        _service_error(
+            429,
+            "VIDEO_COMPAT_QUERY_RATE_LIMIT",
+            "兼容视频查询请求过于频繁",
+            retry_after=5,
         )
 
-    queue = _queue(request)
-    state = _job_status(queue, asset_id)
+    try:
+        queue = _queue(request)
+        state = _job_status(queue, asset_id)
+    except Exception as exc:
+        raise MomentVideoServiceError(
+            503,
+            "VIDEO_COMPAT_QUEUE_UNAVAILABLE",
+            "视频兼容处理队列暂时不可用",
+            retryable=True,
+            retry_after=3,
+        ) from exc
     if state == "finished":
-        # The deterministic RQ job can outlive an R2 object removed by cache
-        # retention. Remove the stale successful job so this ordinary prepare
-        # request recreates the derivative without requiring a manual retry.
+        # Do not synchronously probe R2 on the browser request path. Requeue the
+        # deterministic job and let the worker perform the idempotent HEAD;
+        # this keeps a slow object store from preventing the task from entering
+        # RQ before the browser's request timeout.
         finished_job, _finished_profile = _job_for_asset(queue, asset_id)
         if finished_job is not None:
             try:
                 finished_job.delete()
             except Exception as exc:
-                raise HTTPException(status_code=503, detail="兼容视频暂时无法重新生成") from exc
+                raise MomentVideoServiceError(
+                    503,
+                    "VIDEO_COMPAT_REGENERATE_UNAVAILABLE",
+                    "兼容视频暂时无法重新生成",
+                    retryable=True,
+                    retry_after=3,
+                ) from exc
         state = "missing"
     manual_retry = False
     if state == "failed":
+        # The deterministic R2 object is authoritative once upload succeeds.
+        # A later Redis cache-index failure can still leave the RQ job marked
+        # failed, so reconcile that narrow state before exposing a failure to
+        # the browser or requiring a manual retry.
+        ready = _ready_metadata(request, asset_id)
+        if ready is not None:
+            metadata, profile = ready
+            return _public_payload(
+                asset_id,
+                "ready",
+                size_bytes=int(metadata.get("size") or 0),
+                profile=profile,
+            )
         error_code, retryable = _job_failure_details(queue, asset_id)
         rolling_deploy_mismatch = error_code == "SOURCE_IDENTITY_MISMATCH"
         if rolling_deploy_mismatch:
@@ -339,23 +417,54 @@ def prepare_moment_video(body: PrepareMomentVideo, request: Request) -> dict[str
         if not rolling_deploy_mismatch and not persistence.rate_limit(
             f"moment-video-retry:{identity.user_id}", limit=2, window_seconds=600
         ):
-            raise HTTPException(status_code=429, detail="兼容视频重试过于频繁")
+            _service_error(
+                429,
+                "VIDEO_COMPAT_RETRY_RATE_LIMIT",
+                "兼容视频重试过于频繁",
+                retry_after=60,
+            )
         failed_job, _failed_profile = _job_for_asset(queue, asset_id)
         if failed_job is not None:
             try:
                 failed_job.delete()
             except Exception as exc:
-                raise HTTPException(status_code=503, detail="兼容视频暂时无法重试") from exc
+                raise MomentVideoServiceError(
+                    503,
+                    "VIDEO_COMPAT_RETRY_UNAVAILABLE",
+                    "兼容视频暂时无法重试",
+                    retryable=True,
+                    retry_after=3,
+                ) from exc
         state = "missing"
         manual_retry = True
     if state == "processing":
         return _public_payload(asset_id, "processing")
-    if _queue_depth(queue) >= 50:
-        raise HTTPException(status_code=503, detail="兼容视频处理队列繁忙，请稍后重试")
+    try:
+        queue_depth = _queue_depth(queue)
+    except Exception as exc:
+        raise MomentVideoServiceError(
+            503,
+            "VIDEO_COMPAT_QUEUE_UNAVAILABLE",
+            "视频兼容处理队列暂时不可用",
+            retryable=True,
+            retry_after=3,
+        ) from exc
+    if queue_depth >= 50:
+        _service_error(
+            503,
+            "VIDEO_COMPAT_QUEUE_BUSY",
+            "兼容视频处理队列繁忙，请稍后重试",
+            retry_after=10,
+        )
     if not manual_retry and not persistence.rate_limit(
         f"moment-video-create:{identity.user_id}", limit=6, window_seconds=60
     ):
-        raise HTTPException(status_code=429, detail="兼容视频新建任务过于频繁")
+        _service_error(
+            429,
+            "VIDEO_COMPAT_CREATE_RATE_LIMIT",
+            "兼容视频新建任务过于频繁",
+            retry_after=10,
+        )
 
     try:
         queue.enqueue(
@@ -370,12 +479,37 @@ def prepare_moment_video(body: PrepareMomentVideo, request: Request) -> dict[str
             meta={
                 "owner_user_id": str(identity.user_id),
                 "client_ip_hash": hashlib.sha256(_client_ip(request).encode("utf-8")).hexdigest(),
+                "request_id": str(getattr(request.state, "request_id", ""))[:64],
             },
         )
     except Exception as exc:
         # A racing request may have enqueued the deterministic job first.
-        if _job_status(queue, asset_id) == "missing":
-            raise HTTPException(status_code=503, detail="兼容视频任务暂时无法创建") from exc
+        try:
+            racing_state = _job_status(queue, asset_id)
+        except Exception as state_exc:
+            raise MomentVideoServiceError(
+                503,
+                "VIDEO_COMPAT_QUEUE_UNAVAILABLE",
+                "视频兼容处理队列暂时不可用",
+                retryable=True,
+                retry_after=3,
+            ) from state_exc
+        if racing_state == "missing":
+            raise MomentVideoServiceError(
+                503,
+                "VIDEO_COMPAT_ENQUEUE_FAILED",
+                "兼容视频任务暂时无法创建",
+                retryable=True,
+                retry_after=3,
+            ) from exc
+    _log_event(
+        request,
+        "moment_video_enqueued",
+        asset_id=asset_id,
+        queue=queue.name,
+        queue_depth=queue_depth,
+        manual_retry=manual_retry,
+    )
     return _public_payload(asset_id, "processing")
 
 
@@ -398,9 +532,23 @@ def moment_video_status(asset_id: str, request: Request) -> dict[str, Any]:
         limit=60,
         window_seconds=60,
     ):
-        raise HTTPException(status_code=429, detail="兼容视频状态查询过于频繁")
-    queue = _queue(request)
-    state = _job_status(queue, asset_id)
+        _service_error(
+            429,
+            "VIDEO_COMPAT_STATUS_RATE_LIMIT",
+            "兼容视频状态查询过于频繁",
+            retry_after=3,
+        )
+    try:
+        queue = _queue(request)
+        state = _job_status(queue, asset_id)
+    except Exception as exc:
+        raise MomentVideoServiceError(
+            503,
+            "VIDEO_COMPAT_QUEUE_UNAVAILABLE",
+            "视频兼容处理队列暂时不可用",
+            retryable=True,
+            retry_after=3,
+        ) from exc
     # Avoid one R2 HEAD on every client poll while a long transcode is known to
     # be active. Once the job leaves a pending state, probe the deterministic
     # object so finished jobs and historical cache entries converge to ready.
@@ -433,7 +581,12 @@ def play_compatible_moment_video(asset_id: str, request: Request) -> Response:
     if not persistence.rate_limit(
         f"moment-video-play:{identity.user_id}", limit=60, window_seconds=60
     ):
-        raise HTTPException(status_code=429, detail="兼容视频播放请求过于频繁")
+        _service_error(
+            429,
+            "VIDEO_COMPAT_PLAY_RATE_LIMIT",
+            "兼容视频播放请求过于频繁",
+            retry_after=5,
+        )
     try:
         asset_id = validate_asset_id(asset_id)
     except MomentVideoError as exc:
@@ -467,7 +620,13 @@ def play_compatible_moment_video(asset_id: str, request: Request) -> Response:
             object_key_for_asset(asset_id, profile=profile), expires_seconds=ttl
         )
     except Exception as exc:
-        raise HTTPException(status_code=503, detail="兼容视频存储暂时不可用") from exc
+        raise MomentVideoServiceError(
+            503,
+            "VIDEO_COMPAT_STORAGE_UNAVAILABLE",
+            "兼容视频存储暂时不可用",
+            retryable=True,
+            retry_after=3,
+        ) from exc
     return RedirectResponse(
         signed_url,
         status_code=307,

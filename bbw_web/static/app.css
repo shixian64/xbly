@@ -443,6 +443,11 @@ summary:focus-visible {
   text-align: center;
 }
 
+.login-recovery-retry {
+  justify-self: center;
+  margin-top: 0.15rem;
+}
+
 .login-note {
   margin: 0.8rem 0 0;
   color: var(--faint);
@@ -2718,6 +2723,7 @@ summary:focus-visible {
   position: relative;
   min-width: 0;
   overflow: hidden;
+  contain: layout paint style;
   border-radius: 14px;
   touch-action: pan-y;
 }
@@ -3332,6 +3338,7 @@ summary:focus-visible {
   display: flex;
   width: 100%;
   min-width: 0;
+  contain: layout style;
   flex-direction: column;
   align-items: flex-start;
   gap: 0.12rem;
@@ -6345,7 +6352,7 @@ html.flash-viewing body {
     border-bottom-color: rgba(73, 55, 96, 0.08);
     background: rgba(247, 247, 249, 0.96);
     padding: calc(0.25rem + var(--safe-top)) max(0.7rem, var(--safe-right)) 0.25rem max(0.7rem, var(--safe-left));
-    backdrop-filter: blur(16px);
+    backdrop-filter: none;
   }
 
   .chat-log {

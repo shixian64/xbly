@@ -18,6 +18,11 @@ from bbw_web.jobs import (
     _merge_conversation_candidates,
     _upsert_conversations,
     ingest_history_response,
+    ingest_history_responses_batch,
+)
+from bbw_web.persistence import (
+    HISTORY_CONVERSATION_REFRESH_SECONDS,
+    _history_response_digest,
 )
 
 
@@ -25,6 +30,128 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ConversationBatchTests(unittest.TestCase):
+    def test_conversation_history_digest_ignores_volatile_time_within_refresh_bucket(
+        self,
+    ) -> None:
+        first = {
+            "ok": True,
+            "items": [
+                {
+                    "peer_id": "1001",
+                    "unread_count": 2,
+                    "unread_observed_at": 240.0,
+                }
+            ],
+        }
+        second = {
+            "ok": True,
+            "items": [
+                {
+                    "peer_id": "1001",
+                    "unread_count": 2,
+                    "unread_observed_at": 359.0,
+                }
+            ],
+        }
+
+        first_digest = _history_response_digest(
+            "/api/im/conversations", {"page": "1"}, first, observed_at=240.0
+        )
+        self.assertEqual(
+            first_digest,
+            _history_response_digest(
+                "/api/im/conversations", {"page": "1"}, second, observed_at=359.0
+            ),
+        )
+        changed = {**second, "items": [{**second["items"][0], "unread_count": 3}]}
+        self.assertNotEqual(
+            first_digest,
+            _history_response_digest(
+                "/api/im/conversations", {"page": "1"}, changed, observed_at=359.0
+            ),
+        )
+        self.assertNotEqual(
+            first_digest,
+            _history_response_digest(
+                "/api/im/conversations",
+                {"page": "1"},
+                second,
+                observed_at=240.0 + HISTORY_CONVERSATION_REFRESH_SECONDS,
+            ),
+        )
+        self.assertNotEqual(
+            _history_response_digest(
+                "/api/im/messages", {"peer": "1001"}, {"ok": True, "items": []}
+            ),
+            _history_response_digest(
+                "/api/im/messages", {"peer": "1002"}, {"ok": True, "items": []}
+            ),
+        )
+
+    def test_history_response_batch_reuses_binding_and_transaction(self) -> None:
+        owner_id = uuid.uuid4()
+        account_id = uuid.uuid4()
+        db = Mock()
+        user = SimpleNamespace(id=owner_id)
+        account = SimpleNamespace(id=account_id, upstream_uid="2002")
+
+        @contextmanager
+        def fake_session_scope():
+            yield db
+
+        responses = [
+            {
+                "path": "/api/im/conversations",
+                "query": {"page": "1"},
+                "response_data": {"ok": True, "items": []},
+            },
+            {
+                "path": "/api/im/messages",
+                "query": {"peer": "1001"},
+                "response_data": {"ok": True, "items": []},
+            },
+        ]
+        with (
+            patch("bbw_web.jobs.session_scope", fake_session_scope),
+            patch("bbw_web.jobs.get_settings", return_value=SimpleNamespace()),
+            patch(
+                "bbw_web.jobs._load_owner_binding", return_value=(user, account)
+            ) as load_binding,
+            patch(
+                "bbw_web.jobs._ingest_history_response_in_session",
+                side_effect=[
+                    {
+                        "ok": True,
+                        "conversations": 3,
+                        "messages_created": 0,
+                        "messages_existing": 0,
+                    },
+                    {
+                        "ok": True,
+                        "conversations": 0,
+                        "messages_created": 2,
+                        "messages_existing": 1,
+                    },
+                ],
+            ) as ingest_response,
+            patch("bbw_web.jobs._dispatch_media_outboxes") as dispatch_media,
+        ):
+            result = ingest_history_responses_batch(
+                str(owner_id), str(account_id), responses
+            )
+
+        load_binding.assert_called_once_with(db, owner_id, account_id)
+        self.assertEqual(ingest_response.call_count, 2)
+        self.assertIs(
+            ingest_response.call_args_list[0].kwargs["outbox_ids"],
+            ingest_response.call_args_list[1].kwargs["outbox_ids"],
+        )
+        dispatch_media.assert_not_called()
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(result["conversations"], 3)
+        self.assertEqual(result["messages_created"], 2)
+        self.assertEqual(result["messages_existing"], 1)
+
     def test_duplicate_candidates_keep_fresh_preview_and_unread_state(self) -> None:
         owner_id = uuid.uuid4()
         older = datetime(2026, 7, 22, 10, 0, tzinfo=UTC)

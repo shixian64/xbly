@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import UTC, datetime
 import importlib.util
 from pathlib import Path
@@ -18,6 +19,7 @@ from bbw_web.jobs import (
     _message_identifier,
     _tim_message_random,
     _tim_message_sequence,
+    archive_message_batch_job,
 )
 from bbw_web.normalize import normalize_message
 
@@ -388,6 +390,89 @@ class TimMessageDeduplicationTests(unittest.TestCase):
         )
         self.assertEqual(module._canonical_id("467615", "24564", "44783465"), expected)
 
+    def test_archive_batch_reuses_binding_transaction_and_media_dispatch(self) -> None:
+        owner_id = uuid.uuid4()
+        account_id = uuid.uuid4()
+        first_conversation = SimpleNamespace(id=uuid.uuid4())
+        second_conversation = SimpleNamespace(id=uuid.uuid4())
+        first_message = SimpleNamespace(id=uuid.uuid4())
+        second_message = SimpleNamespace(id=uuid.uuid4())
+        first_outbox = uuid.uuid4()
+        second_outbox = uuid.uuid4()
+        db = Mock()
+        user = SimpleNamespace(id=owner_id, chat_retention_days=180)
+        account = SimpleNamespace(id=account_id, upstream_uid="467615")
+        payloads = [
+            {
+                "idempotency_key": "message-one",
+                "peer_uid": "24564",
+                "conversation_id": "C2C24564",
+                "source": "tim_sdk",
+                "sent_at": "2026-07-21T10:52:57Z",
+            },
+            {
+                "idempotency_key": "message-two",
+                "peer_uid": "24565",
+                "conversation_id": "C2C24565",
+                "source": "history",
+                "sent_at": "2026-07-21T10:53:57Z",
+            },
+        ]
+
+        @contextmanager
+        def fake_session_scope():
+            yield db
+
+        with (
+            patch("bbw_web.jobs.session_scope", new=fake_session_scope),
+            patch("bbw_web.jobs.get_settings", return_value=SimpleNamespace()),
+            patch(
+                "bbw_web.jobs._load_owner_binding",
+                return_value=(user, account),
+            ) as load_binding,
+            patch(
+                "bbw_web.jobs._upsert_conversations",
+                return_value={
+                    "C2C24564": first_conversation,
+                    "C2C24565": second_conversation,
+                },
+            ) as upsert_conversations,
+            patch(
+                "bbw_web.jobs._ingest_message",
+                side_effect=[
+                    (first_message, True, first_outbox),
+                    (second_message, False, second_outbox),
+                ],
+            ) as ingest_message,
+            patch(
+                "bbw_web.jobs._dispatch_media_outboxes",
+                return_value=2,
+            ) as dispatch_media,
+        ):
+            result = archive_message_batch_job(
+                str(owner_id), str(account_id), payloads
+            )
+
+        load_binding.assert_called_once_with(db, owner_id, account_id)
+        upsert_conversations.assert_called_once()
+        self.assertEqual(len(upsert_conversations.call_args.kwargs["candidates"]), 2)
+        self.assertEqual(ingest_message.call_count, 2)
+        self.assertIs(
+            ingest_message.call_args_list[0].kwargs["conversation"],
+            first_conversation,
+        )
+        self.assertIs(
+            ingest_message.call_args_list[1].kwargs["conversation"],
+            second_conversation,
+        )
+        dispatch_media.assert_called_once_with(
+            [first_outbox, second_outbox], limit=2
+        )
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(result["media_dispatched"], 2)
+
 
 class FrontendMessageDeduplicationContracts(unittest.TestCase):
     def test_frontend_upserts_realtime_and_loaded_messages_by_tim_random(self) -> None:
@@ -395,12 +480,74 @@ class FrontendMessageDeduplicationContracts(unittest.TestCase):
 
         self.assertIn("function timMessageRandom(message)", source)
         self.assertIn("function messageIdentityKey(entry)", source)
+        self.assertIn("function messageIdentityLookupKeys(entry)", source)
+        self.assertIn("function findIndexedMessage(", source)
         self.assertIn("const key = messageIdentityKey(entry);", source)
         self.assertIn("messagesReferToSameMessage(previous, entry)", source)
+        merge = source.split("function mergePeerMessages(peer, incoming)", 1)[1].split(
+            "async function loadConversationMessages", 1
+        )[0]
+        self.assertNotIn("[...byKey.entries()].find", merge)
         self.assertIn("[left.id, right.sequence || timMessageSequence(right)]", source)
         self.assertIn("entry.recalledText ||", source)
         self.assertIn("mergePeerMessages(entry.peer, [entry]);", source)
         self.assertIn("message_random: messageRandom", source)
+
+    def test_chat_updates_use_indexed_incremental_dom_rendering(self) -> None:
+        source = (ROOT / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8-sig")
+        incremental = source.split("function renderChatMessageIncrementally", 1)[1].split(
+            "function renderChatLog", 1
+        )[0]
+        full_render = source.split("function renderChatLog", 1)[1].split(
+            "function cancelChatLogAutoScroll", 1
+        )[0]
+        add_message = source.split("function addImMessage", 1)[1].split(
+            "function trimChatMessages", 1
+        )[0]
+
+        self.assertIn("function chatMessageRowHtml(entry)", source)
+        self.assertIn("const CHAT_LOG_MESSAGE_NODES = new WeakMap();", source)
+        self.assertIn("findRenderedChatMessageNode(log, entry)", incremental)
+        self.assertIn("previousRow.replaceWith(nextRow)", incremental)
+        self.assertIn("log.append(nextRow)", incremental)
+        self.assertIn("lastRenderedChatMessageRow(log)", incremental)
+        self.assertIn("chatMessageFitsRenderedOrder(entry, previousRow)", incremental)
+        self.assertNotIn('log.querySelectorAll(".chat-message-row")', incremental)
+        self.assertIn("rebuildChatMessageNodeIndex(log);", full_render)
+        self.assertIn(
+            "if (!renderChatMessageIncrementally(log, renderedEntry)) renderChatLog(log);",
+            add_message,
+        )
+        self.assertNotIn("\n    renderChatLog(log);", add_message)
+
+    def test_long_chats_render_a_bounded_expandable_dom_window(self) -> None:
+        source = (ROOT / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8-sig")
+        chat_log = source.split("function chatLogHtml()", 1)[1].split(
+            "function chatMediaNodeIdentity", 1
+        )[0]
+        incremental = source.split("function renderChatMessageIncrementally", 1)[1].split(
+            "function renderChatLog", 1
+        )[0]
+        older_loader = source.split("async function loadOlderConversationMessages", 1)[1].split(
+            "function activeConversation", 1
+        )[0]
+        search_jump = source.split("async function jumpToMessageSearchResult", 1)[1].split(
+            "function clearConversationBatchDeleteConfirmation", 1
+        )[0]
+
+        self.assertIn("const CHAT_MESSAGE_RENDER_WINDOW = 400;", source)
+        self.assertIn("const CHAT_MESSAGE_RENDER_PAGE = 200;", source)
+        self.assertIn("imMessageRenderLimits: new Map()", source)
+        self.assertIn("allEntries.slice(hiddenCount)", chat_log)
+        self.assertIn("chatHistoryStatusHtml(hiddenCount)", chat_log)
+        self.assertIn("enforceChatMessageRenderWindow(log, entry.peer)", incremental)
+        self.assertIn("revealOlderRenderedMessages(target, log)", older_loader)
+        self.assertLess(
+            older_loader.index("revealOlderRenderedMessages(target, log)"),
+            older_loader.index("S.imMessageHistoryExhaustedPeers.has(target)"),
+        )
+        self.assertIn("expandChatMessageRenderLimit(target, newCount)", older_loader)
+        self.assertIn("ensureChatMessageRenderWindowIncludes(entry)", search_jump)
 
 
 if __name__ == "__main__":

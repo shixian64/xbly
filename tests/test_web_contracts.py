@@ -3398,6 +3398,13 @@ class ImRevokeBffContractTests(unittest.TestCase):
 
 
 class SocialFrontendContractTests(unittest.TestCase):
+    def _app_fragment(self, app_js: str, start: str, end: str) -> str:
+        start_index = app_js.find(start)
+        self.assertGreaterEqual(start_index, 0, f"missing JavaScript boundary: {start}")
+        end_index = app_js.find(end, start_index + len(start))
+        self.assertGreater(end_index, start_index, f"missing JavaScript boundary: {end}")
+        return app_js[start_index:end_index]
+
     def test_visitor_lists_show_exact_directional_visit_times(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
@@ -3424,20 +3431,96 @@ class SocialFrontendContractTests(unittest.TestCase):
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
         index_html = (root / "bbw_web" / "static" / "index.html").read_text(encoding="utf-8")
         restore = app_js.split("async function restoreSessionAtBoot()", 1)[1].split(
+            "async function recoverSessionAfterBoot", 1
+        )[0]
+        classifier = app_js.split("function classifyBootSessionAttempt", 1)[1].split(
+            "function completeRestoredSession", 1
+        )[0]
+        recovery = app_js.split("async function recoverSessionAfterBoot", 1)[1].split(
             "(async function boot()", 1
         )[0]
         boot = app_js.split("(async function boot()", 1)[1].split("})();", 1)[0]
 
+        self.assertIn("BOOT_SESSION_TIMEOUT_MS = 5000", app_js)
         self.assertIn("BOOT_SESSION_RETRY_DELAYS_MS", app_js)
-        self.assertIn("while (true)", restore)
-        self.assertIn('api("/api/me", { authOptional: true, timeout: 8000 })', restore)
-        self.assertIn("result.status === 200 || result.status === 401", restore)
-        self.assertIn('setBootStatusText("服务暂时不可用，正在恢复登录状态…")', restore)
-        self.assertIn("await new Promise((resolve) => setTimeout(resolve, delay))", restore)
+        self.assertNotIn("while (true)", restore)
+        self.assertIn('api("/api/me", { authOptional: true, timeout: BOOT_SESSION_TIMEOUT_MS })', restore)
+        self.assertIn("classifyBootSessionAttempt(result, error)", restore)
+        self.assertIn("status === 401", classifier)
+        self.assertIn("status === 429", classifier)
+        self.assertIn('["offline", "network", "timeout"].includes(error.kind)', classifier)
+        self.assertIn("transient: true", classifier)
+        self.assertIn("while (token === bootSessionRecoveryToken", recovery)
+        self.assertIn("await waitForBootSessionRecovery(recovery.delayMs", recovery)
         self.assertIn("await restoreSessionAtBoot()", boot)
         self.assertNotIn('api("/api/me"', boot)
-        self.assertNotIn("Login screen remains available when the bootstrap request fails.", boot)
+        self.assertIn("scheduleDeferredFeatureLoad()", boot)
+        self.assertGreater(boot.index("scheduleDeferredFeatureLoad()"), boot.index("completeRestoredSession(data)"))
+        self.assertIn("showLogin(true, !recovery)", boot)
+        self.assertIn("recoverSessionAfterBoot(recoveryToken, recovery)", boot)
+        self.assertIn('id="session-recovery-retry"', index_html)
         self.assertIn('id="boot-status-text"', index_html)
+        self.assertIn("class ApiRequestError extends Error", app_js)
+        self.assertIn("responseRetryAfterMs(response)", app_js)
+
+    def test_frontend_keeps_bounded_local_performance_metrics(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        api = self._app_fragment(app_js, "async function api(path", "function archiveHash")
+        scheduler = self._app_fragment(
+            app_js,
+            "function scheduleDeferredFeatureLoad()",
+            "function startSmsCountdown",
+        )
+
+        self.assertIn("PERFORMANCE_METRIC_LIMIT = 120", app_js)
+        self.assertIn('Object.defineProperty(window, "getXBLYPerformanceMetrics"', app_js)
+        self.assertIn('type: "api"', api)
+        self.assertIn('response.headers.get("Server-Timing")', api)
+        self.assertIn("serverDurationMs", api)
+        self.assertIn('type: "long-task"', app_js)
+        self.assertIn('type: "largest-contentful-paint"', app_js)
+        self.assertIn('type: "navigation"', app_js)
+        self.assertIn("requestIdleCallback", scheduler)
+        self.assertIn("DEFERRED_FEATURES_IDLE_TIMEOUT_MS", scheduler)
+
+    def test_friend_filter_batches_dom_updates_to_one_animation_frame(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        filter_scheduler = self._app_fragment(
+            app_js,
+            "function scheduleFriendFilter(input)",
+            'document.addEventListener("input"',
+        )
+
+        self.assertIn("cancelAnimationFrame(S.friendFilterFrame)", filter_scheduler)
+        self.assertIn("requestAnimationFrame(() =>", filter_scheduler)
+        self.assertIn('surface.querySelectorAll("[data-friend-row]")', filter_scheduler)
+        self.assertNotIn('document.querySelectorAll("[data-friend-row]")', filter_scheduler)
+        self.assertIn("scheduleFriendFilter(input);", app_js)
+
+    def test_mobile_chat_header_avoids_scroll_time_backdrop_blur(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
+        mobile_chat = app_css.rsplit(
+            "body.chat-conversation-open .chat-head {", 1
+        )[1].split("}", 1)[0]
+
+        self.assertIn("backdrop-filter: none", mobile_chat)
+        self.assertNotIn("blur(", mobile_chat)
+
+    def test_view_caches_are_lru_bounded_for_long_browser_sessions(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("const PAGE_CACHE_LIMIT = 32;", app_js)
+        self.assertIn("const PANEL_CACHE_LIMIT = 40;", app_js)
+        self.assertIn("const PANEL_DOM_CACHE_LIMIT = 24;", app_js)
+        self.assertIn("while (S.panelCache.size > PANEL_CACHE_LIMIT)", app_js)
+        self.assertGreaterEqual(
+            app_js.count("trimDomCache(S.pageCache, PAGE_CACHE_LIMIT)"),
+            2,
+        )
 
     def test_moment_cards_report_apk_pv_when_they_enter_the_viewport(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -3849,6 +3932,13 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn('${chatAllowed ? "" : " hidden"}>聊天</button>', open_profile)
         self.assertIn('data-action="add-friend"', open_profile)
         self.assertIn('api("/api/im/message-policy"', app_js)
+        self.assertIn("messagePolicyRefreshPromise: null", app_js)
+        self.assertIn(
+            "if (S.messagePolicyRefreshPromise) return S.messagePolicyRefreshPromise;",
+            app_js,
+        )
+        self.assertIn("isCurrentAuthenticatedSession(sessionGeneration)", app_js)
+        self.assertIn("S.messagePolicyRefreshPromise = task", app_js)
         self.assertIn("setMessagePolicyReady(false)", app_js)
         self.assertIn("function currentMessagePolicyFingerprint()", app_js)
         self.assertIn(
@@ -3930,7 +4020,7 @@ class SocialFrontendContractTests(unittest.TestCase):
             tim_connect,
         )
         self.assertIn("persistence.can_message_peer(", api_py)
-        self.assertIn("persistence.message_policy_blocked_peers(identity)", api_py)
+        self.assertIn("persistence.message_policy_snapshot(identity)", api_py)
         self.assertIn("SOCIAL_DM_POLICY_PERSISTENCE_FAILED", api_py)
 
     def test_deferred_policy_cleanup_reconnects_after_capability_rollback(self) -> None:
@@ -4254,8 +4344,11 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
         self.assertIn("const previousAvatars = new Map();", conversation_list_renderer)
         self.assertIn('image?.getAttribute("src")', conversation_list_renderer)
         self.assertIn('document.createElement("template")', conversation_list_renderer)
+        self.assertIn("const nextHtml = conversationListHtml();", conversation_list_renderer)
+        self.assertIn("CONVERSATION_LIST_RENDER_HTML.get(list) === nextHtml", conversation_list_renderer)
         self.assertIn("nextAvatar.replaceWith(previous.avatar);", conversation_list_renderer)
         self.assertIn("list.replaceChildren(template.content);", conversation_list_renderer)
+        self.assertIn("CONVERSATION_LIST_RENDER_HTML.set(list, nextHtml);", conversation_list_renderer)
         self.assertIn("pendingAvatarSwaps.forEach(scheduleConversationAvatarSwap);", conversation_list_renderer)
         self.assertIn("function scheduleConversationAvatarSwap", app_js)
         self.assertIn('currentAvatar.dataset.pendingAvatarSrc !== nextSrc', app_js)
@@ -4670,6 +4763,10 @@ if (merged.profile_resolved !== false) throw new Error("partial merged profile m
         self.assertIn("CHAT_LOG_BOTTOM_FOLLOW.set(log, true)", scrolling)
         self.assertIn("if (!preserveUserIntent) CHAT_LOG_USER_SCROLL_INTENT_UNTIL.delete(log)", scrolling)
         self.assertIn("CHAT_LOG_BOTTOM_SETTLE_DELAYS_MS.forEach", scrolling)
+        self.assertIn("function cancelChatLogScheduledScroll", app_js)
+        self.assertIn("CHAT_LOG_SCROLL_FRAMES", scrolling)
+        self.assertIn("CHAT_LOG_SCROLL_TIMERS", scrolling)
+        self.assertIn("CHAT_LOG_MAINTENANCE_FRAMES", scrolling)
         self.assertIn("function chatLogShouldFollowBottom", scrolling)
         self.assertIn("function chatLogHasRecentUserScrollIntent", scrolling)
         self.assertIn("function scheduleChatLogBottomMaintenance", scrolling)
@@ -5000,6 +5097,11 @@ class RichMessageFrontendContractTests(unittest.TestCase):
             "function chatLogHtml()",
             "function scrollChatLogToBottom",
         )
+        peer_entries = self._app_fragment(
+            app_js,
+            "function peerChatMessageEntries(peer = S.activePeer)",
+            "function chatMessageRenderLimit",
+        )
         message_matcher = self._app_fragment(
             app_js,
             "function messagesReferToSameMessage(left, right)",
@@ -5028,8 +5130,9 @@ class RichMessageFrontendContractTests(unittest.TestCase):
             message_loader.index("mergePendingMessageRevocations("),
         )
         self.assertIn("if (!wasLoaded && S.activePeer === target) refreshChatLog();", message_loader)
-        self.assertIn("entries.every((entry) => entry.revoked)", chat_log)
-        self.assertIn('String(entry.peer || "") === activePeer', chat_log)
+        self.assertIn("peerChatMessageEntries(activePeer)", chat_log)
+        self.assertIn("allEntries.every((entry) => entry.revoked)", chat_log)
+        self.assertIn('String(entry.peer || "") === target', peer_entries)
         self.assertIn("正在加载聊天记录", chat_log)
 
     def test_conversation_loading_starts_before_the_chat_pane_is_redrawn(self) -> None:
@@ -5429,6 +5532,13 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
         self.assertIn("正在准备兼容版本…", app_js)
         self.assertIn("moment_video_compat", app_js)
         self.assertIn("MOMENT_VIDEO_COMPAT_POLL_DELAYS_MS", app_js)
+        self.assertIn("function momentVideoRequestFailure(value, data", app_js)
+        self.assertIn("function retryMomentVideoCompatibilityAfterOnline()", app_js)
+        self.assertIn('video.dataset.compatRetryOnOnline = retryOnOnline ? "1" : "0"', app_js)
+        self.assertIn("isTransientMomentVideoRequest(status)", app_js)
+        self.assertIn("suggestedPollDelay = status.retryAfterMs", app_js)
+        self.assertIn("Date.now() - startedAt < MOMENT_VIDEO_INITIAL_FRAME_WAIT_MS", app_js)
+        self.assertIn('(compatMoment || !video.paused)', app_js)
         self.assertIn("视频暂时无法播放", app_js)
         self.assertIn("当前浏览器暂时无法播放此视频", app_js)
         self.assertIn(

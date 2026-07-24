@@ -994,6 +994,53 @@ def transcode_h264(source: Path, probe: VideoProbe) -> PreparedMedia:
         raise
 
 
+def _remember_cached_asset_after_upload(
+    settings: Any,
+    storage: R2Storage,
+    asset_id: str,
+    size_bytes: int,
+    *,
+    profile: str,
+) -> None:
+    """Best-effort bookkeeping after the authoritative R2 write succeeds."""
+    connection: Redis | None = None
+    try:
+        connection = Redis.from_url(settings.redis_url)
+        remember_cached_asset(
+            connection,
+            settings,
+            asset_id,
+            size_bytes,
+            profile=profile,
+        )
+        trim_cached_assets_after_write(
+            connection,
+            settings,
+            storage,
+            protected_asset_id=asset_id,
+            profile=profile,
+        )
+    except Exception:
+        # Cache indexing and quota trimming are repairable by later status
+        # reconciliation/cleanup. Do not turn an already uploaded playable
+        # object into a failed RQ job.
+        LOGGER.exception(
+            "moment video cache bookkeeping failed after upload asset_id=%s profile=%s",
+            asset_id,
+            profile,
+        )
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                LOGGER.warning(
+                    "moment video Redis close failed asset_id=%s profile=%s",
+                    asset_id,
+                    profile,
+                )
+
+
 def transcode_job(asset_id: str, source_url: str) -> dict[str, Any]:
     """Create one cached H.264 derivative for a browser-incompatible video."""
     asset_id = validate_asset_id(asset_id)
@@ -1011,24 +1058,13 @@ def transcode_job(asset_id: str, source_url: str) -> dict[str, Any]:
             retryable=True,
         ) from exc
     if existing is not None:
-        connection = Redis.from_url(settings.redis_url)
-        try:
-            remember_cached_asset(
-                connection,
-                settings,
-                asset_id,
-                int(existing.get("size") or 0),
-                profile=compat_profile,
-            )
-            trim_cached_assets_after_write(
-                connection,
-                settings,
-                storage,
-                protected_asset_id=asset_id,
-                profile=compat_profile,
-            )
-        finally:
-            connection.close()
+        _remember_cached_asset_after_upload(
+            settings,
+            storage,
+            asset_id,
+            int(existing.get("size") or 0),
+            profile=compat_profile,
+        )
         return {"ok": True, "asset_id": asset_id, "existing": True}
 
     source: PreparedMedia | None = None
@@ -1081,24 +1117,13 @@ def transcode_job(asset_id: str, source_url: str) -> dict[str, Any]:
                 code="R2_UPLOAD_FAILED",
                 retryable=True,
             ) from exc
-        connection = Redis.from_url(settings.redis_url)
-        try:
-            remember_cached_asset(
-                connection,
-                settings,
-                asset_id,
-                compatible.size,
-                profile=compat_profile,
-            )
-            trim_cached_assets_after_write(
-                connection,
-                settings,
-                storage,
-                protected_asset_id=asset_id,
-                profile=compat_profile,
-            )
-        finally:
-            connection.close()
+        _remember_cached_asset_after_upload(
+            settings,
+            storage,
+            asset_id,
+            compatible.size,
+            profile=compat_profile,
+        )
         return {
             "ok": True,
             "asset_id": asset_id,

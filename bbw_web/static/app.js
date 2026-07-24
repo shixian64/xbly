@@ -62,9 +62,15 @@ const CONVERSATION_SWIPE_THRESHOLD_PX = 42;
 const CONVERSATION_SWIPE_LOCK_PX = 8;
 const CONVERSATION_DELETE_CONFIRM_DELAY_MS = 500;
 const CONVERSATION_DISMISS_LIMIT = 500;
-const BOOT_SESSION_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 15000];
+const BOOT_SESSION_TIMEOUT_MS = 5000;
+const BOOT_SESSION_RETRY_DELAYS_MS = [2000, 5000, 15000, 30000];
+const PERFORMANCE_METRIC_LIMIT = 120;
+const DEFERRED_FEATURES_IDLE_TIMEOUT_MS = 1000;
 const MESSAGE_ARCHIVE_RETRY_DELAYS_MS = [1500, 5000];
+const MESSAGE_ARCHIVE_BATCH_SIZE = 16;
+const MESSAGE_ARCHIVE_BATCH_DELAY_MS = 75;
 const MESSAGE_ARCHIVE_MAX_IN_FLIGHT = 2;
+const MESSAGE_ARCHIVE_KEEPALIVE_MAX_BYTES = 48 * 1024;
 const FLASH_ACK_RETRY_DELAYS_MS = [1000, 2500, 5000, 10000, 30000];
 const FLASH_ACK_RETRY_WINDOW_MS = 5 * 60 * 1000;
 const FLASH_ACK_LOCAL_RETENTION_MS = 10 * 60 * 1000;
@@ -75,8 +81,10 @@ const FAST_VIEW_CACHE_TTL_MS = 15 * 1000;
 const FEED_VIEW_CACHE_TTL_MS = 45 * 1000;
 const RELATION_VIEW_CACHE_TTL_MS = 60 * 1000;
 const ME_STATS_TTL_MS = 60 * 1000;
+const PAGE_CACHE_LIMIT = 32;
+const PANEL_CACHE_LIMIT = 40;
 const ROUTE_DOM_CACHE_LIMIT = 12;
-const PANEL_DOM_CACHE_LIMIT = 80;
+const PANEL_DOM_CACHE_LIMIT = 24;
 // Tencent Chat Web SDK defaults to a 2-minute client recall window. The
 // application console may extend it; the admin REST recall route has no fixed
 // time limit while the message is still inside its roaming-storage lifetime.
@@ -87,7 +95,18 @@ const CHAT_LOG_AUTO_SCROLL_GENERATIONS = new WeakMap();
 const CHAT_LOG_BOTTOM_FOLLOW = new WeakMap();
 const CHAT_LOG_USER_SCROLL_INTENT_UNTIL = new WeakMap();
 const CHAT_LOG_LAST_SCROLL_TOP = new WeakMap();
+const CHAT_LOG_MESSAGE_NODES = new WeakMap();
+const CHAT_LOG_NODE_ALIASES = new WeakMap();
+const CHAT_LOG_SCROLL_FRAMES = new WeakMap();
+const CHAT_LOG_SCROLL_TIMERS = new WeakMap();
+const CHAT_LOG_MAINTENANCE_FRAMES = new WeakMap();
+const CHAT_LOG_MESSAGE_COUNTS = new WeakMap();
+const CONVERSATION_LIST_RENDER_HTML = new WeakMap();
 const CHAT_LOG_BOTTOM_SETTLE_DELAYS_MS = [80, 240, 600];
+const CHAT_MESSAGE_RENDER_WINDOW = 400;
+const CHAT_MESSAGE_RENDER_PAGE = 200;
+let bootSessionRecoveryToken = 0;
+let bootSessionRecoveryWake = null;
 const MESSAGE_SEARCH_FILTERS = [
   { id: "all", label: "全部" },
   { id: "media", label: "图片与视频" },
@@ -237,6 +256,7 @@ const S = {
   imArchiveLoadedPeers: new Set(),
   imMessageOlderLoadingPeers: new Set(),
   imMessageHistoryExhaustedPeers: new Set(),
+  imMessageRenderLimits: new Map(),
   messageSearchOpen: false,
   messageSearchRootScope: "global",
   messageSearchScope: "global",
@@ -283,6 +303,7 @@ const S = {
   messageSyncChannel: null,
   authenticatedServicesTimer: null,
   authenticatedServicesPending: false,
+  messagePolicyRefreshPromise: null,
   messageLastPolicySyncAt: 0,
   messageLastSummarySyncAt: 0,
   messageLastPeerSyncAt: 0,
@@ -291,10 +312,12 @@ const S = {
   archivePersistedKeys: new Set(),
   archiveInFlight: 0,
   archiveDrainTimer: null,
+  archiveDrainAt: 0,
   archiveGeneration: 0,
   flashAckAccount: "",
   flashAckPending: new Map(),
   flashAckDrainTimer: null,
+  friendFilterFrame: 0,
   smsTimer: null,
   turnstileRequired: false,
   turnstileSiteKey: "",
@@ -303,10 +326,127 @@ const S = {
   turnstileScriptPromise: null,
   presenceTimer: null,
   serverHeartbeat: false,
+  performanceMetrics: [],
+  performanceObservers: [],
+  featuresLoadScheduled: false,
 };
 
 const $ = (id) => document.getElementById(id);
 const root = () => $("page-root");
+
+function performanceClockNow() {
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+}
+
+function roundedPerformanceMs(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? Math.round(number * 100) / 100 : 0;
+}
+
+function performanceMetricPath(path) {
+  try {
+    return new URL(String(path || ""), window.location.href).pathname.slice(0, 256);
+  } catch {
+    return String(path || "").split(/[?#]/, 1)[0].slice(0, 256);
+  }
+}
+
+function serverTimingAppDuration(value) {
+  for (const metric of String(value || "").split(",")) {
+    if (!/^\s*app(?:\s*;|\s*$)/i.test(metric)) continue;
+    const match = metric.match(/(?:^|;)\s*dur=([0-9]+(?:\.[0-9]+)?)/i);
+    const duration = Number(match?.[1]);
+    if (Number.isFinite(duration) && duration >= 0) return roundedPerformanceMs(duration);
+  }
+  return null;
+}
+
+function recordPerformanceMetric(metric, { replaceType = false } = {}) {
+  if (!metric || typeof metric !== "object") return;
+  const entry = Object.freeze({ ...metric, recordedAt: Date.now() });
+  if (replaceType && entry.type) {
+    const previousIndex = S.performanceMetrics.findIndex((item) => item.type === entry.type);
+    if (previousIndex >= 0) S.performanceMetrics.splice(previousIndex, 1);
+  }
+  S.performanceMetrics.push(entry);
+  if (S.performanceMetrics.length > PERFORMANCE_METRIC_LIMIT) {
+    S.performanceMetrics.splice(0, S.performanceMetrics.length - PERFORMANCE_METRIC_LIMIT);
+  }
+}
+
+if (typeof window.getXBLYPerformanceMetrics !== "function") {
+  Object.defineProperty(window, "getXBLYPerformanceMetrics", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: () => S.performanceMetrics.map((metric) => ({ ...metric })),
+  });
+}
+
+function captureNavigationPerformanceMetric() {
+  const navigation = performance?.getEntriesByType?.("navigation")?.[0];
+  if (!navigation) return;
+  recordPerformanceMetric(
+    {
+      type: "navigation",
+      durationMs: roundedPerformanceMs(navigation.duration),
+      responseStartMs: roundedPerformanceMs(navigation.responseStart),
+      domInteractiveMs: roundedPerformanceMs(navigation.domInteractive),
+      domContentLoadedMs: roundedPerformanceMs(navigation.domContentLoadedEventEnd),
+      loadCompleteMs: roundedPerformanceMs(navigation.loadEventEnd),
+    },
+    { replaceType: true }
+  );
+}
+
+function initLocalPerformanceMetrics() {
+  if (typeof PerformanceObserver === "function") {
+    const supported = new Set(PerformanceObserver.supportedEntryTypes || []);
+    if (supported.has("longtask")) {
+      try {
+        const observer = new PerformanceObserver((list) => {
+          for (const entry of list.getEntries()) {
+            recordPerformanceMetric({
+              type: "long-task",
+              startTimeMs: roundedPerformanceMs(entry.startTime),
+              durationMs: roundedPerformanceMs(entry.duration),
+            });
+          }
+        });
+        observer.observe({ type: "longtask", buffered: true });
+        S.performanceObservers.push(observer);
+      } catch {
+        /* Performance metrics are diagnostic only. */
+      }
+    }
+    if (supported.has("largest-contentful-paint")) {
+      try {
+        const observer = new PerformanceObserver((list) => {
+          const entries = list.getEntries();
+          const entry = entries[entries.length - 1];
+          if (!entry) return;
+          recordPerformanceMetric(
+            {
+              type: "largest-contentful-paint",
+              startTimeMs: roundedPerformanceMs(entry.startTime),
+              size: Math.max(0, Number(entry.size || 0)),
+            },
+            { replaceType: true }
+          );
+        });
+        observer.observe({ type: "largest-contentful-paint", buffered: true });
+        S.performanceObservers.push(observer);
+      } catch {
+        /* Performance metrics are diagnostic only. */
+      }
+    }
+  }
+  const captureNavigation = () => setTimeout(captureNavigationPerformanceMetric, 0);
+  if (document.readyState === "complete") captureNavigation();
+  else window.addEventListener("load", captureNavigation, { once: true });
+}
 
 function usesCoarsePointer() {
   return Boolean(
@@ -756,7 +896,44 @@ function toastEnv(data, success = "操作完成") {
 
 class AuthExpiredError extends Error {}
 
+class ApiRequestError extends Error {
+  constructor(
+    message,
+    {
+      kind = "request",
+      status = 0,
+      retryAfterMs = 0,
+      requestId = "",
+      retryable = false,
+    } = {}
+  ) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.kind = String(kind || "request");
+    this.status = Math.max(0, Number(status || 0));
+    this.retryAfterMs = Math.max(0, Number(retryAfterMs || 0));
+    this.requestId = String(requestId || "");
+    this.retryable = Boolean(retryable);
+  }
+}
+
+function responseRetryAfterMs(response) {
+  const raw = String(response?.headers?.get?.("Retry-After") || "").trim();
+  if (!raw) return 0;
+  if (/^\d+(?:\.\d+)?$/.test(raw)) {
+    return Math.min(5 * 60 * 1000, Math.max(0, Number(raw) * 1000));
+  }
+  const retryAt = Date.parse(raw);
+  if (!Number.isFinite(retryAt)) return 0;
+  return Math.min(5 * 60 * 1000, Math.max(0, retryAt - Date.now()));
+}
+
 async function api(path, options = {}) {
+  const requestStartedAt = performanceClockNow();
+  const requestPath = performanceMetricPath(path);
+  let requestStatus = 0;
+  let requestServerDurationMs = null;
+  let requestOutcome = "pending";
   const {
     timeout = 12000,
     authOptional = false,
@@ -789,13 +966,28 @@ async function api(path, options = {}) {
       headers,
       signal: controller.signal,
     });
+    requestStatus = Number(response.status || 0);
+    requestServerDurationMs = serverTimingAppDuration(response.headers.get("Server-Timing"));
+    requestOutcome = response.ok ? "ok" : "http-error";
+    const retryAfterMs = responseRetryAfterMs(response);
+    const requestId = String(response.headers.get("X-Request-ID") || "").trim();
     const text = await response.text();
     let data = {};
     if (text) {
       try {
         data = JSON.parse(text);
       } catch {
-        throw new Error(`服务返回了无法识别的内容（状态码 ${response.status}）`);
+        throw new ApiRequestError(`服务返回了无法识别的内容（状态码 ${response.status}）`, {
+          kind: "invalid-response",
+          status: response.status,
+          retryAfterMs,
+          requestId,
+          retryable:
+            response.status === 408 ||
+            response.status === 425 ||
+            response.status === 429 ||
+            response.status >= 500,
+        });
       }
     }
 
@@ -828,19 +1020,58 @@ async function api(path, options = {}) {
       toast("登录已失效，请重新登录", "error");
       throw new AuthExpiredError("登录已失效");
     }
-    return { status: response.status, data, ok: response.ok };
+    return {
+      status: response.status,
+      data,
+      ok: response.ok,
+      retryAfterMs,
+      requestId,
+    };
   } catch (error) {
-    if (error instanceof AuthExpiredError) throw error;
+    if (error instanceof AuthExpiredError) {
+      requestOutcome = "auth-expired";
+      throw error;
+    }
+    if (error instanceof ApiRequestError) {
+      requestOutcome = error.kind || "request-error";
+      throw error;
+    }
     if (controller.signal.aborted) {
-      if (outerSignal && outerSignal.aborted) throw new DOMException("Aborted", "AbortError");
-      if (timedOut) throw new Error("请求超时，请检查网络后重试");
+      if (outerSignal && outerSignal.aborted) {
+        requestOutcome = "aborted";
+        throw new DOMException("Aborted", "AbortError");
+      }
+      if (timedOut) {
+        requestOutcome = "timeout";
+        throw new ApiRequestError("请求超时，请检查网络后重试", {
+          kind: "timeout",
+          retryable: true,
+        });
+      }
+      requestOutcome = "aborted";
       throw new DOMException("Aborted", "AbortError");
     }
-    if (error instanceof TypeError) throw new Error("网络连接失败，请稍后重试");
+    if (error instanceof TypeError || error?.name === "NetworkError") {
+      requestOutcome = navigator.onLine === false ? "offline" : "network";
+      throw new ApiRequestError("网络连接失败，请稍后重试", {
+        kind: requestOutcome,
+        retryable: true,
+      });
+    }
+    requestOutcome = "unexpected-error";
     throw error;
   } finally {
     clearTimeout(timer);
     if (outerSignal) outerSignal.removeEventListener("abort", onOuterAbort);
+    recordPerformanceMetric({
+      type: "api",
+      path: requestPath,
+      method: String(fetchOptions.method || "GET").toUpperCase().slice(0, 16),
+      status: requestStatus,
+      outcome: requestOutcome,
+      durationMs: roundedPerformanceMs(performanceClockNow() - requestStartedAt),
+      ...(requestServerDurationMs === null ? {} : { serverDurationMs: requestServerDurationMs }),
+    });
   }
 }
 
@@ -964,65 +1195,120 @@ function rememberArchivedMessageKey(key) {
 function scheduleMessageArchiveDrain(delay = 0) {
   if (!S.authenticated) return;
   const normalizedDelay = Math.max(0, Number(delay) || 0);
+  const dueAt = Date.now() + normalizedDelay;
   if (S.archiveDrainTimer) {
-    if (normalizedDelay > 0) return;
+    if (S.archiveDrainAt && S.archiveDrainAt <= dueAt) return;
     clearTimeout(S.archiveDrainTimer);
     S.archiveDrainTimer = null;
   }
+  S.archiveDrainAt = dueAt;
   S.archiveDrainTimer = setTimeout(() => {
     S.archiveDrainTimer = null;
+    S.archiveDrainAt = 0;
     drainMessageArchiveQueue();
-  }, normalizedDelay);
+  }, Math.max(0, dueAt - Date.now()));
 }
 
-async function dispatchArchivedMessage(item, generation) {
-  S.archiveInFlight += 1;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
+function messageArchiveRequestByteLength(body) {
   try {
-    const response = await fetch("/api/archive/messages", {
+    return typeof TextEncoder === "function"
+      ? new TextEncoder().encode(body).byteLength
+      : String(body || "").length * 3;
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+function messageArchiveRequestCanKeepAlive(body) {
+  return messageArchiveRequestByteLength(body) <= MESSAGE_ARCHIVE_KEEPALIVE_MAX_BYTES;
+}
+
+function messageArchiveBatchBody(items) {
+  return JSON.stringify({ items: items.map((item) => item.payload) });
+}
+
+function settleArchivedMessageBatch(items, { persisted = false } = {}) {
+  items.forEach((item) => {
+    const key = item.payload.idempotency_key;
+    if (S.archiveQueue.get(key) !== item) return;
+    S.archiveQueue.delete(key);
+    if (persisted) rememberArchivedMessageKey(key);
+  });
+}
+
+function deferArchivedMessageBatch(items, delay) {
+  const now = Date.now();
+  items.forEach((item) => {
+    const key = item.payload.idempotency_key;
+    if (S.archiveQueue.get(key) !== item) return;
+    item.attempt += 1;
+    if (item.attempt > MESSAGE_ARCHIVE_RETRY_DELAYS_MS.length || !S.authenticated) {
+      S.archiveQueue.delete(key);
+      return;
+    }
+    const requestedDelay = typeof delay === "function" ? delay(item.attempt) : delay;
+    item.availableAt = now + Math.max(50, Number(requestedDelay) || 0);
+  });
+}
+
+async function sendArchivedMessageBatch(items, generation) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  const body = messageArchiveBatchBody(items);
+  try {
+    const response = await fetch("/api/archive/messages/batch", {
       method: "POST",
       credentials: "include",
-      keepalive: true,
+      keepalive: messageArchiveRequestCanKeepAlive(body),
       headers: {
         Accept: "application/json",
         "Content-Type": "application/json",
         "X-Requested-With": "XMLHttpRequest",
       },
-      body: JSON.stringify(item.payload),
+      body,
       signal: controller.signal,
     });
     if (generation !== S.archiveGeneration) return;
     if (response.ok || response.status === 409) {
-      S.archiveQueue.delete(item.payload.idempotency_key);
-      rememberArchivedMessageKey(item.payload.idempotency_key);
+      settleArchivedMessageBatch(items, { persisted: true });
       return;
     }
-    if ([400, 401, 403, 404, 405, 413, 422].includes(response.status)) {
-      S.archiveQueue.delete(item.payload.idempotency_key);
+    if (response.status === 422) {
+      if (items.length === 1) {
+        settleArchivedMessageBatch(items);
+        return;
+      }
+      const midpoint = Math.ceil(items.length / 2);
+      await sendArchivedMessageBatch(items.slice(0, midpoint), generation);
+      if (generation !== S.archiveGeneration) return;
+      await sendArchivedMessageBatch(items.slice(midpoint), generation);
+      return;
+    }
+    if ([400, 401, 403, 404, 405, 413].includes(response.status)) {
+      settleArchivedMessageBatch(items);
       return;
     }
     if (response.status === 429) {
-      item.attempt += 1;
-      if (item.attempt > MESSAGE_ARCHIVE_RETRY_DELAYS_MS.length || !S.authenticated) {
-        S.archiveQueue.delete(item.payload.idempotency_key);
-        return;
-      }
-      const retryAfter = Number(response.headers.get("Retry-After") || 0);
-      item.availableAt = Date.now() + (Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 30000);
+      deferArchivedMessageBatch(items, responseRetryAfterMs(response) || 30000);
       return;
     }
     throw new Error(`消息归档接口返回状态码 ${response.status}`);
   } catch {
     if (generation !== S.archiveGeneration) return;
-    item.attempt += 1;
-    if (item.attempt > MESSAGE_ARCHIVE_RETRY_DELAYS_MS.length || !S.authenticated) {
-      S.archiveQueue.delete(item.payload.idempotency_key);
-      return;
-    }
-    item.availableAt = Date.now() + MESSAGE_ARCHIVE_RETRY_DELAYS_MS[item.attempt - 1];
+    deferArchivedMessageBatch(
+      items,
+      (attempt) => MESSAGE_ARCHIVE_RETRY_DELAYS_MS[attempt - 1]
+    );
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+async function dispatchArchivedMessageBatch(items, generation) {
+  S.archiveInFlight += 1;
+  try {
+    await sendArchivedMessageBatch(items, generation);
+  } finally {
     if (generation === S.archiveGeneration) {
       S.archiveInFlight = Math.max(0, S.archiveInFlight - 1);
       scheduleMessageArchiveDrain();
@@ -1030,22 +1316,47 @@ async function dispatchArchivedMessage(item, generation) {
   }
 }
 
-function drainMessageArchiveQueue() {
-  if (!S.authenticated) return;
-  const generation = S.archiveGeneration;
-  const now = Date.now();
+function nextMessageArchiveBatch(now = Date.now()) {
+  const items = [];
   let nextAvailableAt = Number.POSITIVE_INFINITY;
   for (const item of S.archiveQueue.values()) {
-    if (S.archiveInFlight >= MESSAGE_ARCHIVE_MAX_IN_FLIGHT) break;
     if (item.inFlight) continue;
     if (item.availableAt > now) {
       nextAvailableAt = Math.min(nextAvailableAt, item.availableAt);
       continue;
     }
-    item.inFlight = true;
-    void dispatchArchivedMessage(item, generation).finally(() => {
+    if (items.length >= MESSAGE_ARCHIVE_BATCH_SIZE) break;
+    if (
+      items.length > 0 &&
+      !messageArchiveRequestCanKeepAlive(messageArchiveBatchBody([...items, item]))
+    ) {
+      break;
+    }
+    // Always send at least one item. If a future schema increase makes one
+    // request exceed this budget, fetch runs without keepalive instead of
+    // starving the queue entry forever.
+    items.push(item);
+  }
+  return { items, nextAvailableAt };
+}
+
+function drainMessageArchiveQueue() {
+  if (!S.authenticated) return;
+  const generation = S.archiveGeneration;
+  const now = Date.now();
+  let nextAvailableAt = Number.POSITIVE_INFINITY;
+  while (S.archiveInFlight < MESSAGE_ARCHIVE_MAX_IN_FLIGHT) {
+    const selection = nextMessageArchiveBatch(now);
+    nextAvailableAt = Math.min(nextAvailableAt, selection.nextAvailableAt);
+    if (!selection.items.length) break;
+    selection.items.forEach((item) => {
+      item.inFlight = true;
+    });
+    void dispatchArchivedMessageBatch(selection.items, generation).finally(() => {
       if (generation !== S.archiveGeneration) return;
-      item.inFlight = false;
+      selection.items.forEach((item) => {
+        item.inFlight = false;
+      });
     });
   }
   if (Number.isFinite(nextAvailableAt)) scheduleMessageArchiveDrain(Math.max(50, nextAvailableAt - now));
@@ -1056,13 +1367,14 @@ function archiveMessageBestEffort(entry, direction = "") {
   const payload = messageArchivePayload(entry, direction);
   if (!payload || S.archivePersistedKeys.has(payload.idempotency_key) || S.archiveQueue.has(payload.idempotency_key)) return;
   S.archiveQueue.set(payload.idempotency_key, { payload, attempt: 0, availableAt: Date.now(), inFlight: false });
-  scheduleMessageArchiveDrain();
+  scheduleMessageArchiveDrain(MESSAGE_ARCHIVE_BATCH_DELAY_MS);
 }
 
 function clearMessageArchiveDeliveryState() {
   S.archiveGeneration += 1;
   clearTimeout(S.archiveDrainTimer);
   S.archiveDrainTimer = null;
+  S.archiveDrainAt = 0;
   S.archiveQueue.clear();
   S.archivePersistedKeys.clear();
   S.archiveInFlight = 0;
@@ -1403,6 +1715,7 @@ function applyUser(user) {
     S.messagePolicyReady = false;
     S.messagePolicyGeneration += 1;
     S.messagePolicyFingerprint = "";
+    S.messagePolicyRefreshPromise = null;
     S.privateMessagePeers.clear();
     S.matchMessagePeers.clear();
     S.blockedPrivateMessagePeers.clear();
@@ -1700,8 +2013,12 @@ function resumeMessageChannelAfterPolicyReady() {
 }
 
 function refreshMessagePolicy() {
-  return api("/api/im/message-policy", { timeout: 6000 })
+  if (!S.authenticated) return Promise.resolve({});
+  if (S.messagePolicyRefreshPromise) return S.messagePolicyRefreshPromise;
+  const sessionGeneration = S.sessionGeneration;
+  const task = api("/api/im/message-policy", { timeout: 6000 })
     .then(({ data }) => {
+      if (!isCurrentAuthenticatedSession(sessionGeneration)) return {};
       if (data?.ok !== true) {
         if (!S.messagePolicyReady) setMessagePolicyReady(false);
         return {};
@@ -1726,9 +2043,21 @@ function refreshMessagePolicy() {
       return data.capabilities || {};
     })
     .catch(() => {
-      if (!S.messagePolicyReady) setMessagePolicyReady(false);
+      if (
+        isCurrentAuthenticatedSession(sessionGeneration) &&
+        !S.messagePolicyReady
+      ) {
+        setMessagePolicyReady(false);
+      }
       return {};
+    })
+    .finally(() => {
+      if (S.messagePolicyRefreshPromise === task) {
+        S.messagePolicyRefreshPromise = null;
+      }
     });
+  S.messagePolicyRefreshPromise = task;
+  return task;
 }
 
 function messageSyncAccountId() {
@@ -2637,7 +2966,7 @@ function discardCurrentMinePanelDomSnapshot() {
 function rememberPanelSnapshot(key, html, metadata = {}) {
   S.panelCache.set(key, { html, metadata, time: Date.now() });
   S.panelDomCache.delete(key);
-  while (S.panelCache.size > 80) {
+  while (S.panelCache.size > PANEL_CACHE_LIMIT) {
     const oldest = S.panelCache.keys().next().value;
     if (oldest == null) break;
     S.panelCache.delete(oldest);
@@ -2647,7 +2976,10 @@ function rememberPanelSnapshot(key, html, metadata = {}) {
 
 function rememberCurrentPageSnapshot(key = routeCacheKey(S.route)) {
   if (!root()) return;
-  if (S.route !== "msg") S.pageCache.set(key, { html: root().innerHTML, time: Date.now() });
+  if (S.route !== "msg") {
+    S.pageCache.set(key, { html: root().innerHTML, time: Date.now() });
+    trimDomCache(S.pageCache, PAGE_CACHE_LIMIT);
+  }
   rememberRouteDomSnapshot(key);
 }
 
@@ -2864,6 +3196,7 @@ async function activateRoute(id, { force = false } = {}) {
     S.routeDomKey = cacheKey;
     if (target !== "msg") {
       S.pageCache.set(cacheKey, { html: rendered, time: Date.now() });
+      trimDomCache(S.pageCache, PAGE_CACHE_LIMIT);
       if (isMineRoute(target)) {
         const panelKey = minePanelCacheKey(target);
         rememberPanelSnapshot(panelKey, html);
@@ -6368,7 +6701,7 @@ function updateVoiceTranscriptEntry(entry, text, status, { persist = true } = {}
   };
   S.imMessages[index] = next;
   if (persist && next.voiceText) persistVoiceTranscript(next, next.voiceText, next.voiceTextStatus);
-  refreshChatLog();
+  if (!refreshChatMessageEntry(next)) refreshChatLog();
   return next;
 }
 
@@ -6909,11 +7242,61 @@ function chatMessageContentHtml(entry) {
   return `${chatMessageQuoteHtml(entry)}${chatMessageBodyHtml(entry)}`;
 }
 
-function chatHistoryStatusHtml() {
+function peerChatMessageEntries(peer = S.activePeer) {
+  const target = String(peer || "");
+  if (!target) return [];
+  return S.imMessages
+    .filter(
+      (entry) => entry.type !== "system" && String(entry.peer || "") === target
+    )
+    .sort(compareMessageOrder);
+}
+
+function chatMessageRenderLimit(peer = S.activePeer) {
+  const target = String(peer || "");
+  const configured = Number(S.imMessageRenderLimits.get(target) || 0);
+  return Math.max(
+    CHAT_MESSAGE_RENDER_WINDOW,
+    Math.min(2000, Number.isFinite(configured) ? configured : 0)
+  );
+}
+
+function expandChatMessageRenderLimit(peer, count = CHAT_MESSAGE_RENDER_PAGE) {
+  const target = String(peer || "");
+  if (!target) return CHAT_MESSAGE_RENDER_WINDOW;
+  const current = chatMessageRenderLimit(target);
+  const next = Math.min(2000, current + Math.max(0, Number(count) || 0));
+  S.imMessageRenderLimits.set(target, next);
+  return next;
+}
+
+function hiddenChatMessageCount(peer = S.activePeer) {
+  const entries = peerChatMessageEntries(peer);
+  return Math.max(0, entries.length - chatMessageRenderLimit(peer));
+}
+
+function ensureChatMessageRenderWindowIncludes(entry) {
+  const peer = String(entry?.peer || S.activePeer || "");
+  if (!peer) return false;
+  const entries = peerChatMessageEntries(peer);
+  const index = entries.findIndex((candidate) =>
+    messagesReferToSameMessage(candidate, entry)
+  );
+  if (index < 0) return false;
+  const required = entries.length - index;
+  if (required <= chatMessageRenderLimit(peer)) return false;
+  S.imMessageRenderLimits.set(peer, Math.min(2000, required));
+  return true;
+}
+
+function chatHistoryStatusHtml(hiddenCount = hiddenChatMessageCount()) {
   const peer = String(S.activePeer || "");
   if (!peer) return "";
   if (S.imMessageOlderLoadingPeers.has(peer)) {
     return '<div class="chat-history-status is-loading" role="status">正在加载更早消息…</div>';
+  }
+  if (hiddenCount > 0) {
+    return `<div class="chat-history-status" data-chat-window-hidden="${hiddenCount}">继续向上滚动查看更早消息</div>`;
   }
   if (S.imMessageHistoryExhaustedPeers.has(peer)) {
     return '<div class="chat-history-status">没有更早的消息</div>';
@@ -6921,23 +7304,108 @@ function chatHistoryStatusHtml() {
   return "";
 }
 
+function chatMessageRowHtml(entry) {
+  const state = chatMessageState(entry);
+  const mineClass = entry.type === "mine" ? " mine" : "";
+  const revokeAction = revokeActionInfo(entry);
+  const canRetry = canRetryFailedChatMessage(entry);
+  const canEditRevoked = canEditRevokedMessage(entry);
+  const canQuote = canQuoteChatMessage(entry);
+  const voiceTranscriptAction = voiceTranscriptActionInfo(entry);
+  const sentTime = chatMessageTimeInfo(entry.timestamp);
+  const readTime = chatMessageReadTimeInfo(entry, sentTime);
+  const stateIndicator =
+    state?.indicator
+      ? `<span class="chat-read-indicator ${esc(state.className)}" role="img" aria-label="消息${esc(
+          state.label
+        )}" title="${esc(state.label)}"></span>`
+      : "";
+  const contextualActionsHtml = `${
+    voiceTranscriptAction
+      ? `<button type="button" class="chat-message-action voice-text" data-action="voice-to-text" data-message-id="${esc(
+          entry.id
+        )}" data-message-random="${esc(
+          entry.messageRandom || timMessageRandom(entry)
+        )}" aria-label="${esc(voiceTranscriptAction.title)}" title="${esc(voiceTranscriptAction.title)}" ${
+          voiceTranscriptAction.disabled ? "disabled" : ""
+        }>${esc(voiceTranscriptAction.label)}</button>`
+      : ""
+  }${
+    canQuote
+      ? `<button type="button" class="chat-message-action quote" data-action="quote-chat-message" data-message-id="${esc(
+          entry.id
+        )}" data-message-random="${esc(
+          entry.messageRandom || timMessageRandom(entry)
+        )}" aria-label="引用消息" title="引用这条消息">引用</button>`
+      : ""
+  }${
+    revokeAction
+      ? `<button type="button" class="chat-message-action${
+          revokeAction.outsideDefaultWindow ? " is-outside-default-window" : ""
+        }" data-action="revoke-chat-message" data-message-id="${esc(entry.id)}" aria-label="${esc(
+          revokeAction.title
+        )}" title="${esc(revokeAction.title)}">${esc(revokeAction.label)}</button>`
+      : ""
+  }`;
+  const metaHtml = `${
+    sentTime
+      ? `<time class="chat-message-time"${sentTime.datetime ? ` datetime="${esc(sentTime.datetime)}"` : ""} title="${esc(
+          `消息发出时间：${sentTime.title}`
+        )}">${esc(sentTime.label)}</time>`
+      : ""
+  }${
+    readTime
+      ? `<time class="chat-message-time is-read-time"${readTime.datetime ? ` datetime="${esc(readTime.datetime)}"` : ""} title="${esc(
+          `消息已读时间：${readTime.title}`
+        )}">已读 ${esc(readTime.label)}</time>`
+      : ""
+  }${state && !state.indicator ? `<span class="chat-message-state ${esc(state.className)}">${esc(state.label)}</span>` : ""}${
+    canRetry
+      ? `<button type="button" class="chat-message-action retry" data-action="retry-chat-message" data-message-id="${esc(
+          entry.id
+        )}" aria-label="重试发送" title="重新发送这条消息">重试</button>`
+      : ""
+  }${
+    contextualActionsHtml
+      ? `<span class="chat-message-actions contextual" role="group" aria-label="消息操作">${contextualActionsHtml}</span>`
+      : ""
+  }`;
+  const hasContextActions = Boolean(contextualActionsHtml);
+  return `<div class="chat-message-row${mineClass}${hasContextActions ? " has-context-actions" : ""}" data-message-id="${esc(
+    entry.id
+  )}" data-message-random="${esc(
+    entry.messageRandom || timMessageRandom(entry)
+  )}" data-message-sequence="${esc(entry.sequence || timMessageSequence(entry))}" data-message-timestamp="${esc(
+    entry.timestamp
+  )}" data-message-key="${esc(entry.msgKey || "")}" data-message-identity="${esc(
+    messageIdentityKey(entry)
+  )}"><div class="chat-message-main${mineClass}">${stateIndicator}<div class="chat-line${mineClass}${
+    entry.revoked ? ` is-revoked${canEditRevoked ? " can-edit" : ""}` : ""
+  } chat-kind-${esc(entry.kind || "text")}" data-message-id="${esc(entry.id)}" data-chat-message-bubble${
+    hasContextActions ? ' tabindex="0" aria-label="显示消息操作" aria-expanded="false"' : ""
+  }>${chatMessageContentHtml(entry)}${
+    entry.delivery === "sending" && entry.kind !== "text"
+      ? `<progress class="chat-upload-track" max="100" value="${Math.min(
+          100,
+          Math.max(2, Math.round(Number(entry.progress || 0) * 100))
+        )}" aria-label="上传进度"></progress>`
+      : ""
+  }</div></div>${metaHtml ? `<div class="chat-message-meta">${metaHtml}</div>` : ""}</div>`;
+}
+
 function chatLogHtml() {
   const activePeer = String(S.activePeer || "");
-  const entries = activePeer
-    ? S.imMessages.filter(
-        (entry) => entry.type !== "system" && String(entry.peer || "") === activePeer
-      )
-    : [];
+  const allEntries = peerChatMessageEntries(activePeer);
   if (
-    entries.length &&
+    allEntries.length &&
     S.activePeer &&
     S.imMessageLoadingPeers.has(S.activePeer) &&
     !S.imMessageLoadedPeers.has(S.activePeer) &&
-    entries.every((entry) => entry.revoked)
+    allEntries.every((entry) => entry.revoked)
   ) {
     return `<div class="chat-line system">正在加载聊天记录…</div>`;
   }
-  if (!entries.length) {
+  if (!allEntries.length) {
     if (S.activePeer && S.imMessageLoadingPeers.has(S.activePeer)) {
       return `<div class="chat-line system">正在加载聊天记录…</div>`;
     }
@@ -6946,93 +7414,10 @@ function chatLogHtml() {
     }
     return `<div class="chat-line system">还没有消息，礼貌地打个招呼吧</div>`;
   }
-  const sortedEntries = entries.sort(compareMessageOrder);
-  return `${chatHistoryStatusHtml()}${sortedEntries
-    .map((entry) => {
-      const state = chatMessageState(entry);
-      const mineClass = entry.type === "mine" ? " mine" : "";
-      const revokeAction = revokeActionInfo(entry);
-      const canRetry = canRetryFailedChatMessage(entry);
-      const canEditRevoked = canEditRevokedMessage(entry);
-      const canQuote = canQuoteChatMessage(entry);
-      const voiceTranscriptAction = voiceTranscriptActionInfo(entry);
-      const sentTime = chatMessageTimeInfo(entry.timestamp);
-      const readTime = chatMessageReadTimeInfo(entry, sentTime);
-      const stateIndicator =
-        state?.indicator
-          ? `<span class="chat-read-indicator ${esc(state.className)}" role="img" aria-label="消息${esc(
-              state.label
-            )}" title="${esc(state.label)}"></span>`
-          : "";
-      const contextualActionsHtml = `${
-        voiceTranscriptAction
-          ? `<button type="button" class="chat-message-action voice-text" data-action="voice-to-text" data-message-id="${esc(
-              entry.id
-            )}" data-message-random="${esc(
-              entry.messageRandom || timMessageRandom(entry)
-            )}" aria-label="${esc(voiceTranscriptAction.title)}" title="${esc(voiceTranscriptAction.title)}" ${
-              voiceTranscriptAction.disabled ? "disabled" : ""
-            }>${esc(voiceTranscriptAction.label)}</button>`
-          : ""
-      }${
-        canQuote
-          ? `<button type="button" class="chat-message-action quote" data-action="quote-chat-message" data-message-id="${esc(
-              entry.id
-            )}" data-message-random="${esc(
-              entry.messageRandom || timMessageRandom(entry)
-            )}" aria-label="引用消息" title="引用这条消息">引用</button>`
-          : ""
-      }${
-        revokeAction
-          ? `<button type="button" class="chat-message-action${
-              revokeAction.outsideDefaultWindow ? " is-outside-default-window" : ""
-            }" data-action="revoke-chat-message" data-message-id="${esc(entry.id)}" aria-label="${esc(
-              revokeAction.title
-            )}" title="${esc(revokeAction.title)}">${esc(revokeAction.label)}</button>`
-          : ""
-      }`;
-      const metaHtml = `${
-        sentTime
-          ? `<time class="chat-message-time"${sentTime.datetime ? ` datetime="${esc(sentTime.datetime)}"` : ""} title="${esc(
-              `消息发出时间：${sentTime.title}`
-            )}">${esc(sentTime.label)}</time>`
-          : ""
-      }${
-        readTime
-          ? `<time class="chat-message-time is-read-time"${readTime.datetime ? ` datetime="${esc(readTime.datetime)}"` : ""} title="${esc(
-              `消息已读时间：${readTime.title}`
-            )}">已读 ${esc(readTime.label)}</time>`
-          : ""
-      }${
-        state && !state.indicator ? `<span class="chat-message-state ${esc(state.className)}">${esc(state.label)}</span>` : ""
-      }${
-        canRetry
-          ? `<button type="button" class="chat-message-action retry" data-action="retry-chat-message" data-message-id="${esc(
-              entry.id
-            )}" aria-label="重试发送" title="重新发送这条消息">重试</button>`
-          : ""
-      }${
-        contextualActionsHtml
-          ? `<span class="chat-message-actions contextual" role="group" aria-label="消息操作">${contextualActionsHtml}</span>`
-          : ""
-      }`;
-      const hasContextActions = Boolean(contextualActionsHtml);
-      return `<div class="chat-message-row${mineClass}${hasContextActions ? " has-context-actions" : ""}" data-message-id="${esc(entry.id)}" data-message-random="${esc(
-        entry.messageRandom || timMessageRandom(entry)
-      )}" data-message-sequence="${esc(entry.sequence || timMessageSequence(entry))}"><div class="chat-message-main${mineClass}">${stateIndicator}<div class="chat-line${mineClass}${
-        entry.revoked ? ` is-revoked${canEditRevoked ? " can-edit" : ""}` : ""
-      } chat-kind-${esc(entry.kind || "text")}" data-message-id="${esc(entry.id)}" data-chat-message-bubble${
-        hasContextActions ? ' tabindex="0" aria-label="显示消息操作" aria-expanded="false"' : ""
-      }>${chatMessageContentHtml(entry)}${
-        entry.delivery === "sending" && entry.kind !== "text"
-          ? `<progress class="chat-upload-track" max="100" value="${Math.min(
-              100,
-              Math.max(2, Math.round(Number(entry.progress || 0) * 100))
-            )}" aria-label="上传进度"></progress>`
-          : ""
-      }</div></div>${metaHtml ? `<div class="chat-message-meta">${metaHtml}</div>` : ""}</div>`;
-    })
-    .join("")}`;
+  const renderLimit = chatMessageRenderLimit(activePeer);
+  const hiddenCount = Math.max(0, allEntries.length - renderLimit);
+  const visibleEntries = hiddenCount ? allEntries.slice(hiddenCount) : allEntries;
+  return `${chatHistoryStatusHtml(hiddenCount)}${visibleEntries.map(chatMessageRowHtml).join("")}`;
 }
 
 function chatMediaNodeIdentity(image) {
@@ -7106,14 +7491,217 @@ function restoreReusableChatMedia(root, captured) {
   });
 }
 
+function chatMessageNodeAliases(entry) {
+  const aliases = new Set();
+  const identity = String(entry?.identity || (entry ? messageIdentityKey(entry) : "")).trim();
+  const id = String(entry?.id || "").trim();
+  const messageRandom = String(entry?.messageRandom || timMessageRandom(entry) || "").trim();
+  const sequence = String(entry?.sequence || timMessageSequence(entry) || "").trim();
+  const messageKey = String(entry?.msgKey || "").trim();
+  if (identity) aliases.add(`identity|${identity}`);
+  if (messageRandom) aliases.add(`random|${messageRandom}`);
+  if (messageKey) aliases.add(`message-key|${messageKey}`);
+  if (id) aliases.add(`id-sequence|${id}`);
+  if (sequence) aliases.add(`id-sequence|${sequence}`);
+  return [...aliases];
+}
+
+function chatMessageRowAliases(row) {
+  if (!row) return [];
+  return chatMessageNodeAliases({
+    id: row.dataset.messageId,
+    messageRandom: row.dataset.messageRandom,
+    sequence: row.dataset.messageSequence,
+    msgKey: row.dataset.messageKey,
+    identity: row.dataset.messageIdentity,
+  });
+}
+
+function registerChatMessageNode(log, row) {
+  if (!log || !row) return;
+  let index = CHAT_LOG_MESSAGE_NODES.get(log);
+  if (!index) {
+    index = new Map();
+    CHAT_LOG_MESSAGE_NODES.set(log, index);
+  }
+  const aliases = chatMessageRowAliases(row);
+  CHAT_LOG_NODE_ALIASES.set(row, aliases);
+  aliases.forEach((alias) => index.set(alias, row));
+}
+
+function unregisterChatMessageNode(log, row) {
+  const index = log && CHAT_LOG_MESSAGE_NODES.get(log);
+  if (!index || !row) return;
+  (CHAT_LOG_NODE_ALIASES.get(row) || []).forEach((alias) => {
+    if (index.get(alias) === row) index.delete(alias);
+  });
+  CHAT_LOG_NODE_ALIASES.delete(row);
+}
+
+function rebuildChatMessageNodeIndex(log) {
+  if (!log) return;
+  CHAT_LOG_MESSAGE_NODES.set(log, new Map());
+  const rows = log.querySelectorAll(".chat-message-row");
+  rows.forEach((row) => registerChatMessageNode(log, row));
+  CHAT_LOG_MESSAGE_COUNTS.set(log, rows.length);
+}
+
+function findRenderedChatMessageNode(log, entry) {
+  const index = log && CHAT_LOG_MESSAGE_NODES.get(log);
+  if (!index) return null;
+  for (const alias of chatMessageNodeAliases(entry)) {
+    const row = index.get(alias);
+    if (row?.isConnected) return row;
+  }
+  return null;
+}
+
+function createChatMessageNode(entry) {
+  const template = document.createElement("template");
+  template.innerHTML = chatMessageRowHtml(entry);
+  return template.content.firstElementChild;
+}
+
+function renderedChatMessageOrderEntry(row) {
+  return {
+    id: row?.dataset.messageId || "",
+    msgKey: row?.dataset.messageKey || "",
+    sequence: row?.dataset.messageSequence || "",
+    timestamp: Number(row?.dataset.messageTimestamp || 0),
+  };
+}
+
+function adjacentRenderedChatMessageRow(row, property) {
+  let candidate = row?.[property] || null;
+  while (candidate && !candidate.classList?.contains("chat-message-row")) {
+    candidate = candidate[property] || null;
+  }
+  return candidate;
+}
+
+function lastRenderedChatMessageRow(log) {
+  let candidate = log?.lastElementChild || null;
+  while (candidate && !candidate.classList?.contains("chat-message-row")) {
+    candidate = candidate.previousElementSibling;
+  }
+  return candidate;
+}
+
+function firstRenderedChatMessageRow(log) {
+  let candidate = log?.firstElementChild || null;
+  while (candidate && !candidate.classList?.contains("chat-message-row")) {
+    candidate = candidate.nextElementSibling;
+  }
+  return candidate;
+}
+
+function syncChatHistoryStatusNode(log) {
+  if (!log) return;
+  log.querySelector(".chat-history-status")?.remove();
+  const statusHtml = chatHistoryStatusHtml();
+  if (statusHtml) log.insertAdjacentHTML("afterbegin", statusHtml);
+}
+
+function enforceChatMessageRenderWindow(log, peer = S.activePeer) {
+  if (!log) return false;
+  const limit = chatMessageRenderLimit(peer);
+  let count = Number(CHAT_LOG_MESSAGE_COUNTS.get(log) || 0);
+  let changed = false;
+  while (count > limit) {
+    const row = firstRenderedChatMessageRow(log);
+    if (!row) break;
+    unregisterChatMessageNode(log, row);
+    row.remove();
+    count -= 1;
+    changed = true;
+  }
+  CHAT_LOG_MESSAGE_COUNTS.set(log, count);
+  if (changed) syncChatHistoryStatusNode(log);
+  return changed;
+}
+
+function chatMessageFitsRenderedOrder(entry, row) {
+  if (!row) return true;
+  const previousRow = adjacentRenderedChatMessageRow(row, "previousElementSibling");
+  if (previousRow && compareMessageOrder(entry, renderedChatMessageOrderEntry(previousRow)) < 0) {
+    return false;
+  }
+  const nextRow = adjacentRenderedChatMessageRow(row, "nextElementSibling");
+  return !nextRow || compareMessageOrder(entry, renderedChatMessageOrderEntry(nextRow)) <= 0;
+}
+
+function renderChatMessageIncrementally(log, entry) {
+  if (
+    !log ||
+    !entry ||
+    entry.type === "system" ||
+    String(entry.peer || "") !== String(S.activePeer || "")
+  ) {
+    return false;
+  }
+  if (
+    entry.revoked &&
+    S.imMessageLoadingPeers.has(String(entry.peer || "")) &&
+    !S.imMessageLoadedPeers.has(String(entry.peer || ""))
+  ) {
+    return false;
+  }
+  if (!CHAT_LOG_MESSAGE_NODES.has(log)) rebuildChatMessageNodeIndex(log);
+  const previousRow = findRenderedChatMessageNode(log, entry);
+  if (previousRow && !chatMessageFitsRenderedOrder(entry, previousRow)) return false;
+  const nextRow = createChatMessageNode(entry);
+  if (!nextRow) return false;
+  if (previousRow) {
+    const reusableMedia = captureReusableChatMedia(previousRow);
+    unregisterChatMessageNode(log, previousRow);
+    previousRow.replaceWith(nextRow);
+    restoreReusableChatMedia(nextRow, reusableMedia);
+    registerChatMessageNode(log, nextRow);
+    return true;
+  }
+
+  const lastRow = lastRenderedChatMessageRow(log);
+  if (lastRow && compareMessageOrder(entry, renderedChatMessageOrderEntry(lastRow)) < 0) {
+    return false;
+  }
+  [...log.children].forEach((child) => {
+    if (child.classList.contains("chat-line") && child.classList.contains("system")) child.remove();
+  });
+  log.append(nextRow);
+  registerChatMessageNode(log, nextRow);
+  CHAT_LOG_MESSAGE_COUNTS.set(
+    log,
+    Number(CHAT_LOG_MESSAGE_COUNTS.get(log) || 0) + 1
+  );
+  enforceChatMessageRenderWindow(log, entry.peer);
+  return true;
+}
+
 function renderChatLog(log, html = chatLogHtml(), captured = captureReusableChatMedia(log)) {
   if (!log) return;
   log.innerHTML = html;
   restoreReusableChatMedia(log, captured);
+  rebuildChatMessageNodeIndex(log);
+}
+
+function cancelChatLogScheduledScroll(log) {
+  if (!log) return;
+  (CHAT_LOG_SCROLL_FRAMES.get(log) || []).forEach((frame) =>
+    cancelAnimationFrame(frame)
+  );
+  (CHAT_LOG_SCROLL_TIMERS.get(log) || []).forEach((timer) =>
+    clearTimeout(timer)
+  );
+  const maintenanceFrame = CHAT_LOG_MAINTENANCE_FRAMES.get(log);
+  if (maintenanceFrame !== undefined) cancelAnimationFrame(maintenanceFrame);
+  CHAT_LOG_SCROLL_FRAMES.delete(log);
+  CHAT_LOG_SCROLL_TIMERS.delete(log);
+  CHAT_LOG_MAINTENANCE_FRAMES.delete(log);
 }
 
 function cancelChatLogAutoScroll(log = $("im-log"), { preserveUserIntent = false } = {}) {
   if (!log) return false;
+  cancelChatLogScheduledScroll(log);
   const generation = Number(CHAT_LOG_AUTO_SCROLL_GENERATIONS.get(log) || 0) + 1;
   CHAT_LOG_AUTO_SCROLL_GENERATIONS.set(log, generation);
   CHAT_LOG_BOTTOM_FOLLOW.set(log, false);
@@ -7123,6 +7711,7 @@ function cancelChatLogAutoScroll(log = $("im-log"), { preserveUserIntent = false
 
 function scrollChatLogToBottom(log = $("im-log")) {
   if (!log) return;
+  cancelChatLogScheduledScroll(log);
   const generation = Number(CHAT_LOG_AUTO_SCROLL_GENERATIONS.get(log) || 0) + 1;
   CHAT_LOG_AUTO_SCROLL_GENERATIONS.set(log, generation);
   CHAT_LOG_BOTTOM_FOLLOW.set(log, true);
@@ -7138,11 +7727,19 @@ function scrollChatLogToBottom(log = $("im-log")) {
     return true;
   };
   scroll();
-  requestAnimationFrame(() => {
+  const frames = [];
+  const firstFrame = requestAnimationFrame(() => {
     if (!scroll()) return;
-    requestAnimationFrame(scroll);
+    const secondFrame = requestAnimationFrame(scroll);
+    frames.push(secondFrame);
   });
-  CHAT_LOG_BOTTOM_SETTLE_DELAYS_MS.forEach((delay) => setTimeout(scroll, delay));
+  frames.push(firstFrame);
+  CHAT_LOG_SCROLL_FRAMES.set(log, frames);
+  const timers = [];
+  CHAT_LOG_BOTTOM_SETTLE_DELAYS_MS.forEach((delay) => {
+    timers.push(setTimeout(scroll, delay));
+  });
+  CHAT_LOG_SCROLL_TIMERS.set(log, timers);
 }
 
 function chatLogIsNearBottom(log = $("im-log"), threshold = 96) {
@@ -7169,9 +7766,13 @@ function chatLogHasRecentUserScrollIntent(log = $("im-log")) {
 function scheduleChatLogBottomMaintenance(node = $("im-log")) {
   const log = node?.id === "im-log" ? node : node?.closest?.("#im-log");
   if (!log || !chatLogShouldFollowBottom(log)) return false;
-  requestAnimationFrame(() => {
+  const previousFrame = CHAT_LOG_MAINTENANCE_FRAMES.get(log);
+  if (previousFrame !== undefined) cancelAnimationFrame(previousFrame);
+  const frame = requestAnimationFrame(() => {
+    CHAT_LOG_MAINTENANCE_FRAMES.delete(log);
     if (log.isConnected && chatLogShouldFollowBottom(log)) scrollChatLogToBottom(log);
   });
+  CHAT_LOG_MAINTENANCE_FRAMES.set(log, frame);
   return true;
 }
 
@@ -7195,18 +7796,28 @@ function addImMessage(text, type = "system", peer = "", meta = {}) {
     ...meta,
   };
   entry.preview = entry.preview || messagePreview(entry);
-  if (entry.peer) mergePeerMessages(entry.peer, [entry]);
-  else {
+  let changed = true;
+  let renderedEntry = entry;
+  if (entry.peer) {
+    changed = mergePeerMessages(entry.peer, [entry]);
+    renderedEntry =
+      findChatMessageByIdentity(
+        entry.id,
+        entry.messageRandom || timMessageRandom(entry),
+        entry.sequence || timMessageSequence(entry),
+        entry.peer
+      ) || entry;
+  } else {
     S.imMessages.push(entry);
     trimChatMessages(100);
   }
   const log = $("im-log");
-  if (log) {
+  if (log && changed) {
     const shouldStickToBottom = type === "mine" || chatLogShouldFollowBottom(log);
-    renderChatLog(log);
+    if (!renderChatMessageIncrementally(log, renderedEntry)) renderChatLog(log);
     if (shouldStickToBottom) scrollChatLogToBottom(log);
   }
-  return entry;
+  return renderedEntry;
 }
 
 function trimChatMessages(limit = 500) {
@@ -7230,6 +7841,27 @@ function refreshChatLog({ forceBottom = false, suppressBottom = false } = {}) {
   const shouldStickToBottom = forceBottom || chatLogShouldFollowBottom(log);
   renderChatLog(log);
   if (!suppressBottom && shouldStickToBottom) scrollChatLogToBottom(log);
+}
+
+function refreshChatMessageEntries(entries, { forceBottom = false, incrementalLimit = 24 } = {}) {
+  const log = $("im-log");
+  if (!log) return false;
+  const activePeer = String(S.activePeer || "");
+  const activeEntries = (Array.isArray(entries) ? entries : [entries]).filter(
+    (entry) => entry && String(entry.peer || "") === activePeer
+  );
+  if (!activeEntries.length) return false;
+  const shouldStickToBottom = forceBottom || chatLogShouldFollowBottom(log);
+  const incrementallyRendered =
+    activeEntries.length <= incrementalLimit &&
+    activeEntries.every((entry) => renderChatMessageIncrementally(log, entry));
+  if (!incrementallyRendered) renderChatLog(log);
+  if (shouldStickToBottom) scrollChatLogToBottom(log);
+  return true;
+}
+
+function refreshChatMessageEntry(entry, options = {}) {
+  return refreshChatMessageEntries([entry], options);
 }
 
 function closeChatMessageActions() {
@@ -7279,55 +7911,118 @@ function schedulePeerMediaReconcile(peer) {
   S.imMediaReconcileTimers.set(target, timers);
 }
 
-function peerMessageRevision(peer) {
+function messageIdentityLookupKeys(entry) {
+  const keys = new Set();
+  const primary = messageIdentityKey(entry);
+  if (primary && !primary.startsWith("fallback|")) keys.add(`primary|${primary}`);
+  const messageRandom = String(entry?.messageRandom || timMessageRandom(entry) || "").trim();
+  const messageKey = String(entry?.msgKey || "").trim();
+  const id = String(entry?.id || "").trim();
+  const sequence = String(entry?.sequence || timMessageSequence(entry) || "").trim();
+  if (messageRandom) keys.add(`random|${messageRandom}`);
+  if (messageKey) keys.add(`message-key|${messageKey}`);
+  if (id) keys.add(`id-sequence|${id}`);
+  if (sequence) keys.add(`id-sequence|${sequence}`);
+  return [...keys];
+}
+
+function addIndexedMessage(identityIndex, aliasesByKey, orderByKey, key, entry) {
+  const aliases = messageIdentityLookupKeys(entry);
+  aliasesByKey.set(key, aliases);
+  if (!orderByKey.has(key)) orderByKey.set(key, orderByKey.size);
+  aliases.forEach((alias) => {
+    if (!identityIndex.has(alias)) identityIndex.set(alias, new Set());
+    identityIndex.get(alias).add(key);
+  });
+}
+
+function removeIndexedMessage(identityIndex, aliasesByKey, orderByKey, key) {
+  (aliasesByKey.get(key) || []).forEach((alias) => {
+    const matches = identityIndex.get(alias);
+    if (!matches) return;
+    matches.delete(key);
+    if (!matches.size) identityIndex.delete(alias);
+  });
+  aliasesByKey.delete(key);
+  orderByKey.delete(key);
+}
+
+function findIndexedMessage(identityIndex, byKey, orderByKey, entry, key) {
+  if (byKey.has(key)) return [key, byKey.get(key)];
+  const candidates = new Set();
+  messageIdentityLookupKeys(entry).forEach((alias) => {
+    (identityIndex.get(alias) || []).forEach((candidateKey) => candidates.add(candidateKey));
+  });
+  return [...candidates]
+    .sort((left, right) => Number(orderByKey.get(left) || 0) - Number(orderByKey.get(right) || 0))
+    .map((candidateKey) => [candidateKey, byKey.get(candidateKey)])
+    .find(([, previous]) => previous && messagesReferToSameMessage(previous, entry));
+}
+
+function peerMessageRevision(peer, entries = S.imMessages) {
   const target = String(peer || "");
-  return S.imMessages
-    .filter((entry) => entry.peer === target)
-    .map((entry) =>
-      [
-        entry.id,
-        entry.msgKey,
-        entry.sequence,
-        entry.messageRandom,
-        entry.timestamp,
-        entry.type,
-        entry.kind,
-        entry.text,
-        entry.delivery,
-        entry.progress,
-        entry.revoked,
-        entry.recalledText,
-        entry.peerRead,
-        entry.readAt,
-        entry.flashId,
-        entry.voiceText,
-        entry.voiceTextStatus,
-        JSON.stringify(normalizeMessageQuote(entry.quote) || null),
-        entry.media?.url,
-        entry.media?.thumbnail,
-        entry.media?.uuid,
-      ]
-        .map((value) => String(value ?? ""))
-        .join("\u001f")
-    )
-    .sort()
-    .join("\u001e");
+  const revision = new Map();
+  entries.forEach((entry) => {
+    if (String(entry.peer || "") !== target) return;
+    const value = [
+      entry.id,
+      entry.msgKey,
+      entry.sequence,
+      entry.messageRandom,
+      entry.timestamp,
+      entry.type,
+      entry.kind,
+      entry.text,
+      entry.delivery,
+      entry.progress,
+      entry.revoked,
+      entry.recalledText,
+      entry.peerRead,
+      entry.readAt,
+      entry.flashId,
+      entry.voiceText,
+      entry.voiceTextStatus,
+      JSON.stringify(normalizeMessageQuote(entry.quote) || null),
+      entry.media?.url,
+      entry.media?.thumbnail,
+      entry.media?.uuid,
+    ]
+      .map((item) => String(item ?? ""))
+      .join("\u001f");
+    revision.set(value, Number(revision.get(value) || 0) + 1);
+  });
+  return revision;
+}
+
+function peerMessageRevisionEquals(left, right) {
+  if (left.size !== right.size) return false;
+  for (const [key, count] of left.entries()) {
+    if (right.get(key) !== count) return false;
+  }
+  return true;
 }
 
 function mergePeerMessages(peer, incoming) {
   const target = String(peer || "");
-  const previousRevision = peerMessageRevision(target);
+  const targetMessages = [];
+  const otherPeers = [];
   const previousBlobUrls = new Set();
-  S.imMessages
-    .filter((entry) => entry.peer === target)
-    .forEach((entry) => collectBlobObjectUrls(entry.media, previousBlobUrls));
-  const otherPeers = S.imMessages.filter((entry) => entry.peer !== target);
+  S.imMessages.forEach((entry) => {
+    if (String(entry.peer || "") === target) {
+      targetMessages.push(entry);
+      collectBlobObjectUrls(entry.media, previousBlobUrls);
+    } else {
+      otherPeers.push(entry);
+    }
+  });
+  const previousRevision = peerMessageRevision(target, targetMessages);
   const byKey = new Map();
-  [...S.imMessages.filter((entry) => entry.peer === target), ...incoming].forEach((entry) => {
+  const identityIndex = new Map();
+  const aliasesByKey = new Map();
+  const orderByKey = new Map();
+  [...targetMessages, ...incoming].forEach((entry) => {
     const key = messageIdentityKey(entry);
-    const matched = [...byKey.entries()].find(
-      ([existingKey, previous]) => existingKey === key || messagesReferToSameMessage(previous, entry)
-    );
+    const matched = findIndexedMessage(identityIndex, byKey, orderByKey, entry, key);
     const previousKey = matched?.[0] || "";
     const previous = matched?.[1];
     const merged = previous
@@ -7362,8 +8057,16 @@ function mergePeerMessages(peer, incoming) {
                 : Number(previous.voiceTextStatus || 0),
           }
         : entry;
-    if (previousKey) byKey.delete(previousKey);
-    byKey.set(messageIdentityKey(merged), merged);
+    if (previousKey) {
+      removeIndexedMessage(identityIndex, aliasesByKey, orderByKey, previousKey);
+      byKey.delete(previousKey);
+    }
+    const mergedKey = messageIdentityKey(merged);
+    if (byKey.has(mergedKey)) {
+      removeIndexedMessage(identityIndex, aliasesByKey, orderByKey, mergedKey);
+    }
+    byKey.set(mergedKey, merged);
+    addIndexedMessage(identityIndex, aliasesByKey, orderByKey, mergedKey, merged);
   });
   S.imMessages = [...otherPeers, ...byKey.values()];
   trimChatMessages(2000);
@@ -7372,7 +8075,7 @@ function mergePeerMessages(peer, incoming) {
   previousBlobUrls.forEach((url) => {
     if (!retainedBlobUrls.has(url)) revokeChatObjectUrl(url);
   });
-  return previousRevision !== peerMessageRevision(target);
+  return !peerMessageRevisionEquals(previousRevision, peerMessageRevision(target));
 }
 
 async function loadConversationMessages(peer, { force = false } = {}) {
@@ -7458,6 +8161,31 @@ function oldestPeerMessageTimestamp(peer) {
   return timestamps.length ? Math.min(...timestamps) : 0;
 }
 
+function revealOlderRenderedMessages(
+  peer,
+  log = $("im-log"),
+  count = CHAT_MESSAGE_RENDER_PAGE
+) {
+  const target = String(peer || "").trim();
+  if (!target || !log || String(S.activePeer || "") !== target) return false;
+  const hiddenCount = hiddenChatMessageCount(target);
+  if (!hiddenCount) return false;
+  const previousHeight = log.scrollHeight;
+  const previousTop = log.scrollTop;
+  expandChatMessageRenderLimit(target, Math.min(hiddenCount, count));
+  renderChatLog(log);
+  const restorePosition = () => {
+    if (!log.isConnected || String(S.activePeer || "") !== target) return;
+    log.scrollTop = Math.max(
+      0,
+      previousTop + log.scrollHeight - previousHeight
+    );
+  };
+  restorePosition();
+  requestAnimationFrame(restorePosition);
+  return true;
+}
+
 async function loadOlderConversationMessages(peer, log = $("im-log")) {
   const target = String(peer || "").trim();
   if (
@@ -7466,11 +8194,12 @@ async function loadOlderConversationMessages(peer, log = $("im-log")) {
     String(S.activePeer || "") !== target ||
     !S.imMessageLoadedPeers.has(target) ||
     S.imMessageLoadingPeers.has(target) ||
-    S.imMessageOlderLoadingPeers.has(target) ||
-    S.imMessageHistoryExhaustedPeers.has(target)
+    S.imMessageOlderLoadingPeers.has(target)
   ) {
     return false;
   }
+  if (revealOlderRenderedMessages(target, log)) return true;
+  if (S.imMessageHistoryExhaustedPeers.has(target)) return false;
   const oldestTimestamp = oldestPeerMessageTimestamp(target);
   if (!oldestTimestamp) return false;
 
@@ -7539,6 +8268,7 @@ async function loadOlderConversationMessages(peer, log = $("im-log")) {
       S.imMessageHistoryExhaustedPeers.delete(target);
     }
     if (String(S.activePeer || "") === target && log.isConnected) {
+      expandChatMessageRenderLimit(target, newCount);
       renderChatLog(log);
       const restorePosition = () => {
         if (!log.isConnected || String(S.activePeer || "") !== target) return;
@@ -8488,6 +9218,7 @@ async function jumpToMessageSearchResult(index) {
   cancelChatLogAutoScroll();
   await loadMessageSearchContext(entry, { suppressBottom: true }).catch(() => false);
   if (String(S.activePeer || "") !== peer) return false;
+  ensureChatMessageRenderWindowIncludes(entry);
   refreshChatLog({ suppressBottom: true });
   await new Promise((resolve) => requestAnimationFrame(resolve));
   cancelChatLogAutoScroll();
@@ -8737,6 +9468,7 @@ function removeConversationListItems(peers) {
     S.imQuoteDrafts.delete(peer);
     S.imMessageOlderLoadingPeers.delete(peer);
     S.imMessageHistoryExhaustedPeers.delete(peer);
+    S.imMessageRenderLimits.delete(peer);
   });
   const wasActive = targets.has(String(S.activePeer || ""));
   if (wasActive) {
@@ -9094,6 +9826,8 @@ function chatPaneHtml() {
 }
 
 function renderConversationList(list) {
+  const nextHtml = conversationListHtml();
+  if (CONVERSATION_LIST_RENDER_HTML.get(list) === nextHtml) return false;
   const previousAvatars = new Map();
   const pendingAvatarSwaps = [];
   list.querySelectorAll("[data-conversation-item][data-uid]").forEach((item) => {
@@ -9107,7 +9841,7 @@ function renderConversationList(list) {
   });
 
   const template = document.createElement("template");
-  template.innerHTML = conversationListHtml();
+  template.innerHTML = nextHtml;
 
   template.content.querySelectorAll("[data-conversation-item][data-uid]").forEach((item) => {
     const previous = previousAvatars.get(String(item.dataset.uid || ""));
@@ -9125,7 +9859,9 @@ function renderConversationList(list) {
     pendingAvatarSwaps.push({ currentAvatar: previous.avatar, nextAvatar, nextImage, nextSrc });
   });
   list.replaceChildren(template.content);
+  CONVERSATION_LIST_RENDER_HTML.set(list, nextHtml);
   pendingAvatarSwaps.forEach(scheduleConversationAvatarSwap);
+  return true;
 }
 
 function scheduleConversationAvatarSwap({ currentAvatar, nextAvatar, nextImage, nextSrc }) {
@@ -9202,7 +9938,8 @@ function refreshMessageConversationRegion({
   layout.classList.toggle("is-list-collapsed", S.conversationListCollapsed);
   document.body.classList.toggle("chat-conversation-open", Boolean(S.activePeer));
   if (refreshList) {
-    controls.innerHTML = conversationListControlsHtml();
+    const nextControlsHtml = conversationListControlsHtml();
+    if (controls.innerHTML !== nextControlsHtml) controls.innerHTML = nextControlsHtml;
     renderConversationList(list);
   } else {
     list.querySelectorAll(".conversation-card").forEach((card) => {
@@ -9577,8 +10314,15 @@ function updateLocalMessage(id, patch) {
   const next = typeof patch === "function" ? patch(current) : { ...current, ...patch };
   S.imMessages[index] = next;
   if (next.peer) mergePeerMessages(next.peer, []);
-  refreshChatLog();
-  return next;
+  const merged =
+    findChatMessageByIdentity(
+      next.id,
+      next.messageRandom || timMessageRandom(next),
+      next.sequence || timMessageSequence(next),
+      next.peer
+    ) || next;
+  if (!refreshChatMessageEntry(merged)) refreshChatLog();
+  return merged;
 }
 
 function appendLocalMessage(entry) {
@@ -9587,8 +10331,16 @@ function appendLocalMessage(entry) {
     S.imMessages.push(entry);
     trimChatMessages(500);
   }
-  refreshChatLog();
-  return entry;
+  const merged = entry?.peer
+    ? findChatMessageByIdentity(
+        entry.id,
+        entry.messageRandom || timMessageRandom(entry),
+        entry.sequence || timMessageSequence(entry),
+        entry.peer
+      ) || entry
+    : entry;
+  if (!refreshChatMessageEntry(merged, { forceBottom: true })) refreshChatLog({ forceBottom: true });
+  return merged;
 }
 
 function messageTimestampMs(entry) {
@@ -9704,7 +10456,7 @@ function markLocalMessageRevoked(entry, serverEntry = null) {
   const index = S.imMessages.indexOf(entry);
   if (index >= 0) S.imMessages[index] = next;
   updateConversationPreviewFromMessages(next.peer);
-  refreshChatLog();
+  if (!refreshChatMessageEntry(next)) refreshChatLog();
   refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
   return next;
 }
@@ -9794,6 +10546,9 @@ async function jumpToQuotedMessage(quote) {
   if (!entry) {
     toast("原消息不在当前已加载的记录中", "error", 3200);
     return false;
+  }
+  if (ensureChatMessageRenderWindowIncludes(entry)) {
+    refreshChatLog({ suppressBottom: true });
   }
   const rows = [...document.querySelectorAll("#im-log .chat-message-row")];
   const target = rows.find((row) => {
@@ -11496,7 +12251,11 @@ function cancelPendingVideoFrameCallback(video) {
   }
 }
 
-function failMomentVideoCompatibility(video, text = "视频暂时无法播放", { retry = true } = {}) {
+function failMomentVideoCompatibility(
+  video,
+  text = "视频暂时无法播放",
+  { retry = true, retryOnOnline = false } = {}
+) {
   if (!video?.isConnected) return;
   cancelMomentVideoCompatibility(video);
   cancelPendingVideoFrameCallback(video);
@@ -11507,6 +12266,7 @@ function failMomentVideoCompatibility(video, text = "视频暂时无法播放", 
   video.dataset.mediaRetryPending = "0";
   video.dataset.mediaFailed = "1";
   video.dataset.videoFrameUnsupported = "1";
+  video.dataset.compatRetryOnOnline = retryOnOnline ? "1" : "0";
   setMomentVideoState(video, "failed");
   setMomentVideoStartVisible(video, false);
   setMomentVideoFallback(video, text, { retry });
@@ -11521,6 +12281,7 @@ function applyMomentVideoCompatibility(video, data, { resumePlayback = false } =
   video.dataset.mediaSource = playbackUrl;
   video.dataset.compatPending = "0";
   video.dataset.compatUnavailable = "0";
+  video.dataset.compatRetryOnOnline = "0";
   video.dataset.mediaFailed = "0";
   video.dataset.mediaRetryCount = "0";
   video.dataset.mediaRetryPending = "1";
@@ -11562,7 +12323,63 @@ function applyMomentVideoCompatibility(video, data, { resumePlayback = false } =
 }
 
 function momentVideoFailureText(data, fallback = "视频暂时无法播放") {
-  return localizedSystemText(data?.message || data?.detail || fallback, fallback);
+  const detail = data?.detail;
+  const detailText =
+    detail && typeof detail === "object"
+      ? detail.message || detail.error || ""
+      : detail;
+  return localizedSystemText(data?.message || detailText || fallback, fallback);
+}
+
+function isTransientMomentVideoRequest(value) {
+  const status = Number(value?.status || 0);
+  if (value instanceof ApiRequestError) return value.retryable;
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function momentVideoRequestFailure(value, data = {}) {
+  const status = Number(value?.status || 0);
+  const kind = value instanceof ApiRequestError ? value.kind : "";
+  if (kind === "offline") {
+    return {
+      text: "网络连接不可用，联网后将自动重试兼容处理",
+      retry: true,
+      retryOnOnline: true,
+    };
+  }
+  if (kind === "network") {
+    return {
+      text: "网络连接失败，联网后将自动重试兼容处理",
+      retry: true,
+      retryOnOnline: true,
+    };
+  }
+  if (kind === "timeout") {
+    return { text: "视频兼容服务响应超时，请稍后重试", retry: true, retryOnOnline: false };
+  }
+  if (kind === "invalid-response") {
+    return { text: "视频兼容服务返回异常，请稍后重试", retry: true, retryOnOnline: false };
+  }
+  if (status === 429) {
+    return {
+      text: momentVideoFailureText(data, "视频兼容请求过于频繁，请稍后重试"),
+      retry: data?.retryable !== false,
+      retryOnOnline: false,
+    };
+  }
+  if (status >= 500) {
+    return {
+      text: momentVideoFailureText(data, "视频兼容服务暂时不可用，请稍后重试"),
+      retry: data?.retryable !== false,
+      retryOnOnline: false,
+    };
+  }
+  const explicitRetryable = typeof data?.retryable === "boolean" ? data.retryable : null;
+  return {
+    text: momentVideoFailureText(data),
+    retry: explicitRetryable ?? (status > 0 ? isTransientMomentVideoRequest(value) : true),
+    retryOnOnline: false,
+  };
 }
 
 function waitForMomentVideoPoll(delay, signal) {
@@ -11571,16 +12388,40 @@ function waitForMomentVideoPoll(delay, signal) {
       reject(new DOMException("Aborted", "AbortError"));
       return;
     }
+    const cleanup = () => {
+      signal?.removeEventListener("abort", onAbort);
+      window.removeEventListener("online", onOnline);
+    };
     const onAbort = () => {
       clearTimeout(timer);
+      cleanup();
       reject(new DOMException("Aborted", "AbortError"));
     };
+    const onOnline = () => {
+      clearTimeout(timer);
+      cleanup();
+      resolve();
+    };
     const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
+      cleanup();
       resolve();
     }, delay);
     signal?.addEventListener("abort", onAbort, { once: true });
+    window.addEventListener("online", onOnline, { once: true });
   });
+}
+
+function retryMomentVideoCompatibilityAfterOnline() {
+  if (!S.authenticated || document.hidden || S.momentVideoCompatActive) return;
+  const video = [...document.querySelectorAll('video[data-moment-video="true"]')].find(
+    (candidate) =>
+      candidate.isConnected &&
+      candidate.dataset.compatRetryOnOnline === "1" &&
+      candidate.dataset.playbackRequested === "1"
+  );
+  if (!video) return;
+  video.dataset.compatRetryOnOnline = "0";
+  void prepareMomentVideoCompatibility(video);
 }
 
 async function prepareMomentVideoCompatibility(video, { retry = false } = {}) {
@@ -11633,9 +12474,8 @@ async function prepareMomentVideoCompatibility(video, { retry = false } = {}) {
     if (!video.isConnected || video.dataset.compatSequence !== sequence) return;
     let data = prepared.data || {};
     if (!prepared.ok || data.status === "failed") {
-      failMomentVideoCompatibility(video, momentVideoFailureText(data), {
-        retry: data?.retryable !== false,
-      });
+      const failure = momentVideoRequestFailure(prepared, data);
+      failMomentVideoCompatibility(video, failure.text, failure);
       return;
     }
     if (data.status === "ready") {
@@ -11651,24 +12491,49 @@ async function prepareMomentVideoCompatibility(video, { retry = false } = {}) {
     }
 
     let pollAttempt = 0;
+    let suggestedPollDelay = 0;
     while (
       video.isConnected &&
       video.dataset.compatSequence === sequence &&
       Date.now() - startedAt < MOMENT_VIDEO_COMPAT_TIMEOUT_MS
     ) {
-      const retryAfter = MOMENT_VIDEO_COMPAT_POLL_DELAYS_MS[
-        Math.min(pollAttempt, MOMENT_VIDEO_COMPAT_POLL_DELAYS_MS.length - 1)
-      ];
+      const retryAfter = Math.max(
+        suggestedPollDelay,
+        MOMENT_VIDEO_COMPAT_POLL_DELAYS_MS[
+          Math.min(pollAttempt, MOMENT_VIDEO_COMPAT_POLL_DELAYS_MS.length - 1)
+        ]
+      );
+      suggestedPollDelay = 0;
       pollAttempt += 1;
       await waitForMomentVideoPoll(retryAfter, controller.signal);
       if (!video.isConnected || video.dataset.compatSequence !== sequence) return;
-      const status = await api(statusUrl, { timeout: 12000, signal: controller.signal });
+      let status = null;
+      try {
+        status = await api(statusUrl, { timeout: 12000, signal: controller.signal });
+      } catch (error) {
+        if (error instanceof ApiRequestError && error.retryable) {
+          suggestedPollDelay = error.retryAfterMs;
+          const failure = momentVideoRequestFailure(error);
+          setMomentVideoFallback(
+            video,
+            failure.retryOnOnline
+              ? "网络连接已中断，联网后继续查询兼容版本…"
+              : "视频兼容服务暂时不可用，正在继续查询…"
+          );
+          continue;
+        }
+        throw error;
+      }
       if (!video.isConnected || video.dataset.compatSequence !== sequence) return;
       data = status.data || {};
+      if (!status.ok && isTransientMomentVideoRequest(status)) {
+        suggestedPollDelay = status.retryAfterMs;
+        setMomentVideoFallback(video, "视频兼容服务暂时不可用，正在继续查询…");
+        continue;
+      }
       if (!status.ok || data.status === "failed") {
-        failMomentVideoCompatibility(video, momentVideoFailureText(data), {
-          retry: data?.retryable !== false,
-        });
+        const failure = momentVideoRequestFailure(status, data);
+        failMomentVideoCompatibility(video, failure.text, failure);
         return;
       }
       if (data.status === "ready") {
@@ -11691,7 +12556,8 @@ async function prepareMomentVideoCompatibility(video, { retry = false } = {}) {
     if (!video.isConnected || video.dataset.compatSequence !== sequence) return;
     if (error instanceof AuthExpiredError) return;
     if (error?.name === "AbortError") return;
-    failMomentVideoCompatibility(video);
+    const failure = momentVideoRequestFailure(error);
+    failMomentVideoCompatibility(video, failure.text, failure);
   } finally {
     if (S.momentVideoCompatControllers.get(video) === controller) {
       S.momentVideoCompatControllers.delete(video);
@@ -11750,12 +12616,16 @@ function scheduleVideoFrameCompatibilityCheck(video) {
       video.dataset.videoFrameCheckStartedAt = "0";
       return;
     }
+    const compatMoment = isMomentVideo(video) && video.dataset.mediaMode === "compat";
+    if (
+      Date.now() - startedAt < MOMENT_VIDEO_INITIAL_FRAME_WAIT_MS &&
+      (compatMoment || !video.paused)
+    ) {
+      scheduleVideoFrameCompatibilityCheck(video);
+      return;
+    }
+    if (video.paused && !compatMoment) return;
     if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-      if (!video.paused && Date.now() - startedAt < MOMENT_VIDEO_INITIAL_FRAME_WAIT_MS) {
-        scheduleVideoFrameCompatibilityCheck(video);
-        return;
-      }
-      if (video.paused) return;
       if (isMomentVideo(video)) {
         if (video.dataset.mediaMode !== "compat") {
           void prepareMomentVideoCompatibility(video);
@@ -12592,14 +13462,6 @@ async function pageNearby(signal, { force = false } = {}) {
     }
     return `<div class="discovery-page">${discoveryTabsHtml(activeTab)}<div id="discovery-panel" class="discovery-panel" role="tabpanel" aria-labelledby="discovery-tab-${activeTab}">${cached.html}</div></div>`;
   }
-  void api("/api/home", { signal })
-    .then(({ data }) => {
-      applyCapabilities(data.capabilities);
-      if (data.user) applyUser(data.user);
-    })
-    .catch((error) => {
-      if (error?.name !== "AbortError") console.info("[home-refresh]", error?.message || error);
-    });
   let peopleData;
   try {
     peopleData = await fetchDiscoveryPeople(activeTab, { signal });
@@ -14451,7 +15313,7 @@ function applyPeerReadEvent(event) {
     readThroughByPeer.set(peer, Math.max(readThroughByPeer.get(peer) || 0, readThrough));
     readAtByPeer.set(peer, Math.max(readAtByPeer.get(peer) || 0, explicitReadAt || observedAt));
   });
-  let changed = false;
+  const changedEntries = [];
   S.imMessages = S.imMessages.map((entry) => {
     if (entry.type !== "mine") return entry;
     const idMatches = entry.id && ids.has(String(entry.id));
@@ -14472,10 +15334,11 @@ function applyPeerReadEvent(event) {
     );
     const readAt = readAtCandidates.length ? Math.max(...readAtCandidates) : observedAt;
     if (entry.peerRead === true && Number(entry.readAt || 0) === readAt) return entry;
-    changed = true;
-    return { ...entry, peerRead: true, readState: "read", readAt };
+    const next = { ...entry, peerRead: true, readState: "read", readAt };
+    changedEntries.push(next);
+    return next;
   });
-  if (changed) refreshChatLog();
+  if (changedEntries.length && !refreshChatMessageEntries(changedEntries)) refreshChatLog();
 }
 
 function mergeRevokedMessage(previous, revoked) {
@@ -14553,6 +15416,7 @@ function deferReplayedMessageRevocation(entry) {
 
 function applyMessageRevokedEvent(event, me = String(S.user?.uid || S.user?.id || "")) {
   const changedPeers = new Set();
+  const changedEntries = [];
   timEventRows(event).forEach((message) => {
     if (!message || typeof message !== "object") return;
     const peer = timMessagePeer(message, me);
@@ -14574,6 +15438,7 @@ function applyMessageRevokedEvent(event, me = String(S.user?.uid || S.user?.id |
       releaseMessageLocalMedia(previous);
       archived = mergeRevokedMessage(previous, revoked);
       S.imMessages[index] = archived;
+      changedEntries.push(archived);
       if (peer) changedPeers.add(String(peer));
     } else if (peer && !S.imMessageLoadedPeers.has(String(peer))) {
       // TIM can replay revoke events during login before this conversation's
@@ -14582,13 +15447,17 @@ function applyMessageRevokedEvent(event, me = String(S.user?.uid || S.user?.id |
       queuePendingMessageRevocation(revoked);
     } else if (peer && (revoked.id || revoked.msgKey)) {
       S.imMessages.push(revoked);
+      changedEntries.push(revoked);
       if (peer) changedPeers.add(String(peer));
     }
     archiveMessageBestEffort(archived);
   });
   if (!changedPeers.size) return;
   changedPeers.forEach(updateConversationPreviewFromMessages);
-  refreshChatLog();
+  const activeEntries = changedEntries.filter(
+    (entry) => String(entry.peer || "") === String(S.activePeer || "")
+  );
+  if (activeEntries.length && !refreshChatMessageEntries(activeEntries)) refreshChatLog();
   refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
 }
 
@@ -14643,7 +15512,16 @@ function attachTimHandlers(chat, TIM, credential) {
         archiveMessageBestEffort(entry, entry.type === "mine" ? "outgoing" : "incoming");
         if (entry.revoked) updateConversationPreviewFromMessages(peer);
         else updateConversationActivity(peer, { lastMessage: messagePreview(entry) });
-        if (peer === String(S.activePeer)) refreshChatLog();
+        if (peer === String(S.activePeer)) {
+          const merged =
+            findChatMessageByIdentity(
+              entry.id,
+              entry.messageRandom || timMessageRandom(entry),
+              entry.sequence || timMessageSequence(entry),
+              peer
+            ) || entry;
+          refreshChatMessageEntry(merged);
+        }
       });
       refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
     };
@@ -15267,6 +16145,7 @@ async function logout() {
     clearTimeout(S.authenticatedServicesTimer);
     S.authenticatedServicesTimer = null;
     S.authenticatedServicesPending = false;
+    S.messagePolicyRefreshPromise = null;
     clearPeerMediaReconcile();
     clearMessageArchiveDeliveryState();
     persistPendingFlashAcknowledgements();
@@ -15302,6 +16181,7 @@ async function logout() {
     S.imArchiveLoadedPeers.clear();
     S.imMessageOlderLoadingPeers.clear();
     S.imMessageHistoryExhaustedPeers.clear();
+    S.imMessageRenderLimits.clear();
     resetMessageSearchState();
     S.imComposerPanel = "";
     setChatComposerDraft("");
@@ -16313,23 +17193,41 @@ async function handleProductForm(form, submitter) {
   }
 }
 
+function applyFeatureEnvelope(data) {
+  const features = data && data.features;
+  applyCapabilities(data?.capabilities);
+  S.serverHeartbeat = Boolean(data?.auto_heartbeat);
+  S.inviteLoginAvailable = Boolean(data?.capabilities?.invite_login);
+  S.labEnabled = Boolean(
+    data?.lab_enabled === true ||
+      (!Array.isArray(features) && features && features.lab_enabled === true) ||
+      (Array.isArray(features) && features.some((item) => item && item.id === "lab" && item.lab_enabled === true))
+  );
+  buildNav();
+}
+
 async function loadFeatures() {
   try {
-    const { data } = await api("/api/features", { authOptional: true, timeout: 6000 });
-    const features = data && data.features;
-    applyCapabilities(data?.capabilities);
-    S.serverHeartbeat = Boolean(data?.auto_heartbeat);
-    S.inviteLoginAvailable = Boolean(data?.capabilities?.invite_login);
-    S.labEnabled = Boolean(
-      data?.lab_enabled === true ||
-        (!Array.isArray(features) && features && features.lab_enabled === true) ||
-        (Array.isArray(features) && features.some((item) => item && item.id === "lab" && item.lab_enabled === true))
-    );
+    const { data } = await api("/api/features", { authOptional: true, timeout: 6000, priority: "low" });
+    applyFeatureEnvelope(data);
   } catch {
     S.labEnabled = false;
     S.inviteLoginAvailable = null;
+    buildNav();
   }
-  buildNav();
+}
+
+function scheduleDeferredFeatureLoad() {
+  if (S.featuresLoadScheduled) return;
+  S.featuresLoadScheduled = true;
+  const run = () => {
+    void loadFeatures().catch(() => {});
+  };
+  if (typeof window.requestIdleCallback === "function") {
+    window.requestIdleCallback(run, { timeout: DEFERRED_FEATURES_IDLE_TIMEOUT_MS });
+  } else {
+    setTimeout(run, 0);
+  }
 }
 
 function startSmsCountdown(button, seconds = 60) {
@@ -16390,6 +17288,7 @@ function completeBrowserLogin(data) {
   S.messagePolicyReady = false;
   S.messagePolicyGeneration += 1;
   S.messagePolicyFingerprint = "";
+  S.messagePolicyRefreshPromise = null;
   clearAllViewCaches();
   resetMomentViewTaskAssist();
   closeMessageSyncChannel();
@@ -16521,6 +17420,7 @@ async function cancelPendingLogin() {
 
 $("login-form").addEventListener("submit", (event) => {
   event.preventDefault();
+  cancelBootSessionRecovery();
   const button = $("login-submit");
   void withLoginPending(button, () =>
     S.loginStage === "invite" ? submitLoginInvite() : submitLoginCredentials()
@@ -16530,6 +17430,28 @@ $("login-form").addEventListener("submit", (event) => {
 $("login-back").addEventListener("click", (event) => {
   void withLoginPending(event.currentTarget, cancelPendingLogin);
 });
+
+function scheduleFriendFilter(input) {
+  if (S.friendFilterFrame) cancelAnimationFrame(S.friendFilterFrame);
+  const query = String(input?.value || "").trim().toLowerCase();
+  const surface = input?.closest?.(".contact-surface");
+  S.friendFilterFrame = requestAnimationFrame(() => {
+    S.friendFilterFrame = 0;
+    if (!surface?.isConnected) return;
+    let visible = 0;
+    surface.querySelectorAll("[data-friend-row]").forEach((row) => {
+      const match = !query || String(row.dataset.searchText || "").includes(query);
+      const hidden = !match;
+      if (row.hidden !== hidden) row.hidden = hidden;
+      if (match) visible += 1;
+    });
+    surface.querySelectorAll(".contact-group").forEach((group) => {
+      const hidden = !group.querySelector("[data-friend-row]:not([hidden])");
+      if (group.hidden !== hidden) group.hidden = hidden;
+    });
+    surface.querySelector("#friend-search-empty")?.classList.toggle("hide", visible > 0);
+  });
+}
 
 document.addEventListener("input", (event) => {
   const composerInput = event.target.closest && event.target.closest("#im-text");
@@ -16547,18 +17469,7 @@ document.addEventListener("input", (event) => {
   }
   const input = event.target.closest && event.target.closest("#friend-filter");
   if (!input) return;
-  const query = input.value.trim().toLowerCase();
-  let visible = 0;
-  document.querySelectorAll("[data-friend-row]").forEach((row) => {
-    const match = !query || String(row.dataset.searchText || "").includes(query);
-    row.hidden = !match;
-    if (match) visible += 1;
-  });
-  document.querySelectorAll(".contact-group").forEach((group) => {
-    group.hidden = !group.querySelector("[data-friend-row]:not([hidden])");
-  });
-  const empty = $("friend-search-empty");
-  if (empty) empty.classList.toggle("hide", visible > 0);
+  scheduleFriendFilter(input);
 });
 
 document.addEventListener(
@@ -16999,6 +17910,7 @@ window.visualViewport?.addEventListener("scroll", syncVisualViewport, { passive:
 window.addEventListener("online", () => {
   if (S.authenticated) restorePendingFlashAcknowledgements();
   if (!S.authenticated || document.hidden) return;
+  retryMomentVideoCompatibilityAfterOnline();
   if (!VOICE_MATCH_ENABLED) void cleanupDisabledVoiceMatchQueue();
   S.imNextReconnectAt = 0;
   S.messageLastPeerSyncAt = 0;
@@ -17136,44 +18048,185 @@ function setBootStatusText(text) {
   if (status) status.textContent = String(text || "正在恢复登录状态…");
 }
 
+function setSessionRecoveryMessage(text, { retryVisible = false } = {}) {
+  const message = $("login-message");
+  if (message) message.textContent = String(text || "");
+  const retry = $("session-recovery-retry");
+  if (retry) retry.classList.toggle("hide", !retryVisible);
+}
+
+function cancelBootSessionRecovery() {
+  bootSessionRecoveryToken += 1;
+  if (bootSessionRecoveryWake) bootSessionRecoveryWake();
+  bootSessionRecoveryWake = null;
+  const retry = $("session-recovery-retry");
+  if (retry) retry.classList.add("hide");
+}
+
+function waitForBootSessionRecovery(delayMs, { retryOnOnline = true } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      if (retryOnOnline) window.removeEventListener("online", finish);
+      if (bootSessionRecoveryWake === finish) bootSessionRecoveryWake = null;
+      resolve();
+    };
+    bootSessionRecoveryWake = finish;
+    if (Number.isFinite(delayMs) && delayMs >= 0) timer = setTimeout(finish, delayMs);
+    if (retryOnOnline) window.addEventListener("online", finish, { once: true });
+  });
+}
+
+function classifyBootSessionAttempt(result, error, transientFailures = 0) {
+  const status = Number(result?.status || error?.status || 0);
+  if (status === 401) return { resolved: true, transient: false };
+  if (status === 200 && result?.data?.ok === true) {
+    return { resolved: true, transient: false };
+  }
+
+  const backoff = BOOT_SESSION_RETRY_DELAYS_MS[
+    Math.min(transientFailures, BOOT_SESSION_RETRY_DELAYS_MS.length - 1)
+  ];
+  const retryAfterMs = Math.max(0, Number(result?.retryAfterMs || error?.retryAfterMs || 0));
+  if (status === 429) {
+    const delayMs = Math.max(backoff, retryAfterMs || 10000);
+    const seconds = Math.max(1, Math.ceil(delayMs / 1000));
+    return {
+      resolved: false,
+      transient: true,
+      retryOnOnline: true,
+      delayMs,
+      bootText: `登录状态恢复请求较频繁，将在 ${seconds} 秒后重试…`,
+      loginText: `登录状态恢复请求较频繁，将在 ${seconds} 秒后自动重试。`,
+    };
+  }
+  if (status === 408 || status === 425 || status >= 500) {
+    return {
+      resolved: false,
+      transient: true,
+      retryOnOnline: true,
+      delayMs: Math.max(backoff, retryAfterMs),
+      bootText: "服务暂时不可用，您可以先使用登录页面…",
+      loginText:
+        transientFailures >= 2
+          ? "服务仍不可用，系统会继续在后台恢复登录状态。"
+          : "服务暂时不可用，登录页面已先显示，系统会在后台恢复登录状态。",
+    };
+  }
+  if (error instanceof ApiRequestError && ["offline", "network", "timeout"].includes(error.kind)) {
+    const offline = error.kind === "offline";
+    return {
+      resolved: false,
+      transient: true,
+      retryOnOnline: true,
+      delayMs: backoff,
+      bootText: offline ? "网络连接不可用，您可以先使用登录页面…" : "网络连接不稳定，您可以先使用登录页面…",
+      loginText: offline
+        ? "网络连接不可用，联网后将自动恢复登录状态。"
+        : "网络连接不稳定，系统会在后台恢复登录状态。",
+    };
+  }
+  return {
+    resolved: false,
+    transient: false,
+    retryOnOnline: false,
+    delayMs: null,
+    bootText: "服务响应异常，您可以先使用登录页面…",
+    loginText: "服务响应异常，无法确认登录状态。请重新检查或联系管理员。",
+  };
+}
+
+function completeRestoredSession(data) {
+  cancelBootSessionRecovery();
+  S.sessionGeneration += 1;
+  S.authenticated = true;
+  S.messagePolicyRefreshPromise = null;
+  applyFeatureEnvelope(data);
+  applyUser(data.user);
+  if (!VOICE_MATCH_ENABLED) void cleanupDisabledVoiceMatchQueue();
+  showLogin(false);
+  S.authenticatedServicesPending = true;
+  const desired = hashRoute();
+  go(isRouteAllowed(desired) ? desired : "nearby", { replace: !isRouteAllowed(desired), force: true });
+}
+
 async function restoreSessionAtBoot() {
+  let result = null;
+  let error = null;
+  try {
+    result = await api("/api/me", { authOptional: true, timeout: BOOT_SESSION_TIMEOUT_MS });
+  } catch (caught) {
+    error = caught;
+  }
+  const recovery = classifyBootSessionAttempt(result, error);
+  if (recovery.resolved) return { ...result, recovery: null };
+  setBootStatusText(recovery.bootText);
+  return {
+    status: Number(result?.status || error?.status || 0),
+    data: result?.data || {},
+    ok: false,
+    recovery,
+  };
+}
+
+async function recoverSessionAfterBoot(token, initialRecovery) {
   let transientFailures = 0;
-  while (true) {
+  let recovery = initialRecovery;
+  while (token === bootSessionRecoveryToken && !S.authenticated) {
+    setSessionRecoveryMessage(recovery.loginText, { retryVisible: true });
+    await waitForBootSessionRecovery(recovery.delayMs, {
+      retryOnOnline: recovery.retryOnOnline,
+    });
+    if (token !== bootSessionRecoveryToken || S.authenticated) return;
+    setSessionRecoveryMessage("正在重新检查登录状态…");
+    let result = null;
+    let error = null;
     try {
-      const result = await api("/api/me", { authOptional: true, timeout: 8000 });
-      if (result.status === 200 || result.status === 401) return result;
-    } catch {
-      // A network error does not prove that the durable session is invalid.
+      result = await api("/api/me", { authOptional: true, timeout: BOOT_SESSION_TIMEOUT_MS });
+    } catch (caught) {
+      error = caught;
     }
-    setBootStatusText("服务暂时不可用，正在恢复登录状态…");
-    const delay = BOOT_SESSION_RETRY_DELAYS_MS[
-      Math.min(transientFailures, BOOT_SESSION_RETRY_DELAYS_MS.length - 1)
-    ];
+    if (token !== bootSessionRecoveryToken || S.authenticated) return;
+    const next = classifyBootSessionAttempt(result, error, transientFailures);
+    if (next.resolved) {
+      if (result?.status === 200 && result.data?.ok && result.data?.user?.logged_in) {
+        completeRestoredSession(result.data);
+      } else {
+        setSessionRecoveryMessage("");
+      }
+      return;
+    }
     transientFailures += 1;
-    await new Promise((resolve) => setTimeout(resolve, delay));
+    recovery = next;
   }
 }
 
+$("session-recovery-retry")?.addEventListener("click", () => {
+  setSessionRecoveryMessage("正在重新检查登录状态…");
+  if (bootSessionRecoveryWake) bootSessionRecoveryWake();
+});
+
 (async function boot() {
+  initLocalPerformanceMetrics();
   setLoginMode("password");
-  const featuresTask = Promise.resolve(loadFeatures()).catch(() => {});
-  const { status, data } = await restoreSessionAtBoot();
-  await Promise.allSettled([featuresTask]);
+  buildNav();
+  const { status, data, recovery } = await restoreSessionAtBoot();
   if (status === 200 && data.ok && data.user?.logged_in) {
-    S.sessionGeneration += 1;
-    S.authenticated = true;
-    applyCapabilities(data.capabilities);
-    applyUser(data.user);
-    if (!VOICE_MATCH_ENABLED) void cleanupDisabledVoiceMatchQueue();
-    showLogin(false);
-    S.serverHeartbeat = Boolean(data.auto_heartbeat ?? S.serverHeartbeat);
-    S.authenticatedServicesPending = true;
-    const desired = hashRoute();
-    go(isRouteAllowed(desired) ? desired : "nearby", { replace: !isRouteAllowed(desired), force: true });
+    completeRestoredSession(data);
     return;
   }
+  scheduleDeferredFeatureLoad();
   S.authenticated = false;
   applyUser(null);
-  showLogin(true, true);
+  showLogin(true, !recovery);
+  if (recovery) {
+    setSessionRecoveryMessage(recovery.loginText, { retryVisible: true });
+    const recoveryToken = ++bootSessionRecoveryToken;
+    void recoverSessionAfterBoot(recoveryToken, recovery);
+  }
   if (!isRouteAllowed(hashRoute())) history.replaceState(null, "", "#/nearby");
 })();

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
 import sys
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +17,7 @@ if str(ROOT) not in sys.path:
 from bbw_protocol.client import ApiResult  # noqa: E402
 from bbw_protocol.modules.social import SocialAPI  # noqa: E402
 from bbw_web import bff_server as BFF  # noqa: E402
+from bbw_web.jobs import record_product_events_batch  # noqa: E402
 
 
 class FriendRequestProtocolContractTests(unittest.TestCase):
@@ -139,17 +143,13 @@ class FriendRequestPersistenceContractTests(unittest.TestCase):
     def test_add_friend_maps_to_active_friend_request_relationship(self) -> None:
         source = (ROOT / "bbw_web" / "jobs.py").read_text(encoding="utf-8-sig")
         tree = ast.parse(source)
-        function = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == "record_product_event"
-        )
         assignment = next(
             node
-            for node in ast.walk(function)
+            for node in tree.body
             if isinstance(node, ast.Assign)
             and any(
-                isinstance(target, ast.Name) and target.id == "relationship_map"
+                isinstance(target, ast.Name)
+                and target.id == "PRODUCT_RELATIONSHIP_MAP"
                 for target in node.targets
             )
         )
@@ -159,6 +159,102 @@ class FriendRequestPersistenceContractTests(unittest.TestCase):
             relationship_map["/api/social/add-friend"],
             ("friend_request", "active"),
         )
+
+    def test_product_event_batch_reuses_owner_binding_and_transaction(self) -> None:
+        owner_id = uuid.uuid4()
+        db = Mock()
+        user = SimpleNamespace(id=owner_id)
+        account = SimpleNamespace(upstream_uid="42")
+        event_repository = Mock()
+        relationship_repository = Mock()
+        payloads = [
+            {"path": "/api/social/follow", "status": 200},
+            {"path": "/api/social/visit", "status": 200},
+        ]
+
+        @contextmanager
+        def fake_session_scope():
+            yield db
+
+        with (
+            patch("bbw_web.jobs.session_scope", new=fake_session_scope),
+            patch(
+                "bbw_web.jobs._load_owner_binding", return_value=(user, account)
+            ) as load_binding,
+            patch(
+                "bbw_web.jobs.ActivityEventRepository",
+                return_value=event_repository,
+            ),
+            patch(
+                "bbw_web.jobs.RelationshipRepository",
+                return_value=relationship_repository,
+            ),
+            patch(
+                "bbw_web.jobs._record_product_event_in_session",
+                side_effect=[
+                    {"event_id": "event-1", "relationship_id": "relation-1"},
+                    {"event_id": "event-2", "relationship_id": None},
+                ],
+            ) as record_event,
+        ):
+            result = record_product_events_batch(str(owner_id), payloads)
+
+        load_binding.assert_called_once_with(db, owner_id, None)
+        self.assertEqual(record_event.call_count, 2)
+        self.assertIs(
+            record_event.call_args_list[0].kwargs["relationship_cache"],
+            record_event.call_args_list[1].kwargs["relationship_cache"],
+        )
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(result["relationship_updates"], 1)
+
+    def test_product_event_batch_marks_conversations_read_off_request_path(self) -> None:
+        owner_id = uuid.uuid4()
+        db = Mock()
+        user = SimpleNamespace(id=owner_id)
+        account = SimpleNamespace(upstream_uid="42")
+        event_repository = Mock()
+        event_repository.insert_idempotent.return_value = SimpleNamespace(
+            id=uuid.uuid4()
+        )
+        conversation_repository = Mock()
+        conversation_repository.mark_peers_read.return_value = 2
+
+        @contextmanager
+        def fake_session_scope():
+            yield db
+
+        with (
+            patch("bbw_web.jobs.session_scope", new=fake_session_scope),
+            patch(
+                "bbw_web.jobs._load_owner_binding", return_value=(user, account)
+            ),
+            patch(
+                "bbw_web.jobs.ActivityEventRepository",
+                return_value=event_repository,
+            ),
+            patch("bbw_web.jobs.RelationshipRepository", return_value=Mock()),
+            patch(
+                "bbw_web.jobs.ConversationRepository",
+                return_value=conversation_repository,
+            ),
+        ):
+            result = record_product_events_batch(
+                str(owner_id),
+                [
+                    {
+                        "path": "/api/im/read",
+                        "status": 200,
+                        "request": {"peers": ["9", "10", "9"]},
+                        "response": {"ok": True, "read_peers": ["9", "10"]},
+                    }
+                ],
+            )
+
+        args = conversation_repository.mark_peers_read.call_args.args
+        self.assertEqual(args, (owner_id, ["9", "10"]))
+        self.assertIn("observed_at", conversation_repository.mark_peers_read.call_args.kwargs)
+        self.assertEqual(result["conversations_marked_read"], 2)
 
     def test_accepting_or_observing_friend_closes_pending_request(self) -> None:
         source = (ROOT / "bbw_web" / "jobs.py").read_text(encoding="utf-8-sig")
