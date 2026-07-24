@@ -259,19 +259,22 @@ sudo sh -c 'umask 077; openssl rand -base64 32 | tr -d "\n" > docker/secrets/adm
 
 ## 6. 资源预算
 
-2 GB 内存是本方案的最低测试配置，Compose 已设置以下硬上限：
+当前资源预算面向 16 逻辑 CPU、约 15 GiB 内存的后端主机。建议宿主机至少配备 12 GiB 内存，16 GiB 更适合同时运行系统服务、监控和运维工具。Compose 已设置以下硬上限：
 
 | 服务 | 内存上限 | CPU 上限 | 说明 |
 |---|---:|---:|---|
-| PostgreSQL | 448 MB | 0.70 | 40 连接，96 MB shared buffers，关闭 JIT |
-| Redis | 128 MB | 0.15 | 数据上限 96 MB，`noeviction` |
-| App | 384 MB | 0.80 | Uvicorn 1 worker、64 并发上限 |
-| RQ Worker | 320 MB | 0.60 | 媒体使用临时文件和流式处理，禁止整段视频入内存 |
-| Scheduler | 128 MB | 0.10 | 单实例 Redis 锁 |
+| PostgreSQL | 1536 MB | 1.50 | 40 连接，256 MB shared buffers，关闭 JIT |
+| Redis | 384 MB | 0.50 | 数据上限 192 MB，`noeviction`，为 AOF 重写保留余量 |
+| App | 768 MB | 1.50 | Uvicorn 1 worker、64 并发上限 |
+| RQ Worker | 1024 MB | 1.50 | 媒体使用临时文件和流式处理，禁止整段视频入内存 |
+| IM Ingest Worker | 512 MB | 1.00 | 独立处理 IM 入站队列 |
+| Sync Worker | 768 MB | 1.25 | 独立处理同步队列和外部请求 |
+| Transcode Worker | 1024 MB | 1.25 | 单线程转码，为高分辨率视频保留内存余量 |
+| Scheduler | 192 MB | 0.25 | 单实例 Redis 锁 |
 | Caddy | 96 MB | 0.25 | 非 root，内部监听 8080/8443 |
 | Migrate（一次性） | 256 MB | 0.30 | 只在升级阶段运行，不计入稳态合计 |
 
-六个常驻服务的内存上限合计 1504 MiB、CPU 上限合计 2.60；首次迁移阶段 PostgreSQL、Redis 和 Migrate 的上限合计 832 MiB、1.15 CPU。更新时旧常驻容器可能与 Migrate 短暂重叠，最坏上限为 1760 MiB、2.90 CPU，仍给宿主系统保留有限余量。Swap 只负责缓冲瞬时压力，不代表能够提高稳定并发。持续出现 Swap、OOM 或队列堆积时，应先升级到至少 4 GB RAM，而不是继续增加 worker。
+后端模式下八个常驻服务的内存硬上限合计 6208 MiB、CPU 上限合计 8.75；Migrate 运行时再增加 256 MiB、0.30 CPU。Caddy 通常部署在独立边缘主机；如与后端同机，再增加 96 MiB、0.25 CPU。硬上限不等于常驻占用，但宿主机仍应保留至少 4 GiB 内存供系统、文件缓存和运维进程使用。Swap 只负责缓冲瞬时压力，不代表能够提高稳定并发。
 
 检查资源：
 
