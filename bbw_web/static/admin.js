@@ -239,8 +239,6 @@ function markPageUpdated(value = Date.now()) {
 
 function updateViewContext(view) {
   const meta = ADMIN_VIEW_META[view] || ADMIN_VIEW_META.overview;
-  const breadcrumb = $("admin-breadcrumb-current");
-  if (breadcrumb) breadcrumb.textContent = meta.label;
   document.title = `${meta.title} - XBLY 管理工作台`;
 }
 
@@ -2682,11 +2680,6 @@ $("admin-lock-sensitive").addEventListener("click", (event) => {
 $("admin-navigation").addEventListener("click", (event) => {
   const button = event.target.closest("[data-admin-view]");
   if (button) void activateView(button.dataset.adminView);
-});
-
-$("admin-view-overview").addEventListener("click", (event) => {
-  const button = event.target.closest("[data-admin-jump]");
-  if (button) void activateView(button.dataset.adminJump);
 });
 
 $("admin-invite-create-form").addEventListener("submit", (event) => {

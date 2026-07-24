@@ -376,6 +376,15 @@ def result_photo(result: Any) -> Dict[str, str]:
     return {"path": "", "url": ""}
 
 
+def photo_from_path(value: Any) -> Dict[str, str]:
+    """Rebuild a previously validated OSS flash-photo result."""
+
+    path = _safe_oss_path(value)
+    if not path:
+        return {"path": "", "url": ""}
+    return {"path": path, "url": _object_url(path)}
+
+
 def result_value(result: Any, *keys: str) -> str:
     data = getattr(result, "data", None)
     for item in _walk_dicts(data):

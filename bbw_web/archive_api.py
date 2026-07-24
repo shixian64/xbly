@@ -268,6 +268,16 @@ def _archived_message_item(message: Any) -> dict[str, Any]:
     media = metadata.get("media_report")
     if not isinstance(media, dict):
         media = {}
+    else:
+        media = dict(media)
+    if (
+        str(message.message_type or "").strip().lower() == "flash"
+        and str(message.direction or "").strip().lower() == "incoming"
+    ):
+        # Keep the archived media metadata server-side, but never replay a
+        # received flash photo's source addresses to the recipient.
+        media.pop("url", None)
+        media.pop("thumbnail", None)
     message_id = str(message.upstream_message_id or message.id)
     message_key = str(
         metadata.get("message_key")

@@ -277,6 +277,36 @@ class RuntimePersistence:
     WEB_PRESENCE_TTL_SECONDS = 120
     PRESENCE_REST_FAILURE_TTL_SECONDS = 10 * 60
     MOMENT_VIDEO_GRANT_SECONDS = 2 * 60 * 60
+    FLASH_REVEAL_TTL_SECONDS = 5 * 60
+    FLASH_REVEALED_TTL_SECONDS = 10 * 60
+    FLASH_REVEAL_READ_SCRIPT = """
+local acknowledged = redis.call('EXISTS', KEYS[1])
+if acknowledged == 1 then
+  return false
+end
+return redis.call('GET', KEYS[2])
+"""
+    FLASH_REVEAL_REMEMBER_SCRIPT = """
+local acknowledged = redis.call('EXISTS', KEYS[1])
+if acknowledged == 1 then
+  return 0
+end
+redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
+return 1
+"""
+    FLASH_REVEAL_ACK_SCRIPT = """
+local acknowledged = redis.call('EXISTS', KEYS[1])
+if acknowledged == 1 then
+  return 1
+end
+local pending = redis.call('EXISTS', KEYS[2])
+if pending == 0 then
+  return 0
+end
+redis.call('DEL', KEYS[2])
+redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
+return 1
+"""
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -374,6 +404,84 @@ class RuntimePersistence:
     def presence_rest_retry_after(self) -> int:
         ttl = int(self.redis.ttl(self._presence_rest_failure_key()) or 0)
         return max(0, ttl)
+
+    def _flash_reveal_digest(self, upstream_uid: str, unique_id: str) -> str:
+        return keyed_identifier_hash(
+            f"{str(upstream_uid or '').strip()}\n{str(unique_id or '').strip()}",
+            self.session_hmac_key,
+            purpose="flash-reveal",
+        )
+
+    def _flash_reveal_key(self, upstream_uid: str, unique_id: str) -> str:
+        return (
+            f"{self.settings.redis_prefix}:flash-reveal:pending:"
+            f"{self._flash_reveal_digest(upstream_uid, unique_id)}"
+        )
+
+    def _flash_revealed_key(self, upstream_uid: str, unique_id: str) -> str:
+        return (
+            f"{self.settings.redis_prefix}:flash-reveal:acknowledged:"
+            f"{self._flash_reveal_digest(upstream_uid, unique_id)}"
+        )
+
+    def cached_flash_reveal(self, upstream_uid: str, unique_id: str) -> str:
+        if not str(upstream_uid or "").strip() or not str(unique_id or "").strip():
+            return ""
+        value = self.redis.eval(
+            self.FLASH_REVEAL_READ_SCRIPT,
+            2,
+            self._flash_revealed_key(upstream_uid, unique_id),
+            self._flash_reveal_key(upstream_uid, unique_id),
+        )
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="ignore")
+        return str(value or "")[:2048]
+
+    def remember_flash_reveal(
+        self,
+        upstream_uid: str,
+        unique_id: str,
+        photo_path: str,
+    ) -> bool:
+        uid = str(upstream_uid or "").strip()
+        identifier = str(unique_id or "").strip()
+        path = str(photo_path or "").strip()[:2048]
+        if not uid or not identifier or not path:
+            return False
+        return bool(
+            self.redis.eval(
+                self.FLASH_REVEAL_REMEMBER_SCRIPT,
+                2,
+                self._flash_revealed_key(uid, identifier),
+                self._flash_reveal_key(uid, identifier),
+                path.encode("utf-8"),
+                self.FLASH_REVEAL_TTL_SECONDS,
+            )
+        )
+
+    def flash_reveal_acknowledged(self, upstream_uid: str, unique_id: str) -> bool:
+        uid = str(upstream_uid or "").strip()
+        identifier = str(unique_id or "").strip()
+        if not uid or not identifier:
+            return False
+        return bool(self.redis.exists(self._flash_revealed_key(uid, identifier)))
+
+    def acknowledge_flash_reveal(self, upstream_uid: str, unique_id: str) -> bool:
+        uid = str(upstream_uid or "").strip()
+        identifier = str(unique_id or "").strip()
+        if not uid or not identifier:
+            return False
+        pending_key = self._flash_reveal_key(uid, identifier)
+        acknowledged_key = self._flash_revealed_key(uid, identifier)
+        return bool(
+            self.redis.eval(
+                self.FLASH_REVEAL_ACK_SCRIPT,
+                2,
+                acknowledged_key,
+                pending_key,
+                self.FLASH_REVEALED_TTL_SECONDS,
+            )
+        )
 
     def _claim_response_digest(
         self,

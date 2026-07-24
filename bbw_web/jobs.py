@@ -20,6 +20,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from botocore.exceptions import ClientError
 from redis import Redis
 from rq import Queue
 from sqlalchemy import and_, delete, or_, select
@@ -69,6 +70,8 @@ CHAT_PROVIDER = "tim"
 SYNC_SOURCE = "beibeiwu"
 SYNC_STREAM = "chat-history"
 MEDIA_OPERATION = "media.archive"
+MEDIA_MAX_ATTEMPTS = 8
+MEDIA_CONFIGURATION_ALERT_INTERVAL = MEDIA_MAX_ATTEMPTS
 DEFAULT_MEDIA_HOSTS = (
     "oss.banghua.xin",
     "*.myqcloud.com",
@@ -890,7 +893,7 @@ def _ingest_message(
                 "reported": media_spec["reported"],
             },
             status="pending",
-            max_attempts=8,
+            max_attempts=MEDIA_MAX_ATTEMPTS,
         )
         outbox_id = operation.id
     return row, created, outbox_id
@@ -2355,6 +2358,35 @@ def _fail_outbox(outbox_id: uuid.UUID, exc: Exception, *, permanent: bool) -> No
         row.last_error = str(exc)[:2000]
 
 
+def _defer_outbox_configuration_error(outbox_id: uuid.UUID, exc: Exception) -> bool:
+    """Keep a configuration-blocked media outbox recoverable and request periodic alerts."""
+
+    with session_scope() as db:
+        row = db.scalar(
+            select(OperationOutbox).where(OperationOutbox.id == outbox_id).with_for_update()
+        )
+        if row is None:
+            return True
+        if row.status == "completed":
+            return False
+        # Configuration failures do not consume the ordinary transient-error
+        # retry budget.  Extending the ceiling also keeps attempt numbers
+        # monotonic, so every later RQ job id remains unique while credentials
+        # are repaired outside the worker.
+        row.max_attempts = max(row.max_attempts + 1, row.attempt_count + 1)
+        row.status = "retry"
+        row.available_at = utcnow() + timedelta(
+            seconds=min(3600, 30 * (2 ** min(row.attempt_count, 7)))
+        )
+        row.locked_by = None
+        row.locked_until = None
+        row.last_error = str(exc)[:2000]
+        return (
+            row.attempt_count > 0
+            and row.attempt_count % MEDIA_CONFIGURATION_ALERT_INTERVAL == 0
+        )
+
+
 def _permanent_media_error(exc: Exception) -> bool:
     if isinstance(exc, NotFoundError):
         return True
@@ -2372,6 +2404,41 @@ def _permanent_media_error(exc: Exception) -> bool:
         status = int(exc.response.status_code)
         return 400 <= status < 500 and status not in {408, 425, 429}
     return False
+
+
+def _media_storage_configuration_error(
+    exc: Exception,
+    *,
+    during_r2_initialization: bool = False,
+) -> bool:
+    if during_r2_initialization and isinstance(exc, (RuntimeError, OSError, ValueError)):
+        # R2Storage validates required settings and reads credential files
+        # or validates endpoint values before boto3 can produce a ClientError.
+        # Restrict this classification to that initialization boundary so
+        # unrelated worker failures keep their normal retry behavior.
+        return True
+    if not isinstance(exc, ClientError):
+        return False
+    response = exc.response if isinstance(exc.response, Mapping) else {}
+    error = response.get("Error") if isinstance(response.get("Error"), Mapping) else {}
+    metadata = (
+        response.get("ResponseMetadata")
+        if isinstance(response.get("ResponseMetadata"), Mapping)
+        else {}
+    )
+    code = str(error.get("Code") or "").strip()
+    try:
+        status = int(metadata.get("HTTPStatusCode") or 0)
+    except (TypeError, ValueError, OverflowError):
+        status = 0
+    return status in {401, 403} or code in {
+        "AccessDenied",
+        "AuthorizationHeaderMalformed",
+        "InvalidAccessKeyId",
+        "NoSuchBucket",
+        "InvalidToken",
+        "SignatureDoesNotMatch",
+    }
 
 
 def archive_media_job(outbox_id: str) -> dict[str, Any]:
@@ -2415,6 +2482,7 @@ def archive_media_job(outbox_id: str) -> dict[str, Any]:
     prepared: PreparedMedia | None = None
     reserved_media_id: uuid.UUID | None = None
     object_key = ""
+    initializing_r2_storage = False
     try:
         with session_scope() as db:
             message = MessageRepository(db).get(owner_id, message_id)
@@ -2437,7 +2505,9 @@ def archive_media_job(outbox_id: str) -> dict[str, Any]:
             _finish_outbox(operation_id)
             return {"ok": True, "media_id": str(existing_id), "existing": True}
 
+        initializing_r2_storage = True
         storage = R2Storage(settings)
+        initializing_r2_storage = False
         with session_scope() as db:
             stale = list(
                 db.scalars(
@@ -2547,7 +2617,27 @@ def archive_media_job(outbox_id: str) -> dict[str, Any]:
                             )
                 except Exception:
                     pass
+        configuration_error = _media_storage_configuration_error(
+            exc,
+            during_r2_initialization=initializing_r2_storage,
+        )
         permanent = _permanent_media_error(exc)
+        if configuration_error:
+            # Invalid R2 credentials cannot be repaired by rerunning the same
+            # RQ job immediately.  Preserve a durable retry for recovery after
+            # configuration is fixed, and periodically fail the RQ invocation
+            # so exhausted configuration retries remain visible to operators.
+            should_alert = _defer_outbox_configuration_error(operation_id, safe_exc)
+            if should_alert:
+                raise RuntimeError(
+                    "media archival configuration failure; durable retry remains scheduled"
+                ) from None
+            return {
+                "ok": False,
+                "retry": True,
+                "configuration_error": True,
+                "error": safe_error_text[:500],
+            }
         _fail_outbox(operation_id, safe_exc, permanent=permanent)
         if permanent:
             return {"ok": False, "permanent": True, "error": safe_error_text[:500]}

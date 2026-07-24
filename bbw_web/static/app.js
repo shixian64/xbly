@@ -57,6 +57,10 @@ const CONVERSATION_DISMISS_LIMIT = 500;
 const BOOT_SESSION_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 15000];
 const MESSAGE_ARCHIVE_RETRY_DELAYS_MS = [1500, 5000];
 const MESSAGE_ARCHIVE_MAX_IN_FLIGHT = 2;
+const FLASH_ACK_RETRY_DELAYS_MS = [1000, 2500, 5000, 10000, 30000];
+const FLASH_ACK_RETRY_WINDOW_MS = 5 * 60 * 1000;
+const FLASH_ACK_LOCAL_RETENTION_MS = 10 * 60 * 1000;
+const FLASH_ACK_STORAGE_PREFIX = "bbw:im:flash-acks:";
 const PAGE_CACHE_TTL_MS = 2 * 60 * 1000;
 const PAGE_CACHE_MAX_AGE_MS = 15 * 60 * 1000;
 const FAST_VIEW_CACHE_TTL_MS = 15 * 1000;
@@ -274,6 +278,9 @@ const S = {
   archiveInFlight: 0,
   archiveDrainTimer: null,
   archiveGeneration: 0,
+  flashAckAccount: "",
+  flashAckPending: new Map(),
+  flashAckDrainTimer: null,
   smsTimer: null,
   turnstileRequired: false,
   turnstileSiteKey: "",
@@ -786,6 +793,8 @@ async function api(path, options = {}) {
       disconnectMomentViewTracking();
       clearPeerMediaReconcile();
       clearMessageArchiveDeliveryState();
+      persistPendingFlashAcknowledgements();
+      clearFlashAckDeliveryState();
       S._imConnecting = null;
       S.imConnectingGeneration = -1;
       scrubAuthenticatedDom();
@@ -1263,9 +1272,38 @@ function deleteOriginDatabase(name) {
   });
 }
 
+function clearLocalStoragePreservingFlashAcknowledgements() {
+  // Pending flash ACKs are one-time-consumption tombstones, not reusable
+  // media credentials. Preserve only validated, short-lived records while
+  // removing every other localStorage entry during logout/auth cleanup.
+  const keys = [];
+  for (let index = 0; index < localStorage.length; index += 1) {
+    const key = localStorage.key(index);
+    if (key) keys.push(key);
+  }
+  const now = Date.now();
+  keys.forEach((key) => {
+    if (!key.startsWith(FLASH_ACK_STORAGE_PREFIX)) {
+      localStorage.removeItem(key);
+      return;
+    }
+    try {
+      const stored = JSON.parse(localStorage.getItem(key) || "{}");
+      const items = normalizeStoredFlashAcknowledgements(stored, now);
+      if (items.length) {
+        localStorage.setItem(key, JSON.stringify({ version: 1, items }));
+      } else {
+        localStorage.removeItem(key);
+      }
+    } catch {
+      localStorage.removeItem(key);
+    }
+  });
+}
+
 async function clearSensitiveBrowserStorage() {
   try {
-    localStorage.clear();
+    clearLocalStoragePreservingFlashAcknowledgements();
   } catch {
     /* Storage can be unavailable in private browsing. */
   }
@@ -2133,6 +2171,7 @@ function startMessageSyncTimer() {
 
 function startMessageServices() {
   startMessageSyncTimer();
+  restorePendingFlashAcknowledgements();
   return Promise.allSettled([
     runMessageSyncCycle({ force: true }),
     loadArchivedConversationSummary(),
@@ -10419,6 +10458,12 @@ async function sendFlashPhoto(file, { retryMessageId = "", peer: requestedPeer =
       id: String(data.message_id || data.msg_uid || pendingID),
       flashId,
       cloudCustomData: flashId,
+      media: {
+        url: String(data.url || data.photo_url || ""),
+        name: String(file.name || "").slice(0, 255),
+        mime: String(data.content_type || file.type || "").slice(0, 128),
+        size: Math.max(0, Number(data.size || file.size || 0) || 0),
+      },
       delivery: "sent",
       progress: 1,
       retryFile: null,
@@ -11825,7 +11870,6 @@ function closeFlashViewer() {
   const hold = S.imFlashHold;
   if (hold) {
     hold.active = false;
-    hold.controller?.abort();
     clearTimeout(hold.timer);
     clearInterval(hold.countdownTimer);
     if (hold.image) {
@@ -11848,9 +11892,244 @@ function closeFlashViewer() {
   document.documentElement.classList.remove("flash-viewing");
 }
 
+function archiveRevealedFlashPhoto(uniqueid, url) {
+  const id = String(uniqueid || "").trim();
+  const remoteUrl = String(url || "").trim();
+  if (!id || !remoteUrl) return null;
+  const entry = S.imMessages.find(
+    (item) => item?.kind === "flash" && String(item.flashId || "").trim() === id
+  );
+  if (!entry) return null;
+  if (String(entry.media?.url || "") === remoteUrl) return entry;
+  const archived = {
+    ...entry,
+    media: { ...(entry.media || {}), url: remoteUrl },
+  };
+  const index = S.imMessages.indexOf(entry);
+  if (index >= 0) S.imMessages[index] = archived;
+  archiveMessageBestEffort(archived, archived.type === "mine" ? "outgoing" : "incoming");
+  return archived;
+}
+
+function acknowledgeFlashReveal(uniqueid) {
+  const id = String(uniqueid || "").trim();
+  if (!id) return Promise.resolve(false);
+  return api("/api/im/flash/ack", {
+    method: "POST",
+    body: JSON.stringify({ uniqueid: id }),
+    timeout: 5000,
+    keepalive: true,
+  })
+    .then(({ data }) => data?.ok === true && data?.acknowledged === true)
+    .catch(() => false);
+}
+
+function flashAckStorageKey(account = messageSyncAccountId()) {
+  const normalized = String(account || "").trim();
+  return normalized ? `${FLASH_ACK_STORAGE_PREFIX}${archiveHash(normalized)}` : "";
+}
+
+function normalizeStoredFlashAcknowledgements(stored, now = Date.now()) {
+  const items = Array.isArray(stored?.items) ? stored.items : [];
+  const normalized = new Map();
+  items.slice(-50).forEach((value) => {
+    const id = String(value?.id || "").trim();
+    const viewedAt = Number(value?.viewedAt || 0);
+    if (
+      !id ||
+      id.length > 512 ||
+      [...id].some((character) => character.charCodeAt(0) < 33) ||
+      !Number.isFinite(viewedAt) ||
+      viewedAt <= 0 ||
+      viewedAt > now + 60 * 1000 ||
+      now - viewedAt >= FLASH_ACK_LOCAL_RETENTION_MS
+    ) {
+      return;
+    }
+    normalized.set(id, { id, viewedAt });
+  });
+  return [...normalized.values()]
+    .sort((left, right) => left.viewedAt - right.viewedAt)
+    .slice(-50);
+}
+
+function persistPendingFlashAcknowledgements() {
+  const key = flashAckStorageKey(S.flashAckAccount);
+  if (!key) return;
+  const now = Date.now();
+  const items = [...S.flashAckPending.values()]
+    .filter((item) => item.id && now - item.viewedAt < FLASH_ACK_LOCAL_RETENTION_MS)
+    .sort((left, right) => left.viewedAt - right.viewedAt)
+    .slice(-50)
+    .map((item) => ({ id: item.id, viewedAt: item.viewedAt }));
+  try {
+    if (items.length) localStorage.setItem(key, JSON.stringify({ version: 1, items }));
+    else localStorage.removeItem(key);
+  } catch {
+    // Private browsing can disable localStorage; memory retries remain active.
+  }
+}
+
+function syncFlashAckAccount({ forceReload = false } = {}) {
+  const account = messageSyncAccountId();
+  const accountChanged = account !== S.flashAckAccount;
+  if (!accountChanged && !forceReload) return;
+  if (accountChanged) {
+    clearTimeout(S.flashAckDrainTimer);
+    S.flashAckDrainTimer = null;
+    S.flashAckPending.clear();
+    S.flashAckAccount = account;
+  }
+  const key = flashAckStorageKey(account);
+  if (!key) return;
+  const now = Date.now();
+  try {
+    const stored = JSON.parse(localStorage.getItem(key) || "{}");
+    const normalized = normalizeStoredFlashAcknowledgements(stored, now);
+    // Storage is an additional cross-tab source, not an authoritative snapshot:
+    // private browsing or quota failures can leave valid in-memory retries absent.
+    normalized.forEach((item) => {
+      const existing = S.flashAckPending.get(item.id);
+      if (existing) {
+        existing.viewedAt = Math.min(existing.viewedAt, item.viewedAt);
+        return;
+      }
+      S.flashAckPending.set(item.id, {
+        id: item.id,
+        viewedAt: item.viewedAt,
+        attempt: 0,
+        availableAt: now,
+        inFlight: false,
+      });
+    });
+  } catch {
+    // Invalid or unavailable storage must not prevent the viewer from closing.
+  }
+  persistPendingFlashAcknowledgements();
+}
+
+function clearFlashAckDeliveryState() {
+  clearTimeout(S.flashAckDrainTimer);
+  S.flashAckDrainTimer = null;
+  S.flashAckPending.clear();
+  S.flashAckAccount = "";
+}
+
+function scheduleFlashAckDrain(delay = 0) {
+  if (!S.authenticated) return;
+  syncFlashAckAccount();
+  if (!S.flashAckAccount || !S.flashAckPending.size) return;
+  const normalizedDelay = Math.max(0, Number(delay) || 0);
+  if (S.flashAckDrainTimer) {
+    if (normalizedDelay > 0) return;
+    clearTimeout(S.flashAckDrainTimer);
+  }
+  S.flashAckDrainTimer = setTimeout(() => {
+    S.flashAckDrainTimer = null;
+    drainFlashAckQueue();
+  }, normalizedDelay);
+}
+
+async function dispatchFlashAcknowledgement(item, account) {
+  item.inFlight = true;
+  const acknowledged = await acknowledgeFlashReveal(item.id);
+  if (account !== S.flashAckAccount || S.flashAckPending.get(item.id) !== item) return;
+  if (acknowledged) {
+    S.flashAckPending.delete(item.id);
+    const hold = S.imFlashHold;
+    if (hold?.id === item.id) hold.acknowledged = true;
+    persistPendingFlashAcknowledgements();
+    return;
+  }
+  item.attempt += 1;
+  const delay = FLASH_ACK_RETRY_DELAYS_MS[
+    Math.min(item.attempt - 1, FLASH_ACK_RETRY_DELAYS_MS.length - 1)
+  ];
+  item.availableAt = Date.now() + delay;
+}
+
+function drainFlashAckQueue() {
+  if (!S.authenticated) return;
+  syncFlashAckAccount();
+  const account = S.flashAckAccount;
+  const now = Date.now();
+  let nextAvailableAt = Number.POSITIVE_INFINITY;
+  for (const item of S.flashAckPending.values()) {
+    if (now - item.viewedAt >= FLASH_ACK_RETRY_WINDOW_MS || item.inFlight) continue;
+    if (item.availableAt > now) {
+      nextAvailableAt = Math.min(nextAvailableAt, item.availableAt);
+      continue;
+    }
+    void dispatchFlashAcknowledgement(item, account).finally(() => {
+      if (account !== S.flashAckAccount || S.flashAckPending.get(item.id) !== item) return;
+      item.inFlight = false;
+      scheduleFlashAckDrain();
+    });
+  }
+  if (Number.isFinite(nextAvailableAt)) {
+    scheduleFlashAckDrain(Math.max(50, nextAvailableAt - now));
+  }
+}
+
+function queueFlashRevealAcknowledgement(uniqueid) {
+  const id = String(uniqueid || "").trim();
+  if (!id || !S.authenticated) return;
+  syncFlashAckAccount();
+  if (!S.flashAckPending.has(id)) {
+    S.flashAckPending.set(id, {
+      id,
+      viewedAt: Date.now(),
+      attempt: 0,
+      availableAt: Date.now(),
+      inFlight: false,
+    });
+    persistPendingFlashAcknowledgements();
+  }
+  scheduleFlashAckDrain();
+}
+
+function flashRevealAwaitingAcknowledgement(uniqueid) {
+  const id = String(uniqueid || "").trim();
+  if (!id) return false;
+  syncFlashAckAccount();
+  const item = S.flashAckPending.get(id);
+  if (!item) return false;
+  if (Date.now() - item.viewedAt >= FLASH_ACK_LOCAL_RETENTION_MS) {
+    S.flashAckPending.delete(id);
+    persistPendingFlashAcknowledgements();
+    return false;
+  }
+  scheduleFlashAckDrain();
+  return true;
+}
+
+function restorePendingFlashAcknowledgements() {
+  if (!S.authenticated) return;
+  syncFlashAckAccount({ forceReload: true });
+  scheduleFlashAckDrain();
+}
+
+function flushPendingFlashAcknowledgements() {
+  if (!S.authenticated) return;
+  syncFlashAckAccount();
+  for (const item of S.flashAckPending.values()) {
+    if (Date.now() - item.viewedAt >= FLASH_ACK_RETRY_WINDOW_MS) continue;
+    void fetch("/api/im/flash/ack", {
+      method: "POST",
+      credentials: "include",
+      keepalive: true,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ uniqueid: item.id }),
+    }).catch(() => {});
+  }
+}
+
 async function openFlashViewer(uniqueid) {
   const id = String(uniqueid || "").trim();
   if (!id) throw new Error("闪图凭证不可用");
+  if (flashRevealAwaitingAcknowledgement(id)) {
+    throw new Error("闪图已查看，状态正在确认");
+  }
   if (S.imFlashHold?.active) return;
   closeFlashViewer();
   const viewer = ensureFlashViewer();
@@ -11860,8 +12139,7 @@ async function openFlashViewer(uniqueid) {
   const image = previousImage.cloneNode(false);
   image.hidden = true;
   previousImage.replaceWith(image);
-  const controller = new AbortController();
-  const hold = { id, active: true, controller, image, timer: null, countdownTimer: null };
+  const hold = { id, active: true, image, timer: null, countdownTimer: null, acknowledged: false };
   S.imFlashHold = hold;
   title.textContent = "正在读取闪图…";
   countdown.textContent = "画面保持隐藏，加载完成后开始 5 秒计时；松手立即关闭";
@@ -11871,24 +12149,31 @@ async function openFlashViewer(uniqueid) {
     const { data } = await api("/api/im/flash/get", {
       method: "POST",
       body: JSON.stringify({ uniqueid: id }),
-      signal: controller.signal,
       timeout: 15000,
     });
-    if (!hold.active || S.imFlashHold !== hold) return;
-    if (!data?.ok) throw new Error(errorInfo(data, "闪图不可查看").title);
+    if (!data?.ok) {
+      if (!hold.active || S.imFlashHold !== hold) return;
+      throw new Error(errorInfo(data, "闪图不可查看").title);
+    }
     const rawUrl = firstMessageValue(
       [data, data.info, data.data, data.message],
       ["url", "photo_url", "photourl", "path", "message"],
       ""
     );
     const url = mediaUrl(rawUrl);
-    if (!url) throw new Error("闪图地址不可用或已失效");
+    if (!url) {
+      if (!hold.active || S.imFlashHold !== hold) return;
+      throw new Error("闪图地址不可用或已失效");
+    }
+    archiveRevealedFlashPhoto(id, url);
+    if (!hold.active || S.imFlashHold !== hold) return;
     title.textContent = "正在安全加载闪图…";
     countdown.textContent = "画面保持隐藏，加载完成后开始 5 秒计时；松手立即关闭";
     image.onload = () => {
       if (!hold.active || S.imFlashHold !== hold) return;
       image.onload = null;
       image.onerror = null;
+      queueFlashRevealAcknowledgement(id);
       image.hidden = false;
       title.textContent = "5 秒闪图";
       const started = Date.now();
@@ -14866,6 +15151,8 @@ async function logout() {
     S.authenticatedServicesPending = false;
     clearPeerMediaReconcile();
     clearMessageArchiveDeliveryState();
+    persistPendingFlashAcknowledgements();
+    clearFlashAckDeliveryState();
     await cleanupIM();
     await clearSensitiveBrowserStorage();
     revokeAllChatObjectUrls();
@@ -16544,11 +16831,20 @@ window.visualViewport?.addEventListener("resize", syncVisualViewport, { passive:
 window.visualViewport?.addEventListener("scroll", syncVisualViewport, { passive: true });
 
 window.addEventListener("online", () => {
+  if (S.authenticated) restorePendingFlashAcknowledgements();
   if (!S.authenticated || document.hidden) return;
   S.imNextReconnectAt = 0;
   S.messageLastPeerSyncAt = 0;
   startMessageSyncTimer();
   void runMessageSyncCycle({ force: true });
+});
+
+window.addEventListener("storage", (event) => {
+  if (!S.authenticated || !event.key?.startsWith(FLASH_ACK_STORAGE_PREFIX)) return;
+  const key = flashAckStorageKey();
+  if (!key || event.key !== key) return;
+  syncFlashAckAccount({ forceReload: true });
+  scheduleFlashAckDrain();
 });
 
 document.addEventListener("visibilitychange", () => {
@@ -16593,6 +16889,7 @@ window.addEventListener("pageshow", (event) => {
 window.addEventListener("pagehide", (event) => {
   finishVoiceRecording(null, true);
   closeFlashViewer();
+  flushPendingFlashAcknowledgements();
   closeChatMediaViewer();
   stopPresenceTimer();
   stopMessageSyncTimer();

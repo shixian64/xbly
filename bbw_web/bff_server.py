@@ -37,6 +37,19 @@ STORE: Optional[SessionStore] = None
 PRESENCE_BACKEND: Any = None
 
 
+def _flash_reveal_backend(method: str, *args: Any, default: Any = None) -> Any:
+    backend = PRESENCE_BACKEND
+    callback = getattr(backend, method, None) if backend is not None else None
+    if not callable(callback):
+        return default
+    try:
+        return callback(*args)
+    except Exception:
+        # Flash viewing must remain available when the short-lived Redis cache
+        # is unavailable; the upstream one-time status remains authoritative.
+        return default
+
+
 class ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
     """Reject a second local server instead of sharing the same Windows port."""
 
@@ -3954,6 +3967,48 @@ class Handler(BaseHTTPRequestHandler):
                     unique_id = F.validate_unique_id(
                         data.get("uniqueid") or data.get("uniqueId") or data.get("unique_id")
                     )
+                    account_uid = str(app.session.uid or "").strip()
+                    if _flash_reveal_backend(
+                        "flash_reveal_acknowledged",
+                        account_uid,
+                        unique_id,
+                        default=False,
+                    ):
+                        expired_message = "闪图已查看、已失效或不存在"
+                        return self.ok(
+                            {
+                                "ok": False,
+                                "message": expired_message,
+                                "error": expired_message,
+                                "uniqueid": unique_id,
+                                "photo_status": "acknowledged",
+                            },
+                            410,
+                        )
+                    cached_path = str(
+                        _flash_reveal_backend(
+                            "cached_flash_reveal",
+                            account_uid,
+                            unique_id,
+                            default="",
+                        )
+                        or ""
+                    )
+                    cached_photo = F.photo_from_path(cached_path)
+                    if cached_photo["url"]:
+                        return self.ok(
+                            {
+                                "ok": True,
+                                "uniqueid": unique_id,
+                                "path": cached_photo["path"],
+                                "url": cached_photo["url"],
+                                "photo_url": cached_photo["url"],
+                                "photo_status": "0",
+                                "message": "闪图已获取",
+                                "error": None,
+                                "cached": True,
+                            }
+                        )
                     result = app.im.flash_photo_get(uniqueid=unique_id)
                     payload = R(result)
                     photo_status = F.result_value(
@@ -3986,6 +4041,32 @@ class Handler(BaseHTTPRequestHandler):
                     if photo_status:
                         payload["photo_status"] = photo_status
                     if payload.get("ok") and photo["url"]:
+                        remembered = bool(
+                            _flash_reveal_backend(
+                                "remember_flash_reveal",
+                                account_uid,
+                                unique_id,
+                                photo["path"],
+                                default=False,
+                            )
+                        )
+                        if not remembered and _flash_reveal_backend(
+                            "flash_reveal_acknowledged",
+                            account_uid,
+                            unique_id,
+                            default=False,
+                        ):
+                            expired_message = "闪图已查看、已失效或不存在"
+                            return self.ok(
+                                {
+                                    "ok": False,
+                                    "message": expired_message,
+                                    "error": expired_message,
+                                    "uniqueid": unique_id,
+                                    "photo_status": "acknowledged",
+                                },
+                                410,
+                            )
                         payload["message"] = "闪图已获取"
                         payload["error"] = None
                         return self.ok(payload)
@@ -3994,6 +4075,36 @@ class Handler(BaseHTTPRequestHandler):
                         return self.ok(payload, 502)
                     payload.update(ok=False, error="闪图已查看、已失效或不存在")
                     return self.ok(payload, 410)
+                except F.FlashPhotoError as exc:
+                    return self.ok({"ok": False, "error": exc.message}, exc.status)
+
+            if path == "/api/im/flash/ack":
+                if not self._allow_sensitive_action(
+                    "flash-ack",
+                    str(app.session.uid or sid or "-"),
+                    limit=120,
+                    window_sec=60.0,
+                ):
+                    return
+                try:
+                    unique_id = F.validate_unique_id(
+                        data.get("uniqueid") or data.get("uniqueId") or data.get("unique_id")
+                    )
+                    acknowledged = bool(
+                        _flash_reveal_backend(
+                            "acknowledge_flash_reveal",
+                            str(app.session.uid or "").strip(),
+                            unique_id,
+                            default=False,
+                        )
+                    )
+                    return self.ok(
+                        {
+                            "ok": True,
+                            "uniqueid": unique_id,
+                            "acknowledged": acknowledged,
+                        }
+                    )
                 except F.FlashPhotoError as exc:
                     return self.ok({"ok": False, "error": exc.message}, exc.status)
 

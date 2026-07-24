@@ -33,6 +33,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers
+from starlette.requests import ClientDisconnect
 
 from bbw_web import bff_server as legacy
 from bbw_web.store import SessionStore
@@ -418,7 +419,10 @@ async def _legacy_dispatch(request: Request) -> Response:
         return JSONResponse({"ok": False, "error": "invalid content length"}, status_code=400)
     if declared_length < 0 or declared_length > max_body:
         return JSONResponse({"ok": False, "error": "request body too large"}, status_code=413)
-    raw_body = await request.body()
+    try:
+        raw_body = await request.body()
+    except ClientDisconnect:
+        return Response(status_code=499)
     return await run_in_threadpool(_legacy_dispatch_sync, request, raw_body)
 
 
@@ -1044,7 +1048,16 @@ async def sanitized_validation_error(
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next: Any) -> Response:
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except RuntimeError as exc:
+        if str(exc) != "No response returned.":
+            raise
+        # Starlette raises this exact error when the browser disconnects while
+        # a blocking legacy route is still finishing in the thread pool.  The
+        # route has no client left to receive a response, so record the common
+        # reverse-proxy status instead of emitting an application traceback.
+        return Response(status_code=499)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")

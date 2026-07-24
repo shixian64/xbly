@@ -329,6 +329,49 @@ class TimMessageDeduplicationTests(unittest.TestCase):
         self.assertEqual(items[0]["text"], "aa？！?")
         self.assertTrue(items[0]["revoked"])
 
+    def test_archive_output_hides_received_flash_source_addresses(self) -> None:
+        received = SimpleNamespace(
+            id=uuid.uuid4(),
+            upstream_message_id="received-flash",
+            extra_data={
+                "flash_id": "flash-1",
+                "media_report": {
+                    "url": "https://oss.banghua.xin/images/received.jpg",
+                    "thumbnail": "https://oss.banghua.xin/images/received-thumb.jpg",
+                    "mime": "image/jpeg",
+                    "size": 128,
+                },
+            },
+            body="[闪图]",
+            message_type="flash",
+            sender_upstream_uid="467615",
+            recipient_upstream_uid="24564",
+            direction="incoming",
+            status="sent",
+            occurred_at=datetime(2026, 7, 21, 10, 52, 57, tzinfo=UTC),
+        )
+        sent = SimpleNamespace(
+            **{
+                **received.__dict__,
+                "id": uuid.uuid4(),
+                "upstream_message_id": "sent-flash",
+                "sender_upstream_uid": "24564",
+                "recipient_upstream_uid": "467615",
+                "direction": "outgoing",
+            }
+        )
+
+        received_item = _archived_message_item(received)
+        sent_item = _archived_message_item(sent)
+
+        self.assertNotIn("url", received_item["media"])
+        self.assertNotIn("thumbnail", received_item["media"])
+        self.assertEqual(received_item["media"]["mime"], "image/jpeg")
+        self.assertEqual(
+            sent_item["media"]["url"],
+            "https://oss.banghua.xin/images/received.jpg",
+        )
+
     def test_data_migration_uses_runtime_canonical_algorithm(self) -> None:
         path = ROOT / "migrations" / "versions" / "20260720_0005_deduplicate_tim_messages.py"
         spec = importlib.util.spec_from_file_location("message_dedup_migration", path)

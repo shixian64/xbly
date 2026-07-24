@@ -8,7 +8,7 @@
   <meta name="color-scheme" content="light" />
   <meta http-equiv="Cache-Control" content="no-store" />
   <title>XBLY 管理工作台</title>
-  <link rel="stylesheet" href="/static/admin.css?v=20260717-admin-workspace-v5" />
+  <link rel="stylesheet" href="/static/admin.css?v=20260724-admin-clarity-v6" />
 </head>
 <body>
   <a class="admin-skip-link" href="#admin-content">跳到主要内容</a>
@@ -55,13 +55,13 @@
       <div class="admin-topbar-leading">
         <button id="admin-sidebar-toggle" class="admin-button admin-button-secondary admin-navigation-toggle" type="button" aria-controls="admin-sidebar" aria-expanded="true">收起导航</button>
         <div class="admin-brand-copy">
-          <p class="admin-eyebrow">XBLY 管理工作台</p>
-          <h1>系统管理</h1>
+          <h1>XBLY 管理工作台</h1>
+          <p>系统管理</p>
         </div>
       </div>
       <form id="admin-global-search-form" class="admin-global-search" role="search" method="get" action="/admin">
         <label class="admin-visually-hidden" for="admin-global-search">全局搜索用户</label>
-        <input id="admin-global-search" name="search" type="search" maxlength="160" placeholder="搜索用户昵称、内部编号或上游编号" />
+        <input id="admin-global-search" name="search" type="search" maxlength="160" placeholder="搜索昵称、内部编号或上游编号" />
         <button class="admin-button admin-button-primary" type="submit">搜索用户</button>
       </form>
       <div class="admin-topbar-session">
@@ -74,7 +74,7 @@
         <div class="admin-topbar-actions">
           <button id="admin-lock-sensitive" class="admin-button admin-button-secondary" type="button" hidden>锁定敏感访问</button>
           <button id="admin-refresh" class="admin-button admin-button-secondary" type="button">刷新数据</button>
-          <button id="admin-logout" class="admin-button admin-button-danger" type="button">退出管理端</button>
+          <button id="admin-logout" class="admin-button admin-button-danger" type="button">退出登录</button>
         </div>
       </div>
     </header>
@@ -83,49 +83,38 @@
       <button id="admin-sidebar-backdrop" class="admin-sidebar-backdrop" type="button" aria-label="关闭管理导航" hidden><span class="admin-visually-hidden">关闭管理导航</span></button>
       <aside id="admin-sidebar" class="admin-sidebar" aria-label="管理功能">
         <div class="admin-sidebar-heading">
-          <strong>管理导航</strong>
-          <span>全局资源治理</span>
+          <strong>管理功能</strong>
         </div>
         <nav id="admin-navigation" class="admin-navigation">
           <section class="admin-navigation-group" aria-labelledby="admin-nav-workbench">
             <h2 id="admin-nav-workbench" class="admin-navigation-group-title">工作台</h2>
             <button type="button" data-admin-view="overview" aria-current="page">
               <span class="admin-navigation-label">运行概览</span>
-              <span class="admin-navigation-description">关键指标、容量与运行状态</span>
             </button>
           </section>
           <section class="admin-navigation-group" aria-labelledby="admin-nav-members">
             <h2 id="admin-nav-members" class="admin-navigation-group-title">用户与准入</h2>
             <button type="button" data-admin-view="users">
               <span class="admin-navigation-label">用户管理</span>
-              <span class="admin-navigation-description">资料、内容、关系与权限</span>
             </button>
             <button type="button" data-admin-view="invites">
               <span class="admin-navigation-label">邀请码管理</span>
-              <span class="admin-navigation-description">创建、筛选与停用</span>
             </button>
           </section>
           <section class="admin-navigation-group" aria-labelledby="admin-nav-governance">
             <h2 id="admin-nav-governance" class="admin-navigation-group-title">治理与安全</h2>
             <button type="button" data-admin-view="audit">
               <span class="admin-navigation-label">审计日志</span>
-              <span class="admin-navigation-description">追踪读取与敏感操作</span>
             </button>
             <button type="button" data-admin-view="security">
               <span class="admin-navigation-label">安全与访问</span>
-              <span class="admin-navigation-description">身份验证与管理员密码</span>
             </button>
           </section>
         </nav>
-        <div class="admin-sidebar-note">
-          <strong>隐私保护</strong>
-          <p>管理端不会在浏览器持久存储登录信息或敏感数据，页面隐藏时会主动清理敏感内容。</p>
-        </div>
       </aside>
 
       <main id="admin-content" class="admin-content" tabindex="-1">
-        <div class="admin-context-bar" aria-label="当前位置与数据状态">
-          <p class="admin-breadcrumb"><span>系统管理</span><span aria-hidden="true">/</span><strong id="admin-breadcrumb-current">运行概览</strong></p>
+        <div class="admin-context-bar" aria-label="数据状态">
           <p id="admin-page-updated">数据尚未刷新</p>
         </div>
         <section id="admin-view-overview" class="admin-view" data-view="overview" aria-labelledby="admin-overview-title">
@@ -136,8 +125,8 @@
               <p>从用户、会话、数据资产和存储容量四个维度快速判断系统状态。</p>
             </div>
           </header>
-          <div id="admin-overview-alerts" class="admin-health-grid" aria-live="polite"></div>
           <div id="admin-overview-metrics" class="admin-metric-grid" aria-live="polite"></div>
+          <div id="admin-overview-alerts" class="admin-health-grid" aria-live="polite"></div>
           <div class="admin-panel-grid admin-panel-grid-overview">
             <section class="admin-panel" aria-labelledby="admin-storage-title">
               <div class="admin-panel-title">
@@ -167,21 +156,6 @@
               <p>统计系统当前保存的核心业务与审计数据。</p>
             </div>
             <div id="admin-overview-jobs"></div>
-          </section>
-          <section class="admin-panel admin-quick-panel" aria-labelledby="admin-quick-title">
-            <div class="admin-panel-title">
-              <div>
-                <p class="admin-panel-kicker">快捷入口</p>
-                <h3 id="admin-quick-title">常用管理任务</h3>
-              </div>
-              <p>直接进入高频管理场景，减少层级跳转。</p>
-            </div>
-            <div class="admin-quick-actions">
-              <button class="admin-quick-action" type="button" data-admin-jump="users"><strong>查看用户</strong><span>检索用户并查看完整数据</span></button>
-              <button class="admin-quick-action" type="button" data-admin-jump="invites"><strong>管理邀请码</strong><span>创建或停用准入凭证</span></button>
-              <button class="admin-quick-action" type="button" data-admin-jump="audit"><strong>追踪审计</strong><span>核查管理员与系统操作</span></button>
-              <button class="admin-quick-action" type="button" data-admin-jump="security"><strong>检查安全</strong><span>管理身份验证与访问状态</span></button>
-            </div>
           </section>
         </section>
 
@@ -534,6 +508,6 @@
     </form>
   </dialog>
 
-  <script src="/static/admin.js?v=20260717-admin-workspace-v5"></script>
+  <script src="/static/admin.js?v=20260724-admin-clarity-v6"></script>
 </body>
 </html>

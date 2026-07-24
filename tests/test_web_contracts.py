@@ -5186,6 +5186,18 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
         self.assertIn("new MediaRecorder(", app_js)
         self.assertIn('api("/api/im/flash/send"', app_js)
         self.assertIn('api("/api/im/flash/get"', app_js)
+        self.assertIn('api("/api/im/flash/ack"', app_js)
+        self.assertIn("archiveRevealedFlashPhoto(id, url)", app_js)
+        self.assertIn("data?.ok === true && data?.acknowledged === true", app_js)
+        self.assertIn("queueFlashRevealAcknowledgement(id)", app_js)
+        self.assertIn("flushPendingFlashAcknowledgements()", app_js)
+        self.assertIn("clearLocalStoragePreservingFlashAcknowledgements()", app_js)
+        self.assertIn("key.startsWith(FLASH_ACK_STORAGE_PREFIX)", app_js)
+        self.assertIn("normalizeStoredFlashAcknowledgements(stored, now)", app_js)
+        self.assertNotIn("localStorage.clear()", app_js)
+        self.assertIn("keepalive: true", app_js)
+        self.assertIn('url: String(data.url || data.photo_url || "")', app_js)
+        self.assertNotIn("hold.controller?.abort()", app_js)
         self.assertIn("ensureTimUploadPluginLoaded()", app_js)
         self.assertIn(
             'registerPlugin({ "tim-upload-plugin": window.TIMUploadPlugin })',

@@ -3,14 +3,20 @@ from __future__ import annotations
 import io
 import time
 import unittest
+import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
+
+from botocore.exceptions import ClientError
 
 from bbw_protocol.client import ApiResult
 from bbw_protocol.modules.im import ImAPI
 from bbw_web import bff_server
 from bbw_web import flash_photo as flash
+from bbw_web import jobs
+from bbw_web.persistence import RuntimePersistence
 
 
 def multipart_body(boundary: str, image: bytes) -> bytes:
@@ -151,13 +157,158 @@ class FlashProtocolTests(unittest.TestCase):
         self.assertEqual(calls[2][3], "GET")
 
 
+class MediaArchiveFailureTests(unittest.TestCase):
+    def test_r2_access_denied_is_treated_as_configuration_failure(self) -> None:
+        error = ClientError(
+            {
+                "Error": {"Code": "AccessDenied", "Message": "Access Denied"},
+                "ResponseMetadata": {"HTTPStatusCode": 403},
+            },
+            "PutObject",
+        )
+
+        self.assertTrue(jobs._media_storage_configuration_error(error))
+        self.assertFalse(jobs._permanent_media_error(error))
+
+    def test_missing_r2_bucket_is_treated_as_configuration_failure(self) -> None:
+        error = ClientError(
+            {
+                "Error": {"Code": "NoSuchBucket", "Message": "Bucket does not exist"},
+                "ResponseMetadata": {"HTTPStatusCode": 404},
+            },
+            "PutObject",
+        )
+
+        self.assertTrue(jobs._media_storage_configuration_error(error))
+        self.assertFalse(jobs._permanent_media_error(error))
+
+    def test_r2_initialization_configuration_failures_are_suppressed(self) -> None:
+        missing_settings = RuntimeError(
+            "R2 endpoint, bucket and credentials are required"
+        )
+        invalid_endpoint = ValueError("Invalid endpoint: not-a-url")
+        invalid_encoding = UnicodeDecodeError(
+            "utf-8",
+            b"\xff",
+            0,
+            1,
+            "invalid start byte",
+        )
+        unreadable_credentials = PermissionError(
+            13,
+            "Permission denied",
+            "/run/secrets/r2-access-key",
+        )
+
+        self.assertTrue(
+            jobs._media_storage_configuration_error(
+                missing_settings,
+                during_r2_initialization=True,
+            )
+        )
+        self.assertTrue(
+            jobs._media_storage_configuration_error(
+                unreadable_credentials,
+                during_r2_initialization=True,
+            )
+        )
+        self.assertTrue(
+            jobs._media_storage_configuration_error(
+                invalid_endpoint,
+                during_r2_initialization=True,
+            )
+        )
+        self.assertTrue(
+            jobs._media_storage_configuration_error(
+                invalid_encoding,
+                during_r2_initialization=True,
+            )
+        )
+        self.assertFalse(
+            jobs._media_storage_configuration_error(
+                OSError("temporary media file write failed"),
+                during_r2_initialization=False,
+            )
+        )
+
+    def test_configuration_failures_remain_retryable_and_alert_every_eight_attempts(self) -> None:
+        row = SimpleNamespace(
+            status="processing",
+            attempt_count=0,
+            max_attempts=jobs.MEDIA_MAX_ATTEMPTS,
+            available_at=None,
+            locked_by="worker",
+            locked_until=jobs.utcnow(),
+            last_error=None,
+        )
+        db = SimpleNamespace(scalar=lambda _statement: row)
+        outbox_id = uuid.uuid4()
+        alerts = []
+
+        with patch.object(jobs, "session_scope") as session_scope:
+            session_scope.return_value.__enter__.return_value = db
+            for attempt in range(1, jobs.MEDIA_MAX_ATTEMPTS + 1):
+                row.status = "processing"
+                row.attempt_count = attempt
+                alerts.append(
+                    jobs._defer_outbox_configuration_error(
+                        outbox_id,
+                        RuntimeError("R2 configuration is invalid"),
+                    )
+                )
+
+        self.assertEqual(
+            alerts,
+            [False] * (jobs.MEDIA_MAX_ATTEMPTS - 1) + [True],
+        )
+        self.assertEqual(row.status, "retry")
+        self.assertEqual(row.attempt_count, jobs.MEDIA_MAX_ATTEMPTS)
+        self.assertEqual(row.max_attempts, jobs.MEDIA_MAX_ATTEMPTS * 2)
+        self.assertIsNone(row.locked_by)
+        self.assertIsNone(row.locked_until)
+        self.assertIn("configuration is invalid", row.last_error)
+
+
+class FlashRevealPersistenceTests(unittest.TestCase):
+    def test_cached_reveal_checks_acknowledged_and_reads_pending_atomically(self) -> None:
+        calls = []
+
+        class FakeRedis:
+            def eval(self, script, key_count, *values):
+                calls.append((script, key_count, values))
+                return b"images/202607/atomic.png"
+
+        runtime = RuntimePersistence.__new__(RuntimePersistence)
+        runtime.redis = FakeRedis()
+        runtime._flash_revealed_key = lambda _uid, _identifier: "acknowledged"
+        runtime._flash_reveal_key = lambda _uid, _identifier: "pending"
+
+        result = runtime.cached_flash_reveal("42", "flash-1")
+
+        self.assertEqual(result, "images/202607/atomic.png")
+        self.assertEqual(calls[0][1:], (2, ("acknowledged", "pending")))
+        self.assertIn("redis.call('EXISTS', KEYS[1])", calls[0][0])
+        self.assertIn("redis.call('GET', KEYS[2])", calls[0][0])
+
+    def test_ack_retry_is_successful_after_the_first_response_is_lost(self) -> None:
+        runtime = RuntimePersistence.__new__(RuntimePersistence)
+        runtime.redis = SimpleNamespace(eval=lambda *_args: 1)
+        runtime._flash_reveal_key = lambda _uid, _identifier: "pending"
+        runtime._flash_revealed_key = lambda _uid, _identifier: "acknowledged"
+
+        self.assertTrue(runtime.acknowledge_flash_reveal("42", "flash-1"))
+
+
 class FlashBffRoutingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.old_store = bff_server.STORE
+        self.old_presence_backend = bff_server.PRESENCE_BACKEND
         bff_server.STORE = SimpleNamespace()
+        bff_server.PRESENCE_BACKEND = None
 
     def tearDown(self) -> None:
         bff_server.STORE = self.old_store
+        bff_server.PRESENCE_BACKEND = self.old_presence_backend
 
     def _run(self, path, data, app, upload=None, permission=None, match_peers=None):
         values = {
@@ -263,6 +414,107 @@ class FlashBffRoutingTests(unittest.TestCase):
         self.assertEqual(response[1]["path"], "images/202607/a.png")
         self.assertEqual(response[1]["url"], "https://oss.banghua.xin/images/202607/a.png")
         self.assertNotIn("data", response[1])
+
+    def test_get_is_cached_until_browser_acknowledges_display(self) -> None:
+        calls = []
+
+        class FlashRevealBackend:
+            def __init__(self):
+                self.pending = {}
+                self.acknowledged = set()
+
+            def cached_flash_reveal(self, uid, unique_id):
+                return self.pending.get((uid, unique_id), "")
+
+            def remember_flash_reveal(self, uid, unique_id, path):
+                self.pending[(uid, unique_id)] = path
+                return True
+
+            def flash_reveal_acknowledged(self, uid, unique_id):
+                return (uid, unique_id) in self.acknowledged
+
+            def acknowledge_flash_reveal(self, uid, unique_id):
+                key = (uid, unique_id)
+                if key not in self.pending:
+                    return False
+                self.pending.pop(key, None)
+                self.acknowledged.add(key)
+                return True
+
+        result = ApiResult(
+            True,
+            200,
+            '{"code":"200"}',
+            data={"code": "200", "message": "images/202607/cached.png"},
+            code="200",
+        )
+        app = SimpleNamespace(
+            session=SimpleNamespace(uid="42"),
+            im=SimpleNamespace(
+                flash_photo_get=lambda **kwargs: calls.append(kwargs) or result,
+            ),
+        )
+        bff_server.PRESENCE_BACKEND = FlashRevealBackend()
+
+        first = self._run("/api/im/flash/get", {"uniqueid": "flash-1"}, app)
+        second = self._run("/api/im/flash/get", {"uniqueid": "flash-1"}, app)
+        acknowledged = self._run("/api/im/flash/ack", {"uniqueid": "flash-1"}, app)
+        after_ack = self._run("/api/im/flash/get", {"uniqueid": "flash-1"}, app)
+
+        self.assertEqual(first[0], 200)
+        self.assertEqual(second[0], 200)
+        self.assertTrue(second[1]["cached"])
+        self.assertEqual(calls, [{"uniqueid": "flash-1"}])
+        self.assertTrue(acknowledged[1]["acknowledged"])
+        self.assertEqual(after_ack[0], 410)
+        self.assertEqual(after_ack[1]["photo_status"], "acknowledged")
+
+    def test_get_does_not_return_photo_when_ack_wins_cache_race(self) -> None:
+        class FlashRevealBackend:
+            def __init__(self):
+                self.acknowledged = False
+
+            def cached_flash_reveal(self, _uid, _unique_id):
+                return ""
+
+            def remember_flash_reveal(self, _uid, _unique_id, _path):
+                self.acknowledged = True
+                return False
+
+            def flash_reveal_acknowledged(self, _uid, _unique_id):
+                return self.acknowledged
+
+        result = ApiResult(
+            True,
+            200,
+            '{"code":"200"}',
+            data={"code": "200", "message": "images/202607/raced.png"},
+            code="200",
+        )
+        app = SimpleNamespace(
+            session=SimpleNamespace(uid="42"),
+            im=SimpleNamespace(flash_photo_get=lambda **_kwargs: result),
+        )
+        bff_server.PRESENCE_BACKEND = FlashRevealBackend()
+
+        response = self._run("/api/im/flash/get", {"uniqueid": "flash-race"}, app)
+
+        self.assertEqual(response[0], 410)
+        self.assertFalse(response[1]["ok"])
+        self.assertEqual(response[1]["photo_status"], "acknowledged")
+        self.assertNotIn("path", response[1])
+        self.assertNotIn("url", response[1])
+        self.assertNotIn("photo_url", response[1])
+
+    def test_pending_flash_acknowledgements_sync_across_tabs(self) -> None:
+        app_js = (
+            Path(__file__).resolve().parents[1] / "bbw_web" / "static" / "app.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('window.addEventListener("storage"', app_js)
+        self.assertIn("syncFlashAckAccount({ forceReload: true })", app_js)
+        self.assertIn("event.key?.startsWith(FLASH_ACK_STORAGE_PREFIX)", app_js)
+        self.assertNotIn("if (!storedIds.has(id)) S.flashAckPending.delete(id)", app_js)
 
     def test_flash_send_is_denied_before_upload_without_permission_or_match(self) -> None:
         app = SimpleNamespace(session=SimpleNamespace(uid="42"), im=SimpleNamespace())
