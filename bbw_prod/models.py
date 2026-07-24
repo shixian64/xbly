@@ -337,6 +337,33 @@ class Message(UUIDPrimaryKeyMixin, TimestampMixin, SerializableMixin, Base):
             "provider",
             text("(metadata ->> 'message_sequence')"),
         ),
+        Index(
+            "ix_messages_body_trgm",
+            text("message_search_index_text(body) gin_trgm_ops"),
+            postgresql_using="gin",
+            postgresql_where=text(
+                "status <> 'revoked' AND "
+                "coalesce(metadata ->> 'revoked', 'false') NOT IN ('true', '1')"
+            ),
+        ),
+        Index(
+            "ix_messages_media_name_trgm",
+            text("message_search_media_name(metadata) gin_trgm_ops"),
+            postgresql_using="gin",
+            postgresql_where=text(
+                "status <> 'revoked' AND "
+                "coalesce(metadata ->> 'revoked', 'false') NOT IN ('true', '1')"
+            ),
+        ),
+        Index(
+            "ix_messages_quote_text_trgm",
+            text("message_search_quote_text(metadata) gin_trgm_ops"),
+            postgresql_using="gin",
+            postgresql_where=text(
+                "status <> 'revoked' AND "
+                "coalesce(metadata ->> 'revoked', 'false') NOT IN ('true', '1')"
+            ),
+        ),
         Index("ix_messages_retention", "retention_expires_at"),
     )
 

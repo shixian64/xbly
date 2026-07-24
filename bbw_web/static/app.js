@@ -70,6 +70,14 @@ const PANEL_DOM_CACHE_LIMIT = 80;
 // time limit while the message is still inside its roaming-storage lifetime.
 const MESSAGE_REVOKE_DEFAULT_WINDOW_MS = 2 * 60 * 1000;
 const MESSAGE_PENDING_REVOKE_LIMIT = 50;
+const MESSAGE_SEARCH_DEBOUNCE_MS = 500;
+const CHAT_LOG_AUTO_SCROLL_GENERATIONS = new WeakMap();
+const MESSAGE_SEARCH_FILTERS = [
+  { id: "all", label: "全部" },
+  { id: "media", label: "图片与视频" },
+  { id: "file", label: "文件" },
+  { id: "link", label: "链接" },
+];
 const MEDIA_RECONCILE_DELAYS_MS = [1200, 3500, 8000];
 const CHAT_MEDIA_RETRY_DELAYS_MS = [700, 1800, 4000];
 const CHAT_AUDIO_REFRESH_PAGE_SIZE = 15;
@@ -211,6 +219,23 @@ const S = {
   imArchiveLoadedPeers: new Set(),
   imMessageOlderLoadingPeers: new Set(),
   imMessageHistoryExhaustedPeers: new Set(),
+  messageSearchOpen: false,
+  messageSearchRootScope: "global",
+  messageSearchScope: "global",
+  messageSearchPeer: "",
+  messageSearchPeerName: "",
+  messageSearchPeerAvatar: "",
+  messageSearchQuery: "",
+  messageSearchKind: "all",
+  messageSearchDate: "",
+  messageSearchResults: [],
+  messageSearchTotal: 0,
+  messageSearchHasMore: false,
+  messageSearchLoading: false,
+  messageSearchError: "",
+  messageSearchSeq: 0,
+  messageSearchTimer: null,
+  messageSearchController: null,
   imComposerPanel: "",
   imComposerDraft: "",
   imComposerDraftRevision: 0,
@@ -751,6 +776,7 @@ async function api(path, options = {}) {
       S.meStats = null;
       S.meStatsAt = 0;
       clearAllViewCaches();
+      resetMessageSearchState();
       clearTimeout(S.authenticatedServicesTimer);
       S.authenticatedServicesTimer = null;
       S.authenticatedServicesPending = false;
@@ -2662,6 +2688,7 @@ async function activateRoute(id, { force = false } = {}) {
     go(target, { replace: true });
     return;
   }
+  if (target !== "msg" && S.messageSearchOpen) closeMessageSearch();
   if (target === "social") {
     const params = hashParams();
     if (!params.has("tab")) {
@@ -6997,14 +7024,30 @@ function renderChatLog(log, html = chatLogHtml(), captured = captureReusableChat
   restoreReusableChatMedia(log, captured);
 }
 
+function cancelChatLogAutoScroll(log = $("im-log")) {
+  if (!log) return false;
+  const generation = Number(CHAT_LOG_AUTO_SCROLL_GENERATIONS.get(log) || 0) + 1;
+  CHAT_LOG_AUTO_SCROLL_GENERATIONS.set(log, generation);
+  return true;
+}
+
 function scrollChatLogToBottom(log = $("im-log")) {
   if (!log) return;
+  const generation = Number(CHAT_LOG_AUTO_SCROLL_GENERATIONS.get(log) || 0) + 1;
+  CHAT_LOG_AUTO_SCROLL_GENERATIONS.set(log, generation);
   const scroll = () => {
-    if (log.isConnected) log.scrollTop = log.scrollHeight;
+    if (
+      !log.isConnected ||
+      CHAT_LOG_AUTO_SCROLL_GENERATIONS.get(log) !== generation
+    ) {
+      return false;
+    }
+    log.scrollTop = log.scrollHeight;
+    return true;
   };
   scroll();
   requestAnimationFrame(() => {
-    scroll();
+    if (!scroll()) return;
     requestAnimationFrame(scroll);
   });
 }
@@ -7062,12 +7105,13 @@ function trimChatMessages(limit = 500) {
   });
 }
 
-function refreshChatLog({ forceBottom = false } = {}) {
+function refreshChatLog({ forceBottom = false, suppressBottom = false } = {}) {
   const log = $("im-log");
   if (!log) return;
+  if (suppressBottom) cancelChatLogAutoScroll(log);
   const shouldStickToBottom = forceBottom || chatLogIsNearBottom(log);
   renderChatLog(log);
-  if (shouldStickToBottom) scrollChatLogToBottom(log);
+  if (!suppressBottom && shouldStickToBottom) scrollChatLogToBottom(log);
 }
 
 function closeChatMessageActions() {
@@ -7577,11 +7621,769 @@ function conversationListControlsHtml() {
         batchDeleteLabel
       )}</button></div>`
     : "";
+  const searchTrigger = S.conversationBatchMode
+    ? ""
+    : '<div class="conversation-search-row"><button type="button" class="message-search-trigger" data-action="open-global-message-search">搜索聊天记录</button></div>';
   return `<div class="pane-head"><div class="pane-head-copy"><h2>${
     S.conversationBatchMode ? "批量管理" : "聊天列表"
   }</h2><p data-conversation-count aria-live="polite">${esc(
     summary
-  )}</p></div><div class="pane-head-actions">${actions}</div></div>${batchToolbar}`;
+  )}</p></div><div class="pane-head-actions">${actions}</div></div>${searchTrigger}${batchToolbar}`;
+}
+
+function stopMessageSearchRequest({ invalidate = true } = {}) {
+  if (S.messageSearchTimer) clearTimeout(S.messageSearchTimer);
+  S.messageSearchTimer = null;
+  if (S.messageSearchController) S.messageSearchController.abort();
+  S.messageSearchController = null;
+  if (invalidate) S.messageSearchSeq += 1;
+  S.messageSearchLoading = false;
+}
+
+function setMessageSearchBackgroundInactive(inactive = S.messageSearchOpen) {
+  const layout = document.querySelector(".message-page > .conversation-layout");
+  if (!layout) return false;
+  const disabled = Boolean(inactive);
+  layout.inert = disabled;
+  if (disabled) layout.setAttribute("aria-hidden", "true");
+  else layout.removeAttribute("aria-hidden");
+  return true;
+}
+
+function resetMessageSearchState() {
+  stopMessageSearchRequest();
+  S.messageSearchOpen = false;
+  S.messageSearchRootScope = "global";
+  S.messageSearchScope = "global";
+  S.messageSearchPeer = "";
+  S.messageSearchPeerName = "";
+  S.messageSearchPeerAvatar = "";
+  S.messageSearchQuery = "";
+  S.messageSearchKind = "all";
+  S.messageSearchDate = "";
+  S.messageSearchResults = [];
+  S.messageSearchTotal = 0;
+  S.messageSearchHasMore = false;
+  S.messageSearchError = "";
+}
+
+function closeMessageSearch({ remove = true } = {}) {
+  const wasOpen = S.messageSearchOpen;
+  resetMessageSearchState();
+  if (remove) document.querySelector(".message-search-view")?.remove();
+  setMessageSearchBackgroundInactive(false);
+  return wasOpen;
+}
+
+function messageSearchCriteriaPresent() {
+  return Boolean(
+    String(S.messageSearchQuery || "").trim() ||
+      S.messageSearchKind !== "all" ||
+      String(S.messageSearchDate || "").trim()
+  );
+}
+
+function messageSearchConversation(peer) {
+  const target = String(peer || "").trim();
+  return S.conversations.find((item) => conversationPeer(item) === target) || null;
+}
+
+function messageSearchConversationName(peer, preferred = "") {
+  const target = String(peer || "").trim();
+  const requested = String(preferred || "").trim();
+  if (!conversationNameIsPlaceholder(requested, target)) return requested;
+  const conversation = messageSearchConversation(target);
+  return conversationEntryDisplayName(conversation, requested, target);
+}
+
+function messageSearchConversationAvatar(peer, preferred = "") {
+  return validAvatarValue(preferred) || conversationAvatar(messageSearchConversation(peer) || {});
+}
+
+function openMessageSearch(scope = "global") {
+  const normalizedScope = scope === "conversation" ? "conversation" : "global";
+  if (normalizedScope === "conversation" && !S.activePeer) {
+    throw new Error("请先打开一个聊天");
+  }
+  stopMessageSearchRequest();
+  S.messageSearchOpen = true;
+  S.messageSearchRootScope = normalizedScope;
+  S.messageSearchScope = normalizedScope;
+  S.messageSearchPeer = normalizedScope === "conversation" ? String(S.activePeer || "") : "";
+  S.messageSearchPeerName =
+    normalizedScope === "conversation"
+      ? messageSearchConversationName(S.activePeer, S.activePeerName)
+      : "";
+  S.messageSearchPeerAvatar =
+    normalizedScope === "conversation" ? messageSearchConversationAvatar(S.activePeer) : "";
+  S.messageSearchQuery = "";
+  S.messageSearchKind = "all";
+  S.messageSearchDate = "";
+  S.messageSearchResults = [];
+  S.messageSearchTotal = 0;
+  S.messageSearchHasMore = false;
+  S.messageSearchLoading = false;
+  S.messageSearchError = "";
+  mountMessageSearchView({ focus: true });
+  if (S.messageSearchPeer) void loadConversationMessages(S.messageSearchPeer);
+}
+
+function messageSearchBack() {
+  if (
+    S.messageSearchOpen &&
+    S.messageSearchRootScope === "global" &&
+    S.messageSearchScope === "conversation"
+  ) {
+    stopMessageSearchRequest();
+    S.messageSearchScope = "global";
+    S.messageSearchPeer = "";
+    S.messageSearchPeerName = "";
+    S.messageSearchPeerAvatar = "";
+    S.messageSearchResults = [];
+    S.messageSearchTotal = 0;
+    S.messageSearchHasMore = false;
+    S.messageSearchError = "";
+    mountMessageSearchView({ focus: false });
+    if (messageSearchCriteriaPresent()) scheduleMessageSearch(0);
+    return true;
+  }
+  return closeMessageSearch();
+}
+
+function messageSearchTitle() {
+  if (S.messageSearchScope === "global") return "搜索全部聊天记录";
+  return `查找与 ${messageSearchConversationName(
+    S.messageSearchPeer,
+    S.messageSearchPeerName
+  )} 的聊天记录`;
+}
+
+function messageSearchFilterHtml() {
+  const filters = MESSAGE_SEARCH_FILTERS.map((filter) => {
+    const active = filter.id === S.messageSearchKind;
+    return `<button type="button" class="message-search-filter${active ? " on" : ""}" data-action="set-message-search-kind" data-kind="${esc(
+      filter.id
+    )}" aria-pressed="${String(active)}">${esc(filter.label)}</button>`;
+  }).join("");
+  const canClear = messageSearchCriteriaPresent();
+  return `<div class="message-search-filters"><div class="message-search-kind-list" role="group" aria-label="按消息类型筛选">${filters}</div><label class="message-search-date"><span>日期</span><input type="date" id="message-search-date" name="date" value="${esc(
+    S.messageSearchDate
+  )}" aria-label="按日期筛选聊天记录" /></label><button type="button" class="utility-btn message-search-clear" data-action="clear-message-search" ${
+    canClear ? "" : "disabled"
+  }>清空条件</button></div>`;
+}
+
+function messageSearchViewHtml() {
+  const drilldown =
+    S.messageSearchRootScope === "global" && S.messageSearchScope === "conversation";
+  return `<section class="message-search-view" role="dialog" aria-modal="true" aria-label="${esc(
+    messageSearchTitle()
+  )}"><header class="message-search-head"><button type="button" class="utility-btn" data-action="message-search-back">${
+    drilldown ? "返回全部结果" : "返回"
+  }</button><div class="message-search-heading"><h2>${esc(
+    messageSearchTitle()
+  )}</h2><p>${
+    S.messageSearchScope === "global"
+      ? "结果会先按聊天对象归类"
+      : "点击结果可回到原消息并查看上下文"
+  }</p></div></header><form class="message-search-form" data-form="message-search"><label class="sr-only" for="message-search-input">搜索聊天记录</label><input id="message-search-input" name="query" type="search" maxlength="120" autocomplete="off" enterkeyhint="search" placeholder="输入消息关键词" value="${esc(
+    S.messageSearchQuery
+  )}" /><button type="submit" class="btn primary">搜索</button></form>${messageSearchFilterHtml()}<div class="message-search-results ui-scrollbar" id="message-search-results" aria-live="polite" aria-busy="${String(
+    S.messageSearchLoading
+  )}">${messageSearchResultsHtml()}</div></section>`;
+}
+
+function mountMessageSearchView({ focus = false } = {}) {
+  if (!S.messageSearchOpen || S.route !== "msg") return false;
+  const page = document.querySelector(".message-page");
+  if (!page) return false;
+  const template = document.createElement("template");
+  template.innerHTML = messageSearchViewHtml();
+  const next = template.content.firstElementChild;
+  const current = page.querySelector(":scope > .message-search-view");
+  if (current) current.replaceWith(next);
+  else page.querySelector(":scope > .conversation-layout")?.insertAdjacentElement("afterend", next);
+  if (focus) {
+    const input = $("message-search-input");
+    input?.focus({ preventScroll: true });
+    if (input) input.setSelectionRange(input.value.length, input.value.length);
+  }
+  setMessageSearchBackgroundInactive(true);
+  return true;
+}
+
+function refreshMessageSearchResults() {
+  const panel = $("message-search-results");
+  if (!panel || !S.messageSearchOpen) return false;
+  panel.setAttribute("aria-busy", String(S.messageSearchLoading));
+  panel.innerHTML = messageSearchResultsHtml();
+  const clear = document.querySelector(".message-search-clear");
+  if (clear) clear.disabled = !messageSearchCriteriaPresent();
+  return true;
+}
+
+function messageSearchEntryText(entry) {
+  const quote = normalizeMessageQuote(entry?.quote);
+  return [
+    entry?.text,
+    entry?.voiceText,
+    entry?.media?.name,
+    quote?.text,
+  ]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .join(" ");
+}
+
+function messageSearchKindLabel(kind) {
+  return {
+    image: "图片",
+    video: "视频",
+    flash: "闪图",
+    file: "文件",
+    audio: "语音",
+    face: "表情包",
+    location: "位置",
+    relay: "聊天记录",
+    custom: "自定义消息",
+    text: "文字",
+  }[String(kind || "text").toLowerCase()] || "消息";
+}
+
+function messageSearchEntryPreview(entry, query = S.messageSearchQuery) {
+  const text = String(entry?.text || "").trim();
+  const mediaName = String(entry?.media?.name || "").trim();
+  const quoteText = String(normalizeMessageQuote(entry?.quote)?.text || "").trim();
+  const voiceText = String(entry?.voiceText || "").trim();
+  const candidates = [
+    { searchable: text, preview: text },
+    { searchable: mediaName, preview: mediaName },
+    { searchable: quoteText, preview: quoteText ? `引用：${quoteText}` : "" },
+    { searchable: voiceText, preview: voiceText },
+  ].filter((candidate) => candidate.searchable);
+  const normalizedQuery = String(query || "").trim().toLocaleLowerCase("zh-CN");
+  if (normalizedQuery) {
+    const matched = candidates.find((candidate) =>
+      candidate.searchable.toLocaleLowerCase("zh-CN").includes(normalizedQuery)
+    );
+    if (matched) return matched.preview;
+  }
+  if (text) return text;
+  if (voiceText) return voiceText;
+  if (mediaName) return mediaName;
+  if (quoteText) return `引用：${quoteText}`;
+  return messageSearchKindLabel(entry?.kind);
+}
+
+function messageSearchDateValue(entry) {
+  const timestamp = messageTimestampMs(entry);
+  if (!timestamp) return "";
+  const parts = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(timestamp));
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return values.year && values.month && values.day
+    ? `${values.year}-${values.month}-${values.day}`
+    : "";
+}
+
+function messageMatchesSearch(entry, peer = "") {
+  if (!entry || entry.type === "system" || entry.revoked) return false;
+  const target = String(peer || "").trim();
+  if (target && String(entry.peer || "") !== target) return false;
+  const kind = String(entry.kind || "text").toLowerCase();
+  if (S.messageSearchKind === "media" && !["image", "video", "flash"].includes(kind)) {
+    return false;
+  }
+  if (S.messageSearchKind === "file" && kind !== "file") return false;
+  const searchable = messageSearchEntryText(entry);
+  if (S.messageSearchKind === "link" && !/https?:\/\//i.test(String(entry?.text || ""))) {
+    return false;
+  }
+  if (S.messageSearchDate && messageSearchDateValue(entry) !== S.messageSearchDate) return false;
+  const query = String(S.messageSearchQuery || "").trim().toLocaleLowerCase("zh-CN");
+  return !query || searchable.toLocaleLowerCase("zh-CN").includes(query);
+}
+
+function messageSearchEntryFromPayload(item) {
+  const peer = String(item?.peer_id || item?.conversation_user || timMessagePeer(item) || "").trim();
+  if (!peer) return null;
+  const entry = timMessageEntry(
+    { ...item, source: item?.source || "archive" },
+    peer,
+    String(S.user?.uid || S.user?.id || "")
+  );
+  const mediaName = String(item?.media?.name || "").trim();
+  if (mediaName) entry.media = { ...(entry.media || {}), name: mediaName };
+  const conversation = messageSearchConversation(peer) || {};
+  entry.peerName = messageSearchConversationName(
+    peer,
+    item?.conversation_name || item?.nickname || conversationDisplayName(conversation)
+  );
+  entry.peerAvatar = messageSearchConversationAvatar(
+    peer,
+    item?.conversation_avatar || item?.avatar
+  );
+  entry.matchCount = Math.max(0, Number(item?.match_count || 0));
+  return entry;
+}
+
+function localMessageSearchResults(peer = "") {
+  const target = String(peer || "").trim();
+  return S.imMessages
+    .filter((entry) => messageMatchesSearch(entry, target))
+    .map((entry) => {
+      const conversation = messageSearchConversation(entry.peer) || {};
+      return {
+        ...entry,
+        peerName: messageSearchConversationName(
+          entry.peer,
+          conversationDisplayName(conversation)
+        ),
+        peerAvatar: messageSearchConversationAvatar(entry.peer),
+        matchCount: 0,
+      };
+    });
+}
+
+function mergeMessageSearchResults(remote, local) {
+  const merged = [];
+  [...remote, ...local].forEach((candidate) => {
+    if (!candidate) return;
+    const index = merged.findIndex((previous) => messagesReferToSameMessage(previous, candidate));
+    if (index < 0) {
+      merged.push(candidate);
+      return;
+    }
+    const previous = merged[index];
+    merged[index] = {
+      ...previous,
+      ...candidate,
+      peerName: candidate.peerName || previous.peerName,
+      peerAvatar: candidate.peerAvatar || previous.peerAvatar,
+      matchCount: Math.max(Number(previous.matchCount || 0), Number(candidate.matchCount || 0)),
+    };
+  });
+  return merged.sort((left, right) => compareMessageOrder(right, left));
+}
+
+function scheduleMessageSearch(delay = MESSAGE_SEARCH_DEBOUNCE_MS) {
+  stopMessageSearchRequest();
+  S.messageSearchResults = [];
+  S.messageSearchTotal = 0;
+  S.messageSearchHasMore = false;
+  S.messageSearchError = "";
+  if (!messageSearchCriteriaPresent()) {
+    refreshMessageSearchResults();
+    return;
+  }
+  S.messageSearchLoading = true;
+  refreshMessageSearchResults();
+  S.messageSearchTimer = setTimeout(() => {
+    S.messageSearchTimer = null;
+    void runMessageSearch();
+  }, Math.max(0, Number(delay) || 0));
+}
+
+async function runMessageSearch() {
+  if (!S.messageSearchOpen || !messageSearchCriteriaPresent()) {
+    S.messageSearchLoading = false;
+    refreshMessageSearchResults();
+    return [];
+  }
+  if (S.messageSearchController) S.messageSearchController.abort();
+  const controller = new AbortController();
+  const seq = ++S.messageSearchSeq;
+  S.messageSearchController = controller;
+  const peer = S.messageSearchScope === "conversation" ? S.messageSearchPeer : "";
+  const local = localMessageSearchResults(peer);
+  S.messageSearchResults = local;
+  S.messageSearchTotal = local.length;
+  S.messageSearchHasMore = false;
+  S.messageSearchLoading = true;
+  S.messageSearchError = "";
+  refreshMessageSearchResults();
+
+  const params = new URLSearchParams({
+    q: String(S.messageSearchQuery || "").trim(),
+    kind: S.messageSearchKind,
+    date: S.messageSearchDate,
+    limit: "200",
+  });
+  if (peer) params.set("peer", peer);
+  try {
+    const { data, ok } = await api(`/api/archive/search?${params.toString()}`, {
+      signal: controller.signal,
+      timeout: 12000,
+    });
+    if (!ok || data?.ok === false) {
+      const info = errorInfo(data, "聊天记录搜索失败");
+      throw new Error(info.title || "聊天记录搜索失败");
+    }
+    if (
+      controller.signal.aborted ||
+      seq !== S.messageSearchSeq ||
+      !S.messageSearchOpen
+    ) {
+      return [];
+    }
+    const remote = itemsOf(data)
+      .map(messageSearchEntryFromPayload)
+      .filter((entry) => entry && messageMatchesSearch(entry, peer));
+    S.messageSearchResults = mergeMessageSearchResults(remote, local);
+    S.messageSearchTotal = Math.max(
+      Number(data?.total || 0),
+      S.messageSearchResults.length
+    );
+    S.messageSearchHasMore = data?.has_more === true;
+    S.messageSearchError = "";
+    return S.messageSearchResults;
+  } catch (error) {
+    if (error?.name === "AbortError" || seq !== S.messageSearchSeq) return [];
+    S.messageSearchResults = local;
+    S.messageSearchTotal = local.length;
+    S.messageSearchHasMore = false;
+    S.messageSearchError = error?.message || "聊天记录搜索失败";
+    return local;
+  } finally {
+    if (seq === S.messageSearchSeq) {
+      S.messageSearchController = null;
+      S.messageSearchLoading = false;
+      refreshMessageSearchResults();
+    }
+  }
+}
+
+function messageSearchSnippet(value, query = S.messageSearchQuery, maxLength = 180) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!text || text.length <= maxLength) return text;
+  const normalizedQuery = String(query || "").trim().toLocaleLowerCase("zh-CN");
+  const matchAt = normalizedQuery
+    ? text.toLocaleLowerCase("zh-CN").indexOf(normalizedQuery)
+    : -1;
+  const start = matchAt >= 0 ? Math.max(0, matchAt - 55) : 0;
+  const end = Math.min(text.length, start + maxLength);
+  return `${start > 0 ? "…" : ""}${text.slice(start, end)}${end < text.length ? "…" : ""}`;
+}
+
+function messageSearchHighlightedHtml(value) {
+  const text = messageSearchSnippet(value);
+  const query = String(S.messageSearchQuery || "").trim();
+  if (!text || !query) return esc(text);
+  const loweredText = text.toLocaleLowerCase("zh-CN");
+  const loweredQuery = query.toLocaleLowerCase("zh-CN");
+  let cursor = 0;
+  let html = "";
+  while (cursor < text.length) {
+    const index = loweredText.indexOf(loweredQuery, cursor);
+    if (index < 0) {
+      html += esc(text.slice(cursor));
+      break;
+    }
+    html += `${esc(text.slice(cursor, index))}<mark>${esc(
+      text.slice(index, index + query.length)
+    )}</mark>`;
+    cursor = index + query.length;
+  }
+  return html;
+}
+
+function messageSearchGroups() {
+  const groups = new Map();
+  S.messageSearchResults.forEach((entry, index) => {
+    const peer = String(entry.peer || "").trim();
+    if (!peer) return;
+    if (!groups.has(peer)) {
+      groups.set(peer, {
+        peer,
+        name: messageSearchConversationName(peer, entry.peerName),
+        avatar: messageSearchConversationAvatar(peer, entry.peerAvatar),
+        latest: entry,
+        latestIndex: index,
+        items: [],
+        count: 0,
+      });
+    }
+    const group = groups.get(peer);
+    group.items.push(entry);
+    group.count = Math.max(
+      group.items.length,
+      Number(group.count || 0),
+      Number(entry.matchCount || 0)
+    );
+    if (compareMessageOrder(entry, group.latest) > 0) {
+      group.latest = entry;
+      group.latestIndex = index;
+    }
+  });
+  return [...groups.values()].sort((left, right) =>
+    compareMessageOrder(right.latest, left.latest)
+  );
+}
+
+function messageSearchGroupHtml(group) {
+  const preview = messageSearchEntryPreview(group.latest);
+  const timeInfo = chatMessageTimeInfo(group.latest?.timestamp);
+  return `<button type="button" class="message-search-group" data-action="open-message-search-group" data-uid="${esc(
+    group.peer
+  )}" data-name="${esc(group.name)}" data-avatar="${esc(
+    group.avatar || ""
+  )}">${conversationAvatarHtml(group.avatar)}<span class="message-search-group-copy"><span class="message-search-result-head"><strong>${esc(
+    group.name
+  )}</strong>${timeInfo ? `<time datetime="${esc(timeInfo.datetime || "")}">${esc(timeInfo.label)}</time>` : ""}</span><span class="message-search-result-preview">${messageSearchHighlightedHtml(
+    preview
+  )}</span></span><span class="message-search-group-count">${esc(
+    group.count
+  )} 条相关聊天记录</span></button>`;
+}
+
+function messageSearchResultHtml(entry, index) {
+  const timeInfo = chatMessageTimeInfo(entry.timestamp);
+  const peerName = messageSearchConversationName(entry.peer, entry.peerName);
+  const author = entry.type === "mine" ? "我" : peerName;
+  return `<button type="button" class="message-search-result" data-action="jump-to-message-search-result" data-result-index="${esc(
+    index
+  )}"><span class="message-search-result-head"><strong>${esc(author)}</strong>${
+    timeInfo
+      ? `<time datetime="${esc(timeInfo.datetime || "")}" title="${esc(
+          timeInfo.title
+        )}">${esc(timeInfo.label)}</time>`
+      : ""
+  }</span><span class="message-search-result-preview">${messageSearchHighlightedHtml(
+    messageSearchEntryPreview(entry)
+  )}</span><span class="message-search-result-kind">${esc(
+    messageSearchKindLabel(entry.kind)
+  )}</span></button>`;
+}
+
+function messageSearchResultsHtml() {
+  if (!messageSearchCriteriaPresent()) {
+    return `<div class="message-search-intro"><strong>查找聊天记录</strong><span>输入关键词，或选择消息类型和日期进行筛选。</span></div>`;
+  }
+  const warning = S.messageSearchError
+    ? `<div class="message-search-warning"><strong>已同步记录暂时无法完整搜索</strong><span>${esc(
+        S.messageSearchError
+      )}${S.messageSearchResults.length ? "，以下显示当前已加载的结果。" : ""}</span></div>`
+    : "";
+  if (S.messageSearchLoading && !S.messageSearchResults.length) {
+    return `${warning}<div class="message-search-loading" role="status">正在搜索聊天记录…</div>`;
+  }
+  if (!S.messageSearchResults.length) {
+    return `${warning}<div class="message-search-empty"><strong>没有找到相关聊天记录</strong><span>可以更换关键词、日期或消息类型。</span></div>`;
+  }
+  const loading = S.messageSearchLoading
+    ? '<div class="message-search-progress" role="status">正在继续搜索已同步记录…</div>'
+    : "";
+  const more = S.messageSearchHasMore
+    ? '<div class="message-search-limit">结果较多，当前只展示最近的匹配消息。</div>'
+    : "";
+  if (S.messageSearchScope === "global") {
+    const groups = messageSearchGroups();
+    const groupedTotal = groups.reduce((sum, group) => sum + group.count, 0);
+    const total = Math.max(S.messageSearchTotal, groupedTotal);
+    return `${warning}${loading}<div class="message-search-summary">${
+      S.messageSearchHasMore ? "已显示最近" : "找到"
+    } ${esc(
+      total
+    )} 条相关记录，当前按 ${esc(groups.length)} 个聊天展示</div><div class="message-search-group-list">${groups
+      .map(messageSearchGroupHtml)
+      .join("")}</div>${more}`;
+  }
+  const total = Math.max(S.messageSearchTotal, S.messageSearchResults.length);
+  return `${warning}${loading}<div class="message-search-summary">${
+    S.messageSearchHasMore ? "已显示最近" : "找到"
+  } ${esc(
+    total
+  )} 条相关记录</div><div class="message-search-result-list">${S.messageSearchResults
+    .map(messageSearchResultHtml)
+    .join("")}</div>${more}`;
+}
+
+function setMessageSearchKind(kind) {
+  const target = MESSAGE_SEARCH_FILTERS.some((filter) => filter.id === kind) ? kind : "all";
+  if (target === S.messageSearchKind) return;
+  S.messageSearchKind = target;
+  mountMessageSearchView({ focus: true });
+  scheduleMessageSearch(0);
+}
+
+function clearMessageSearchFilters() {
+  stopMessageSearchRequest();
+  S.messageSearchQuery = "";
+  S.messageSearchKind = "all";
+  S.messageSearchDate = "";
+  S.messageSearchResults = [];
+  S.messageSearchTotal = 0;
+  S.messageSearchHasMore = false;
+  S.messageSearchError = "";
+  mountMessageSearchView({ focus: true });
+}
+
+function openMessageSearchGroup(peer, name = "", avatar = "") {
+  const target = String(peer || "").trim();
+  if (!target || S.messageSearchRootScope !== "global") return false;
+  stopMessageSearchRequest();
+  S.messageSearchScope = "conversation";
+  S.messageSearchPeer = target;
+  S.messageSearchPeerName = messageSearchConversationName(target, name);
+  S.messageSearchPeerAvatar = messageSearchConversationAvatar(target, avatar);
+  S.messageSearchResults = [];
+  S.messageSearchTotal = 0;
+  S.messageSearchHasMore = false;
+  S.messageSearchError = "";
+  mountMessageSearchView({ focus: false });
+  scheduleMessageSearch(0);
+  return true;
+}
+
+async function openPrivateConversation(
+  uid,
+  {
+    name = "",
+    avatar = "",
+    chatOrigin = "",
+    replaceName = false,
+    focusComposer = false,
+    refreshList = true,
+    seedMessages = [],
+  } = {}
+) {
+  const target = String(uid || "").trim();
+  if (!target) throw new Error("缺少对方 UID");
+  if (!(await ensurePrivateChatEntryPermission(target, chatOrigin))) {
+    toast("当前无法打开与该用户的私聊", "error", 4200);
+    return false;
+  }
+  if (target !== S.activePeer) {
+    S.imComposerPanel = "";
+    setChatComposerDraft($("im-text")?.value ?? S.imComposerDraft);
+    S.imVoiceMode = false;
+    finishVoiceRecording(null, true);
+    closeFlashViewer();
+  }
+  S.activePeer = target;
+  restoreChatComposerDraft(target);
+  restoreChatMessageQuote(target);
+  const conversation = ensureConversationForPeer(target, {
+    name,
+    avatar,
+    replaceName,
+  });
+  S.activePeerName = conversationEntryDisplayName(conversation, name, target);
+  if (Array.isArray(seedMessages) && seedMessages.length) {
+    mergePeerMessages(target, seedMessages.map((entry) => ({ ...entry, peer: target })));
+  }
+  markConversationRead(target);
+  closeProfileDialog();
+  if (S.route !== "msg") {
+    go("msg", { force: true });
+  } else {
+    void loadConversationMessages(target);
+    refreshMessageConversationRegion({ focusComposer, refreshList });
+  }
+  return true;
+}
+
+function chatMessageRowByIdentity({ id = "", messageRandom = "", sequence = "" } = {}) {
+  const targetId = String(id || "");
+  const targetRandom = String(messageRandom || "");
+  const targetSequence = String(sequence || "");
+  const rows = [...document.querySelectorAll("#im-log .chat-message-row")];
+  return (
+    (targetId && rows.find((row) => row.dataset.messageId === targetId)) ||
+    (targetSequence && rows.find((row) => row.dataset.messageSequence === targetSequence)) ||
+    (targetRandom && rows.find((row) => row.dataset.messageRandom === targetRandom)) ||
+    null
+  );
+}
+
+function highlightSearchTargetMessage(
+  identity,
+  { scroll = true, behavior = "smooth" } = {}
+) {
+  const target = chatMessageRowByIdentity(identity);
+  if (!target) return false;
+  document.querySelectorAll("#im-log .chat-message-row.is-search-target").forEach((row) =>
+    row.classList.remove("is-search-target")
+  );
+  target.classList.remove("is-search-target");
+  void target.offsetWidth;
+  target.classList.add("is-search-target");
+  if (scroll) target.scrollIntoView({ behavior, block: "center" });
+  setTimeout(() => target.classList.remove("is-search-target"), 2400);
+  return true;
+}
+
+async function loadMessageSearchContext(entry, { suppressBottom = false } = {}) {
+  const peer = String(entry?.peer || "").trim();
+  const timestamp = messageTimestampMs(entry);
+  if (!peer || !timestamp) return false;
+  const params = new URLSearchParams({
+    peer,
+    around: new Date(timestamp).toISOString(),
+    limit: "60",
+  });
+  const { data, ok } = await api(`/api/archive/messages?${params.toString()}`, {
+    timeout: 8000,
+  });
+  if (!ok || data?.ok === false) return false;
+  const context = itemsOf(data).map((item) =>
+    timMessageEntry(
+      { ...item, source: "archive" },
+      peer,
+      String(S.user?.uid || S.user?.id || "")
+    )
+  );
+  if (!context.length) return false;
+  const changed = mergePeerMessages(peer, context);
+  if (changed && String(S.activePeer || "") === peer) {
+    refreshChatLog({ suppressBottom });
+  }
+  return changed;
+}
+
+async function jumpToMessageSearchResult(index) {
+  const position = Number(index);
+  const entry = Number.isInteger(position) ? S.messageSearchResults[position] : null;
+  if (!entry) throw new Error("搜索结果已失效，请重新搜索");
+  const peer = String(entry.peer || "").trim();
+  if (!peer) throw new Error("搜索结果缺少聊天对象");
+  const identity = {
+    id: String(entry.id || ""),
+    messageRandom: String(entry.messageRandom || timMessageRandom(entry) || ""),
+    sequence: String(entry.sequence || timMessageSequence(entry) || ""),
+  };
+  const opened = await openPrivateConversation(peer, {
+    name: entry.peerName,
+    avatar: entry.peerAvatar,
+    chatOrigin: "conversation",
+    replaceName: !conversationNameIsPlaceholder(entry.peerName, peer),
+    focusComposer: false,
+    refreshList: true,
+    seedMessages: [entry],
+  });
+  if (!opened) return false;
+  closeMessageSearch();
+  cancelChatLogAutoScroll();
+  await loadMessageSearchContext(entry, { suppressBottom: true }).catch(() => false);
+  if (String(S.activePeer || "") !== peer) return false;
+  refreshChatLog({ suppressBottom: true });
+  await new Promise((resolve) => requestAnimationFrame(resolve));
+  cancelChatLogAutoScroll();
+  const found = highlightSearchTargetMessage(identity, { behavior: "auto" });
+  if (!found) {
+    toast("已打开对应聊天，但原消息暂时无法定位", "error", 3600);
+    return false;
+  }
+  setTimeout(() => {
+    if (String(S.activePeer || "") === peer) {
+      highlightSearchTargetMessage(identity, { scroll: false });
+    }
+  }, 500);
+  return true;
 }
 
 function clearConversationBatchDeleteConfirmation() {
@@ -8153,16 +8955,16 @@ function chatPaneHtml() {
   }
   const conversation = activeConversation() || {};
   const canSendPrivateMessage = canStartPrivateChat(S.activePeer);
-  return `<div class="chat-head"><button type="button" class="utility-btn mobile-only" data-action="close-conversation">返回</button>${expandListButton}<div><h2>${esc(
+  return `<div class="chat-head"><button type="button" class="utility-btn mobile-only" data-action="close-conversation">返回</button>${expandListButton}<div class="chat-head-copy"><h2>${esc(
     S.activePeerName || `用户 ${S.activePeer}`
   )}</h2><p class="chat-peer-presence">${presenceBadgeHtml(
     S.activePeer,
     { ...(conversation.user || {}), ...conversation },
     "presence-compact",
     true
-  )}</p></div><button type="button" class="utility-btn chat-profile" data-action="open-profile" data-uid="${esc(
+  )}</p></div><div class="chat-head-actions"><button type="button" class="utility-btn" data-action="open-conversation-message-search">查找聊天记录</button><button type="button" class="utility-btn chat-profile" data-action="open-profile" data-uid="${esc(
     S.activePeer
-  )}">资料</button></div>
+  )}">资料</button></div></div>
     <div class="chat-log ui-scrollbar" id="im-log" aria-live="polite">${chatLogHtml()}</div>
     ${
       isSystemCustomerServicePeer(S.activePeer)
@@ -11451,13 +12253,13 @@ async function pageMessages(signal) {
     S.activePeerName = active.nickname || active.peer_name || active.user?.nickname || `用户 ${S.activePeer}`;
   }
   if (S.activePeer) void loadConversationMessages(S.activePeer);
-  return `<div class="message-page${S.activePeer ? " conversation-open" : ""}"><section class="conversation-layout${S.activePeer ? " has-active" : ""}${S.conversationListCollapsed ? " is-list-collapsed" : ""}">
+  return `<div class="message-page${S.activePeer ? " conversation-open" : ""}"><section class="conversation-layout${S.activePeer ? " has-active" : ""}${S.conversationListCollapsed ? " is-list-collapsed" : ""}"${S.messageSearchOpen ? ' inert aria-hidden="true"' : ""}>
       <aside class="conversation-list-pane" aria-label="聊天列表">
         <div data-conversation-list-controls>${conversationListControlsHtml()}</div>
         <div class="conversation-list ui-scrollbar" id="conversation-list">${conversationListHtml()}</div>
       </aside>
       <div class="chat-pane">${chatPaneHtml()}</div>
-    </section><div id="im-info" class="result-panel"></div></div>`;
+    </section>${S.messageSearchOpen ? messageSearchViewHtml() : ""}<div id="im-info" class="result-panel"></div></div>`;
 }
 
 function matchHistoryModeLabel(mode) {
@@ -14095,6 +14897,7 @@ async function logout() {
     S.imArchiveLoadedPeers.clear();
     S.imMessageOlderLoadingPeers.clear();
     S.imMessageHistoryExhaustedPeers.clear();
+    resetMessageSearchState();
     S.imComposerPanel = "";
     setChatComposerDraft("");
     S.imComposerDrafts.clear();
@@ -14584,6 +15387,38 @@ async function handleAction(action, button) {
     refreshChatComposerKeepingText();
     return;
   }
+  if (action === "open-global-message-search") {
+    openMessageSearch("global");
+    return;
+  }
+  if (action === "open-conversation-message-search") {
+    openMessageSearch("conversation");
+    return;
+  }
+  if (action === "message-search-back") {
+    messageSearchBack();
+    return;
+  }
+  if (action === "clear-message-search") {
+    clearMessageSearchFilters();
+    return;
+  }
+  if (action === "set-message-search-kind") {
+    setMessageSearchKind(String(button.dataset.kind || "all"));
+    return;
+  }
+  if (action === "open-message-search-group") {
+    openMessageSearchGroup(
+      button.dataset.uid,
+      button.dataset.name,
+      button.dataset.avatar
+    );
+    return;
+  }
+  if (action === "jump-to-message-search-result") {
+    await jumpToMessageSearchResult(button.dataset.resultIndex);
+    return;
+  }
   if (action === "open-chat" || action === "select-conversation") {
     const uid = String(button.dataset.uid || "").trim();
     if (!uid) throw new Error("缺少对方 UID");
@@ -14855,6 +15690,12 @@ function formValues(form) {
 async function handleProductForm(form, submitter) {
   const kind = form.dataset.form;
   const values = formValues(form);
+  if (kind === "message-search") {
+    S.messageSearchQuery = String(values.query || "");
+    S.messageSearchDate = String(values.date || S.messageSearchDate || "");
+    stopMessageSearchRequest();
+    return runMessageSearch();
+  }
   if (kind === "moment-search") {
     S.momentsSearch = String(values.query || "").trim();
     return switchMomentsTab(S.momentsTab, { force: true });
@@ -15154,6 +15995,7 @@ function completeBrowserLogin(data) {
   S.imArchiveLoadedPeers.clear();
   S.imMessageOlderLoadingPeers.clear();
   S.imMessageHistoryExhaustedPeers.clear();
+  resetMessageSearchState();
   S.imAudioSourceRefreshes.clear();
   S.imVoiceTranscriptLoading.clear();
   S.conversations = [];
@@ -15291,6 +16133,12 @@ document.addEventListener("input", (event) => {
     if (resized && S.route === "msg" && S.activePeer) requestAnimationFrame(() => scrollChatLogToBottom());
     return;
   }
+  const messageSearchInput = event.target.closest && event.target.closest("#message-search-input");
+  if (messageSearchInput) {
+    S.messageSearchQuery = String(messageSearchInput.value || "");
+    scheduleMessageSearch();
+    return;
+  }
   const input = event.target.closest && event.target.closest("#friend-filter");
   if (!input) return;
   const query = input.value.trim().toLowerCase();
@@ -15332,6 +16180,12 @@ document.addEventListener("focusout", (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  const messageSearchDate = event.target.closest && event.target.closest("#message-search-date");
+  if (messageSearchDate) {
+    S.messageSearchDate = String(messageSearchDate.value || "");
+    scheduleMessageSearch(0);
+    return;
+  }
   const matchInput = event.target.closest && event.target.closest(".match-filter-form input");
   if (matchInput) {
     const form = matchInput.closest("form");
@@ -15457,6 +16311,11 @@ document.addEventListener("keyup", (event) => {
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     if (event.repeat || event.isComposing) return;
+    if (S.messageSearchOpen && document.querySelector(".message-search-view")) {
+      event.preventDefault();
+      messageSearchBack();
+      return;
+    }
     if (hasOpenDialogSurface()) return;
     const hadOpenMessageActions = Boolean(document.querySelector(".chat-message-row.is-actions-open"));
     closeChatMessageActions();

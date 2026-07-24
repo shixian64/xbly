@@ -38,6 +38,14 @@ from .models import (
 ModelT = TypeVar("ModelT")
 
 
+def _message_search_index_pattern(value: str) -> str:
+    """Match the database byte-token function, including for one-character terms."""
+
+    normalized = str(value or "").strip().lower()
+    encoded = "".join(f"x{byte:02x}" for byte in normalized.encode("utf-8"))
+    return f"%{encoded}%"
+
+
 class Repository(Generic[ModelT]):
     model: type[ModelT]
 
@@ -316,6 +324,23 @@ class ConversationRepository(Repository[Conversation]):
         )
         return list(self.db.scalars(stmt))
 
+    def list_by_ids(
+        self,
+        owner_user_id: uuid.UUID,
+        conversation_ids: list[uuid.UUID],
+    ) -> list[Conversation]:
+        ids = list(dict.fromkeys(conversation_ids))
+        if not ids:
+            return []
+        return list(
+            self.db.scalars(
+                select(Conversation).where(
+                    Conversation.owner_user_id == owner_user_id,
+                    Conversation.id.in_(ids[:500]),
+                )
+            )
+        )
+
     def list_for_peers(
         self,
         owner_user_id: uuid.UUID,
@@ -467,6 +492,117 @@ class MessageRepository(Repository[Message]):
             stmt = stmt.where(Message.occurred_at < before)
         stmt = stmt.order_by(Message.occurred_at.desc()).limit(min(limit, 500))
         return list(self.db.scalars(stmt))
+
+    def list_around_conversation(
+        self,
+        owner_user_id: uuid.UUID,
+        conversation_id: uuid.UUID,
+        *,
+        around: datetime,
+        limit: int = 60,
+    ) -> list[Message]:
+        bounded_limit = min(max(1, int(limit)), 200)
+        before_limit = bounded_limit // 2 + bounded_limit % 2
+        after_limit = bounded_limit // 2
+        base_conditions = (
+            Message.owner_user_id == owner_user_id,
+            Message.conversation_id == conversation_id,
+        )
+        before = list(
+            self.db.scalars(
+                select(Message)
+                .where(*base_conditions, Message.occurred_at <= around)
+                .order_by(Message.occurred_at.desc(), Message.created_at.desc())
+                .limit(before_limit)
+            )
+        )
+        after = (
+            list(
+                self.db.scalars(
+                    select(Message)
+                    .where(*base_conditions, Message.occurred_at > around)
+                    .order_by(Message.occurred_at.asc(), Message.created_at.asc())
+                    .limit(after_limit)
+                )
+            )
+            if after_limit
+            else []
+        )
+        return sorted(
+            [*before, *after],
+            key=lambda message: (message.occurred_at, message.created_at),
+        )
+
+    def search_for_owner(
+        self,
+        owner_user_id: uuid.UUID,
+        *,
+        conversation_id: uuid.UUID | None = None,
+        query: str = "",
+        kind: str = "all",
+        occurred_from: datetime | None = None,
+        occurred_to: datetime | None = None,
+        limit: int = 200,
+    ) -> tuple[list[Message], dict[uuid.UUID, int], bool]:
+        conditions: list[Any] = [
+            Message.owner_user_id == owner_user_id,
+            Message.status != "revoked",
+            func.coalesce(Message.extra_data["revoked"].astext, "false").notin_(
+                ("true", "1")
+            ),
+        ]
+        if conversation_id is not None:
+            conditions.append(Message.conversation_id == conversation_id)
+
+        normalized_query = str(query or "").strip()
+        if normalized_query:
+            pattern = _message_search_index_pattern(normalized_query)
+            conditions.append(
+                or_(
+                    func.message_search_index_text(Message.body).like(pattern),
+                    func.message_search_media_name(Message.extra_data).like(pattern),
+                    func.message_search_quote_text(Message.extra_data).like(pattern),
+                )
+            )
+
+        if kind == "media":
+            conditions.append(Message.message_type.in_(("image", "video", "flash")))
+        elif kind == "file":
+            conditions.append(Message.message_type == "file")
+        elif kind == "link":
+            conditions.append(
+                or_(
+                    func.message_search_index_text(Message.body).like(
+                        _message_search_index_pattern("https://")
+                    ),
+                    func.message_search_index_text(Message.body).like(
+                        _message_search_index_pattern("http://")
+                    ),
+                )
+            )
+
+        if occurred_from is not None:
+            conditions.append(Message.occurred_at >= occurred_from)
+        if occurred_to is not None:
+            conditions.append(Message.occurred_at < occurred_to)
+
+        bounded_limit = min(max(1, int(limit)), 200)
+        matched_rows = list(
+            self.db.scalars(
+                select(Message)
+                .where(*conditions)
+                .order_by(Message.occurred_at.desc(), Message.created_at.desc())
+                .limit(bounded_limit + 1)
+            )
+        )
+        has_more = len(matched_rows) > bounded_limit
+        rows = matched_rows[:bounded_limit]
+        group_counts: dict[uuid.UUID, int] = {}
+        for message in rows:
+            group_counts[message.conversation_id] = (
+                group_counts.get(message.conversation_id, 0) + 1
+            )
+        return rows, group_counts, has_more
 
     def latest_for_conversations(
         self,

@@ -3,6 +3,7 @@ fastapi>=0.116,<1.0
 uvicorn>=0.35,<1.0
 python-multipart>=0.0.20,<1.0
 pydantic>=2.11,<3.0
+tzdata>=2025.2,<2027
 
 # Database and migrations
 SQLAlchemy>=2.0.41,<3.0

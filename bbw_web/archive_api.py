@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal, Optional
+from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 
@@ -16,6 +17,8 @@ from bbw_web import bff_server as legacy
 
 
 router = APIRouter(prefix="/api/archive", tags=["archive"])
+MESSAGE_SEARCH_KINDS = ("all", "media", "file", "link")
+MESSAGE_SEARCH_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 class MediaReport(BaseModel):
@@ -199,6 +202,65 @@ def _local_public_profile_map(db: Any, peers: list[str]) -> dict[str, dict[str, 
         if len(public_profile) > 1:
             profiles[peer] = public_profile
     return profiles
+
+
+def _conversation_search_fields(
+    conversation: Any,
+    local_profile: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    metadata = (
+        dict(conversation.extra_data)
+        if isinstance(conversation.extra_data, dict)
+        else {}
+    )
+    user = metadata.get("user") if isinstance(metadata.get("user"), dict) else {}
+    profile = local_profile if isinstance(local_profile, dict) else {}
+    peer = str(conversation.peer_upstream_uid or "").strip()
+    nickname = next(
+        (
+            value
+            for value in (
+                str(profile.get("nickname") or profile.get("name") or "").strip(),
+                str(conversation.title or "").strip(),
+                str(user.get("nickname") or user.get("name") or "").strip(),
+            )
+            if not _conversation_name_is_placeholder(value, peer)
+        ),
+        f"用户 {peer}" if peer else "聊天",
+    )
+    avatar = str(
+        profile.get("avatar")
+        or profile.get("portrait")
+        or metadata.get("avatar")
+        or user.get("avatar")
+        or user.get("portrait")
+        or ""
+    ).strip()
+    return {
+        "peer_id": peer,
+        "conversation_user": peer,
+        "conversation_name": nickname,
+        "nickname": nickname,
+        "conversation_avatar": avatar,
+        "avatar": avatar,
+    }
+
+
+def _message_search_day_window(value: str) -> tuple[datetime | None, datetime | None]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None, None
+    try:
+        selected = date.fromisoformat(raw)
+        local_start = datetime.combine(
+            selected,
+            time.min,
+            tzinfo=MESSAGE_SEARCH_TIMEZONE,
+        )
+        local_end = local_start + timedelta(days=1)
+        return local_start.astimezone(UTC), local_end.astimezone(UTC)
+    except (OverflowError, ValueError) as error:
+        raise HTTPException(status_code=400, detail="搜索日期格式不正确") from error
 
 
 def _archived_message_item(message: Any) -> dict[str, Any]:
@@ -455,6 +517,7 @@ def archived_messages(
     peer: str,
     limit: int = 200,
     before: datetime | None = None,
+    around: datetime | None = None,
 ) -> dict[str, Any]:
     persistence = request.app.state.persistence
     identity = persistence.require_identity(_sid(request))
@@ -481,16 +544,31 @@ def archived_messages(
         )
         if conversation is None:
             return {"ok": True, "items": [], "list": [], "count": 0}
-        rows = MessageRepository(db).list_for_conversation(
-            identity.user_id,
-            conversation.id,
-            before=before,
-            limit=bounded_limit,
-        )
+        repository = MessageRepository(db)
+        if around is not None:
+            rows = repository.list_around_conversation(
+                identity.user_id,
+                conversation.id,
+                around=around,
+                limit=bounded_limit,
+            )
+            ordered_rows = rows
+        else:
+            rows = repository.list_for_conversation(
+                identity.user_id,
+                conversation.id,
+                before=before,
+                limit=bounded_limit,
+            )
+            ordered_rows = list(reversed(rows))
         items = _deduplicate_archived_message_items(
-            [_archived_message_item(message) for message in reversed(rows)]
+            [_archived_message_item(message) for message in ordered_rows]
         )
-    next_before = rows[-1].occurred_at.isoformat() if len(rows) == bounded_limit else ""
+    next_before = (
+        rows[-1].occurred_at.isoformat()
+        if around is None and len(rows) == bounded_limit
+        else ""
+    )
     return {
         "ok": True,
         "items": items,
@@ -498,6 +576,125 @@ def archived_messages(
         "count": len(items),
         "has_more": bool(next_before),
         "next_before": next_before,
+        "context": around is not None,
+    }
+
+
+@router.get("/search")
+def archived_message_search(
+    request: Request,
+    q: str = Query(default="", max_length=120),
+    peer: str = Query(default="", max_length=128),
+    kind: Literal["all", "media", "file", "link"] = "all",
+    search_date: str = Query(default="", alias="date", max_length=10),
+    limit: int = Query(default=200, ge=1, le=200),
+) -> dict[str, Any]:
+    persistence = request.app.state.persistence
+    identity = persistence.require_identity(_sid(request))
+    if identity is None:
+        raise HTTPException(status_code=401, detail="请先登录")
+    if not persistence.rate_limit(
+        f"archive-message-search:{identity.user_id}", limit=120, window_seconds=60
+    ):
+        raise HTTPException(status_code=429, detail="聊天记录搜索过于频繁")
+
+    normalized_query = str(q or "").strip()
+    target = str(peer or "").strip()
+    if target and (
+        len(target) > 128
+        or any(ord(char) < 33 for char in target)
+        or target == str(identity.upstream_uid or "").strip()
+    ):
+        raise HTTPException(status_code=400, detail="聊天对象 UID 不合法")
+    if kind not in MESSAGE_SEARCH_KINDS:
+        raise HTTPException(status_code=400, detail="消息类型筛选不合法")
+    occurred_from, occurred_to = _message_search_day_window(search_date)
+    if not normalized_query and kind == "all" and occurred_from is None:
+        return {
+            "ok": True,
+            "items": [],
+            "list": [],
+            "groups": [],
+            "count": 0,
+            "total": 0,
+            "has_more": False,
+        }
+
+    with session_scope() as db:
+        conversation_repository = ConversationRepository(db)
+        conversation = None
+        if target:
+            conversation = conversation_repository.get_by_peer(identity.user_id, target)
+            if conversation is None:
+                return {
+                    "ok": True,
+                    "items": [],
+                    "list": [],
+                    "groups": [],
+                    "count": 0,
+                    "total": 0,
+                    "has_more": False,
+                }
+        rows, group_counts, has_more = MessageRepository(db).search_for_owner(
+            identity.user_id,
+            conversation_id=conversation.id if conversation is not None else None,
+            query=normalized_query,
+            kind=kind,
+            occurred_from=occurred_from,
+            occurred_to=occurred_to,
+            limit=limit,
+        )
+        conversation_ids = list(dict.fromkeys(row.conversation_id for row in rows))
+        conversations = conversation_repository.list_by_ids(
+            identity.user_id,
+            conversation_ids,
+        )
+        conversation_map = {item.id: item for item in conversations}
+        local_profiles = _local_public_profile_map(
+            db,
+            [str(item.peer_upstream_uid or "") for item in conversations],
+        )
+
+        items: list[dict[str, Any]] = []
+        groups: dict[str, dict[str, Any]] = {}
+        for message in rows:
+            current_conversation = conversation_map.get(message.conversation_id)
+            if current_conversation is None:
+                continue
+            peer_uid = str(current_conversation.peer_upstream_uid or "").strip()
+            if not peer_uid:
+                continue
+            conversation_fields = _conversation_search_fields(
+                current_conversation,
+                local_profiles.get(peer_uid),
+            )
+            item = {
+                **_archived_message_item(message),
+                **conversation_fields,
+                "conversation_id": str(
+                    current_conversation.upstream_conversation_id or f"C2C{peer_uid}"
+                ),
+                "match_count": int(group_counts.get(message.conversation_id, 0)),
+            }
+            items.append(item)
+            if peer_uid not in groups:
+                groups[peer_uid] = {
+                    **conversation_fields,
+                    "conversation_id": item["conversation_id"],
+                    "count": item["match_count"],
+                    "latest_at": item["timestamp"],
+                    "preview": _message_preview(message),
+                }
+
+    group_items = list(groups.values())
+    return {
+        "ok": True,
+        "items": items,
+        "list": items,
+        "groups": group_items,
+        "count": len(items),
+        "total": len(items),
+        "has_more": has_more,
     }
 
 
