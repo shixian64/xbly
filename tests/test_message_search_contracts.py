@@ -178,6 +178,22 @@ class MessageSearchBackendTests(unittest.TestCase):
         self.assertIn("CREATE INDEX CONCURRENTLY", migration)
         self.assertIn("DROP INDEX CONCURRENTLY IF EXISTS", migration)
 
+    def test_message_search_wrapper_functions_are_schema_qualified(self) -> None:
+        migration = (
+            ROOT
+            / "migrations"
+            / "versions"
+            / "20260724_0008_schema_qualify_message_search_functions.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('revision: str = "20260724_0008"', migration)
+        self.assertIn(
+            'down_revision: Union[str, Sequence[str], None] = "20260723_0007"',
+            migration,
+        )
+        self.assertEqual(migration.count("SELECT {helper}("), 2)
+        self.assertIn('"public.message_search_index_text"', migration)
+
 
 class MessageSearchFrontendContracts(unittest.TestCase):
     def _app_js(self) -> str:
