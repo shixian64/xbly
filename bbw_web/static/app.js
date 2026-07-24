@@ -32,7 +32,12 @@ const SOCIAL_TABS = ["friends", "apply", "follows", "fans", "visitors", "black"]
 // Keep the voice matching implementation and vendor files for later reuse, but
 // do not expose or initialize the feature while this switch is disabled.
 const VOICE_MATCH_ENABLED = false;
-const MATCH_HUB_TABS = ["match", "bottle"];
+const MATCH_HUB_TAB_ITEMS = [
+  ["match", "匹配"],
+  ...(VOICE_MATCH_ENABLED ? [["voice", "语音匹配"]] : []),
+  ["bottle", "漂流瓶"],
+];
+const MATCH_HUB_TABS = MATCH_HUB_TAB_ITEMS.map(([id]) => id);
 const RONG_IM_SDK_SRC = "/static/vendor/rong/rong-imlib-5.9.5.js";
 const RONG_RTC_SDK_SRC = "/static/vendor/rong/rong-rtc-5.7.2.js";
 const RONG_CALL_SDK_SRC = "/static/vendor/rong/rong-call-5.2.10.js";
@@ -12806,11 +12811,10 @@ async function pageBottle(signal) {
 
 function matchHubHeader(tab) {
   const activeTab = normalizeMatchTab(tab);
-  const tabs = [
-    ["match", "匹配"],
-    ["bottle", "漂流瓶"],
-  ];
-  return `<section class="match-hub-header"><div class="match-hub-copy"><span>相遇方式</span><strong>选择匹配或漂流瓶</strong><p>切换标签，只更新下方内容。</p></div><nav class="match-hub-tabs" role="tablist" aria-label="相遇方式">${tabs
+  const choiceLabel = VOICE_MATCH_ENABLED ? "选择匹配、语音匹配或漂流瓶" : "选择匹配或漂流瓶";
+  return `<section class="match-hub-header"><div class="match-hub-copy"><span>相遇方式</span><strong>${choiceLabel}</strong><p>切换标签，只更新下方内容。</p></div><nav class="match-hub-tabs${
+    VOICE_MATCH_ENABLED ? " voice-enabled" : ""
+  }" role="tablist" aria-label="相遇方式">${MATCH_HUB_TAB_ITEMS
     .map(
       ([id, label]) => `<button type="button" id="match-hub-tab-${id}" role="tab" class="match-hub-tab${activeTab === id ? " on" : ""}" aria-selected="${
         activeTab === id
@@ -14131,7 +14135,7 @@ function cleanupDisabledVoiceMatchQueue() {
   const generation = S.sessionGeneration;
   const request = api("/api/match/voice/cancel", {
     method: "POST",
-    body: "{}",
+    body: JSON.stringify({ force_remote: true }),
     timeout: 6000,
     authOptional: true,
   })
@@ -17088,7 +17092,10 @@ window.addEventListener("pagehide", (event) => {
       void fetch("/api/heartbeat/stop", { ...options, body: "{}" }).catch(() => {});
     }
     if (!event.persisted && !VOICE_MATCH_ENABLED) {
-      void fetch("/api/match/voice/cancel", { ...options, body: "{}" }).catch(() => {});
+      void fetch("/api/match/voice/cancel", {
+        ...options,
+        body: JSON.stringify({ force_remote: true }),
+      }).catch(() => {});
     } else if (VOICE_MATCH_ENABLED) {
       const voiceState = voiceMatchServerState();
       if (!event.persisted && !S.voiceMatchSession && voiceState.state !== "idle") {

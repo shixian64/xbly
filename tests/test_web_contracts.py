@@ -2510,8 +2510,39 @@ class VoiceMatchBffContractTests(unittest.TestCase):
         self.assertEqual(harness.response[0], 200)
         self.assertTrue(harness.response[1]["ok"])
         self.assertFalse(harness.response[1]["remote_required"])
+        self.assertFalse(harness.response[1]["forced_remote"])
         self.assertEqual(harness.response[1]["state"], "idle")
         self.assertIsNone(harness.response[1]["target"])
+
+    def test_voice_force_cancel_removes_remote_queue_when_local_state_is_missing(self) -> None:
+        calls = []
+        removed = ApiResult(True, 200, "", data=None, kind="empty")
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(
+                session=SimpleNamespace(uid="42"),
+                match=SimpleNamespace(
+                    cancel_voice=lambda **kwargs: calls.append(kwargs) or removed
+                ),
+            ),
+            native=SimpleNamespace(),
+            lock=threading.RLock(),
+            match_pool_online_list_enabled=False,
+            nearby_custom_city_enabled=False,
+            voice_match_state={},
+        )
+
+        harness = self._harness(
+            "/api/match/voice/cancel", web_user, body={"force_remote": True}
+        )
+        bff_server.Handler.do_POST(harness)
+
+        self.assertEqual(harness.response[0], 200)
+        self.assertTrue(harness.response[1]["ok"])
+        self.assertTrue(harness.response[1]["remote_required"])
+        self.assertTrue(harness.response[1]["remote_ok"])
+        self.assertTrue(harness.response[1]["forced_remote"])
+        self.assertEqual(harness.response[1]["state"], "idle")
+        self.assertEqual(calls, [{"id_": "42"}])
 
 
 class PrivateMessagePermissionBffContractTests(unittest.TestCase):
@@ -3601,7 +3632,9 @@ class SocialFrontendContractTests(unittest.TestCase):
         ):
             self.assertIn(retained, app_js)
         self.assertIn("const VOICE_MATCH_ENABLED = false;", app_js)
-        self.assertIn('const MATCH_HUB_TABS = ["match", "bottle"]', app_js)
+        self.assertIn("const MATCH_HUB_TAB_ITEMS = [", app_js)
+        self.assertIn('...(VOICE_MATCH_ENABLED ? [["voice", "语音匹配"]] : [])', app_js)
+        self.assertIn("const MATCH_HUB_TABS = MATCH_HUB_TAB_ITEMS.map", app_js)
         self.assertIn('if (!VOICE_MATCH_ENABLED) return Promise.reject(new Error("语音匹配已停用"));', app_js)
         self.assertIn('if (!VOICE_MATCH_ENABLED) throw new Error("语音匹配已停用");', app_js)
         self.assertIn("S.matchTab = normalizeMatchTab(requestedMatchTab);", app_js)
@@ -3609,15 +3642,16 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("function cleanupDisabledVoiceMatchQueue()", app_js)
         self.assertIn("voiceMatchDisabledCleanupGeneration: -1", app_js)
         self.assertIn("S.voiceMatchDisabledCleanupGeneration === S.sessionGeneration", app_js)
-        self.assertIn('api("/api/match/voice/cancel", {', app_js)
+        self.assertIn('body: JSON.stringify({ force_remote: true })', app_js)
         self.assertIn("if (!VOICE_MATCH_ENABLED) tasks.push(cleanupDisabledVoiceMatchQueue());", app_js)
         self.assertIn("else await cleanupDisabledVoiceMatchQueue();", app_js)
-        self.assertIn('void fetch("/api/match/voice/cancel", { ...options, body: "{}" })', app_js)
+        self.assertGreaterEqual(app_js.count("JSON.stringify({ force_remote: true })"), 2)
         match_header = app_js.split("function matchHubHeader", 1)[1].split(
             "function normalizeMomentsTab", 1
         )[0]
-        self.assertNotIn('["voice", "语音匹配"]', match_header)
-        self.assertNotIn("语音匹配或漂流瓶", match_header)
+        self.assertIn("MATCH_HUB_TAB_ITEMS", match_header)
+        self.assertIn('VOICE_MATCH_ENABLED ? " voice-enabled" : ""', match_header)
+        self.assertIn('VOICE_MATCH_ENABLED ? "选择匹配、语音匹配或漂流瓶"', match_header)
         self.assertNotIn("/static/vendor/rong/", index_html)
 
     def test_match_page_uses_responsive_preference_workbench(self) -> None:
@@ -3651,12 +3685,14 @@ class SocialFrontendContractTests(unittest.TestCase):
         match_header = app_js.split("function matchHubHeader", 1)[1].split(
             "function normalizeMomentsTab", 1
         )[0]
-        self.assertNotIn('["voice", "语音匹配"]', match_header)
+        self.assertIn("MATCH_HUB_TAB_ITEMS", match_header)
         self.assertIn(".match-stats-grid", app_css)
         self.assertIn(".match-submit", app_css)
         self.assertIn(".match-hub-tabs", app_css)
         match_tabs_css = app_css.split(".match-hub-tabs {", 1)[1].split("}", 1)[0]
         self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", match_tabs_css)
+        voice_match_tabs_css = app_css.split(".match-hub-tabs.voice-enabled {", 1)[1].split("}", 1)[0]
+        self.assertIn("grid-template-columns: repeat(3, minmax(0, 1fr))", voice_match_tabs_css)
         self.assertIn(".match-panel-loading", app_css)
         self.assertIn(".voice-match-control-card", app_css)
         self.assertIn(".voice-call-dialog", app_css)
@@ -4241,7 +4277,7 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
         self.assertIn('id: "social"', app_js)
         self.assertIn('const SOCIAL_TABS = ["friends", "apply", "follows", "fans", "visitors", "black"]', app_js)
         self.assertIn('name: "关系中心"', app_js)
-        self.assertIn('const MATCH_HUB_TABS = ["match", "bottle"]', app_js)
+        self.assertIn("const MATCH_HUB_TABS = MATCH_HUB_TAB_ITEMS.map", app_js)
         self.assertNotIn("LEGACY_MATCH_ROUTES", app_js)
         self.assertNotIn('["room", "语音房"]', app_js)
         self.assertNotIn("function pageRoom", app_js)

@@ -1221,6 +1221,10 @@ summary:focus-visible {
   backdrop-filter: blur(14px);
 }
 
+.match-hub-tabs.voice-enabled {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
 .match-hub-tab {
   min-height: 46px;
   border: 1px solid transparent;

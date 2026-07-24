@@ -4489,6 +4489,7 @@ class Handler(BaseHTTPRequestHandler):
                 # removeXiaobeiMatch returning success (the APK does not call
                 # remove after receiving a user either).  Keeping it blocked
                 # on a false remove response would prevent all later matches.
+                force_remote = _as_bool(data.get("force_remote"))
                 with u.lock:
                     stored = getattr(u, "voice_match_state", None)
                     stored_state = (
@@ -4496,7 +4497,9 @@ class Handler(BaseHTTPRequestHandler):
                         if isinstance(stored, dict)
                         else "idle"
                     )
-                    if stored_state in {"idle", "matched"}:
+                    if stored_state == "matched" or (
+                        stored_state == "idle" and not force_remote
+                    ):
                         state = _set_voice_match_state(u, "idle")
                         return self.ok(
                             {
@@ -4510,6 +4513,7 @@ class Handler(BaseHTTPRequestHandler):
                                 "error": None,
                                 "remote_ok": True,
                                 "remote_required": False,
+                                "forced_remote": False,
                                 **state,
                             }
                         )
@@ -4529,6 +4533,7 @@ class Handler(BaseHTTPRequestHandler):
                         "error": None if remote.get("ok") else "服务端取消状态未确认，请留意后续来电",
                         "remote_ok": bool(remote.get("ok")),
                         "remote_required": True,
+                        "forced_remote": force_remote,
                         **state,
                     },
                     200 if remote.get("ok") else 502,
