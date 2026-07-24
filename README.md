@@ -248,7 +248,8 @@ py -3 -m uvicorn bbw_web.api:app `
 
 - 一个已经接入 Cloudflare DNS 代理的域名。
 - 一个保持私有的 Cloudflare R2 Bucket。
-- 仅限该 Bucket 的 R2 Access Key ID 和 Secret Access Key。
+- 仅限该 Bucket、权限为 **Object Read & Write** 的 R2 Access Key ID 和
+  Secret Access Key；只读密钥无法归档或清理媒体。
 - 当前有效的腾讯 IM Secret Key 与 RoomKit Business Token。
 
 ### 1. 获取项目并填写非敏感配置

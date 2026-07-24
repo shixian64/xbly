@@ -101,14 +101,14 @@ else
 fi
 
 if [[ ! -s "${SECRETS_DIR}/r2_access_key_id" ]]; then
-    value="$(read_required_secret R2_ACCESS_KEY_ID '请输入 Cloudflare R2 Access Key ID: ')"
+    value="$(read_required_secret R2_ACCESS_KEY_ID '请输入具备 Object Read & Write 权限的 Cloudflare R2 Access Key ID: ')"
     write_if_missing r2_access_key_id "$value"
 else
     printf '保留已有 secret: %s\n' r2_access_key_id
 fi
 
 if [[ ! -s "${SECRETS_DIR}/r2_secret_access_key" ]]; then
-    value="$(read_required_secret R2_SECRET_ACCESS_KEY '请输入 Cloudflare R2 Secret Access Key: ')"
+    value="$(read_required_secret R2_SECRET_ACCESS_KEY '请输入具备 Object Read & Write 权限的 Cloudflare R2 Secret Access Key: ')"
     write_if_missing r2_secret_access_key "$value"
 else
     printf '保留已有 secret: %s\n' r2_secret_access_key

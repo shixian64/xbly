@@ -268,6 +268,71 @@ class MediaArchiveFailureTests(unittest.TestCase):
         self.assertIsNone(row.locked_until)
         self.assertIn("configuration is invalid", row.last_error)
 
+    def test_historical_configuration_failures_recover_only_after_write_delete_probe(self) -> None:
+        settings = SimpleNamespace(redis_prefix="bbw")
+
+        class FakeRedis:
+            def __init__(self):
+                self.values = {}
+
+            def get(self, key):
+                return self.values.get(key)
+
+            def set(self, key, value, **_kwargs):
+                self.values[key] = value
+                return True
+
+        connection = FakeRedis()
+        storage = SimpleNamespace(verify_write_delete=lambda: True)
+        with (
+            patch.object(jobs, "_has_failed_media_configuration_outboxes", return_value=True),
+            patch.object(jobs, "R2Storage", return_value=storage),
+            patch.object(
+                jobs,
+                "_recover_failed_media_configuration_outboxes",
+                return_value=20,
+            ) as recover,
+        ):
+            recovered = jobs._maybe_recover_failed_media_configuration_outboxes(
+                settings,
+                connection,
+            )
+
+        self.assertEqual(recovered, 20)
+        recover.assert_called_once_with(limit=20)
+        self.assertEqual(connection.values["bbw:media:r2-write-delete-ready"], "1")
+
+    def test_failed_write_delete_probe_keeps_historical_failures_paused(self) -> None:
+        settings = SimpleNamespace(redis_prefix="bbw")
+
+        class FakeRedis:
+            def get(self, _key):
+                return None
+
+            def set(self, _key, _value, **_kwargs):
+                return True
+
+        storage = SimpleNamespace(
+            verify_write_delete=lambda: (_ for _ in ()).throw(
+                RuntimeError("write denied")
+            )
+        )
+        with (
+            patch.object(jobs, "_has_failed_media_configuration_outboxes", return_value=True),
+            patch.object(jobs, "R2Storage", return_value=storage),
+            patch.object(
+                jobs,
+                "_recover_failed_media_configuration_outboxes",
+            ) as recover,
+        ):
+            recovered = jobs._maybe_recover_failed_media_configuration_outboxes(
+                settings,
+                FakeRedis(),
+            )
+
+        self.assertEqual(recovered, 0)
+        recover.assert_not_called()
+
 
 class FlashRevealPersistenceTests(unittest.TestCase):
     def test_cached_reveal_checks_acknowledged_and_reads_pending_atomically(self) -> None:

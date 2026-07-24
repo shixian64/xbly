@@ -158,6 +158,25 @@ class R2Storage:
     def delete(self, key: str) -> None:
         self.client.delete_object(Bucket=self.bucket, Key=key)
 
+    def verify_write_delete(self) -> bool:
+        """Verify that the configured credentials can both write and delete.
+
+        ``HeadBucket`` also succeeds for read-only R2 tokens, which is not
+        sufficient for media archival.  Use one stable, empty probe object so
+        a token that can write but cannot delete leaves at most one harmless
+        object for a later successful probe to remove.
+        """
+
+        key = "health/media-archive-write-delete-probe"
+        self.upload_bytes(
+            key=key,
+            data=b"",
+            content_type="application/octet-stream",
+            metadata={"probe": "write-delete"},
+        )
+        self.delete(key)
+        return True
+
     def health(self) -> bool:
         self.client.head_bucket(Bucket=self.bucket)
         return True

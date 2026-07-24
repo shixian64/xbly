@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import socket
@@ -72,6 +73,27 @@ SYNC_STREAM = "chat-history"
 MEDIA_OPERATION = "media.archive"
 MEDIA_MAX_ATTEMPTS = 8
 MEDIA_CONFIGURATION_ALERT_INTERVAL = MEDIA_MAX_ATTEMPTS
+MEDIA_CONFIGURATION_PROBE_SECONDS = 300
+MEDIA_CONFIGURATION_READY_SECONDS = 900
+MEDIA_CONFIGURATION_ERROR_MARKERS = (
+    "accessdenied",
+    "access denied",
+    "authorizationheadermalformed",
+    "invalidaccesskeyid",
+    "invalid access key",
+    "invalidtoken",
+    "invalid token",
+    "signaturedoesnotmatch",
+    "signature does not match",
+    "nosuchbucket",
+    "no such bucket",
+    "bucket does not exist",
+    "r2 endpoint, bucket and credentials are required",
+    "invalid endpoint",
+    "/run/secrets/r2_",
+    "/run/secrets/r2-",
+)
+LOGGER = logging.getLogger(__name__)
 DEFAULT_MEDIA_HOSTS = (
     "oss.banghua.xin",
     "*.myqcloud.com",
@@ -992,6 +1014,107 @@ def _dispatch_media_outboxes(
     return dispatched
 
 
+def _failed_media_configuration_filter():
+    return or_(
+        *(
+            OperationOutbox.last_error.ilike(f"%{marker}%")
+            for marker in MEDIA_CONFIGURATION_ERROR_MARKERS
+        )
+    )
+
+
+def _has_failed_media_configuration_outboxes() -> bool:
+    with session_scope() as db:
+        return (
+            db.scalar(
+                select(OperationOutbox.id)
+                .where(
+                    OperationOutbox.operation_type == MEDIA_OPERATION,
+                    OperationOutbox.status == "failed",
+                    OperationOutbox.last_error.is_not(None),
+                    _failed_media_configuration_filter(),
+                )
+                .limit(1)
+            )
+            is not None
+        )
+
+
+def _recover_failed_media_configuration_outboxes(*, limit: int = 20) -> int:
+    """Move historical R2 configuration failures back into durable retry."""
+
+    now = utcnow()
+    with session_scope() as db:
+        rows = list(
+            db.scalars(
+                select(OperationOutbox)
+                .where(
+                    OperationOutbox.operation_type == MEDIA_OPERATION,
+                    OperationOutbox.status == "failed",
+                    OperationOutbox.last_error.is_not(None),
+                    _failed_media_configuration_filter(),
+                )
+                .order_by(OperationOutbox.updated_at, OperationOutbox.created_at)
+                .with_for_update(skip_locked=True)
+                .limit(max(1, min(int(limit), 100)))
+            )
+        )
+        for row in rows:
+            row.status = "retry"
+            row.max_attempts = max(row.max_attempts + 1, row.attempt_count + 1)
+            row.available_at = now
+            row.locked_by = None
+            row.locked_until = None
+            row.completed_at = None
+        db.flush()
+        return len(rows)
+
+
+def _maybe_recover_failed_media_configuration_outboxes(
+    settings: Settings,
+    connection: Redis,
+    *,
+    limit: int = 20,
+) -> int:
+    """Probe R2 capabilities and revive old failures only after they work."""
+
+    if not _has_failed_media_configuration_outboxes():
+        return 0
+    prefix = str(settings.redis_prefix or "bbw").strip(": ") or "bbw"
+    ready_key = f"{prefix}:media:r2-write-delete-ready"
+    probe_key = f"{prefix}:media:r2-write-delete-probe"
+    ready = bool(connection.get(ready_key))
+    if not ready:
+        acquired = connection.set(
+            probe_key,
+            "1",
+            nx=True,
+            ex=MEDIA_CONFIGURATION_PROBE_SECONDS,
+        )
+        if not acquired:
+            return 0
+        try:
+            R2Storage(settings).verify_write_delete()
+        except Exception as exc:
+            LOGGER.warning(
+                "R2 write/delete capability unavailable; historical media retries remain paused: %s",
+                type(exc).__name__,
+            )
+            return 0
+        connection.set(
+            ready_key,
+            "1",
+            ex=MEDIA_CONFIGURATION_READY_SECONDS,
+        )
+    recovered = _recover_failed_media_configuration_outboxes(limit=limit)
+    if recovered:
+        LOGGER.warning(
+            "Recovered %d historical media outboxes after R2 write/delete verification",
+            recovered,
+        )
+    return recovered
+
+
 def archive_message_job(
     owner_user_id: str,
     external_account_id: str,
@@ -1730,11 +1853,17 @@ def schedule_due_syncs() -> dict[str, Any]:
                         error=row.last_error if row else None,
                     )
                 )
+    media_recovered = _maybe_recover_failed_media_configuration_outboxes(
+        settings,
+        connection,
+        limit=20,
+    )
     media_dispatched = _dispatch_media_outboxes(limit=20)
     return {
         "ok": True,
         "scheduled": len(scheduled),
         "queue_errors": queue_errors,
+        "media_recovered": media_recovered,
         "media_dispatched": media_dispatched,
     }
 
@@ -2628,6 +2757,13 @@ def archive_media_job(outbox_id: str) -> dict[str, Any]:
             # configuration is fixed, and periodically fail the RQ invocation
             # so exhausted configuration retries remain visible to operators.
             should_alert = _defer_outbox_configuration_error(operation_id, safe_exc)
+            LOGGER.warning(
+                "Media archival deferred for an R2 configuration error: "
+                "outbox_id=%s attempt=%d error=%s",
+                operation_id,
+                _attempt,
+                safe_error_text[:500],
+            )
             if should_alert:
                 raise RuntimeError(
                     "media archival configuration failure; durable retry remains scheduled"

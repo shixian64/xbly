@@ -173,6 +173,10 @@ bash docker/init-secrets.sh
 - 空的版本化凭据旧密钥 keyring；后续轮换会把旧主密钥写入该文件。
 - 独立手机号 HMAC 密钥和 Session HMAC 密钥。
 - 随机初始管理员密码。
+
+录入的 R2 API Token 必须限制到目标 Bucket，并选择 **Object Read &
+Write** 权限。`Object Read` 只能读取对象，媒体归档所需的 `PutObject` 和
+`DeleteObject` 都会返回 `AccessDenied`。
 - 交互录入腾讯 IM Secret Key 和 RoomKit Business Token。
 - 交互录入 R2 Access Key ID、R2 Secret Access Key。
 - 可选录入 Turnstile Secret Key。
