@@ -1,0 +1,41 @@
+name: bbw-edge
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      APP_DOMAIN: ${APP_DOMAIN:?set APP_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
+      APP_UPSTREAM: ${APP_UPSTREAM:?set APP_UPSTREAM}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${BBW_DATA_ROOT:-/var/lib/bbw}/caddy/data:/data
+      - ${BBW_DATA_ROOT:-/var/lib/bbw}/caddy/config:/config
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    ports:
+      - "80:8080"
+      - "443:8443"
+      - "443:8443/udp"
+    mem_limit: 96m
+    mem_reservation: 48m
+    cpus: 0.25
+    pids_limit: 64
+    stop_grace_period: 30s
+    logging: *default-logging

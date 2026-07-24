@@ -496,6 +496,7 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
       APP_DOMAIN: ${APP_DOMAIN:?set APP_DOMAIN}
       ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
+      APP_UPSTREAM: ${APP_UPSTREAM:-app:8000}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ${BBW_DATA_ROOT:-/var/lib/bbw}/caddy/data:/data

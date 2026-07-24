@@ -48,6 +48,40 @@ Docker 网络划分：
 - `queue`：内部队列网络，仅 Redis、App、Worker 和 Scheduler 接入；Scheduler 在网络层也无法访问 PostgreSQL。
 - `egress`：仅普通 Worker 与转码 Worker 使用的出站网络，不包含数据库公网入口；转码 Worker 只挂载 R2 凭据，不挂载数据库、应用主密钥或腾讯 IM Secret。
 
+### 2.1 通过 Tailscale 分离入口与后端
+
+需要把公网入口和业务运行环境拆到两台机器时，入口机只运行
+`compose.edge.yaml` 中的 Caddy，后端机使用 `compose.yaml` 加
+`compose.backend.yaml` 运行 App、Worker、PostgreSQL 和 Redis。
+
+入口机 `.env` 设置：
+
+```dotenv
+APP_UPSTREAM=100.83.127.12:18000
+```
+
+后端机 `.env` 设置自己的稳定 Tailscale IPv4 和监听端口：
+
+```dotenv
+BBW_TAILSCALE_IP=100.83.127.12
+BBW_BACKEND_PORT=18000
+```
+
+启动命令：
+
+```bash
+# 后端机；所需 APP_IMAGE 必须已经存在或先从镜像仓库拉取。
+docker compose -f compose.yaml -f compose.backend.yaml up -d --no-build
+
+# 入口机。
+docker compose -f compose.edge.yaml up -d --no-build
+```
+
+后端应用端口只绑定 Tailscale 地址，不能发布到公网或局域网地址。Tailnet
+ACL 应进一步限制为仅允许入口机访问该端口。切换前必须先停止旧入口机的
+App、Scheduler 和全部 Worker，再生成最终 PostgreSQL/Redis 快照；禁止复制
+仍在写入的数据库卷，也不能同时运行两套 Scheduler 或 Worker。
+
 ## 3. 仓库中的部署文件
 
 | 文件 | 作用 |
@@ -55,6 +89,8 @@ Docker 网络划分：
 | `Dockerfile` | Python 3.12 非 root 应用镜像，只复制运行时所需文件 |
 | `.dockerignore` | 默认全部排除，再显式允许源码；APK、Git、Session、Secret 永不进入上下文 |
 | `compose.yaml` | 完整单机服务拓扑、健康检查、资源限制和 Docker secrets |
+| `compose.backend.yaml` | 后端机覆盖配置：关闭公网 Caddy，并只在 Tailscale 地址发布 App |
+| `compose.edge.yaml` | 入口机独立 Caddy，只把 Cloudflare 流量转发到 Tailscale 后端 |
 | `Caddyfile` | HTTPS、Cloudflare 来源限制、可信客户端 IP 和安全响应头 |
 | `.env.example` | 非敏感环境变量模板 |
 | `requirements.txt` | FastAPI、数据库、Redis/RQ、R2、加密和媒体依赖 |

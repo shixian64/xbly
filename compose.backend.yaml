@@ -1,0 +1,10 @@
+services:
+  app:
+    ports:
+      - "${BBW_TAILSCALE_IP:?set BBW_TAILSCALE_IP}:${BBW_BACKEND_PORT:-18000}:8000"
+
+  # The public TLS entrypoint remains on the edge host. Assigning a profile
+  # keeps Caddy out of a normal backend-only `docker compose up -d`.
+  caddy:
+    profiles:
+      - edge-disabled
