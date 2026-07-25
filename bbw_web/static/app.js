@@ -3588,8 +3588,11 @@ async function ensurePrivateChatPermission(uid) {
 
 function canOpenPrivateChatEntry(uid, origin = "") {
   const target = String(uid || "").trim();
-  void origin;
-  return Boolean(target && canStartPrivateChat(target));
+  if (!target) return false;
+  const normalizedOrigin = String(origin || "").trim();
+  // 系统客服是只读会话，只允许从已有会话或聊天记录入口打开。
+  if (isSystemCustomerServicePeer(target)) return normalizedOrigin === "conversation";
+  return canStartPrivateChat(target);
 }
 
 async function ensurePrivateChatEntryPermission(uid, origin = "") {
@@ -4585,7 +4588,7 @@ function conversationCard(item) {
     ${selectionControl}
     <button type="button" class="conversation-card${active ? " on" : ""}" data-action="select-conversation" data-uid="${esc(
       peer
-    )}" data-name="${esc(name)}" data-avatar="${esc(avatar || "")}" aria-label="${esc(cardLabel)}" ${
+    )}" data-name="${esc(name)}" data-avatar="${esc(avatar || "")}" data-chat-origin="conversation" aria-label="${esc(cardLabel)}" ${
       S.conversationBatchMode ? `aria-pressed="${String(batchSelected)}"` : ""
     } aria-disabled="${String(!chatAllowed)}"${chatDisabled ? " disabled" : ""} title="${esc(
       chatAllowed ? name : "当前私聊权限不可用"

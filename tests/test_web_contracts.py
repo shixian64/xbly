@@ -3898,8 +3898,12 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("hasExistingConversation(target)", can_start_private_chat)
         self.assertIn("S.blockedPrivateMessagePeers.has(target)", can_start_private_chat)
         self.assertIn("function canOpenPrivateChatEntry(uid, origin", app_js)
-        self.assertIn("void origin", app_js)
-        self.assertIn("return Boolean(target && canStartPrivateChat(target))", app_js)
+        self.assertIn('const normalizedOrigin = String(origin || "").trim()', app_js)
+        self.assertIn(
+            'if (isSystemCustomerServicePeer(target)) return normalizedOrigin === "conversation"',
+            app_js,
+        )
+        self.assertIn("return canStartPrivateChat(target)", app_js)
         self.assertIn("function ensurePrivateChatEntryPermission(uid, origin", app_js)
         self.assertIn("function rememberMatchMessagePeers(data)", app_js)
         self.assertIn("function rememberMessagePolicyAllowedPeers(values)", app_js)
@@ -4456,8 +4460,23 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
     def test_system_customer_service_conversation_is_read_only(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        can_start_private_chat = app_js.split("function canStartPrivateChat(uid)", 1)[1].split(
+            "async function ensurePrivateChatPermission", 1
+        )[0]
+        can_open_private_chat = app_js.split(
+            "function canOpenPrivateChatEntry(uid, origin", 1
+        )[1].split("async function ensurePrivateChatEntryPermission", 1)[0]
+        conversation_card = app_js.split("function conversationCard(item)", 1)[1].split(
+            "function visitorCard", 1
+        )[0]
 
         self.assertIn('const SYSTEM_CUSTOMER_SERVICE_UID = "1"', app_js)
+        self.assertIn("isSystemCustomerServicePeer(target)", can_start_private_chat)
+        self.assertIn(
+            'if (isSystemCustomerServicePeer(target)) return normalizedOrigin === "conversation"',
+            can_open_private_chat,
+        )
+        self.assertIn('data-chat-origin="conversation"', conversation_card)
         self.assertIn("isSystemCustomerServicePeer(S.activePeer)", app_js)
         self.assertIn("系统客服消息无需回复", app_js)
         self.assertIn("if (isSystemCustomerServicePeer(peer))", app_js)
