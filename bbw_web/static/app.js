@@ -7633,7 +7633,7 @@ function chatMessageFitsRenderedOrder(entry, row) {
   return !nextRow || compareMessageOrder(entry, renderedChatMessageOrderEntry(nextRow)) <= 0;
 }
 
-function renderChatMessageIncrementally(log, entry) {
+function renderChatMessageIncrementally(log, entry, previousEntry = null) {
   if (
     !log ||
     !entry ||
@@ -7650,7 +7650,16 @@ function renderChatMessageIncrementally(log, entry) {
     return false;
   }
   if (!CHAT_LOG_MESSAGE_NODES.has(log)) rebuildChatMessageNodeIndex(log);
-  const previousRow = findRenderedChatMessageNode(log, entry);
+  const entryRow = findRenderedChatMessageNode(log, entry);
+  const previousEntryRow = previousEntry
+    ? findRenderedChatMessageNode(log, previousEntry)
+    : null;
+  // A send acknowledgement can change the optimistic local identity while a
+  // realtime echo has already rendered the authoritative identity. Let the
+  // caller fall back to a full render so the two DOM rows collapse to the one
+  // merged state entry instead of leaving the local "sending" row behind.
+  if (entryRow && previousEntryRow && entryRow !== previousEntryRow) return false;
+  const previousRow = entryRow || previousEntryRow;
   if (previousRow && !chatMessageFitsRenderedOrder(entry, previousRow)) return false;
   const nextRow = createChatMessageNode(entry);
   if (!nextRow) return false;
@@ -7846,25 +7855,33 @@ function refreshChatLog({ forceBottom = false, suppressBottom = false } = {}) {
   if (!suppressBottom && shouldStickToBottom) scrollChatLogToBottom(log);
 }
 
-function refreshChatMessageEntries(entries, { forceBottom = false, incrementalLimit = 24 } = {}) {
+function refreshChatMessageEntries(
+  entries,
+  { forceBottom = false, incrementalLimit = 24, previousEntries = [] } = {}
+) {
   const log = $("im-log");
   if (!log) return false;
   const activePeer = String(S.activePeer || "");
-  const activeEntries = (Array.isArray(entries) ? entries : [entries]).filter(
-    (entry) => entry && String(entry.peer || "") === activePeer
-  );
+  const activeEntries = (Array.isArray(entries) ? entries : [entries])
+    .map((entry, index) => ({ entry, previousEntry: previousEntries[index] || null }))
+    .filter(({ entry }) => entry && String(entry.peer || "") === activePeer);
   if (!activeEntries.length) return false;
   const shouldStickToBottom = forceBottom || chatLogShouldFollowBottom(log);
   const incrementallyRendered =
     activeEntries.length <= incrementalLimit &&
-    activeEntries.every((entry) => renderChatMessageIncrementally(log, entry));
+    activeEntries.every(({ entry, previousEntry }) =>
+      renderChatMessageIncrementally(log, entry, previousEntry)
+    );
   if (!incrementallyRendered) renderChatLog(log);
   if (shouldStickToBottom) scrollChatLogToBottom(log);
   return true;
 }
 
 function refreshChatMessageEntry(entry, options = {}) {
-  return refreshChatMessageEntries([entry], options);
+  return refreshChatMessageEntries([entry], {
+    ...options,
+    previousEntries: [options.previousEntry || null],
+  });
 }
 
 function closeChatMessageActions() {
@@ -10324,7 +10341,7 @@ function updateLocalMessage(id, patch) {
       next.sequence || timMessageSequence(next),
       next.peer
     ) || next;
-  if (!refreshChatMessageEntry(merged)) refreshChatLog();
+  if (!refreshChatMessageEntry(merged, { previousEntry: current })) refreshChatLog();
   return merged;
 }
 

@@ -520,6 +520,34 @@ class FrontendMessageDeduplicationContracts(unittest.TestCase):
         )
         self.assertNotIn("\n    renderChatLog(log);", add_message)
 
+    def test_send_ack_reconciles_the_optimistic_and_realtime_dom_rows(self) -> None:
+        source = (ROOT / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8-sig")
+        incremental = source.split("function renderChatMessageIncrementally", 1)[1].split(
+            "function renderChatLog", 1
+        )[0]
+        refresh = source.split("function refreshChatMessageEntries", 1)[1].split(
+            "function closeChatMessageActions", 1
+        )[0]
+        update_local = source.split("function updateLocalMessage", 1)[1].split(
+            "function appendLocalMessage", 1
+        )[0]
+
+        self.assertIn("previousEntry = null", incremental)
+        self.assertIn("findRenderedChatMessageNode(log, previousEntry)", incremental)
+        self.assertIn(
+            "if (entryRow && previousEntryRow && entryRow !== previousEntryRow) return false;",
+            incremental,
+        )
+        self.assertIn("const previousRow = entryRow || previousEntryRow;", incremental)
+        self.assertIn("previousEntries = []", refresh)
+        self.assertIn(
+            "renderChatMessageIncrementally(log, entry, previousEntry)", refresh
+        )
+        self.assertIn(
+            "refreshChatMessageEntry(merged, { previousEntry: current })",
+            update_local,
+        )
+
     def test_long_chats_render_a_bounded_expandable_dom_window(self) -> None:
         source = (ROOT / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8-sig")
         chat_log = source.split("function chatLogHtml()", 1)[1].split(
