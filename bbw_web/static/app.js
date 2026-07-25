@@ -3589,9 +3589,9 @@ async function ensurePrivateChatPermission(uid) {
 function canOpenPrivateChatEntry(uid, origin = "") {
   const target = String(uid || "").trim();
   if (!target) return false;
-  const normalizedOrigin = String(origin || "").trim();
-  // 系统客服是只读会话，只允许从已有会话或聊天记录入口打开。
-  if (isSystemCustomerServicePeer(target)) return normalizedOrigin === "conversation";
+  void origin;
+  // 系统客服面向所有登录用户开放查看，发送入口仍由 canStartPrivateChat 拒绝。
+  if (isSystemCustomerServicePeer(target)) return true;
   return canStartPrivateChat(target);
 }
 

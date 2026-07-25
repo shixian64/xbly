@@ -71,6 +71,7 @@ PROFILE_CACHE_TTL_SEC = 15 * 60.0
 PROFILE_CACHE_ERROR_TTL_SEC = 30.0
 MESSAGE_BLOCK_SNAPSHOT_TTL_SEC = 60.0
 MESSAGE_BLOCK_SNAPSHOT_RETRY_SEC = 10.0
+SYSTEM_CUSTOMER_SERVICE_UID = "1"
 FRIEND_APPLICATION_PAGE_SIZE = 15
 FRIEND_APPLICATION_SCAN_PAGES = 5
 MOMENT_ID_CURSOR_TABS = frozenset({"推荐", "招募令", "关注"})
@@ -2347,6 +2348,7 @@ class Handler(BaseHTTPRequestHandler):
             or target.lower() in {"0", "none", "null"}
             or len(target) > 128
             or target == current_uid
+            or target == SYSTEM_CUSTOMER_SERVICE_UID
         ):
             return False
         if not Handler.ensure_message_blocks_loaded(self, user):
@@ -2372,6 +2374,14 @@ class Handler(BaseHTTPRequestHandler):
             if target in set(getattr(user, attribute, set()) or set()):
                 return True
         return False
+
+    def can_view_message_peer(self, user: Any, peer: Any) -> bool:
+        target = str(peer or "").strip()
+        session = getattr(getattr(user, "app", None), "session", None)
+        current_uid = str(getattr(session, "uid", "") or "").strip()
+        if target == SYSTEM_CUSTOMER_SERVICE_UID:
+            return bool(current_uid and target != current_uid)
+        return Handler.can_message_peer(self, user, target)
 
     def deny_private_message(self, capabilities: Dict[str, bool]) -> None:
         self.ok(
@@ -3345,7 +3355,7 @@ class Handler(BaseHTTPRequestHandler):
             if summary_only and around_time is None:
                 return self.ok({"ok": False, "error": "缺少会话消息时间"}, 400)
             capabilities = Handler.web_user_capabilities(self, u)
-            if not Handler.can_message_peer(self, u, peer):
+            if not Handler.can_view_message_peer(self, u, peer):
                 return Handler.deny_private_message(self, capabilities)
             try:
                 payload = _tim_roaming_message_envelope(
@@ -3700,7 +3710,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.ok({"ok": False, "error": "缺少聊天对象 UID"}, 400)
                 capabilities = Handler.web_user_capabilities(self, u)
                 for peer_uid in peer_uids:
-                    if not Handler.can_message_peer(self, u, peer_uid):
+                    if not Handler.can_view_message_peer(self, u, peer_uid):
                         return Handler.deny_private_message(self, capabilities)
                 supplied_receipts = data.get("receipt_messages")
                 receipt_messages = (

@@ -1672,6 +1672,19 @@ class SocialBffRoutingTests(unittest.TestCase):
         self.assertEqual(response[0], 403)
         self.assertEqual(response[1]["code"], "PRIVATE_MESSAGE_PERMISSION_REQUIRED")
 
+    def test_system_customer_service_history_is_available_to_every_user(self) -> None:
+        calls, response = self._run_get(
+            "/api/im/messages?peer=1",
+            authorized_peer=False,
+        )
+
+        self.assertEqual(
+            calls,
+            [("roaming", "1", "42"), ("roaming", "42", "1")],
+        )
+        self.assertEqual(response[0], 200)
+        self.assertTrue(response[1]["ok"])
+
     def test_presence_prefers_web_ttl_and_skips_blocked_tim_rest(self) -> None:
         backend = SimpleNamespace(
             read_web_presence=lambda uids: {"9"} if "9" in uids else set(),
@@ -2556,6 +2569,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
     def _run_rest_send(
         self,
         *,
+        peer="9",
         enabled=False,
         friend_peers=(),
         match_peers=(),
@@ -2606,7 +2620,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                 return True
 
             def body(self):
-                return {"peer": "9", "text": "你好"}
+                return {"peer": peer, "text": "你好"}
 
             def sid(self):
                 return "sid"
@@ -2736,6 +2750,31 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         self.assertEqual(response[0], 502)
         self.assertEqual(response[1]["conversation_read_peers"], ["9"])
         self.assertEqual(response[1]["receipt_failed_peers"], ["9"])
+
+    def test_system_customer_service_read_report_needs_no_private_message_grant(self) -> None:
+        calls, receipt_calls, response = self._run_mark_read(
+            authorized=False,
+            peers=["1"],
+        )
+
+        self.assertEqual(calls, [("42", "1")])
+        self.assertEqual(receipt_calls[0][:2], ("42", "1"))
+        self.assertEqual(response[0], 200)
+        self.assertTrue(response[1]["read"])
+
+    def test_system_customer_service_cannot_receive_user_messages(self) -> None:
+        calls, response = self._run_rest_send(
+            peer="1",
+            enabled=True,
+            friend_peers={"1"},
+            match_peers={"1"},
+            conversation_peers={"1"},
+            authorizer=lambda _peer: True,
+        )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(response[0], 403)
+        self.assertEqual(response[1]["code"], "PRIVATE_MESSAGE_PERMISSION_REQUIRED")
 
     def test_match_existing_conversation_and_live_authorizer_are_allowed(self) -> None:
         for kwargs in (
@@ -3898,9 +3937,9 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("hasExistingConversation(target)", can_start_private_chat)
         self.assertIn("S.blockedPrivateMessagePeers.has(target)", can_start_private_chat)
         self.assertIn("function canOpenPrivateChatEntry(uid, origin", app_js)
-        self.assertIn('const normalizedOrigin = String(origin || "").trim()', app_js)
+        self.assertIn("void origin", can_start_private_chat)
         self.assertIn(
-            'if (isSystemCustomerServicePeer(target)) return normalizedOrigin === "conversation"',
+            "if (isSystemCustomerServicePeer(target)) return true",
             app_js,
         )
         self.assertIn("return canStartPrivateChat(target)", app_js)
@@ -4473,7 +4512,7 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
         self.assertIn('const SYSTEM_CUSTOMER_SERVICE_UID = "1"', app_js)
         self.assertIn("isSystemCustomerServicePeer(target)", can_start_private_chat)
         self.assertIn(
-            'if (isSystemCustomerServicePeer(target)) return normalizedOrigin === "conversation"',
+            "if (isSystemCustomerServicePeer(target)) return true",
             can_open_private_chat,
         )
         self.assertIn('data-chat-origin="conversation"', conversation_card)
