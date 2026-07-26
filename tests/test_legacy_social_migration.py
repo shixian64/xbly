@@ -560,6 +560,45 @@ class LegacyRelationshipSnapshotTests(unittest.TestCase):
 
 
 class SqlAlchemyLegacySocialWriterTests(unittest.TestCase):
+    def test_begin_invalidates_an_existing_complete_marker_before_writes(self) -> None:
+        migration_account = account()
+        window = ImportWindow(
+            coverage_started_at=NOW - timedelta(days=180),
+            coverage_ended_at=NOW,
+        )
+        captured: dict[str, object] = {}
+
+        class CursorRepository:
+            def __init__(self, _db):
+                pass
+
+            def upsert(self, **values):
+                captured.update(values)
+                return SimpleNamespace(**values)
+
+        @contextmanager
+        def db_scope():
+            yield SimpleNamespace()
+
+        writer = SqlAlchemyLegacySocialWriter(
+            db_scope=db_scope,
+            clock=lambda: NOW,
+        )
+        with patch.object(
+            writer,
+            "_binding",
+            return_value=(SimpleNamespace(), SimpleNamespace()),
+        ), patch(
+            "bbw_web.social_native.legacy_migration.SyncCursorRepository",
+            CursorRepository,
+        ):
+            writer.begin(migration_account, window)
+
+        marker = json.loads(str(captured["cursor"]))
+        self.assertFalse(marker["complete"])
+        self.assertEqual(marker["phase"], "applying")
+        self.assertIsNone(captured["last_succeeded_at"])
+
     def test_complete_verifies_rows_then_writes_account_bound_marker(self) -> None:
         migration_account = account()
         snapshot = complete_snapshot(migration_account=migration_account)

@@ -608,6 +608,31 @@ class UserCredentialService:
         credential = self.credentials.get_for_user(user_id)
         return credential is not None and credential.disabled_at is None
 
+    def suspend_stale_password(
+        self,
+        *,
+        user_id: uuid.UUID,
+        verified_at: datetime,
+    ) -> bool | None:
+        """Disable an older local digest until a verified refresh can hash it.
+
+        ``None`` means no credential exists, ``False`` means another concurrent
+        verified login has already refreshed the row, and ``True`` means this
+        call disabled an older digest.  The tri-state lets the login path keep
+        first-time enrollment blocking without leaving a revoked password
+        usable during an upstream outage.
+        """
+
+        confirmed_at = _aware(verified_at)
+        credential = self.credentials.get_for_user(user_id, for_update=True)
+        if credential is None:
+            return None
+        if _aware(credential.verified_at) >= confirmed_at:
+            return False
+        credential.disabled_at = confirmed_at
+        self.db.flush()
+        return True
+
     def enroll_verified_password(
         self,
         *,
@@ -647,6 +672,7 @@ class UserCredentialService:
             credential.enrollment_source = source
             credential.password_changed_at = confirmed_at
             credential.verified_at = confirmed_at
+            credential.disabled_at = None
             self.db.flush()
             return CredentialEnrollment(credential, False, True, False)
 
@@ -655,6 +681,7 @@ class UserCredentialService:
             credential.password_hash = self.passwords.hash(password)
         if confirmed_at > _aware(credential.verified_at):
             credential.verified_at = confirmed_at
+        credential.disabled_at = None
         self.db.flush()
         return CredentialEnrollment(credential, False, False, rehashed)
 
@@ -1052,8 +1079,8 @@ class LoginAccountService:
         登录本身已由上游认证成功，不能为登记让内存硬哈希在闸门之外无界并
         发。闸门短暂拥挤（短超时未取得槽位）时按用户是否已有凭据行区分：
 
-        - 已有凭据行：仅推迟摘要刷新并记 WARNING（否则用户改密后旧摘要在
-          本地兜底路径静默保留且无迹可查），下一次可信密码登录自动重试；
+        - 已有凭据行：立即禁用比本次上游认证更旧的本地摘要并记 WARNING，
+          下一次可信密码登录完成哈希后再恢复本地兜底；
         - 尚无凭据行（新注册或存量未迁移用户）：升级为阻塞等待后强制登记，
           保证任何成功登录的用户至少有一行本地凭据，否则私信、媒体等依赖
           凭据行的主体解析全部失效，本地兜底登录也无从建立。等待上界为
@@ -1064,12 +1091,17 @@ class LoginAccountService:
             int(getattr(self.settings, "local_password_auth_concurrency", 2))
         )
         if not gate.acquire(timeout=1.0):
-            existing = self.user_credentials.credentials.get_for_user(user_id)
-            if existing is not None:
+            suspended = self.user_credentials.suspend_stale_password(
+                user_id=user_id,
+                verified_at=verified_at,
+            )
+            if suspended is not None:
+                if suspended is False:
+                    return True
                 LOGGER.warning(
                     "opportunistic credential refresh deferred for user %s: "
-                    "enrollment gate is saturated; the stale local digest is "
-                    "kept and will be refreshed on the next verified login",
+                    "enrollment gate is saturated; the stale local digest was "
+                    "disabled until the next verified login refreshes it",
                     user_id,
                 )
                 return False

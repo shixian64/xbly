@@ -629,7 +629,7 @@ class MomentVideoCompatibilityContracts(unittest.TestCase):
         self.assertIn("def head_object(self, key: str)", r2)
         self.assertIn("ca-certificates ffmpeg tzdata", dockerfile)
         self.assertIn(
-            "critical,im-ingest,default,media,sync,transcode-v2,transcode",
+            "critical,im-ingest,agent-control,agent,default,media,sync,",
             config,
         )
         self.assertIn("transcode-worker:", compose)

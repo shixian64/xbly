@@ -210,7 +210,7 @@ docker compose up -d
 docker compose ps
 ```
 
-`app`、`migrate`、`worker`、`transcode-worker` 和 `scheduler` 共用同一个
+`app`、`migrate`、全部 Worker 和 `scheduler` 共用同一个
 `APP_IMAGE` 与 Dockerfile。禁止在本项目中执行不带服务名的
 `docker compose build --pull`：Compose 会并行构建多个目标，多个 BuildKit
 导出器同时写入同一镜像标签时会发生竞态，常见报错为
@@ -223,7 +223,7 @@ docker compose ps
 查看启动日志：
 
 ```bash
-docker compose logs --tail 100 postgres redis migrate app worker transcode-worker scheduler caddy
+docker compose logs --tail 100 postgres redis migrate app worker im-ingest-worker sync-worker agent-worker transcode-worker scheduler caddy
 ```
 
 健康验证：
@@ -279,12 +279,13 @@ sudo sh -c 'umask 077; openssl rand -base64 32 | tr -d "\n" > docker/secrets/adm
 | RQ Worker | 1024 MB | 1.50 | 媒体使用临时文件和流式处理，禁止整段视频入内存 |
 | IM Ingest Worker | 512 MB | 1.00 | 独立处理 IM 入站队列 |
 | Sync Worker | 768 MB | 1.25 | 独立处理同步队列和外部请求 |
+| Agent Worker | 768 MB | 1.25 | 独立处理 BYOK 后台控制与无人值守任务 |
 | Transcode Worker | 1024 MB | 1.25 | 单线程转码，为高分辨率视频保留内存余量 |
 | Scheduler | 192 MB | 0.25 | 单实例 Redis 锁 |
 | Caddy | 96 MB | 0.25 | 非 root，内部监听 8080/8443 |
 | Migrate（一次性） | 256 MB | 0.30 | 只在升级阶段运行，不计入稳态合计 |
 
-后端模式下八个常驻服务的内存硬上限合计 6208 MiB、CPU 上限合计 8.75；Migrate 运行时再增加 256 MiB、0.30 CPU。Caddy 通常部署在独立边缘主机；如与后端同机，再增加 96 MiB、0.25 CPU。硬上限不等于常驻占用，但宿主机仍应保留至少 4 GiB 内存供系统、文件缓存和运维进程使用。Swap 只负责缓冲瞬时压力，不代表能够提高稳定并发。
+后端模式下九个常驻服务的内存硬上限合计 6976 MiB、CPU 上限合计 10.00；Migrate 运行时再增加 256 MiB、0.30 CPU。Caddy 通常部署在独立边缘主机；如与后端同机，再增加 96 MiB、0.25 CPU。硬上限不等于常驻占用，但宿主机仍应保留至少 4 GiB 内存供系统、文件缓存和运维进程使用。Swap 只负责缓冲瞬时压力，不代表能够提高稳定并发。
 
 检查资源：
 
@@ -421,9 +422,9 @@ docker compose -f compose.yaml -f compose.blue-green.yaml --profile blue-green s
 最后只更新明确列出的 Worker；不要用全量 `up -d` 意外启动已停用的 App 槽位：
 
 ```bash
-docker compose up -d --no-deps --no-build worker im-ingest-worker sync-worker transcode-worker scheduler
+docker compose up -d --no-deps --no-build worker im-ingest-worker sync-worker agent-worker transcode-worker scheduler
 docker compose ps
-docker compose -f compose.yaml -f compose.blue-green.yaml --profile blue-green logs --tail 100 migrate app app-green worker transcode-worker scheduler
+docker compose -f compose.yaml -f compose.blue-green.yaml --profile blue-green logs --tail 100 migrate app app-green worker im-ingest-worker sync-worker agent-worker transcode-worker scheduler
 ```
 
 首次引入本蓝绿配置时，旧 App 尚没有 `/internal/drain`，只能先启动新槽位，再停止
@@ -439,7 +440,7 @@ docker compose -f compose.yaml -f compose.blue-green.yaml --profile blue-green l
 ### 8.2 进程和队列
 
 ```bash
-docker compose logs --since 30m app worker transcode-worker scheduler
+docker compose logs --since 30m app worker im-ingest-worker sync-worker agent-worker transcode-worker scheduler
 docker compose exec redis redis-cli INFO memory
 docker compose exec redis redis-cli INFO persistence
 docker compose exec redis redis-cli --scan --pattern 'rq:*' | head

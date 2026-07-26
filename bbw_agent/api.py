@@ -828,7 +828,14 @@ def _runtime_still_enabled(
             status_code=409,
         )
     connection = ModelConnectionRepository(db).get(owner_user_id, connection_id)
-    if connection is None or not connection.enabled:
+    if (
+        connection is None
+        or not connection.enabled
+        or (
+            require_user_enabled
+            and str(connection.last_test_status or "") != "ok"
+        )
+    ):
         raise AgentServiceError(
             "connection_disabled",
             "模型连接已关闭，本次结果已取消",
@@ -1166,6 +1173,7 @@ def update_autonomy_settings(
                     and connection is not None
                     and connection.enabled
                     and connection.api_key_encrypted
+                    and connection.last_test_status == "ok"
                 ),
             )
             recent_tasks = AgentAutonomyTaskRepository(db).list_recent(
@@ -1564,26 +1572,20 @@ def analyze_style(
                     run_type="style_analysis",
                     idempotency_key=body.idempotency_key,
                 )
-                if existing is not None:
-                    if existing.status == "succeeded":
-                        profile = style_public(
-                            StyleProfileRepository(db).get(context.owner_user_id)
-                        )
-                        return {
-                            "ok": True,
-                            "reused": True,
-                            "run_id": str(existing.id),
-                            "style_profile": profile,
-                        }
-                    raise AgentServiceError(
-                        "idempotency_conflict",
-                        "相同请求已经处理或仍在运行，请重新发起",
-                        status_code=409,
+                if existing is not None and existing.status == "succeeded":
+                    profile = style_public(
+                        StyleProfileRepository(db).get(context.owner_user_id)
                     )
+                    return {
+                        "ok": True,
+                        "reused": True,
+                        "run_id": str(existing.id),
+                        "style_profile": profile,
+                    }
                 plan = build_style_analysis_plan(
                     db, owner_user_id=context.owner_user_id
                 )
-                run = runs.add_running(
+                run, acquired = runs.enqueue_running(
                     owner_user_id=context.owner_user_id,
                     connection_id=runtime.connection_id,
                     run_type="style_analysis",
@@ -1593,6 +1595,22 @@ def analyze_style(
                     source_message_count=plan.source_message_count,
                     prompt_char_count=plan.prompt_char_count,
                 )
+                if not acquired:
+                    if run.status == "succeeded":
+                        profile = style_public(
+                            StyleProfileRepository(db).get(context.owner_user_id)
+                        )
+                        return {
+                            "ok": True,
+                            "reused": True,
+                            "run_id": str(run.id),
+                            "style_profile": profile,
+                        }
+                    raise AgentServiceError(
+                        "idempotency_conflict",
+                        "相同请求已经处理或仍在运行，请重新发起",
+                        status_code=409,
+                    )
                 run_id = run.id
             with session_scope() as db:
                 _runtime_still_enabled(
@@ -1701,21 +1719,19 @@ def generate_reply_draft(
                     run_type="reply_draft",
                     idempotency_key=body.idempotency_key,
                 )
-                if existing is not None:
-                    if existing.status == "succeeded" and existing.output_text is not None:
-                        return {
-                            "ok": True,
-                            "reused": True,
-                            "run_id": str(existing.id),
-                            "draft": existing.output_text,
-                            "origin": "agent",
-                            "executed": False,
-                        }
-                    raise AgentServiceError(
-                        "idempotency_conflict",
-                        "相同请求已经处理或仍在运行，请重新发起",
-                        status_code=409,
-                    )
+                if (
+                    existing is not None
+                    and existing.status == "succeeded"
+                    and existing.output_text is not None
+                ):
+                    return {
+                        "ok": True,
+                        "reused": True,
+                        "run_id": str(existing.id),
+                        "draft": existing.output_text,
+                        "origin": "agent",
+                        "executed": False,
+                    }
                 plan = build_reply_draft_plan(
                     db,
                     owner_user_id=context.owner_user_id,
@@ -1723,7 +1739,7 @@ def generate_reply_draft(
                     objective=body.objective,
                     runtime=runtime,
                 )
-                run = runs.add_running(
+                run, acquired = runs.enqueue_running(
                     owner_user_id=context.owner_user_id,
                     connection_id=runtime.connection_id,
                     run_type="reply_draft",
@@ -1733,6 +1749,21 @@ def generate_reply_draft(
                     source_message_count=plan.source_message_count,
                     prompt_char_count=plan.prompt_char_count,
                 )
+                if not acquired:
+                    if run.status == "succeeded" and run.output_text is not None:
+                        return {
+                            "ok": True,
+                            "reused": True,
+                            "run_id": str(run.id),
+                            "draft": run.output_text,
+                            "origin": "agent",
+                            "executed": False,
+                        }
+                    raise AgentServiceError(
+                        "idempotency_conflict",
+                        "相同请求已经处理或仍在运行，请重新发起",
+                        status_code=409,
+                    )
                 run_id = run.id
             with session_scope() as db:
                 _runtime_still_enabled(
@@ -1869,13 +1900,11 @@ def generate_and_send_reply(
                     run_type="reply_send",
                     idempotency_key=body.idempotency_key,
                 )
-                if existing is not None:
-                    if existing.status != "succeeded" or existing.output_text is None:
-                        raise AgentServiceError(
-                            "idempotency_conflict",
-                            "相同直发请求已经处理或仍在运行，请重新发起",
-                            status_code=409,
-                        )
+                if (
+                    existing is not None
+                    and existing.status == "succeeded"
+                    and existing.output_text is not None
+                ):
                     prior_action = AgentActionExecutionRepository(
                         db
                     ).get_by_idempotency(
@@ -1917,7 +1946,7 @@ def generate_and_send_reply(
                         objective=body.objective,
                         runtime=runtime,
                     )
-                    run = runs.add_running(
+                    run, acquired = runs.enqueue_running(
                         owner_user_id=context.owner_user_id,
                         connection_id=runtime.connection_id,
                         run_type="reply_send",
@@ -1927,6 +1956,12 @@ def generate_and_send_reply(
                         source_message_count=plan.source_message_count,
                         prompt_char_count=plan.prompt_char_count,
                     )
+                    if not acquired:
+                        raise AgentServiceError(
+                            "idempotency_conflict",
+                            "相同直发请求已经处理或仍在运行，请重新发起",
+                            status_code=409,
+                        )
                     run_id = run.id
 
             if not reused_model_run:

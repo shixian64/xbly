@@ -159,6 +159,17 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
             '"ai_model_runner_system_settings", "autonomous_agent_enabled"',
             downgrade,
         )
+        delete_autonomy_runs = "DELETE FROM ai_agent_runs WHERE run_type IN"
+        self.assertIn(delete_autonomy_runs, downgrade)
+        self.assertLess(
+            downgrade.index(delete_autonomy_runs),
+            downgrade.index("include_autonomy=False"),
+        )
+        self.assertIn("include_manual_review=True", downgrade)
+        self.assertNotIn(
+            "SET status = 'failed' WHERE status = 'manual_review'",
+            downgrade,
+        )
 
     def test_agent_run_type_constraints_use_alembic_complete_names(self) -> None:
         for migration in (
@@ -602,7 +613,7 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         self.assertIn("runtime.configuration_fingerprint", begin)
         self.assertIn('"model_run_link_failed"', begin)
         self.assertIn('if run.status == "succeeded" and run.output_text and same_runtime:', begin)
-        self.assertIn("runs.fail(", begin)
+        self.assertNotIn("runs.fail(", begin)
 
         record, _ = self.function_source(
             "bbw_agent/repositories.py", "record_model_run_id"

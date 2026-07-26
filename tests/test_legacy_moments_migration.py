@@ -23,6 +23,7 @@ from bbw_web.moments_native.legacy_migration import (
     LegacyMomentsImportOrchestrator,
     LegacyMomentsLimitError,
     LegacyMomentsProviderError,
+    SqlAlchemyLegacyMomentsWriter,
     _list_active_owner_ids,
     _runtime,
     main,
@@ -743,7 +744,19 @@ class BanghuaMomentsReaderTests(unittest.TestCase):
             ],
             "banners": [],
         }
-        for label, data in (("shadowed", shadowed), ("renamed", renamed)):
+        nested_shadowed = {
+            "list": [],
+            "data": {
+                "posts": [
+                    post_item(post_id="502", created_at=NOW - timedelta(days=1))
+                ]
+            },
+        }
+        for label, data in (
+            ("shadowed", shadowed),
+            ("renamed", renamed),
+            ("nested-shadowed", nested_shadowed),
+        ):
             with self.subTest(label=label):
                 reader = self._reader(self._page(data))
                 with self.assertRaisesRegex(
@@ -790,6 +803,43 @@ class BanghuaMomentsReaderTests(unittest.TestCase):
             LegacyMomentsDataError, "legacy_page_structure_unknown"
         ):
             unknown_reader.fetch_post_page(1)
+
+
+class SqlAlchemyLegacyMomentsWriterTests(unittest.TestCase):
+    def test_begin_invalidates_an_existing_complete_marker_before_writes(self) -> None:
+        migration_account = account()
+        window = ImportWindow(
+            coverage_started_at=NOW - timedelta(days=180),
+            coverage_ended_at=NOW,
+        )
+        captured: dict[str, object] = {}
+
+        class CursorRepository:
+            def __init__(self, _db):
+                pass
+
+            def upsert(self, **values):
+                captured.update(values)
+                return SimpleNamespace(**values)
+
+        @contextmanager
+        def db_scope():
+            yield SimpleNamespace()
+
+        writer = SqlAlchemyLegacyMomentsWriter(
+            db_scope=db_scope,
+            clock=lambda: NOW,
+        )
+        with patch(
+            "bbw_web.moments_native.legacy_migration.SyncCursorRepository",
+            CursorRepository,
+        ):
+            writer.begin(migration_account, window)
+
+        marker = json.loads(str(captured["cursor"]))
+        self.assertFalse(marker["complete"])
+        self.assertEqual(marker["phase"], "posts")
+        self.assertIsNone(captured["last_succeeded_at"])
 
 
 class LegacyMomentsCliTests(unittest.TestCase):

@@ -373,6 +373,7 @@ def settings_public(
             and connection is not None
             and connection.enabled
             and connection.api_key_encrypted
+            and connection.last_test_status == "ok"
         ),
         "updated_at": row.updated_at.isoformat(),
     }
@@ -782,6 +783,12 @@ def save_agent_settings(
     ):
         raise AgentServiceError(
             "connection_required", "请先保存并启用一个模型连接", status_code=409
+        )
+    if user_enabled and connection.last_test_status != "ok":
+        raise AgentServiceError(
+            "connection_test_required",
+            "请先成功测试当前模型连接",
+            status_code=409,
         )
     instructions = str(custom_instructions or "").strip()
     if len(instructions) > 4000:
@@ -1244,6 +1251,12 @@ def load_runtime_configuration(
     if connection is None or not connection.enabled:
         raise AgentServiceError(
             "connection_disabled", "当前模型连接未启用", status_code=409
+        )
+    if require_user_enabled and connection.last_test_status != "ok":
+        raise AgentServiceError(
+            "connection_test_required",
+            "请先成功测试当前模型连接",
+            status_code=409,
         )
     try:
         api_key = cipher.decrypt_text(

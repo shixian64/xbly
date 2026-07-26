@@ -32,7 +32,6 @@ from bbw_prod.migration_readiness import (
     DOMAIN_MARKER_SCOPES,
     DOMAIN_MARKER_STREAMS,
     MOMENTS_HISTORY_DAYS,
-    _valid_domain_marker,
 )
 from bbw_prod.models import (
     ExternalAccount,
@@ -498,15 +497,27 @@ def _explicit_empty_page(data: Any) -> bool:
     if isinstance(data, Mapping):
         if not data:
             return True
-        values = list(data.values())
-        if any(isinstance(value, (list, tuple)) and len(value) > 0 for value in values):
-            # 存在未被 extract_list/normalizer 解析出的非空列表，说明结构已
-            # 变化（字段改名或被空的白名单键遮蔽），不得当作空页读完。
-            return False
-        return any(
-            isinstance(value, (list, tuple)) and len(value) == 0
-            for value in values
-        )
+        pending: list[tuple[Any, int]] = [(value, 1) for value in data.values()]
+        saw_empty_list = False
+        seen: set[int] = set()
+        while pending:
+            value, depth = pending.pop()
+            if depth > 32:
+                return False
+            if isinstance(value, (list, tuple)):
+                if value:
+                    # 任意包裹层中的非空列表都说明响应仍承载记录；顶层空
+                    # 白名单键不得遮蔽它并伪造迁移完成。
+                    return False
+                saw_empty_list = True
+                continue
+            if isinstance(value, Mapping):
+                identity = id(value)
+                if identity in seen:
+                    return False
+                seen.add(identity)
+                pending.extend((nested, depth + 1) for nested in value.values())
+        return saw_empty_list
     return False
 
 
@@ -630,13 +641,6 @@ class SqlAlchemyLegacyMomentsWriter:
         succeeded_at: datetime | None,
         error: str | None,
     ) -> None:
-        if str(dict(marker).get("phase") or "") != "complete" and (
-            self._has_valid_complete_marker(db, account)
-        ):
-            # 已有通过严格校验的 complete Marker 时，非 complete 写入
-            # （begin/逐页进度/failed）一律跳过：校验性重跑中途失败必须
-            # 保留既有完整性证明，成功时仍以新 complete Marker 收尾。
-            return
         attempted_at = _as_utc(self.clock())
         SyncCursorRepository(db).upsert(
             owner_user_id=account.owner_user_id,
@@ -650,19 +654,6 @@ class SqlAlchemyLegacyMomentsWriter:
             last_attempted_at=attempted_at,
             last_succeeded_at=succeeded_at,
             last_error=error,
-        )
-
-    def _has_valid_complete_marker(
-        self, db: Any, account: LegacyMomentsAccount
-    ) -> bool:
-        cursor = SyncCursorRepository(db).get(
-            account.owner_user_id, LEGACY_PROVIDER, MOMENTS_STREAM
-        )
-        return _valid_domain_marker(
-            cursor,
-            domain="moments",
-            external_account_id=account.external_account_id,
-            upstream_uid=account.upstream_uid,
         )
 
     def begin(self, account: LegacyMomentsAccount, window: ImportWindow) -> None:

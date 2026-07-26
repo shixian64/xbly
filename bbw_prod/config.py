@@ -299,7 +299,8 @@ class Settings:
                 item.strip()
                 for item in os.getenv(
                     "BBW_RQ_QUEUES",
-                    "critical,im-ingest,default,media,sync,transcode-v2,transcode",
+                    "critical,im-ingest,agent-control,agent,default,media,sync,"
+                    "transcode-v2,transcode",
                 ).split(",")
                 if item.strip()
             ),

@@ -31,6 +31,7 @@ try:
         RuntimeConfiguration,
         api_key_context,
         require_visible_access,
+        settings_public,
     )
     from bbw_prod.crypto import CredentialCipher, EncryptionError, redact_raw_payload
     from bbw_prod.models import (
@@ -461,6 +462,26 @@ class _ScalarSequenceDB:
     f"production dependencies are not installed: {DEPENDENCY_IMPORT_ERROR}",
 )
 class ByokPermissionTests(unittest.TestCase):
+    def test_runner_is_not_ready_until_the_active_connection_test_succeeds(self) -> None:
+        setting = SimpleNamespace(
+            user_enabled=True,
+            mode="draft",
+            custom_instructions=None,
+            temperature_milli=700,
+            max_output_tokens=512,
+            context_message_limit=30,
+            updated_at=SimpleNamespace(isoformat=lambda: "2026-07-26T00:00:00+00:00"),
+        )
+        connection = SimpleNamespace(
+            enabled=True,
+            api_key_encrypted={"ciphertext": "opaque"},
+            last_test_status="failed",
+        )
+
+        self.assertFalse(settings_public(setting, connection=connection)["ready"])
+        connection.last_test_status = "ok"
+        self.assertTrue(settings_public(setting, connection=connection)["ready"])
+
     def test_system_user_and_account_gates_all_fail_closed_with_same_response(self) -> None:
         active_granted_user = SimpleNamespace(
             status="active",
@@ -526,6 +547,34 @@ class ByokPermissionTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.code, "runner_state_changed")
+        self.assertEqual(raised.exception.status_code, 409)
+
+    def test_runtime_result_is_cancelled_when_connection_test_is_not_ok(self) -> None:
+        owner_id = uuid.uuid4()
+        connection_id = uuid.uuid4()
+        user = SimpleNamespace(
+            status="active",
+            disabled_at=None,
+            byok_model_runner_enabled=True,
+        )
+        system = SimpleNamespace(enabled=True)
+        settings = SimpleNamespace(
+            active_connection_id=connection_id,
+            version=1,
+            user_enabled=True,
+        )
+        connection = SimpleNamespace(enabled=True, last_test_status="failed")
+
+        with self.assertRaises(AgentServiceError) as raised:
+            _runtime_still_enabled(
+                _ScalarSequenceDB(user, system, settings, connection),
+                owner_user_id=owner_id,
+                connection_id=connection_id,
+                settings_version=1,
+                require_user_enabled=True,
+            )
+
+        self.assertEqual(raised.exception.code, "connection_disabled")
         self.assertEqual(raised.exception.status_code, 409)
 
 

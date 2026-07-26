@@ -12,6 +12,8 @@
 !bbw_web/**
 !bbw_prod/
 !bbw_prod/**
+!bbw_agent/
+!bbw_agent/**
 
 !docs/
 !docs/api_catalog.json

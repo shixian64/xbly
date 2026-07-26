@@ -30,6 +30,10 @@ from rq.exceptions import InvalidJobOperation
 from sqlalchemy import and_, delete, exists, func, or_, select
 from sqlalchemy.orm import aliased
 
+from bbw_agent.repositories import (
+    AgentActionExecutionRepository,
+    AgentRunRepository,
+)
 from bbw_prod.compatibility import (
     CompatibilityMode,
     compatibility_dispatch_enabled,
@@ -4750,6 +4754,14 @@ def cleanup_expired_data() -> dict[str, Any]:
             compat_media_errors += 1
 
     with session_scope() as db:
+        stale_model_runs_failed = AgentRunRepository(db).fail_stale_running(
+            at=now
+        )
+        stale_action_executions_review = (
+            AgentActionExecutionRepository(
+                db
+            ).mark_stale_running_for_manual_review(at=now)
+        )
         retention = RetentionService(db, settings)
         raw_deleted = retention.purge_expired_raw_responses(at=now)
         audit_deleted = retention.purge_expired_audit_logs(at=now)
@@ -4819,6 +4831,8 @@ def cleanup_expired_data() -> dict[str, Any]:
         "messages_deleted": messages_deleted,
         "canonical_messages_deleted": canonical_messages_deleted,
         "match_history_deleted": match_history_deleted,
+        "stale_model_runs_failed": stale_model_runs_failed,
+        "stale_action_executions_review": stale_action_executions_review,
         "outboxes_deleted": outboxes_deleted,
         "native_upload_intents_deleted": native_media_cleanup[
             "upload_intents_deleted"

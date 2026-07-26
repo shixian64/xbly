@@ -696,12 +696,6 @@ class ByokAgentAutonomyModelRunner(AgentAutonomyModelRunner):
                         if not same_runtime
                         else "model_run_not_reusable"
                     )
-                    if run.status == "running":
-                        runs.fail(
-                            task.owner_user_id,
-                            run.id,
-                            failure_code=replay_error,
-                        )
         assert run_id is not None
         if replay_error:
             raise AgentAutonomyModelError(

@@ -289,10 +289,54 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn("im-ingest-worker:", compose)
         self.assertIn("BBW_RQ_QUEUES: im-ingest", compose)
         self.assertIn(
-            "critical,im-ingest,default,media,sync,transcode-v2,transcode",
+            "critical,im-ingest,agent-control,agent,default,media,sync,",
             config,
         )
         self.assertIn('revision: str = "20260720_0004"', migration)
+
+    def test_agent_worker_is_packaged_secret_complete_and_operable(self) -> None:
+        dockerfile = self.read("Dockerfile")
+        dockerignore = self.read(".dockerignore")
+        compose = self.read("compose.yaml")
+        deployment = self.read("docs/14_PRODUCTION_DEPLOYMENT.md")
+        readme = self.read("README.md")
+        jobs = self.read("bbw_web/jobs.py")
+        migration_env = self.read("migrations/env.py")
+
+        self.assertIn(
+            "COPY --chown=${APP_UID}:${APP_GID} bbw_agent ./bbw_agent",
+            dockerfile,
+        )
+        self.assertIn("!bbw_agent/", dockerignore)
+        self.assertIn("!bbw_agent/**", dockerignore)
+
+        agent_secrets = compose.split("x-agent-worker-secrets:", 1)[1].split(
+            "x-transcode-secrets:", 1
+        )[0]
+        self.assertIn("phone_hmac_key", agent_secrets)
+        self.assertIn("session_hmac_key", agent_secrets)
+        agent_worker = compose.split("  agent-worker:", 1)[1].split(
+            "  transcode-worker:", 1
+        )[0]
+        self.assertIn("BBW_RQ_QUEUES: agent-control,agent", agent_worker)
+        self.assertIn("secrets: *agent-worker-secrets", agent_worker)
+        self.assertNotIn('BBW_PHONE_HMAC_KEY_FILE: ""', agent_worker)
+        self.assertNotIn('BBW_SESSION_HMAC_KEY_FILE: ""', agent_worker)
+
+        for source in (deployment, readme):
+            self.assertIn("agent-worker", source)
+        self.assertIn("AgentRunRepository(db).fail_stale_running(", jobs)
+        self.assertIn("mark_stale_running_for_manual_review", jobs)
+        self.assertIn('"stale_model_runs_failed"', jobs)
+        self.assertIn('"stale_action_executions_review"', jobs)
+        self.assertIn("def _compare_server_default(", migration_env)
+        self.assertEqual(
+            migration_env.count(
+                "compare_server_default=_compare_server_default"
+            ),
+            2,
+        )
+        self.assertNotIn("compare_server_default=False", migration_env)
 
     def test_admin_bootstrap_runs_inside_lifespan_cleanup_scope(self) -> None:
         source = self.read("bbw_web/api.py")

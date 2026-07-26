@@ -68,6 +68,9 @@ AUTONOMY_TASK_ACTIONS = {
     "unfollow_target": "unfollow_user",
 }
 AUTONOMY_MESSAGE_PROVIDER = "web-local"
+AGENT_RUNNING_TIMEOUT = timedelta(minutes=15)
+MODEL_RUN_TIMEOUT_FAILURE_CODE = "model_run_timeout"
+ACTION_EXECUTION_TIMEOUT_FAILURE_CODE = "execution_timeout_unknown"
 
 
 def _normalize_action_type(value: str) -> str:
@@ -414,7 +417,14 @@ class AgentRunRepository:
         source_message_count: int,
         prompt_char_count: int,
     ) -> tuple[AiAgentRun, bool]:
-        """Create one durable model audit row or return its exact replay."""
+        """Create or acquire one durable idempotent model run.
+
+        A process can disappear after committing ``running`` and before it can
+        persist a terminal result.  Model generation has no account-side
+        effect, so an attempt older than the bounded timeout may safely reuse
+        the same audit row and idempotency key.  Fresh running attempts and
+        ordinary terminal failures remain non-acquirable.
+        """
 
         now = utcnow()
         created = self.db.scalars(
@@ -454,7 +464,62 @@ class AgentRunRepository:
             raise RuntimeError(
                 "model run idempotency conflict occurred but row was not found"
             )
+        stale_running = bool(
+            existing.status == "running"
+            and existing.started_at is not None
+            and existing.started_at <= now - AGENT_RUNNING_TIMEOUT
+        )
+        timed_out = bool(
+            existing.status == "failed"
+            and existing.failure_code == MODEL_RUN_TIMEOUT_FAILURE_CODE
+        )
+        if stale_running or timed_out:
+            existing.connection_id = connection_id
+            existing.status = "running"
+            existing.model_snapshot = str(model_snapshot or "")[:160]
+            existing.peer_upstream_uid = (
+                str(peer_upstream_uid or "").strip()[:128] or None
+            )
+            existing.source_message_count = max(0, int(source_message_count))
+            existing.prompt_char_count = max(0, int(prompt_char_count))
+            existing.output_text = None
+            existing.output_char_count = 0
+            existing.input_tokens = None
+            existing.output_tokens = None
+            existing.latency_ms = None
+            existing.failure_code = None
+            existing.started_at = now
+            existing.completed_at = None
+            existing.updated_at = now
+            self.db.flush()
+            return existing, True
         return existing, False
+
+    def fail_stale_running(
+        self,
+        *,
+        at: datetime | None = None,
+        timeout: timedelta = AGENT_RUNNING_TIMEOUT,
+    ) -> int:
+        """Close abandoned model attempts; a later replay may reacquire them."""
+
+        now = at or utcnow()
+        result = self.db.execute(
+            update(AiAgentRun)
+            .where(
+                AiAgentRun.status == "running",
+                AiAgentRun.started_at <= now - timeout,
+            )
+            .values(
+                status="failed",
+                failure_code=MODEL_RUN_TIMEOUT_FAILURE_CODE,
+                output_text=None,
+                output_char_count=0,
+                completed_at=now,
+                updated_at=now,
+            )
+        )
+        return int(result.rowcount or 0)
 
     def succeed(
         self,
@@ -641,12 +706,64 @@ class AgentActionExecutionRepository:
             owner_user_id,
             action_type=normalized_action,
             idempotency_key=normalized_key,
+            for_update=True,
         )
         if existing is None:
             raise RuntimeError(
                 "account action idempotency conflict occurred but row was not found"
             )
+        self._mark_stale_running_row(existing, at=now)
         return existing, False
+
+    def _mark_stale_running_row(
+        self,
+        row: AiAgentActionExecution,
+        *,
+        at: datetime,
+        timeout: timedelta = AGENT_RUNNING_TIMEOUT,
+    ) -> bool:
+        """Fail closed when a side effect may have escaped before a crash."""
+
+        if (
+            row.status != "running"
+            or row.started_at is None
+            or row.started_at > at - timeout
+        ):
+            return False
+        row.status = "manual_review"
+        row.stable_error_code = ACTION_EXECUTION_TIMEOUT_FAILURE_CODE
+        row.external_result_id = None
+        row.completed_at = at
+        row.cancelled_at = None
+        row.updated_at = at
+        self.db.flush()
+        return True
+
+    def mark_stale_running_for_manual_review(
+        self,
+        *,
+        at: datetime | None = None,
+        timeout: timedelta = AGENT_RUNNING_TIMEOUT,
+    ) -> int:
+        """Close abandoned side effects without ever retrying them automatically."""
+
+        now = at or utcnow()
+        result = self.db.execute(
+            update(AiAgentActionExecution)
+            .where(
+                AiAgentActionExecution.status == "running",
+                AiAgentActionExecution.started_at <= now - timeout,
+            )
+            .values(
+                status="manual_review",
+                stable_error_code=ACTION_EXECUTION_TIMEOUT_FAILURE_CODE,
+                external_result_id=None,
+                completed_at=now,
+                cancelled_at=None,
+                updated_at=now,
+            )
+        )
+        return int(result.rowcount or 0)
 
     def claim_next_queued(self) -> AiAgentActionExecution | None:
         stmt = (

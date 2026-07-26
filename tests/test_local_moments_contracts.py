@@ -4,7 +4,9 @@ import uuid
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from bbw_prod.models import (
     LegacySocialBinding,
@@ -37,6 +39,7 @@ from bbw_web.moments_native import (
     SocialReportState,
     SqlAlchemySocialPermissionPolicy,
     SocialTopicView,
+    SqlAlchemyCanonicalSocialStore,
     explain_feed_score,
 )
 
@@ -869,6 +872,254 @@ class LocalMomentsServiceTests(unittest.TestCase):
             self.publish(visibility="unknown")
         with self.assertRaises(InvalidSocialContent):
             self.publish(topics=tuple(f"topic-{index}" for index in range(6)))
+
+
+class SqlAlchemyLegacyDriftConvergenceTests(unittest.TestCase):
+    class _Db:
+        def __init__(self, *scalar_values: object, rows=()) -> None:
+            self.scalar_values = list(scalar_values)
+            self.rows = list(rows)
+            self.added: list[object] = []
+            self.deleted: list[object] = []
+            self.flushed = 0
+
+        def scalar(self, _statement: object) -> object:
+            return self.scalar_values.pop(0)
+
+        def execute(self, _statement: object) -> list[object]:
+            return list(self.rows)
+
+        def add(self, row: object) -> None:
+            self.added.append(row)
+
+        def delete(self, row: object) -> None:
+            self.deleted.append(row)
+
+        def flush(self) -> None:
+            self.flushed += 1
+
+    def test_existing_legacy_post_converges_entity_binding_and_topics(self) -> None:
+        owner_id = uuid.uuid4()
+        post_id = uuid.uuid4()
+        binding = LegacySocialBinding(
+            provider="beibeiwu",
+            entity_type="post",
+            upstream_id="legacy-post-drift",
+            local_entity_id=post_id,
+            local_public_id="pst_legacy",
+            imported_by_user_id=uuid.uuid4(),
+            import_scope="visible-history",
+            source_created_at=NOW - timedelta(days=3),
+            payload_digest="a" * 64,
+            extra_data={"schema": "web-local-social-v1"},
+        )
+        existing = SocialPost(
+            id=post_id,
+            public_id="pst_legacy",
+            payload_digest="a" * 64,
+            author_user_id=owner_id,
+            author_upstream_uid="owner-upstream",
+            author_display_name="旧名称",
+            author_snapshot={"city": "旧城市"},
+            source="legacy-import",
+            title="旧标题",
+            body="旧正文",
+            media={},
+            visibility="private",
+            comment_policy="disabled",
+            hide_comments=True,
+            status="published",
+            is_pinned=False,
+            like_count=1,
+            comment_count=0,
+            view_count=0,
+            report_count=0,
+            source_created_at=NOW - timedelta(days=3),
+            published_at=NOW - timedelta(days=3),
+            version=1,
+            extra_data={"authority": "web-local", "legacy_metadata": {}},
+        )
+        item = LegacyPostInput(
+            provider="beibeiwu",
+            upstream_id="legacy-post-drift",
+            author_user_id=owner_id,
+            author_upstream_uid="owner-upstream",
+            author_display_name="新名称",
+            title="新标题",
+            body="新正文",
+            media={"pictures": ["https://example.com/new.jpg"]},
+            visibility="followers",
+            comment_policy="open",
+            hide_comments=False,
+            source_created_at=NOW - timedelta(days=1),
+            topics=("旅行", "上海"),
+            author_snapshot={"city": "上海"},
+            metadata={
+                "legacy_like_count": 9,
+                "legacy_pinned": True,
+                "plate": "招募令",
+            },
+        )
+        db = self._Db(binding, existing)
+        store = SqlAlchemyCanonicalSocialStore(db)
+        expected_view = object()
+
+        with patch.object(
+            store,
+            "_topics_for_post",
+            return_value=(SimpleNamespace(name="旧话题"),),
+        ), patch.object(store, "_sync_topics") as sync_topics, patch.object(
+            store, "_post_view", return_value=expected_view
+        ):
+            view, created = store.import_legacy_post(
+                requested_by=SocialPrincipal(owner_id, "owner-upstream"),
+                item=item,
+                import_scope="owner",
+                payload_digest="b" * 64,
+                imported_at=NOW,
+            )
+
+        self.assertIs(view, expected_view)
+        self.assertFalse(created)
+        self.assertEqual(existing.payload_digest, "b" * 64)
+        self.assertEqual(existing.author_display_name, "新名称")
+        self.assertEqual(existing.author_snapshot, {"city": "上海"})
+        self.assertEqual(existing.title, "新标题")
+        self.assertEqual(existing.body, "新正文")
+        self.assertEqual(existing.media, item.media)
+        self.assertEqual(existing.visibility, "followers")
+        self.assertEqual(existing.comment_policy, "open")
+        self.assertFalse(existing.hide_comments)
+        self.assertTrue(existing.is_pinned)
+        self.assertEqual(existing.pinned_at, item.source_created_at)
+        self.assertEqual(existing.like_count, 9)
+        self.assertEqual(existing.version, 2)
+        self.assertEqual(binding.payload_digest, "b" * 64)
+        self.assertEqual(binding.import_scope, "owner")
+        self.assertEqual(binding.imported_by_user_id, owner_id)
+        self.assertEqual(binding.source_created_at, item.source_created_at)
+        sync_topics.assert_called_once_with(
+            post=existing,
+            names=("旅行", "上海"),
+            occurred_at=NOW,
+        )
+        self.assertGreaterEqual(db.flushed, 1)
+
+    def test_existing_legacy_comment_converges_and_updates_visible_count(self) -> None:
+        owner_id = uuid.uuid4()
+        post_id = uuid.uuid4()
+        comment_id = uuid.uuid4()
+        binding = LegacySocialBinding(
+            provider="beibeiwu",
+            entity_type="comment",
+            upstream_id="legacy-comment-drift",
+            local_entity_id=comment_id,
+            local_public_id="cmt_legacy",
+            imported_by_user_id=uuid.uuid4(),
+            import_scope="visible-history",
+            source_created_at=NOW - timedelta(days=2),
+            payload_digest="c" * 64,
+            extra_data={"schema": "web-local-social-v1"},
+        )
+        existing = SocialComment(
+            id=comment_id,
+            public_id="cmt_legacy",
+            payload_digest="c" * 64,
+            post_id=post_id,
+            parent_comment_id=None,
+            author_user_id=None,
+            author_upstream_uid="comment-author",
+            author_display_name="旧评论者",
+            author_snapshot={},
+            source="legacy-import",
+            body="旧评论",
+            status="hidden",
+            like_count=1,
+            reply_count=0,
+            source_created_at=NOW - timedelta(days=2),
+            extra_data={},
+        )
+        item = LegacyCommentInput(
+            provider="beibeiwu",
+            upstream_id="legacy-comment-drift",
+            post_upstream_id="legacy-post",
+            parent_upstream_id="",
+            author_user_id=owner_id,
+            author_upstream_uid="comment-author",
+            author_display_name="新评论者",
+            body="新评论",
+            status="active",
+            like_count=7,
+            reply_count=2,
+            source_created_at=NOW - timedelta(hours=1),
+            author_snapshot={"city": "上海"},
+            metadata={"source": "verified"},
+        )
+        post_row = SimpleNamespace(comment_count=4)
+        db = self._Db(binding, existing)
+        store = SqlAlchemyCanonicalSocialStore(db)
+        expected_view = object()
+
+        with patch.object(
+            store, "_post_row", return_value=post_row
+        ), patch.object(store, "_comment_view", return_value=expected_view):
+            view, created = store.import_legacy_comment(
+                requested_by=SocialPrincipal(owner_id, "comment-author"),
+                post=SimpleNamespace(id=post_id),
+                parent=None,
+                item=item,
+                import_scope="owner",
+                payload_digest="d" * 64,
+                imported_at=NOW,
+            )
+
+        self.assertIs(view, expected_view)
+        self.assertFalse(created)
+        self.assertEqual(existing.payload_digest, "d" * 64)
+        self.assertEqual(existing.author_user_id, owner_id)
+        self.assertEqual(existing.author_display_name, "新评论者")
+        self.assertEqual(existing.author_snapshot, {"city": "上海"})
+        self.assertEqual(existing.body, "新评论")
+        self.assertEqual(existing.status, "active")
+        self.assertEqual(existing.like_count, 7)
+        self.assertEqual(existing.reply_count, 2)
+        self.assertEqual(post_row.comment_count, 5)
+        self.assertEqual(binding.payload_digest, "d" * 64)
+        self.assertEqual(binding.import_scope, "owner")
+        self.assertEqual(binding.imported_by_user_id, owner_id)
+
+    def test_topic_sync_updates_membership_positions_and_counts(self) -> None:
+        post = SimpleNamespace(id=uuid.uuid4(), status="published")
+        retained_topic = SimpleNamespace(
+            id=uuid.uuid4(), normalized_name="旅行", post_count=2
+        )
+        removed_topic = SimpleNamespace(
+            id=uuid.uuid4(), normalized_name="旧话题", post_count=3
+        )
+        retained = SimpleNamespace(position=4)
+        removed = SimpleNamespace(position=1)
+        new_topic = SimpleNamespace(
+            id=uuid.uuid4(), normalized_name="上海", post_count=5
+        )
+        db = self._Db(rows=((retained, retained_topic), (removed, removed_topic)))
+        store = SqlAlchemyCanonicalSocialStore(db)
+
+        with patch.object(store, "_ensure_topic", return_value=(new_topic, False)):
+            store._sync_topics(
+                post=post,
+                names=("旅行", "上海"),
+                occurred_at=NOW,
+            )
+
+        self.assertEqual(retained.position, 0)
+        self.assertEqual(db.deleted, [removed])
+        self.assertEqual(removed_topic.post_count, 2)
+        self.assertEqual(new_topic.post_count, 6)
+        self.assertEqual(len(db.added), 1)
+        association = db.added[0]
+        self.assertEqual(association.post_id, post.id)
+        self.assertEqual(association.topic_id, new_topic.id)
+        self.assertEqual(association.position, 1)
 
 
 class LocalSocialSchemaTests(unittest.TestCase):

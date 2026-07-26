@@ -564,11 +564,15 @@ def downgrade() -> None:
         table_name="ai_agent_autonomy_settings",
     )
     op.drop_table("ai_agent_autonomy_settings")
+    # 0015 的模型运行 CHECK 不认识无人值守运行类型。相关功能和任务表
+    # 已在上方移除，因此删除这些专属审计行后才能安全恢复旧枚举。
     op.execute(
-        "UPDATE ai_agent_action_executions "
-        "SET status = 'failed' WHERE status = 'manual_review'"
+        "DELETE FROM ai_agent_runs WHERE run_type IN "
+        "('autonomous_reply', 'autonomous_post', 'autonomous_plan')"
     )
-    _replace_action_execution_unknown_constraints(include_manual_review=False)
+    # manual_review 在 0015 中已经是合法且必要的未知结果终态，降级 0016
+    # 不得篡改为 failed，也不得收窄对应约束。
+    _replace_action_execution_unknown_constraints(include_manual_review=True)
     _replace_agent_run_type_constraint(include_autonomy=False)
     op.drop_column(
         "ai_model_runner_system_settings", "autonomous_agent_enabled"

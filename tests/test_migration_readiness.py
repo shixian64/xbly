@@ -10,6 +10,8 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sqlalchemy.dialects import postgresql
+
 from bbw_prod import migration_readiness
 
 
@@ -272,6 +274,33 @@ def message_peer_relationship_row(
 
 
 class MigrationReadinessEvaluationTests(unittest.TestCase):
+    def test_legacy_media_archive_prefix_uses_the_strict_media_gate(self) -> None:
+        ordinary_compiled = (
+            migration_readiness._ordinary_compatibility_outbox_predicate().compile(
+                dialect=postgresql.dialect()
+            )
+        )
+        media_compiled = (
+            migration_readiness._media_archive_outbox_predicate().compile(
+                dialect=postgresql.dialect()
+            )
+        )
+        ordinary = str(ordinary_compiled)
+        media = str(media_compiled)
+
+        self.assertIn("operation_type LIKE", ordinary)
+        self.assertIn("operation_type NOT LIKE", ordinary)
+        self.assertEqual(
+            set(ordinary_compiled.params.values()),
+            {"compatibility.%", "compatibility.media.archive%"},
+        )
+        self.assertIn("operation_type =", media)
+        self.assertIn("operation_type LIKE", media)
+        self.assertEqual(
+            set(media_compiled.params.values()),
+            {"media.archive", "compatibility.media.archive%"},
+        )
+
     def test_only_active_accounts_with_credentials_uid_and_two_markers_are_ready(self) -> None:
         ready_user = uuid.uuid4()
         ready_account = uuid.uuid4()

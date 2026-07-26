@@ -184,7 +184,9 @@ class SqlAlchemyCanonicalSocialStore:
         if row is not None:
             return row, True
         existing = self.db.scalar(
-            select(SocialTopic).where(SocialTopic.normalized_name == normalized_name)
+            select(SocialTopic)
+            .where(SocialTopic.normalized_name == normalized_name)
+            .with_for_update()
         )
         if existing is None:
             raise RuntimeError("topic conflict occurred without an existing row")
@@ -251,6 +253,60 @@ class SqlAlchemyCanonicalSocialStore:
                 .returning(SocialPostTopic)
             ).first()
             if association is not None:
+                topic.post_count = max(0, int(topic.post_count or 0)) + 1
+
+    def _sync_topics(
+        self,
+        *,
+        post: SocialPost,
+        names: tuple[str, ...],
+        occurred_at: datetime,
+    ) -> None:
+        """Make one legacy-import post's topic set match the verified source."""
+
+        desired = {
+            name.casefold(): (position, name)
+            for position, name in enumerate(names)
+        }
+        current = list(
+            self.db.execute(
+                select(SocialPostTopic, SocialTopic)
+                .join(SocialTopic, SocialTopic.id == SocialPostTopic.topic_id)
+                .where(SocialPostTopic.post_id == post.id)
+                .with_for_update()
+            )
+        )
+        retained: set[str] = set()
+        for association, topic in current:
+            normalized = str(topic.normalized_name or "")
+            target = desired.get(normalized)
+            if target is None:
+                self.db.delete(association)
+                if post.status == "published":
+                    topic.post_count = max(0, int(topic.post_count or 0) - 1)
+                continue
+            association.position = target[0]
+            retained.add(normalized)
+
+        for normalized, (position, name) in desired.items():
+            if normalized in retained:
+                continue
+            topic, _created = self._ensure_topic(
+                name=name,
+                normalized_name=normalized,
+                description="",
+                created_by_user_id=None,
+                occurred_at=occurred_at,
+            )
+            self.db.add(
+                SocialPostTopic(
+                    post_id=post.id,
+                    topic_id=topic.id,
+                    position=position,
+                    created_at=occurred_at,
+                )
+            )
+            if post.status == "published":
                 topic.post_count = max(0, int(topic.post_count or 0)) + 1
 
     def create_post(
@@ -364,35 +420,107 @@ class SqlAlchemyCanonicalSocialStore:
         imported_at: datetime,
     ) -> tuple[SocialPostView, bool]:
         binding = self.db.scalar(
-            select(LegacySocialBinding).where(
+            select(LegacySocialBinding)
+            .where(
                 LegacySocialBinding.provider == item.provider,
                 LegacySocialBinding.entity_type == "post",
                 LegacySocialBinding.upstream_id == item.upstream_id,
             )
+            .with_for_update()
         )
         if binding is not None:
             existing = self.db.scalar(
-                select(SocialPost).where(SocialPost.id == binding.local_entity_id)
+                select(SocialPost)
+                .where(SocialPost.id == binding.local_entity_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
             if existing is None:
                 raise SocialContentNotFound("历史动态绑定已失效")
             if (
-                existing.author_user_id != item.author_user_id
+                existing.source != "legacy-import"
+                or existing.author_user_id != item.author_user_id
                 or existing.author_upstream_uid != item.author_upstream_uid
             ):
                 # digest 收敛只接受同作者的合法漂移；作者身份变化说明上游
                 # 动态 ID 被复用给了别人的内容，必须失败关闭。
                 raise SocialIdempotencyConflict("上游动态 ID 已绑定到其他作者")
+            legacy_metadata = dict(item.metadata or {})
+            category = _post_category(legacy_metadata)
+            is_pinned = bool(legacy_metadata.get("legacy_pinned"))
+            next_extra = dict(existing.extra_data or {})
+            next_extra.update(
+                {
+                    "authority": LOCAL_SOCIAL_PROVIDER,
+                    "category": category,
+                    "legacy_metadata": legacy_metadata,
+                    "plate": "招募令" if category == "recruitment" else "动态",
+                    "schema": LOCAL_SOCIAL_SCHEMA,
+                    "source_provider": item.provider,
+                }
+            )
+            changed = any(
+                (
+                    existing.payload_digest != payload_digest,
+                    existing.author_display_name != item.author_display_name,
+                    dict(existing.author_snapshot or {})
+                    != dict(item.author_snapshot or {}),
+                    existing.title != (item.title or None),
+                    existing.body != (item.body or None),
+                    dict(existing.media or {}) != dict(item.media or {}),
+                    existing.visibility != item.visibility,
+                    existing.comment_policy != item.comment_policy,
+                    bool(existing.hide_comments) != bool(item.hide_comments),
+                    bool(existing.is_pinned) != is_pinned,
+                    existing.pinned_at
+                    != (item.source_created_at if is_pinned else None),
+                    int(existing.like_count or 0)
+                    != _legacy_count(legacy_metadata.get("legacy_like_count")),
+                    existing.source_created_at != item.source_created_at,
+                    existing.published_at != item.source_created_at,
+                    dict(existing.extra_data or {}) != next_extra,
+                    tuple(topic.name for topic in self._topics_for_post(existing.id))
+                    != tuple(item.topics),
+                )
+            )
+            existing.payload_digest = payload_digest
+            existing.author_display_name = item.author_display_name
+            existing.author_snapshot = dict(item.author_snapshot or {})
+            existing.title = item.title or None
+            existing.body = item.body or None
+            existing.media = dict(item.media or {})
+            existing.visibility = item.visibility
+            existing.comment_policy = item.comment_policy
+            existing.hide_comments = bool(item.hide_comments)
+            existing.is_pinned = is_pinned
+            existing.pinned_at = item.source_created_at if is_pinned else None
+            existing.like_count = _legacy_count(
+                legacy_metadata.get("legacy_like_count")
+            )
+            existing.source_created_at = item.source_created_at
+            existing.published_at = item.source_created_at
+            existing.extra_data = next_extra
+            if changed:
+                existing.version = max(1, int(existing.version or 1)) + 1
+                existing.updated_at = imported_at
+            self._sync_topics(
+                post=existing,
+                names=item.topics,
+                occurred_at=imported_at,
+            )
             if binding.payload_digest != payload_digest:
-                # provider+upstream_id 才是 legacy 导入的幂等身份；digest 漂移
-                # （上游内容微调或旧算法存量值）按已导入收敛并登记最新 digest，
-                # 不得让重跑把整账号迁移失败关闭。
                 binding.payload_digest = payload_digest
                 extra = dict(binding.extra_data or {})
                 extra["digest_refreshed_at"] = imported_at.isoformat()
                 binding.extra_data = extra
-                binding.updated_at = imported_at
-                self.db.flush()
+            if import_scope == "owner":
+                binding.import_scope = "owner"
+                binding.imported_by_user_id = requested_by.user_id
+            elif binding.import_scope != "owner":
+                binding.import_scope = import_scope
+            binding.source_created_at = item.source_created_at
+            binding.updated_at = imported_at
+            self.db.flush()
             return self._post_view(existing), False
 
         legacy_metadata = dict(item.metadata or {})
@@ -655,35 +783,89 @@ class SqlAlchemyCanonicalSocialStore:
         imported_at: datetime,
     ) -> tuple[SocialCommentView, bool]:
         binding = self.db.scalar(
-            select(LegacySocialBinding).where(
+            select(LegacySocialBinding)
+            .where(
                 LegacySocialBinding.provider == item.provider,
                 LegacySocialBinding.entity_type == "comment",
                 LegacySocialBinding.upstream_id == item.upstream_id,
             )
+            .with_for_update()
         )
         if binding is not None:
             existing = self.db.scalar(
-                select(SocialComment).where(
-                    SocialComment.id == binding.local_entity_id
-                )
+                select(SocialComment)
+                .where(SocialComment.id == binding.local_entity_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
             if existing is None:
                 raise SocialContentNotFound("历史评论绑定已失效")
-            if existing.post_id != post.id or existing.parent_comment_id != (
-                parent.id if parent is not None else None
+            if (
+                existing.source != "legacy-import"
+                or existing.post_id != post.id
+                or existing.parent_comment_id
+                != (parent.id if parent is not None else None)
+                or existing.author_upstream_uid != item.author_upstream_uid
+                or (
+                    existing.author_user_id is not None
+                    and item.author_user_id is not None
+                    and existing.author_user_id != item.author_user_id
+                )
             ):
                 # digest 收敛只接受同归属的合法漂移；所属动态或父评论变化
                 # 说明上游评论 ID 被复用，必须失败关闭。
                 raise SocialIdempotencyConflict("上游评论 ID 已绑定到其他动态或父评论")
+            next_extra = dict(existing.extra_data or {})
+            next_extra.update(
+                {
+                    "authority": LOCAL_SOCIAL_PROVIDER,
+                    "legacy_metadata": dict(item.metadata or {}),
+                    "legacy_parent_upstream_id": item.parent_upstream_id,
+                    "legacy_post_upstream_id": item.post_upstream_id,
+                    "schema": LOCAL_SOCIAL_SCHEMA,
+                    "source_provider": item.provider,
+                }
+            )
+            previous_status = existing.status
+            next_status = (
+                previous_status if previous_status == "deleted" else item.status
+            )
+            visibility_delta = int(next_status == "active") - int(
+                previous_status == "active"
+            )
+            if visibility_delta:
+                post_row = self._post_row(existing.post_id)
+                post_row.comment_count = max(
+                    0,
+                    int(post_row.comment_count or 0) + visibility_delta,
+                )
+            existing.payload_digest = payload_digest
+            if existing.author_user_id is None and item.author_user_id is not None:
+                existing.author_user_id = item.author_user_id
+            existing.author_display_name = item.author_display_name
+            existing.author_snapshot = dict(item.author_snapshot or {})
+            existing.body = item.body
+            if previous_status != "deleted":
+                existing.status = next_status
+                existing.deleted_at = None
+            existing.like_count = item.like_count
+            existing.reply_count = item.reply_count
+            existing.source_created_at = item.source_created_at
+            existing.extra_data = next_extra
+            existing.updated_at = imported_at
             if binding.payload_digest != payload_digest:
-                # 同 import_legacy_post：digest 漂移按已导入收敛，
-                # 幂等身份以 provider+upstream_id 为准。
                 binding.payload_digest = payload_digest
                 extra = dict(binding.extra_data or {})
                 extra["digest_refreshed_at"] = imported_at.isoformat()
                 binding.extra_data = extra
-                binding.updated_at = imported_at
-                self.db.flush()
+            if import_scope == "owner":
+                binding.import_scope = "owner"
+                binding.imported_by_user_id = requested_by.user_id
+            elif binding.import_scope != "owner":
+                binding.import_scope = import_scope
+            binding.source_created_at = item.source_created_at
+            binding.updated_at = imported_at
+            self.db.flush()
             return self._comment_view(existing), False
 
         comment = SocialComment(
@@ -715,8 +897,9 @@ class SqlAlchemyCanonicalSocialStore:
         )
         self.db.add(comment)
         self.db.flush()
-        post_row = self._post_row(post.id)
-        post_row.comment_count = max(0, int(post_row.comment_count or 0)) + 1
+        if item.status == "active":
+            post_row = self._post_row(post.id)
+            post_row.comment_count = max(0, int(post_row.comment_count or 0)) + 1
         self.db.add(
             LegacySocialBinding(
                 provider=item.provider,

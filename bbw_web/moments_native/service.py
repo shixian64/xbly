@@ -306,8 +306,8 @@ def _legacy_payload_digest(item: LegacyPostInput) -> str:
 
 
 def _legacy_comment_payload_digest(item: LegacyCommentInput) -> str:
-    # 同 _legacy_payload_digest：只保留稳定身份与内容，可变计数、状态、
-    # 快照与相对时间不参与幂等判定。
+    # 同 _legacy_payload_digest：只保留稳定身份与内容。状态决定评论是否
+    # 可展示，必须进入迁移证据；可变计数、快照与相对时间仍不参与摘要。
     return _digest(
         {
             "author_upstream_uid": item.author_upstream_uid,
@@ -317,6 +317,7 @@ def _legacy_comment_payload_digest(item: LegacyCommentInput) -> str:
             "post_upstream_id": item.post_upstream_id,
             "provider": item.provider,
             "schema": LOCAL_SOCIAL_SCHEMA,
+            "status": item.status,
             "upstream_id": item.upstream_id,
         }
     )

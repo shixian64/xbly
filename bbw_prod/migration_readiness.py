@@ -127,6 +127,7 @@ MEDIA_HISTORY_MAX_MESSAGES_PER_ACCOUNT = 1_000_000
 COMPATIBILITY_OUTBOX_PREFIX = "compatibility."
 # 与 bbw_web.jobs.MEDIA_OPERATION 保持一致（bbw_prod 不能反向依赖 bbw_web）。
 MEDIA_ARCHIVE_OPERATION_TYPE = "media.archive"
+LEGACY_MEDIA_ARCHIVE_OPERATION_PREFIX = "compatibility.media.archive"
 R2_CAPABILITY_PROBE_PREFIX = "health/migration-readiness"
 R2_CAPABILITY_PROBE_CONTENT_TYPE = "application/octet-stream"
 R2_CAPABILITY_ERROR_NOT_CHECKED = "r2_probe_not_checked"
@@ -140,6 +141,24 @@ R2_CAPABILITY_ERROR_GET_VERIFICATION = "r2_get_verification_failed"
 R2_CAPABILITY_ERROR_DELETE = "r2_delete_failed"
 R2_CAPABILITY_ERROR_DELETE_CONFIRMATION = "r2_delete_confirmation_failed"
 R2_CAPABILITY_ERROR_DELETE_VERIFICATION = "r2_delete_verification_failed"
+
+
+def _ordinary_compatibility_outbox_predicate() -> Any:
+    return and_(
+        OperationOutbox.operation_type.like(f"{COMPATIBILITY_OUTBOX_PREFIX}%"),
+        OperationOutbox.operation_type.not_like(
+            f"{LEGACY_MEDIA_ARCHIVE_OPERATION_PREFIX}%"
+        ),
+    )
+
+
+def _media_archive_outbox_predicate() -> Any:
+    return or_(
+        OperationOutbox.operation_type == MEDIA_ARCHIVE_OPERATION_TYPE,
+        OperationOutbox.operation_type.like(
+            f"{LEGACY_MEDIA_ARCHIVE_OPERATION_PREFIX}%"
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1324,11 +1343,7 @@ def inspect_readiness(
                 func.count(OperationOutbox.id).label("item_count"),
                 func.min(OperationOutbox.created_at).label("oldest_at"),
             )
-            .where(
-                OperationOutbox.operation_type.like(
-                    f"{COMPATIBILITY_OUTBOX_PREFIX}%"
-                )
-            )
+            .where(_ordinary_compatibility_outbox_predicate())
             .group_by(OperationOutbox.status)
         )
     )
@@ -1339,9 +1354,7 @@ def inspect_readiness(
                 func.count(OperationOutbox.id).label("item_count"),
                 func.min(OperationOutbox.created_at).label("oldest_at"),
             )
-            .where(
-                OperationOutbox.operation_type == MEDIA_ARCHIVE_OPERATION_TYPE
-            )
+            .where(_media_archive_outbox_predicate())
             .group_by(OperationOutbox.status)
         )
     )

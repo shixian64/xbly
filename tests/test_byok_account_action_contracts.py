@@ -4,7 +4,7 @@ import importlib.util
 import sys
 import unittest
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,15 +18,20 @@ try:
     from sqlalchemy.dialects import postgresql
 
     from bbw_agent.repositories import (
+        ACTION_EXECUTION_TIMEOUT_FAILURE_CODE,
+        AGENT_RUNNING_TIMEOUT,
+        MODEL_RUN_TIMEOUT_FAILURE_CODE,
         AgentActionExecutionRepository,
         AgentAutonomyDailyUsageRepository,
         AgentAutonomySettingRepository,
         AgentExecutionSettingRepository,
+        AgentRunRepository,
         SUPPORTED_ACCOUNT_ACTION_TYPES,
         _normalize_action_type,
     )
     from bbw_prod.models import (
         AiAgentActionExecution,
+        AiAgentRun,
         AiAgentAutonomySetting,
         AiAgentExecutionSetting,
         AiModelRunnerSystemSetting,
@@ -121,6 +126,15 @@ class ByokAccountActionSchemaContractTests(unittest.TestCase):
         self.assertIn(
             '"ai_model_runner_system_settings", "account_actions_enabled"',
             migration,
+        )
+        downgrade = migration.split("def downgrade() -> None:", 1)[1]
+        delete_reply_send = (
+            'DELETE FROM ai_agent_runs WHERE run_type = \'reply_send\''
+        )
+        self.assertIn(delete_reply_send, downgrade)
+        self.assertLess(
+            downgrade.index(delete_reply_send),
+            downgrade.index("include_reply_send=False"),
         )
 
     @unittest.skipIf(
@@ -304,12 +318,206 @@ class _ScalarSession:
         self.executed.append(statement)
         return SimpleNamespace(rowcount=self.rowcount)
 
+    def scalars(self, statement: object) -> SimpleNamespace:
+        self.executed.append(statement)
+        return SimpleNamespace(first=lambda: self.values.pop(0))
+
 
 @unittest.skipIf(
     DEPENDENCY_IMPORT_ERROR is not None,
     f"production dependencies are not installed: {DEPENDENCY_IMPORT_ERROR}",
 )
 class ByokAccountActionRepositoryTests(unittest.TestCase):
+    def test_stale_model_run_is_reacquired_but_fresh_run_is_not(self) -> None:
+        owner_id = uuid.uuid4()
+        connection_id = uuid.uuid4()
+        stale_started_at = datetime.now(UTC) - AGENT_RUNNING_TIMEOUT - timedelta(
+            seconds=1
+        )
+        stale = AiAgentRun(
+            id=uuid.uuid4(),
+            owner_user_id=owner_id,
+            connection_id=connection_id,
+            run_type="reply_draft",
+            status="running",
+            idempotency_key="stale-model-run",
+            model_snapshot="old-model",
+            source_message_count=1,
+            prompt_char_count=10,
+            output_text="partial",
+            output_char_count=7,
+            started_at=stale_started_at,
+        )
+        stale_session = _ScalarSession(None, stale)
+
+        claimed, acquired = AgentRunRepository(stale_session).enqueue_running(
+            owner_user_id=owner_id,
+            connection_id=connection_id,
+            run_type="reply_draft",
+            idempotency_key="stale-model-run",
+            model_snapshot="new-model",
+            peer_upstream_uid="peer-1",
+            source_message_count=2,
+            prompt_char_count=20,
+        )
+
+        self.assertIs(claimed, stale)
+        self.assertTrue(acquired)
+        self.assertEqual(stale.status, "running")
+        self.assertEqual(stale.model_snapshot, "new-model")
+        self.assertEqual(stale.peer_upstream_uid, "peer-1")
+        self.assertEqual(stale.source_message_count, 2)
+        self.assertEqual(stale.prompt_char_count, 20)
+        self.assertIsNone(stale.output_text)
+        self.assertEqual(stale.output_char_count, 0)
+        self.assertIsNone(stale.completed_at)
+        self.assertGreater(stale.started_at, stale_started_at)
+        self.assertEqual(stale_session.flushed, 1)
+
+        fresh = AiAgentRun(
+            id=uuid.uuid4(),
+            owner_user_id=owner_id,
+            connection_id=connection_id,
+            run_type="reply_draft",
+            status="running",
+            idempotency_key="fresh-model-run",
+            model_snapshot="same-model",
+            source_message_count=1,
+            prompt_char_count=10,
+            output_char_count=0,
+            started_at=datetime.now(UTC),
+        )
+        fresh_session = _ScalarSession(None, fresh)
+        replay, acquired = AgentRunRepository(fresh_session).enqueue_running(
+            owner_user_id=owner_id,
+            connection_id=connection_id,
+            run_type="reply_draft",
+            idempotency_key="fresh-model-run",
+            model_snapshot="same-model",
+            peer_upstream_uid=None,
+            source_message_count=1,
+            prompt_char_count=10,
+        )
+
+        self.assertIs(replay, fresh)
+        self.assertFalse(acquired)
+        self.assertEqual(fresh_session.flushed, 0)
+
+    def test_cleanup_timeout_model_run_can_be_reacquired(self) -> None:
+        owner_id = uuid.uuid4()
+        connection_id = uuid.uuid4()
+        timed_out = AiAgentRun(
+            id=uuid.uuid4(),
+            owner_user_id=owner_id,
+            connection_id=connection_id,
+            run_type="style_analysis",
+            status="failed",
+            idempotency_key="timed-out-model-run",
+            model_snapshot="old-model",
+            source_message_count=0,
+            prompt_char_count=0,
+            output_char_count=0,
+            failure_code=MODEL_RUN_TIMEOUT_FAILURE_CODE,
+            started_at=datetime.now(UTC) - timedelta(hours=1),
+            completed_at=datetime.now(UTC) - timedelta(minutes=30),
+        )
+        session = _ScalarSession(None, timed_out)
+
+        replay, acquired = AgentRunRepository(session).enqueue_running(
+            owner_user_id=owner_id,
+            connection_id=connection_id,
+            run_type="style_analysis",
+            idempotency_key="timed-out-model-run",
+            model_snapshot="new-model",
+            peer_upstream_uid=None,
+            source_message_count=3,
+            prompt_char_count=30,
+        )
+
+        self.assertIs(replay, timed_out)
+        self.assertTrue(acquired)
+        self.assertEqual(timed_out.status, "running")
+        self.assertIsNone(timed_out.failure_code)
+        self.assertIsNone(timed_out.completed_at)
+
+    def test_stale_running_action_is_manual_review_and_never_requeued(self) -> None:
+        owner_id = uuid.uuid4()
+        account_id = uuid.uuid4()
+        stale = AiAgentActionExecution(
+            id=uuid.uuid4(),
+            owner_user_id=owner_id,
+            external_account_id=account_id,
+            action_type="follow_user",
+            status="running",
+            idempotency_key="stale-action-run",
+            execution_setting_version=1,
+            target_snapshot={"peer": "target"},
+            parameter_snapshot={},
+            approval_source="user_allowlist",
+            trigger_source="model",
+            queued_at=datetime.now(UTC) - timedelta(hours=1),
+            started_at=datetime.now(UTC) - AGENT_RUNNING_TIMEOUT - timedelta(
+                seconds=1
+            ),
+        )
+        session = _ScalarSession(None, stale)
+
+        replay, created = AgentActionExecutionRepository(session).enqueue(
+            owner_user_id=owner_id,
+            external_account_id=account_id,
+            action_type="follow_user",
+            idempotency_key="stale-action-run",
+            execution_setting_version=1,
+            target_snapshot={"peer": "target"},
+            parameter_snapshot={},
+            approval_source="user_allowlist",
+            trigger_source="model",
+        )
+
+        self.assertIs(replay, stale)
+        self.assertFalse(created)
+        self.assertEqual(stale.status, "manual_review")
+        self.assertEqual(
+            stale.stable_error_code,
+            ACTION_EXECUTION_TIMEOUT_FAILURE_CODE,
+        )
+        self.assertIsNotNone(stale.completed_at)
+        self.assertIsNone(stale.cancelled_at)
+        self.assertEqual(session.flushed, 1)
+
+    def test_periodic_cleanup_uses_bounded_running_cutoffs(self) -> None:
+        at = datetime.now(UTC)
+        model_session = _ScalarSession(rowcount=2)
+        action_session = _ScalarSession(rowcount=3)
+
+        self.assertEqual(
+            AgentRunRepository(model_session).fail_stale_running(at=at), 2
+        )
+        self.assertEqual(
+            AgentActionExecutionRepository(
+                action_session
+            ).mark_stale_running_for_manual_review(at=at),
+            3,
+        )
+
+        model_compiled = model_session.executed[0].compile(
+            dialect=postgresql.dialect()
+        )
+        action_compiled = action_session.executed[0].compile(
+            dialect=postgresql.dialect()
+        )
+        self.assertIn("running", model_compiled.params.values())
+        self.assertIn("failed", model_compiled.params.values())
+        self.assertIn(
+            MODEL_RUN_TIMEOUT_FAILURE_CODE, model_compiled.params.values()
+        )
+        self.assertIn("running", action_compiled.params.values())
+        self.assertIn("manual_review", action_compiled.params.values())
+        self.assertIn(
+            ACTION_EXECUTION_TIMEOUT_FAILURE_CODE,
+            action_compiled.params.values(),
+        )
+
     def test_execution_settings_start_disabled_and_revoke_increments_version(self) -> None:
         owner_id = uuid.uuid4()
         create_session = _ScalarSession(None)

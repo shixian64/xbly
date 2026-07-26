@@ -329,6 +329,10 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_table("ai_agent_action_executions")
     op.drop_table("ai_agent_execution_settings")
+    # 0014 的 CHECK 不认识 reply_send。降级本身会移除账号直发能力，
+    # 因而先删除只属于该能力的模型审计行，再收窄枚举；否则任意一条
+    # reply_send 存量都会让 PostgreSQL 拒绝创建旧约束并中断降级。
+    op.execute("DELETE FROM ai_agent_runs WHERE run_type = 'reply_send'")
     _replace_agent_run_type_constraint(include_reply_send=False)
     op.drop_column(
         "ai_model_runner_system_settings", "account_actions_enabled"

@@ -70,7 +70,9 @@ class ByokAgentSchedulerSourceContractTests(unittest.TestCase):
         scheduler = compose.split("\n  scheduler:", 1)[1].split("\n  caddy:", 1)[0]
 
         self.assertIn("BBW_RQ_QUEUES: agent-control,agent", agent)
-        self.assertIn("secrets: *worker-secrets", agent)
+        self.assertIn("secrets: *agent-worker-secrets", agent)
+        self.assertNotIn('BBW_PHONE_HMAC_KEY_FILE: ""', agent)
+        self.assertNotIn('BBW_SESSION_HMAC_KEY_FILE: ""', agent)
         for network in ("database", "queue", "egress"):
             self.assertIn(f"- {network}", agent)
         self.assertIn("stop_grace_period: 6m", agent)

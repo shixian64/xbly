@@ -468,9 +468,23 @@ class OpportunisticEnrollmentGateTests(unittest.TestCase):
         ) -> None:
             self.credentials = FakeCredentialRepository(credential_rows)
             self.calls: list[dict[str, object]] = []
+            self.suspensions: list[dict[str, object]] = []
 
         def enroll_verified_password(self, **kwargs: object) -> None:
             self.calls.append(dict(kwargs))
+
+        def suspend_stale_password(self, **kwargs: object) -> bool | None:
+            self.suspensions.append(dict(kwargs))
+            credential = self.credentials.get_for_user(
+                kwargs["user_id"], for_update=True
+            )
+            if credential is None:
+                return None
+            verified_at = kwargs["verified_at"]
+            if credential.verified_at >= verified_at:
+                return False
+            credential.disabled_at = verified_at
+            return True
 
     def setUp(self) -> None:
         prod_services._reset_enrollment_gate_for_tests()
@@ -511,22 +525,27 @@ class OpportunisticEnrollmentGateTests(unittest.TestCase):
         self.assertIsNone(prod_services._ENROLLMENT_GATE)
         self.assertIsNot(prod_services._opportunistic_enrollment_gate(2), first)
 
-    def test_saturated_gate_with_existing_credential_defers_and_warns(self) -> None:
+    def test_saturated_gate_with_existing_credential_disables_stale_digest(self) -> None:
         service, user, recorder = self.make_service(has_credential=True)
+        credential = recorder.credentials.get_for_user(user.id)
+        self.assertIsNotNone(credential)
         gate = prod_services._opportunistic_enrollment_gate(2)  # 容量 1
         self.assertTrue(gate.acquire(blocking=False))
+        verified_at = datetime.now(UTC)
         try:
             with self.assertLogs("bbw_prod.services", level="WARNING") as logs:
                 enrolled = service._enroll_password_opportunistically(
                     user_id=user.id,
                     password="upstream-password",
-                    verified_at=datetime.now(UTC),
+                    verified_at=verified_at,
                 )
         finally:
             gate.release()
 
         self.assertFalse(enrolled)
         self.assertEqual(recorder.calls, [])
+        self.assertEqual(recorder.suspensions, [{"user_id": user.id, "verified_at": verified_at}])
+        self.assertEqual(credential.disabled_at, verified_at)
         self.assertIn(str(user.id), logs.output[0])
 
     def test_saturated_gate_without_credential_row_blocks_until_enrolled(self) -> None:

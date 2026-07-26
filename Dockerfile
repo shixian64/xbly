@@ -33,6 +33,7 @@ RUN python -m pip install --no-cache-dir --requirement requirements.txt
 COPY --chown=${APP_UID}:${APP_GID} bbw_protocol ./bbw_protocol
 COPY --chown=${APP_UID}:${APP_GID} bbw_web ./bbw_web
 COPY --chown=${APP_UID}:${APP_GID} bbw_prod ./bbw_prod
+COPY --chown=${APP_UID}:${APP_GID} bbw_agent ./bbw_agent
 COPY --chown=${APP_UID}:${APP_GID} docs/api_catalog.json ./docs/api_catalog.json
 COPY --chown=${APP_UID}:${APP_GID} alembic.ini ./alembic.ini
 COPY --chown=${APP_UID}:${APP_GID} migrations ./migrations

@@ -85,6 +85,16 @@ x-worker-secrets: &worker-secrets
   - r2_access_key_id
   - r2_secret_access_key
 
+x-agent-worker-secrets: &agent-worker-secrets
+  - postgres_password
+  - app_master_key
+  - credential_keyring
+  - phone_hmac_key
+  - session_hmac_key
+  - txim_secret_key
+  - r2_access_key_id
+  - r2_secret_access_key
+
 x-transcode-secrets: &transcode-secrets
   - r2_access_key_id
   - r2_secret_access_key
@@ -429,12 +439,10 @@ services:
     environment:
       <<: *app-environment
       BBW_RQ_QUEUES: agent-control,agent
-      BBW_PHONE_HMAC_KEY_FILE: ""
-      BBW_SESSION_HMAC_KEY_FILE: ""
       BBW_ROOMKIT_BUSINESS_TOKEN_FILE: ""
       BBW_TURNSTILE_SITE_KEY: ""
       BBW_TURNSTILE_SECRET_KEY_FILE: ""
-    secrets: *worker-secrets
+    secrets: *agent-worker-secrets
     command: ["python", "-m", "bbw_web.worker"]
     depends_on:
       postgres:

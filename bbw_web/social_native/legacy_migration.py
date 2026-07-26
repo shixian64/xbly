@@ -28,7 +28,6 @@ from bbw_prod.migration_readiness import (
     DOMAIN_MARKER_STREAMS,
     SOCIAL_MARKER_SCOPE_PATHS,
     SOCIAL_MARKER_SOURCE_PATHS,
-    _valid_domain_marker,
 )
 from bbw_prod.models import ExternalAccount, Relationship, SyncCursor, User, utcnow
 from bbw_prod.repositories import RelationshipRepository, SyncCursorRepository
@@ -1027,13 +1026,6 @@ class SqlAlchemyLegacySocialWriter:
         succeeded_at: datetime | None,
         error: str | None,
     ) -> None:
-        if str(dict(marker).get("phase") or "") != "complete" and (
-            self._has_valid_complete_marker(db, account)
-        ):
-            # 已有通过严格校验的 complete Marker 时，applying/failed 写入
-            # 一律跳过：校验性重跑中途失败必须保留既有完整性证明，
-            # 成功时仍以新 complete Marker 收尾。
-            return
         attempted_at = _as_utc(self.clock())
         watermark = max(window.coverage_ended_at, attempted_at)
         SyncCursorRepository(db).upsert(
@@ -1071,19 +1063,6 @@ class SqlAlchemyLegacySocialWriter:
         if row is None:
             raise LegacySocialDataError("legacy_account_binding_changed")
         return row[0], row[1]
-
-    def _has_valid_complete_marker(
-        self, db: Any, account: LegacySocialAccount
-    ) -> bool:
-        cursor = SyncCursorRepository(db).get(
-            account.owner_user_id, LEGACY_PROVIDER, SOCIAL_STREAM
-        )
-        return _valid_domain_marker(
-            cursor,
-            domain="social",
-            external_account_id=account.external_account_id,
-            upstream_uid=account.upstream_uid,
-        )
 
     def begin(self, account: LegacySocialAccount, window: ImportWindow) -> None:
         with self.db_scope() as db:
