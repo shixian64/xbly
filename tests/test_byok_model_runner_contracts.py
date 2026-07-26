@@ -724,6 +724,13 @@ class ByokManagementAndMigrationContractTests(unittest.TestCase):
         self.assertIn("byokAutonomousAgent:", admin_js)
         self.assertIn("userByokAutonomousAgent:", admin_js)
         self.assertIn("async function loadByokAutonomousAgentControl", admin_js)
+        autonomous_render = admin_js.split(
+            "function renderByokAutonomousAgentControl", 1
+        )[1].split("async function loadByokAutonomousAgentControl", 1)[0]
+        self.assertIn(
+            "const backgroundEnabled = feature.background_enabled === true;",
+            autonomous_render,
+        )
         global_submit = admin_js.split(
             '$("admin-byok-autonomous-agent-global-form").addEventListener("submit"',
             1,
@@ -761,8 +768,16 @@ class ByokManagementAndMigrationContractTests(unittest.TestCase):
                 "user.byok_autonomous_agent_changed",
                 "修改用户无人值守运营 Agent 授权",
             ),
+            (
+                "ai.autonomy_settings_changed",
+                "修改无人值守自治设置",
+            ),
         ):
             self.assertIn(f'"{action}": "{label}"', admin_js)
+        self.assertIn("function populateAuditActionOptions", admin_js)
+        self.assertIn("AUDIT_ACTION_LABELS", admin_js)
+        self.assertIn('list="admin-audit-action-options"', admin_html)
+        self.assertIn('<datalist id="admin-audit-action-options">', admin_html)
 
         get_global = admin.split(
             "def get_byok_autonomous_agent_control", 1
@@ -896,6 +911,56 @@ class ByokManagementAndMigrationContractTests(unittest.TestCase):
         self.assertIn("trust_env=False", gateway)
         self.assertNotIn("response.text", gateway)
         self.assertNotIn("response.json()", gateway)
+
+    def test_admin_agent_record_read_endpoints_are_wired_and_non_sensitive(self) -> None:
+        admin = self.read("bbw_web/admin_api.py")
+        admin_html = self.read("bbw_web/static/admin.html")
+        admin_js = self.read("bbw_web/static/admin.js")
+
+        for route in (
+            '@router.get("/users/{user_id}/agent-runs")',
+            '@router.get("/users/{user_id}/agent-actions")',
+            '@router.get("/users/{user_id}/autonomy-tasks")',
+        ):
+            self.assertIn(route, admin)
+        for action in (
+            'action="agent_run.list"',
+            'action="agent_action.list"',
+            'action="autonomy_task.list"',
+        ):
+            self.assertIn(action, admin)
+        self.assertIn(
+            "items = [autonomy_task_public(row) for row in rows]", admin
+        )
+
+        run_public = admin.split("def _agent_run_public", 1)[1].split(
+            "def _agent_action_public", 1
+        )[0]
+        for sensitive in ("model_snapshot", "output_text", "idempotency_key"):
+            self.assertNotIn(f'"{sensitive}"', run_public)
+        action_public = admin.split("def _agent_action_public", 1)[1].split(
+            "def _require_user", 1
+        )[0]
+        for sensitive in (
+            "target_snapshot",
+            "parameter_snapshot",
+            "external_result_id",
+            "idempotency_key",
+        ):
+            self.assertNotIn(f'"{sensitive}"', action_public)
+
+        self.assertIn('data-user-tab="agent"', admin_html)
+        self.assertIn("userAgentRuns:", admin_js)
+        self.assertIn("userAgentActions:", admin_js)
+        self.assertIn("userAutonomyTasks:", admin_js)
+        self.assertIn("async function loadUserAgentRecords", admin_js)
+        self.assertIn('agent: { label: "AI 助手记录", countKey: "agent_runs" }', admin_js)
+        for action, label in (
+            ("agent_run.list", "查看模型运行记录"),
+            ("agent_action.list", "查看动作执行记录"),
+            ("autonomy_task.list", "查看自治任务记录"),
+        ):
+            self.assertIn(f'"{action}": "{label}"', admin_js)
 
 
 if __name__ == "__main__":

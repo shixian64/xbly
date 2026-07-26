@@ -125,6 +125,8 @@ MEDIA_MARKER_SOURCE_PATHS = (
 MEDIA_HISTORY_MAX_PAGES_PER_DIRECTION = 1000
 MEDIA_HISTORY_MAX_MESSAGES_PER_ACCOUNT = 1_000_000
 COMPATIBILITY_OUTBOX_PREFIX = "compatibility."
+# 与 bbw_web.jobs.MEDIA_OPERATION 保持一致（bbw_prod 不能反向依赖 bbw_web）。
+MEDIA_ARCHIVE_OPERATION_TYPE = "media.archive"
 R2_CAPABILITY_PROBE_PREFIX = "health/migration-readiness"
 R2_CAPABILITY_PROBE_CONTENT_TYPE = "application/octet-stream"
 R2_CAPABILITY_ERROR_NOT_CHECKED = "r2_probe_not_checked"
@@ -337,6 +339,14 @@ class MigrationReadinessReport:
     compatibility_outbox_other_unfinished: int
     compatibility_outbox_unfinished: int
     compatibility_outbox_oldest_unfinished_at: str | None
+    media_archive_outbox_total: int
+    media_archive_outbox_pending: int
+    media_archive_outbox_retry: int
+    media_archive_outbox_processing: int
+    media_archive_outbox_failed: int
+    media_archive_outbox_other_unfinished: int
+    media_archive_outbox_unfinished: int
+    media_archive_outbox_oldest_unfinished_at: str | None
     tim_delivery_total: int
     tim_delivery_pending: int
     tim_delivery_retry: int
@@ -348,6 +358,7 @@ class MigrationReadinessReport:
     local_core_ready: bool
     domain_data_ready: bool
     compatibility_outbox_ready: bool
+    media_archive_outbox_ready: bool
     tim_delivery_ready: bool
     r2_write_ready: bool
     r2_read_ready: bool
@@ -827,6 +838,15 @@ def _outbox_summary(rows: Sequence[Any]) -> dict[str, Any]:
     )
 
 
+def _media_archive_summary(rows: Sequence[Any]) -> dict[str, Any]:
+    # ``media.archive`` 待办只有复验后的 ``completed`` 是合法终态；文档
+    # §4.5 明确"不得直接取消"，因此 cancelled 一并计入未完成并阻断切流。
+    return _unfinished_status_summary(
+        rows,
+        terminal_statuses=frozenset({"completed"}),
+    )
+
+
 def _tim_delivery_summary(rows: Sequence[Any]) -> dict[str, Any]:
     # ``cancelled`` is a deliberate terminal state used when a local media
     # revoke prevents or compensates an in-flight APK mirror.  It does not
@@ -888,6 +908,7 @@ def evaluate_readiness(
     cursor_rows: Sequence[Any],
     relationship_rows: Sequence[Any] = (),
     outbox_rows: Sequence[Any] = (),
+    media_archive_rows: Sequence[Any] = (),
     tim_delivery_rows: Sequence[Any] = (),
     r2_capability: R2CapabilityResult | None = None,
 ) -> MigrationReadinessReport:
@@ -1095,6 +1116,7 @@ def evaluate_readiness(
 
     provider_accounts = len(account_rows)
     outbox = _outbox_summary(outbox_rows)
+    media_archives = _media_archive_summary(media_archive_rows)
     tim_deliveries = _tim_delivery_summary(tim_delivery_rows)
     local_core_ready = bool(
         active_accounts > 0
@@ -1109,6 +1131,9 @@ def evaluate_readiness(
         and not duplicate_uids
     )
     compatibility_outbox_ready = outbox["unfinished"] == 0
+    # media Marker 只在写入时点校验该账号的 media.archive 待办；Marker 之后
+    # 新产生的待办若不在此单独把关，--require-ready 会出现盲区。
+    media_archive_outbox_ready = media_archives["unfinished"] == 0
     tim_delivery_ready = tim_deliveries["unfinished"] == 0
     r2_storage_ready = resolved_r2_capability.ready
     cutover_ready = bool(
@@ -1116,6 +1141,7 @@ def evaluate_readiness(
         and domain_data_ready
         and cutover_ready_accounts == active_accounts
         and compatibility_outbox_ready
+        and media_archive_outbox_ready
         and tim_delivery_ready
         and r2_storage_ready
     )
@@ -1174,6 +1200,18 @@ def evaluate_readiness(
         compatibility_outbox_oldest_unfinished_at=outbox[
             "oldest_unfinished_at"
         ],
+        media_archive_outbox_total=media_archives["total"],
+        media_archive_outbox_pending=media_archives["pending"],
+        media_archive_outbox_retry=media_archives["retry"],
+        media_archive_outbox_processing=media_archives["processing"],
+        media_archive_outbox_failed=media_archives["failed"],
+        media_archive_outbox_other_unfinished=media_archives[
+            "other_unfinished"
+        ],
+        media_archive_outbox_unfinished=media_archives["unfinished"],
+        media_archive_outbox_oldest_unfinished_at=media_archives[
+            "oldest_unfinished_at"
+        ],
         tim_delivery_total=tim_deliveries["total"],
         tim_delivery_pending=tim_deliveries["pending"],
         tim_delivery_retry=tim_deliveries["retry"],
@@ -1187,6 +1225,7 @@ def evaluate_readiness(
         local_core_ready=local_core_ready,
         domain_data_ready=domain_data_ready,
         compatibility_outbox_ready=compatibility_outbox_ready,
+        media_archive_outbox_ready=media_archive_outbox_ready,
         tim_delivery_ready=tim_delivery_ready,
         r2_write_ready=resolved_r2_capability.write_ready,
         r2_read_ready=resolved_r2_capability.read_ready,
@@ -1293,6 +1332,19 @@ def inspect_readiness(
             .group_by(OperationOutbox.status)
         )
     )
+    media_archive_rows = list(
+        db.execute(
+            select(
+                OperationOutbox.status.label("status"),
+                func.count(OperationOutbox.id).label("item_count"),
+                func.min(OperationOutbox.created_at).label("oldest_at"),
+            )
+            .where(
+                OperationOutbox.operation_type == MEDIA_ARCHIVE_OPERATION_TYPE
+            )
+            .group_by(OperationOutbox.status)
+        )
+    )
     tim_delivery_rows = list(
         db.execute(
             select(
@@ -1310,6 +1362,7 @@ def inspect_readiness(
         cursor_rows=cursor_rows,
         relationship_rows=relationship_rows,
         outbox_rows=outbox_rows,
+        media_archive_rows=media_archive_rows,
         tim_delivery_rows=tim_delivery_rows,
         r2_capability=r2_capability,
     )

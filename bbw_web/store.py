@@ -15,6 +15,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+import httpx
+
 from bbw_web.providers import (
     ProviderApplication,
     ProviderAuthenticationRejected,
@@ -22,6 +24,7 @@ from bbw_web.providers import (
     ProviderNativeBundle,
     ProviderRuntime,
     ProviderUnavailable,
+    ProviderUpstreamInterrupted,
     RuntimeProvider,
 )
 
@@ -486,6 +489,23 @@ class SessionStore:
                     if timeout_changed:
                         client.timeout = previous_timeout
                 authenticated = bool(r.ok) and bool(user.app.session.logged_in)
+            except httpx.TransportError as e:
+                # 协议层已把超时/网络/代理故障折算为 status=-1（走
+                # ProviderUnavailable → 允许本地密码回退）。能逃逸到这里
+                # 的只剩未折算的传输异常——典型是 RemoteProtocolError：
+                # 复用超过 keepalive_expiry 的陈旧 keep-alive 连接被上游
+                # 或中间层先行关闭。这是可自愈的瞬态故障，包装为专用
+                # 异常向 BFF 传递「可重试、但不触发本地密码回退」的信号，
+                # 避免它落入泛化异常路径被呈现为形似密码错误的 400。
+                try:
+                    user.app.session.password = ""
+                except Exception:
+                    pass
+                if created:
+                    self.drop(user.web_sid)
+                raise ProviderUpstreamInterrupted(
+                    str(e) or "upstream connection interrupted"
+                ) from e
             except Exception:
                 # An arbitrary adapter exception is not evidence that the
                 # upstream is unavailable.  Preserve its type for the BFF's

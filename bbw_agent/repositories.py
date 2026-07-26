@@ -1076,10 +1076,14 @@ class AgentAutonomySettingRepository:
             "consecutive_failure_limit": failure_limit,
         }
         changed = any(getattr(row, name) != value for name, value in values.items())
+        halted = row.halted_at is not None
         if changed:
             for name, value in values.items():
                 setattr(row, name, value)
             row.version = max(1, int(row.version or 1)) + 1
+        if changed or halted:
+            # 用户重新提交策略即视为确认恢复：即使内容未变，也要解除停机并
+            # 重置连续失败计数；版本号只在策略内容变化时递增，避免误作废旧任务。
             row.consecutive_failures = 0
             row.halted_at = None
             row.halted_reason = None
@@ -1328,6 +1332,34 @@ class AgentAutonomyDailyUsageRepository:
         if for_update:
             stmt = stmt.with_for_update()
         return self.db.scalar(stmt)
+
+    def get_many(
+        self,
+        owner_usage_dates: Mapping[uuid.UUID, date],
+    ) -> dict[uuid.UUID, AiAgentAutonomyDailyUsage]:
+        """批量预取各 owner 在其本地日期的用量行；无行的 owner 缺席。
+
+        用两个 IN 条件取超集后在内存里按 (owner, date) 精确配对，避免
+        调度循环里逐 owner 的单行 SELECT。
+        """
+
+        if not owner_usage_dates:
+            return {}
+        rows = self.db.scalars(
+            select(AiAgentAutonomyDailyUsage).where(
+                AiAgentAutonomyDailyUsage.owner_user_id.in_(
+                    list(owner_usage_dates.keys())
+                ),
+                AiAgentAutonomyDailyUsage.usage_date.in_(
+                    sorted(set(owner_usage_dates.values()))
+                ),
+            )
+        )
+        return {
+            row.owner_user_id: row
+            for row in rows
+            if owner_usage_dates.get(row.owner_user_id) == row.usage_date
+        }
 
     def get_or_create_for_update(
         self,
@@ -1637,7 +1669,24 @@ class AgentAutonomyTaskRepository:
         )
         selected: list[uuid.UUID] = []
         selected_owners: set[uuid.UUID] = set()
-        usage_repository = AgentAutonomyDailyUsageRepository(self.db)
+        # 批量预取每个 owner 当天的用量行：候选最多 1000 条时逐行 get()
+        # 会放大成同数量级的单行 SELECT。owner 与 setting 一一对应，本地
+        # 日期按 owner 计算一次即可。
+        owner_usage_dates: dict[uuid.UUID, date] = {}
+        invalid_timezone_owners: set[uuid.UUID] = set()
+        for task, setting in rows:
+            owner = task.owner_user_id
+            if owner in owner_usage_dates or owner in invalid_timezone_owners:
+                continue
+            try:
+                owner_usage_dates[owner] = now.astimezone(
+                    ZoneInfo(str(setting.timezone or "UTC"))
+                ).date()
+            except ZoneInfoNotFoundError:
+                invalid_timezone_owners.add(owner)
+        usage_by_owner = AgentAutonomyDailyUsageRepository(self.db).get_many(
+            owner_usage_dates
+        )
         for task, setting in rows:
             if task.owner_user_id in selected_owners:
                 continue
@@ -1645,13 +1694,9 @@ class AgentAutonomyTaskRepository:
                 seconds=int(setting.minimum_action_interval_seconds)
             ) > now:
                 continue
-            try:
-                usage_date = now.astimezone(
-                    ZoneInfo(str(setting.timezone or "UTC"))
-                ).date()
-            except ZoneInfoNotFoundError:
+            if task.owner_user_id in invalid_timezone_owners:
                 continue
-            usage = usage_repository.get(task.owner_user_id, usage_date)
+            usage = usage_by_owner.get(task.owner_user_id)
             total_count = int(usage.total_actions or 0) if usage is not None else 0
             if total_count >= int(setting.daily_total_limit):
                 continue

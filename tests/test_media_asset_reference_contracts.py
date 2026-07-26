@@ -20,6 +20,7 @@ from bbw_web.media_native.references import (
     MediaAssetReferenceAssetUnavailable,
     MediaAssetReferenceConflict,
     MediaAssetReferenceSlotInvalid,
+    RELEASED_ASSET_CLEANUP_GRACE_SECONDS,
     SqlAlchemyMediaAssetReferenceRepository,
     native_media_content_asset_id,
     native_media_content_path,
@@ -67,6 +68,37 @@ def _bound_reference(
         size_bytes=1024,
         private_bucket="private-media",
         private_object_key=f"production/web-media-private/{owner_user_id}/{asset_id}",
+    )
+
+
+def _profile_avatar_reference(
+    owner_user_id: uuid.UUID, asset_id: uuid.UUID
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        asset_id=asset_id,
+        owner_user_id=owner_user_id,
+        resource_type="profile",
+        profile_user_id=owner_user_id,
+        social_post_id=None,
+        slot="avatar",
+    )
+
+
+def _social_post_reference(
+    owner_user_id: uuid.UUID,
+    social_post_id: uuid.UUID,
+    asset_id: uuid.UUID,
+    slot: str,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        asset_id=asset_id,
+        owner_user_id=owner_user_id,
+        resource_type="social_post",
+        profile_user_id=None,
+        social_post_id=social_post_id,
+        slot=slot,
     )
 
 
@@ -427,6 +459,221 @@ class MediaAssetReferenceRepositoryTests(unittest.TestCase):
         self.assertIn("current_reference_exists", send_source)
         self.assertIn("~current_reference_exists", send_source)
         self.assertIn("reference_after_asset_lock", send_source)
+
+
+class MediaAssetReferenceReleaseStampTests(unittest.TestCase):
+    """释放盖章（expires_at = 释放时刻 + 宽限期）与释放路径锁序契约。"""
+
+    GRACE = timedelta(seconds=RELEASED_ASSET_CLEANUP_GRACE_SECONDS)
+
+    def _assert_stamped_between(self, asset, before, after) -> None:
+        # expires_at 应为 utcnow() + 宽限期；utcnow 落在调用前后两次采样之间，
+        # 允许由此产生的秒级误差。
+        self.assertIsNotNone(asset.expires_at)
+        released_at = asset.expires_at - self.GRACE
+        self.assertGreaterEqual(released_at, before)
+        self.assertLessEqual(released_at, after)
+
+    def test_release_grace_matches_unsent_cleanup_default(self) -> None:
+        from bbw_web.jobs import WEB_NATIVE_MEDIA_UNSENT_GRACE_SECONDS
+
+        self.assertEqual(RELEASED_ASSET_CLEANUP_GRACE_SECONDS, 24 * 60 * 60)
+        self.assertEqual(
+            RELEASED_ASSET_CLEANUP_GRACE_SECONDS,
+            WEB_NATIVE_MEDIA_UNSENT_GRACE_SECONDS,
+        )
+
+    def test_release_profile_avatar_stamps_asset_and_locks_asset_before_reference(
+        self,
+    ) -> None:
+        owner_id = uuid.uuid4()
+        asset = _asset(owner_id)
+        reference = _profile_avatar_reference(owner_id, asset.id)
+        db = _SequenceDB(
+            scalar_values=[SimpleNamespace(id=owner_id)],
+            scalars_values=[
+                [reference],
+                [asset],
+                [reference],
+            ],
+        )
+        before = datetime.now(UTC)
+        released = SqlAlchemyMediaAssetReferenceRepository(db).release_profile_avatar(
+            owner_user_id=owner_id
+        )
+        after = datetime.now(UTC)
+        self.assertTrue(released)
+        self.assertEqual(db.deleted, [reference])
+        self.assertGreaterEqual(db.flushes, 1)
+        self._assert_stamped_between(asset, before, after)
+
+        # 语句顺序：无锁预读定位 → asset FOR UPDATE（populate_existing）
+        # → 引用 FOR UPDATE（populate_existing）。
+        snapshot_sql = str(db.statements[1].compile(dialect=postgresql.dialect()))
+        asset_lock_sql = str(db.statements[2].compile(dialect=postgresql.dialect()))
+        reference_lock_sql = str(db.statements[3].compile(dialect=postgresql.dialect()))
+        self.assertIn("media_asset_references", snapshot_sql)
+        self.assertNotIn("FOR UPDATE", snapshot_sql)
+        self.assertIn("media_assets", asset_lock_sql)
+        self.assertIn("FOR UPDATE", asset_lock_sql)
+        self.assertIn("media_asset_references", reference_lock_sql)
+        self.assertIn("FOR UPDATE", reference_lock_sql)
+        self.assertTrue(
+            db.statements[2].get_execution_options().get("populate_existing")
+        )
+        self.assertTrue(
+            db.statements[3].get_execution_options().get("populate_existing")
+        )
+
+    def test_release_social_post_media_stamps_only_assets_without_existing_expiry(
+        self,
+    ) -> None:
+        owner_id = uuid.uuid4()
+        post_id = uuid.uuid4()
+        released_asset = _asset(owner_id)
+        already_expiring = _asset(owner_id)
+        preset_deadline = datetime(2026, 8, 1, tzinfo=UTC)
+        already_expiring.expires_at = preset_deadline
+        first_ref = _social_post_reference(
+            owner_id, post_id, released_asset.id, "pictures[0]"
+        )
+        second_ref = _social_post_reference(
+            owner_id, post_id, already_expiring.id, "pictures[1]"
+        )
+        db = _SequenceDB(
+            scalar_values=[SimpleNamespace(id=post_id, status="published")],
+            scalars_values=[
+                [first_ref, second_ref],
+                [released_asset, already_expiring],
+                [first_ref, second_ref],
+            ],
+        )
+        before = datetime.now(UTC)
+        count = SqlAlchemyMediaAssetReferenceRepository(db).release_social_post_media(
+            owner_user_id=owner_id,
+            social_post_id=post_id,
+        )
+        after = datetime.now(UTC)
+        self.assertEqual(count, 2)
+        self.assertEqual(db.deleted, [first_ref, second_ref])
+        self._assert_stamped_between(released_asset, before, after)
+        # 已有 expires_at 的 asset 保持原值，不被释放盖章覆盖。
+        self.assertEqual(already_expiring.expires_at, preset_deadline)
+
+        snapshot_sql = str(db.statements[1].compile(dialect=postgresql.dialect()))
+        asset_lock_sql = str(db.statements[2].compile(dialect=postgresql.dialect()))
+        reference_lock_sql = str(db.statements[3].compile(dialect=postgresql.dialect()))
+        self.assertNotIn("FOR UPDATE", snapshot_sql)
+        self.assertIn("media_assets", asset_lock_sql)
+        self.assertIn("FOR UPDATE", asset_lock_sql)
+        self.assertIn("media_asset_references", reference_lock_sql)
+        self.assertIn("FOR UPDATE", reference_lock_sql)
+        self.assertTrue(
+            db.statements[2].get_execution_options().get("populate_existing")
+        )
+
+    def test_release_asset_reference_stamps_asset_and_locks_asset_before_reference(
+        self,
+    ) -> None:
+        owner_id = uuid.uuid4()
+        asset = _asset(owner_id)
+        reference = _profile_avatar_reference(owner_id, asset.id)
+        db = _SequenceDB(
+            scalar_values=[
+                reference,
+                SimpleNamespace(id=owner_id),
+                reference,
+            ],
+            scalars_values=[[asset]],
+        )
+        before = datetime.now(UTC)
+        released = SqlAlchemyMediaAssetReferenceRepository(db).release_asset_reference(
+            owner_user_id=owner_id,
+            asset_id=asset.id,
+        )
+        after = datetime.now(UTC)
+        self.assertTrue(released)
+        self.assertEqual(db.deleted, [reference])
+        self._assert_stamped_between(asset, before, after)
+
+        # 第一条定位查询必须无锁；asset 锁（populate_existing）先于引用行锁。
+        preread_sql = str(db.statements[0].compile(dialect=postgresql.dialect()))
+        asset_lock_sql = str(db.statements[2].compile(dialect=postgresql.dialect()))
+        reference_lock_sql = str(db.statements[3].compile(dialect=postgresql.dialect()))
+        self.assertIn("media_asset_references", preread_sql)
+        self.assertNotIn("FOR UPDATE", preread_sql)
+        self.assertIn("media_assets", asset_lock_sql)
+        self.assertIn("FOR UPDATE", asset_lock_sql)
+        self.assertTrue(
+            db.statements[2].get_execution_options().get("populate_existing")
+        )
+        self.assertIn("media_asset_references", reference_lock_sql)
+        self.assertIn("FOR UPDATE", reference_lock_sql)
+
+    def test_replace_profile_avatar_stamps_old_asset_and_clears_new_expiry(self) -> None:
+        owner_id = uuid.uuid4()
+        old_asset = _asset(owner_id)
+        new_asset = _asset(owner_id)
+        # 新 asset 携带未来的清理时限也允许绑定，绑定后必须清零。
+        new_asset.expires_at = datetime.now(UTC) + timedelta(hours=1)
+        old_reference = _profile_avatar_reference(owner_id, old_asset.id)
+        db = _SequenceDB(
+            scalar_values=[SimpleNamespace(id=owner_id)],
+            scalars_values=[
+                [old_reference],
+                [old_asset, new_asset],
+                [],
+                [old_reference],
+            ],
+        )
+        before = datetime.now(UTC)
+        bound = SqlAlchemyMediaAssetReferenceRepository(db).replace_profile_avatar(
+            owner_user_id=owner_id,
+            asset_id=new_asset.id,
+        )
+        after = datetime.now(UTC)
+        self.assertEqual(bound.asset_id, new_asset.id)
+        self.assertEqual(db.deleted, [old_reference])
+        self.assertEqual(len(db.added), 1)
+        # 旧 asset 从释放时刻起算宽限期；新绑定 asset 的 expires_at 置 None。
+        self._assert_stamped_between(old_asset, before, after)
+        self.assertIsNone(new_asset.expires_at)
+
+    def test_bind_social_post_media_never_stamps_asset_retained_by_new_binding(
+        self,
+    ) -> None:
+        owner_id = uuid.uuid4()
+        post_id = uuid.uuid4()
+        dropped_asset = _asset(owner_id)
+        rebound_asset = _asset(owner_id)
+        dropped_ref = _social_post_reference(
+            owner_id, post_id, dropped_asset.id, "pictures[0]"
+        )
+        rebound_ref = _social_post_reference(
+            owner_id, post_id, rebound_asset.id, "pictures[1]"
+        )
+        db = _SequenceDB(
+            scalar_values=[SimpleNamespace(id=post_id, status="published")],
+            scalars_values=[
+                [dropped_ref, rebound_ref],
+                [dropped_asset, rebound_asset],
+                [],
+                [dropped_ref, rebound_ref],
+            ],
+        )
+        before = datetime.now(UTC)
+        bound = SqlAlchemyMediaAssetReferenceRepository(db).bind_social_post_media(
+            owner_user_id=owner_id,
+            social_post_id=post_id,
+            assets_by_slot={"pictures[0]": rebound_asset.id},
+        )
+        after = datetime.now(UTC)
+        self.assertEqual(bound["pictures[0]"].asset_id, rebound_asset.id)
+        self.assertEqual(db.deleted, [dropped_ref, rebound_ref])
+        self.assertEqual(len(db.added), 1)
+        # 换槽保留的 asset 仍在新绑定中，不盖章；彻底释放的 asset 才盖章。
+        self._assert_stamped_between(dropped_asset, before, after)
+        self.assertIsNone(rebound_asset.expires_at)
 
 
 class _ReferenceRepository:

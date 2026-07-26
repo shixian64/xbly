@@ -38,6 +38,9 @@ const ADMIN_ENDPOINTS = Object.freeze({
     `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/media/${encodeURIComponent(mediaId)}/access`,
   userRelationships: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/relationships`,
   userActivities: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/activities`,
+  userAgentRuns: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/agent-runs`,
+  userAgentActions: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/agent-actions`,
+  userAutonomyTasks: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/autonomy-tasks`,
   userRawResponses: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/raw-responses`,
   userRawResponse: (userId, responseId) =>
     `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/raw-responses/${encodeURIComponent(responseId)}`,
@@ -61,6 +64,7 @@ const ADMIN_USER_TAB_META = Object.freeze({
   media: { label: "媒体资源", countKey: "media" },
   relationships: { label: "关系", countKey: "relationships" },
   activities: { label: "活动", countKey: "activities" },
+  agent: { label: "AI 助手记录", countKey: "agent_runs" },
   raw: { label: "原始响应", countKey: "raw_responses" },
   credentials: { label: "登录凭据", countKey: "" },
 });
@@ -75,6 +79,39 @@ const ADMIN_RELATIONSHIP_KIND_LABELS = Object.freeze({
   message_peer: "会话联系人",
   profile_view: "我查看过",
   visitor: "访客",
+});
+const ADMIN_AGENT_RECORD_KIND_META = Object.freeze({
+  runs: { label: "模型运行", countKey: "agent_runs" },
+  actions: { label: "动作执行", countKey: "agent_actions" },
+  tasks: { label: "自治任务", countKey: "autonomy_tasks" },
+});
+const ADMIN_AGENT_RUN_TYPE_LABELS = Object.freeze({
+  connection_test: "连接测试",
+  style_analysis: "风格分析",
+  reply_draft: "回复草稿",
+  reply_send: "生成并发送",
+  autonomous_reply: "自治回复",
+  autonomous_post: "自治动态",
+  autonomous_plan: "自治规划",
+});
+const ADMIN_AGENT_ACTION_TYPE_LABELS = Object.freeze({
+  send_private_message: "发送私信",
+  publish_text_post: "发布文字动态",
+  follow_user: "关注用户",
+  unfollow_user: "取消关注",
+});
+const ADMIN_AGENT_STATUS_LABELS = Object.freeze({
+  queued: "排队中",
+  deferred: "已延期",
+  leased: "已租约",
+  generating: "生成中",
+  dispatching: "派发中",
+  running: "运行中",
+  succeeded: "成功",
+  failed: "失败",
+  cancelled: "已取消",
+  stale: "已失效",
+  manual_review: "待人工检查",
 });
 
 const ADMIN_STATE = {
@@ -108,6 +145,9 @@ const ADMIN_STATE = {
     relationshipKind: "",
     relationshipState: "",
     activityEventType: "",
+    agentRecordKind: "runs",
+    agentRecordStatus: "",
+    agentRunType: "",
   },
   unlockUntil: 0,
   unlockReason: "",
@@ -945,6 +985,9 @@ function resetAdminState() {
     relationshipKind: "",
     relationshipState: "",
     activityEventType: "",
+    agentRecordKind: "runs",
+    agentRecordStatus: "",
+    agentRunType: "",
   };
   ADMIN_STATE.viewGeneration += 1;
   ADMIN_STATE.invitePage = 1;
@@ -2129,7 +2172,7 @@ function openUserByokAutonomousAgentDialog(enabled) {
 
 async function selectUserTab(tab) {
   if (!ADMIN_STATE.selectedUserId) return;
-  const allowed = ["profile", "messages", "media", "relationships", "activities", "raw", "credentials"];
+  const allowed = ["profile", "messages", "media", "relationships", "activities", "agent", "raw", "credentials"];
   if (!allowed.includes(tab)) return;
   clearCredentialDisplay();
   if (tab !== "raw") ADMIN_STATE.rawDetailVisible = false;
@@ -2146,6 +2189,7 @@ async function selectUserTab(tab) {
   else if (tab === "media") await loadUserMedia();
   else if (tab === "relationships") await loadUserRelationships();
   else if (tab === "activities") await loadUserActivities();
+  else if (tab === "agent") await loadUserAgentRecords();
   else if (tab === "raw") await loadUserRawResponses();
   else if (tab === "credentials") renderCredentialsTab();
 }
@@ -2551,6 +2595,186 @@ async function loadUserActivities(page = 1) {
   }
 }
 
+function agentRecordStatusLabel(value) {
+  const raw = String(value || "");
+  return ADMIN_AGENT_STATUS_LABELS[raw] || raw || "未提供";
+}
+
+function agentRecordStatusOptions(kind) {
+  const byKind = {
+    runs: ["running", "succeeded", "failed", "cancelled"],
+    actions: ["queued", "running", "succeeded", "failed", "cancelled", "manual_review"],
+    tasks: [
+      "queued",
+      "deferred",
+      "leased",
+      "generating",
+      "dispatching",
+      "succeeded",
+      "failed",
+      "cancelled",
+      "stale",
+      "manual_review",
+    ],
+  };
+  return [
+    ["", "全部状态"],
+    ...(byKind[kind] || []).map((status) => [status, agentRecordStatusLabel(status)]),
+  ];
+}
+
+function agentRecordColumns(kind) {
+  if (kind === "actions") {
+    return [
+      { label: "入队时间", render: (row) => formatDate(row.queued_at || row.created_at) },
+      {
+        label: "动作类型",
+        render: (row) => ADMIN_AGENT_ACTION_TYPE_LABELS[row.action_type] || row.action_type || "未提供",
+      },
+      { label: "状态", render: (row) => agentRecordStatusLabel(row.status) },
+      {
+        label: "来源",
+        render: (row) =>
+          primaryCell(
+            row.trigger_source === "model" ? "模型请求" : row.trigger_source === "schedule" ? "后台调度" : row.trigger_source === "system" ? "系统" : "用户",
+            row.approval_source === "user_allowlist" ? "白名单授权" : "用户显式确认"
+          ),
+      },
+      { label: "完成时间", render: (row) => formatDate(row.completed_at || row.cancelled_at) },
+      { label: "错误码", render: (row) => row.stable_error_code || "—" },
+    ];
+  }
+  if (kind === "tasks") {
+    return [
+      { label: "入队时间", render: (row) => formatDate(row.queued_at || row.created_at) },
+      {
+        label: "任务",
+        render: (row) =>
+          primaryCell(
+            ADMIN_AGENT_ACTION_TYPE_LABELS[row.action_type] || row.action_type || "未提供",
+            row.task_type || ""
+          ),
+      },
+      {
+        label: "状态",
+        render: (row) =>
+          primaryCell(
+            agentRecordStatusLabel(row.status),
+            row.outcome_unknown ? "结果未知，需人工检查" : ""
+          ),
+      },
+      { label: "目标用户编号", render: (row) => row.target_upstream_uid || "—" },
+      { label: "计划时间", render: (row) => formatDate(row.scheduled_for) },
+      { label: "完成时间", render: (row) => formatDate(row.completed_at) },
+      { label: "错误码", render: (row) => row.stable_error_code || "—" },
+    ];
+  }
+  return [
+    { label: "开始时间", render: (row) => formatDate(row.started_at || row.created_at) },
+    {
+      label: "运行类型",
+      render: (row) => ADMIN_AGENT_RUN_TYPE_LABELS[row.run_type] || row.run_type || "未提供",
+    },
+    { label: "状态", render: (row) => agentRecordStatusLabel(row.status) },
+    { label: "对方用户编号", render: (row) => row.peer_upstream_uid || "—" },
+    {
+      label: "用量",
+      render: (row) =>
+        primaryCell(
+          `输入 ${formatNumber(row.input_tokens ?? 0)} / 输出 ${formatNumber(row.output_tokens ?? 0)} token`,
+          row.latency_ms !== null && row.latency_ms !== undefined ? `耗时 ${formatNumber(row.latency_ms)} 毫秒` : ""
+        ),
+    },
+    { label: "失败码", render: (row) => row.failure_code || "—" },
+  ];
+}
+
+async function loadUserAgentRecords(page = 1) {
+  const requestedPage = Math.max(1, Number(page) || 1);
+  ADMIN_STATE.detailPage = requestedPage;
+  const requestState = beginUserDetailRequest("agent");
+  if (!requestState.userId) return;
+  const container = $("admin-user-detail-content");
+  renderLoading(container, "正在加载 AI 助手记录");
+  $("admin-user-detail-pagination").replaceChildren();
+  const kind = ADMIN_AGENT_RECORD_KIND_META[ADMIN_STATE.detailFilters.agentRecordKind]
+    ? ADMIN_STATE.detailFilters.agentRecordKind
+    : "runs";
+  const status = ADMIN_STATE.detailFilters.agentRecordStatus || "";
+  const runType = kind === "runs" ? ADMIN_STATE.detailFilters.agentRunType || "" : "";
+  const endpoint =
+    kind === "actions"
+      ? ADMIN_ENDPOINTS.userAgentActions(requestState.userId)
+      : kind === "tasks"
+        ? ADMIN_ENDPOINTS.userAutonomyTasks(requestState.userId)
+        : ADMIN_ENDPOINTS.userAgentRuns(requestState.userId);
+  const query = { page: requestedPage, limit: ADMIN_DETAIL_LIMIT, status };
+  if (runType) query.run_type = runType;
+  try {
+    const data = await adminApi(`${endpoint}${queryString(query)}`);
+    if (!isCurrentUserDetailRequest(requestState)) return;
+    const rows = extractItems(data);
+    const shell = detailTableShell(
+      container,
+      "AI 助手记录",
+      "模型运行、账号动作与无人值守任务均为只读审计视图，不包含提示词、密钥或输出正文。"
+    );
+    const kindSelect = optionSelect(
+      Object.entries(ADMIN_AGENT_RECORD_KIND_META).map(([value, meta]) => [value, meta.label]),
+      kind
+    );
+    kindSelect.id = "admin-user-agent-kind-filter";
+    kindSelect.addEventListener("change", () => {
+      ADMIN_STATE.detailFilters.agentRecordKind = kindSelect.value;
+      ADMIN_STATE.detailFilters.agentRecordStatus = "";
+      ADMIN_STATE.detailFilters.agentRunType = "";
+      void loadUserAgentRecords(1);
+    });
+    const statusSelect = optionSelect(agentRecordStatusOptions(kind), status);
+    statusSelect.id = "admin-user-agent-status-filter";
+    const filter = detailFilterForm(
+      () => {
+        ADMIN_STATE.detailFilters.agentRecordStatus = statusSelect.value;
+        if (kind === "runs") {
+          const runTypeSelect = $("admin-user-agent-run-type-filter");
+          ADMIN_STATE.detailFilters.agentRunType = runTypeSelect ? runTypeSelect.value : "";
+        }
+        void loadUserAgentRecords(1);
+      },
+      () => {
+        ADMIN_STATE.detailFilters.agentRecordStatus = "";
+        ADMIN_STATE.detailFilters.agentRunType = "";
+        void loadUserAgentRecords(1);
+      }
+    );
+    const filterFields = [
+      detailFilterField("记录类型", kindSelect),
+      detailFilterField("状态", statusSelect),
+    ];
+    if (kind === "runs") {
+      const runTypeSelect = optionSelect(
+        [["", "全部运行类型"], ...Object.entries(ADMIN_AGENT_RUN_TYPE_LABELS)],
+        runType
+      );
+      runTypeSelect.id = "admin-user-agent-run-type-filter";
+      filterFields.push(detailFilterField("运行类型", runTypeSelect));
+    }
+    filter.prepend(...filterFields);
+    shell.toolbar.appendChild(filter);
+    renderTable(
+      shell.region,
+      agentRecordColumns(kind),
+      rows,
+      "该用户暂无对应的 AI 助手记录"
+    );
+    const meta = paginationMeta(data, requestedPage, ADMIN_DETAIL_LIMIT, rows.length);
+    renderPagination($("admin-user-detail-pagination"), meta, (nextPage) => void loadUserAgentRecords(nextPage));
+    markPageUpdated();
+  } catch (error) {
+    if (isCurrentUserDetailRequest(requestState)) renderError(container, error);
+  }
+}
+
 async function loadUserRawResponses(page = 1) {
   ADMIN_STATE.rawDetailVisible = false;
   const requestedPage = Math.max(1, Number(page) || 1);
@@ -2788,56 +3012,73 @@ function showCredentialDialog(credentials) {
   }, CREDENTIAL_DISPLAY_MS);
 }
 
+const AUDIT_ACTION_LABELS = {
+  "admin.login_succeeded": "管理员登录成功",
+  "admin.login_failed": "管理员登录失败",
+  "admin.logout": "管理员退出",
+  "admin.overview_view": "查看运行概览",
+  "admin.password_changed": "修改管理员密码",
+  "admin.totp_enrollment_started": "开始绑定身份验证器",
+  "admin.totp_enabled": "启用身份验证器",
+  "credentials.unlock": "解锁敏感访问",
+  "credentials.lock": "锁定敏感访问",
+  "credentials.view": "查看用户明文凭据",
+  "credentials.view_failed": "查看用户凭据失败",
+  "invite.list": "查看邀请码列表",
+  "invite.create": "创建邀请码",
+  "invite.disable": "禁用邀请码",
+  "user.list": "查看用户列表",
+  "user.view": "查看用户详情",
+  "user.status_changed": "修改用户状态",
+  "user.match_pool_online_list_changed": "修改主动私信授权",
+  "user.nearby_custom_city_changed": "修改自定义城市授权",
+  "user.byok_model_runner_changed": "修改用户 BYOK 模型运行器授权",
+  "ai.model_runner_control_view": "查看 BYOK 模型运行器全局状态",
+  "ai.model_runner_global_changed": "修改 BYOK 模型运行器全局开关",
+  "ai.account_actions_control_view": "查看模型账号动作执行全局状态",
+  "ai.account_actions_global_changed": "修改模型账号动作执行全局开关",
+  "user.byok_account_actions_changed": "修改用户模型账号动作执行授权",
+  "ai.autonomous_agent_control_view": "查看无人值守运营 Agent 全局状态",
+  "ai.autonomous_agent_global_changed": "修改无人值守运营 Agent 全局开关",
+  "user.byok_autonomous_agent_changed": "修改用户无人值守运营 Agent 授权",
+  "ai.model_connection_saved": "保存个人模型连接",
+  "ai.agent_settings_saved": "保存个人模型运行器设置",
+  "ai.model_connection_tested": "测试个人模型连接",
+  "ai.style_profile_analyzed": "分析个人语言风格",
+  "ai.reply_draft_generated": "生成回复草稿",
+  "ai.execution_settings_changed": "修改模型账号动作执行设置",
+  "ai.autonomy_settings_changed": "修改无人值守自治设置",
+  "ai.account_action_executed": "执行模型请求的账号动作",
+  "ai.reply_generated_and_sent": "生成并发送模型回复",
+  "conversation.list": "查看用户会话",
+  "message.list": "查看归档消息",
+  "media.list": "查看媒体列表",
+  "media.access": "访问媒体资源",
+  "relationship.list": "查看关系数据",
+  "activity.list": "查看活动记录",
+  "agent_run.list": "查看模型运行记录",
+  "agent_action.list": "查看动作执行记录",
+  "autonomy_task.list": "查看自治任务记录",
+  "raw_response.list": "查看原始响应索引",
+  "raw_response.view": "查看原始响应内容",
+  "audit.list": "查询审计日志",
+};
+
 function auditActionLabel(value) {
   const raw = String(value || "");
-  const labels = {
-    "admin.login_succeeded": "管理员登录成功",
-    "admin.login_failed": "管理员登录失败",
-    "admin.logout": "管理员退出",
-    "admin.overview_view": "查看运行概览",
-    "admin.password_changed": "修改管理员密码",
-    "admin.totp_enrollment_started": "开始绑定身份验证器",
-    "admin.totp_enabled": "启用身份验证器",
-    "credentials.unlock": "解锁敏感访问",
-    "credentials.lock": "锁定敏感访问",
-    "credentials.view": "查看用户明文凭据",
-    "credentials.view_failed": "查看用户凭据失败",
-    "invite.list": "查看邀请码列表",
-    "invite.create": "创建邀请码",
-    "invite.disable": "禁用邀请码",
-    "user.list": "查看用户列表",
-    "user.view": "查看用户详情",
-    "user.status_changed": "修改用户状态",
-    "user.match_pool_online_list_changed": "修改主动私信授权",
-    "user.nearby_custom_city_changed": "修改自定义城市授权",
-    "user.byok_model_runner_changed": "修改用户 BYOK 模型运行器授权",
-    "ai.model_runner_control_view": "查看 BYOK 模型运行器全局状态",
-    "ai.model_runner_global_changed": "修改 BYOK 模型运行器全局开关",
-    "ai.account_actions_control_view": "查看模型账号动作执行全局状态",
-    "ai.account_actions_global_changed": "修改模型账号动作执行全局开关",
-    "user.byok_account_actions_changed": "修改用户模型账号动作执行授权",
-    "ai.autonomous_agent_control_view": "查看无人值守运营 Agent 全局状态",
-    "ai.autonomous_agent_global_changed": "修改无人值守运营 Agent 全局开关",
-    "user.byok_autonomous_agent_changed": "修改用户无人值守运营 Agent 授权",
-    "ai.model_connection_saved": "保存个人模型连接",
-    "ai.agent_settings_saved": "保存个人模型运行器设置",
-    "ai.model_connection_tested": "测试个人模型连接",
-    "ai.style_profile_analyzed": "分析个人语言风格",
-    "ai.reply_draft_generated": "生成回复草稿",
-    "ai.execution_settings_changed": "修改模型账号动作执行设置",
-    "ai.account_action_executed": "执行模型请求的账号动作",
-    "ai.reply_generated_and_sent": "生成并发送模型回复",
-    "conversation.list": "查看用户会话",
-    "message.list": "查看归档消息",
-    "media.list": "查看媒体列表",
-    "media.access": "访问媒体资源",
-    "relationship.list": "查看关系数据",
-    "activity.list": "查看活动记录",
-    "raw_response.list": "查看原始响应索引",
-    "raw_response.view": "查看原始响应内容",
-    "audit.list": "查询审计日志",
-  };
-  return labels[raw] || raw || "未提供";
+  return AUDIT_ACTION_LABELS[raw] || raw || "未提供";
+}
+
+function populateAuditActionOptions() {
+  const datalist = $("admin-audit-action-options");
+  if (!datalist) return;
+  datalist.replaceChildren();
+  Object.entries(AUDIT_ACTION_LABELS).forEach(([action, label]) => {
+    const option = document.createElement("option");
+    option.value = action;
+    option.label = label;
+    datalist.appendChild(option);
+  });
 }
 
 function auditActionCell(value) {
@@ -3093,7 +3334,6 @@ function renderByokAccountActionsControl() {
   }
 
   const enabled = feature.enabled === true;
-  const backgroundEnabled = feature.background_enabled === true;
   const modelRunnerEnabled = feature.model_runner_enabled === true;
   const prerequisiteBlocked = !enabled && !modelRunnerEnabled;
   const featurePanel = element("section", "admin-feature-panel");
@@ -3196,6 +3436,7 @@ function renderByokAutonomousAgentControl() {
   }
 
   const enabled = feature.enabled === true;
+  const backgroundEnabled = feature.background_enabled === true;
   const modelRunnerEnabled = feature.model_runner_enabled === true;
   const accountActionsEnabled = feature.account_actions_enabled === true;
   const prerequisiteBlocked =
@@ -3338,6 +3579,7 @@ async function refreshCurrentContext({ validateSession = true } = {}) {
   } else if (ADMIN_STATE.selectedUserTab === "media") await loadUserMedia(ADMIN_STATE.detailPage);
   else if (ADMIN_STATE.selectedUserTab === "relationships") await loadUserRelationships(ADMIN_STATE.detailPage);
   else if (ADMIN_STATE.selectedUserTab === "activities") await loadUserActivities(ADMIN_STATE.detailPage);
+  else if (ADMIN_STATE.selectedUserTab === "agent") await loadUserAgentRecords(ADMIN_STATE.detailPage);
   else if (ADMIN_STATE.selectedUserTab === "raw") await loadUserRawResponses(ADMIN_STATE.detailPage);
   else if (ADMIN_STATE.selectedUserTab === "credentials") renderCredentialsTab();
 }
@@ -4071,6 +4313,8 @@ $("admin-user-byok-autonomous-agent-dialog").addEventListener("cancel", (event) 
   event.preventDefault();
   closeUserByokAutonomousAgentDialog();
 });
+
+populateAuditActionOptions();
 
 $("admin-audit-filter-form").addEventListener("submit", (event) => {
   event.preventDefault();

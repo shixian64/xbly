@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import re
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import or_, select
@@ -37,6 +38,9 @@ SOCIAL_POST_RESOURCE = "social_post"
 PROFILE_AVATAR_SLOT = "avatar"
 SOCIAL_VIDEO_SLOT = "video"
 SOCIAL_COVER_SLOT = "cover"
+# 引用释放后的清理宽限期，与 jobs.WEB_NATIVE_MEDIA_UNSENT_GRACE_SECONDS
+# 的默认值保持一致；释放时刻起算，而不是按 asset 创建时刻。
+RELEASED_ASSET_CLEANUP_GRACE_SECONDS = 24 * 60 * 60
 _PICTURE_SLOT = re.compile(r"pictures\[(0|[1-9][0-9]*)\]\Z")
 _NATIVE_CONTENT_PATH = re.compile(
     r"/api/media/native/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/content\Z"
@@ -287,6 +291,11 @@ class SqlAlchemyMediaAssetReferenceRepository:
                 )
                 .order_by(MediaAssetRow.id)
                 .with_for_update()
+                # preview/无锁预读会把 asset 装进 identity map；锁定重读
+                # 必须以数据库行覆盖本地属性，否则锁内的 status/expires_at
+                # 复验（以及 _stamp_released_assets 的判定）看到的是拿锁前
+                # 的过期快照。
+                .execution_options(populate_existing=True)
             )
         )
         return {row.id: row for row in rows}
@@ -377,6 +386,26 @@ class SqlAlchemyMediaAssetReferenceRepository:
                 "媒体 asset 越过 deployment、R2 bucket 或 private namespace 边界"
             )
 
+    def _stamp_released_assets(
+        self,
+        assets: Mapping[uuid.UUID, MediaAssetRow],
+        asset_ids: Iterable[uuid.UUID],
+    ) -> None:
+        """引用释放后从释放时刻起算清理宽限期。
+
+        绑定期间 expires_at 恒为 NULL；若释放后仍为 NULL，清理任务会按
+        created_at 判定宽限（旧 asset 会在下一轮立即回收），已签发的短时
+        GET URL 可能中途失效。此处把 expires_at 设为释放时刻 + 宽限期。
+        """
+
+        deadline = utcnow() + timedelta(
+            seconds=RELEASED_ASSET_CLEANUP_GRACE_SECONDS
+        )
+        for asset_id in asset_ids:
+            asset = assets.get(asset_id)
+            if asset is not None and asset.expires_at is None:
+                asset.expires_at = deadline
+
     def _references_for_assets(
         self, asset_ids: Sequence[uuid.UUID]
     ) -> list[MediaAssetReferenceRow]:
@@ -388,6 +417,7 @@ class SqlAlchemyMediaAssetReferenceRepository:
                 .where(MediaAssetReferenceRow.asset_id.in_(asset_ids))
                 .order_by(MediaAssetReferenceRow.asset_id)
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
         )
 
@@ -643,10 +673,16 @@ class SqlAlchemyMediaAssetReferenceRepository:
             assets[normalized_asset].expires_at = None
             self.db.flush()
             return _as_bound_reference(current[0], assets[normalized_asset])
+        released_ids = {
+            reference.asset_id
+            for reference in current
+            if reference.asset_id != normalized_asset
+        }
         for reference in current:
             self.db.delete(reference)
         if current:
             self.db.flush()
+        self._stamp_released_assets(locked_assets, released_ids)
         reference = MediaAssetReferenceRow(
             asset_id=normalized_asset,
             owner_user_id=owner,
@@ -742,10 +778,16 @@ class SqlAlchemyMediaAssetReferenceRepository:
             for reference in current
             if normalized.get(reference.slot) != reference.asset_id
         ]
+        released_ids = {
+            reference.asset_id
+            for reference in removed
+            if reference.asset_id not in set(new_asset_ids)
+        }
         for reference in removed:
             self.db.delete(reference)
         if removed:
             self.db.flush()
+        self._stamp_released_assets(locked_assets, released_ids)
         retained = {
             slot: reference
             for slot, reference in current_by_slot.items()
@@ -779,21 +821,33 @@ class SqlAlchemyMediaAssetReferenceRepository:
     ) -> bool:
         owner = _uuid(owner_user_id, "owner_user_id")
         self._lock_profile(owner, active=False)
+        # 全局锁序：父资源 → asset（UUID 序）→ 引用。先无锁预读定位
+        # asset，再按序加锁；父锁已串行化同 owner 的绑定/释放。
+        selector = select(MediaAssetReferenceRow).where(
+            MediaAssetReferenceRow.resource_type == PROFILE_RESOURCE,
+            MediaAssetReferenceRow.profile_user_id == owner,
+            MediaAssetReferenceRow.slot == PROFILE_AVATAR_SLOT,
+        )
+        snapshot_ids = sorted(
+            {row.asset_id for row in self.db.scalars(selector)}, key=str
+        )
+        locked_assets = (
+            self._lock_owned_assets(owner_user_id=owner, asset_ids=snapshot_ids)
+            if snapshot_ids
+            else {}
+        )
         rows = list(
             self.db.scalars(
-                select(MediaAssetReferenceRow)
-                .where(
-                    MediaAssetReferenceRow.resource_type == PROFILE_RESOURCE,
-                    MediaAssetReferenceRow.profile_user_id == owner,
-                    MediaAssetReferenceRow.slot == PROFILE_AVATAR_SLOT,
+                selector.with_for_update().execution_options(
+                    populate_existing=True
                 )
-                .with_for_update()
             )
         )
         for row in rows:
             self.db.delete(row)
         if rows:
             self.db.flush()
+        self._stamp_released_assets(locked_assets, {row.asset_id for row in rows})
         return bool(rows)
 
     def release_social_post_media(
@@ -813,15 +867,32 @@ class SqlAlchemyMediaAssetReferenceRepository:
                 slot = str(raw_slot)
                 _expected_kind(SOCIAL_POST_RESOURCE, slot)
                 normalized_slots.add(slot)
-        statement = (
-            select(MediaAssetReferenceRow)
-            .where(
-                MediaAssetReferenceRow.resource_type == SOCIAL_POST_RESOURCE,
-                MediaAssetReferenceRow.social_post_id == post_id,
-            )
-            .with_for_update()
+        statement = select(MediaAssetReferenceRow).where(
+            MediaAssetReferenceRow.resource_type == SOCIAL_POST_RESOURCE,
+            MediaAssetReferenceRow.social_post_id == post_id,
         )
-        rows = list(self.db.scalars(statement))
+        # 全局锁序：Post → asset（UUID 序）→ 引用。先无锁预读定位 asset，
+        # Post 锁已串行化同一动态的绑定/释放。
+        snapshot_ids = sorted(
+            {
+                row.asset_id
+                for row in self.db.scalars(statement)
+                if normalized_slots is None or row.slot in normalized_slots
+            },
+            key=str,
+        )
+        locked_assets = (
+            self._lock_owned_assets(owner_user_id=owner, asset_ids=snapshot_ids)
+            if snapshot_ids
+            else {}
+        )
+        rows = list(
+            self.db.scalars(
+                statement.with_for_update().execution_options(
+                    populate_existing=True
+                )
+            )
+        )
         selected = [
             row
             for row in rows
@@ -831,6 +902,9 @@ class SqlAlchemyMediaAssetReferenceRepository:
             self.db.delete(row)
         if selected:
             self.db.flush()
+        self._stamp_released_assets(
+            locked_assets, {row.asset_id for row in selected}
+        )
         return len(selected)
 
     def release_asset_reference(
@@ -867,6 +941,10 @@ class SqlAlchemyMediaAssetReferenceRepository:
             )
         else:
             raise MediaAssetReferenceError("媒体引用目标不完整")
+        # 锁序：父资源（上方已锁）→ asset → 引用。
+        locked_assets = self._lock_owned_assets(
+            owner_user_id=owner, asset_ids=[normalized_asset]
+        )
         current = self.db.scalar(
             select(MediaAssetReferenceRow)
             .where(
@@ -880,6 +958,7 @@ class SqlAlchemyMediaAssetReferenceRepository:
             return False
         self.db.delete(current)
         self.db.flush()
+        self._stamp_released_assets(locked_assets, {normalized_asset})
         return True
 
     def release_resource_references(

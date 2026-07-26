@@ -53,7 +53,7 @@ class DiscoveryMigrationPureTests(unittest.TestCase):
         )
 
     def test_marker_contract_declares_all_discovery_scopes_and_real_sources(self) -> None:
-        source = migration.__file__
+        source = str(migration.__file__).replace("\\", "/")
         self.assertEqual(
             set(DOMAIN_MARKER_SCOPES["discovery"]),
             {"profile", "preferences", "text-match"},

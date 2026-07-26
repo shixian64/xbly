@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+import threading
 import types
 import unittest
 import uuid
@@ -18,6 +19,7 @@ if str(ROOT) not in sys.path:
 
 try:  # noqa: E402
     from bbw_prod import credential_backfill
+    from bbw_prod import services as prod_services
     from bbw_prod.models import ExternalAccount, User, UserCredential
     from bbw_prod.security import UserPasswordHasher, is_safe_user_password_hash
     from bbw_prod.services import (
@@ -449,6 +451,116 @@ class OpportunityEnrollmentTests(unittest.TestCase):
         )
         self.assertEqual(len(recorder.calls), 1)
         self.assertIs(account.password_encrypted, saved_ciphertext)
+
+
+@unittest.skipIf(
+    DEPENDENCY_IMPORT_ERROR is not None,
+    f"production dependencies are not installed: {DEPENDENCY_IMPORT_ERROR}",
+)
+class OpportunisticEnrollmentGateTests(unittest.TestCase):
+    """机会式登记闸门的容量、超时降级与首次登记阻塞语义。"""
+
+    class GateEnrollmentRecorder:
+        """带凭据行读通道的登记记录器，模拟 UserCredentialService。"""
+
+        def __init__(
+            self, credential_rows: dict[uuid.UUID, UserCredential] | None
+        ) -> None:
+            self.credentials = FakeCredentialRepository(credential_rows)
+            self.calls: list[dict[str, object]] = []
+
+        def enroll_verified_password(self, **kwargs: object) -> None:
+            self.calls.append(dict(kwargs))
+
+    def setUp(self) -> None:
+        prod_services._reset_enrollment_gate_for_tests()
+        self.addCleanup(prod_services._reset_enrollment_gate_for_tests)
+
+    def make_service(
+        self, *, has_credential: bool
+    ) -> tuple[LoginAccountService, User, GateEnrollmentRecorder]:
+        user = make_user()
+        service = LoginAccountService.__new__(LoginAccountService)
+        service.settings = types.SimpleNamespace(local_password_auth_concurrency=2)
+        recorder = self.GateEnrollmentRecorder(
+            {user.id: make_credential(user)} if has_credential else None
+        )
+        service.user_credentials = recorder
+        return service, user, recorder
+
+    def test_gate_capacity_is_half_of_configured_bounded_concurrency(self) -> None:
+        # max(1, min(8, capacity) // 2)：与 bbw_web 本地认证闸门叠加后的
+        # 同进程 Argon2 峰值受控在约 1.5 倍配置值以内。
+        for configured, expected in {0: 1, 1: 1, 2: 1, 5: 2, 8: 4, 20: 4}.items():
+            with self.subTest(configured=configured):
+                prod_services._reset_enrollment_gate_for_tests()
+                gate = prod_services._opportunistic_enrollment_gate(configured)
+                acquired = 0
+                while gate.acquire(blocking=False):
+                    acquired += 1
+                self.assertEqual(acquired, expected)
+                for _ in range(acquired):
+                    gate.release()
+
+    def test_reset_hook_replaces_process_level_singleton(self) -> None:
+        first = prod_services._opportunistic_enrollment_gate(2)
+        self.assertIs(prod_services._opportunistic_enrollment_gate(8), first)
+
+        prod_services._reset_enrollment_gate_for_tests()
+
+        self.assertIsNone(prod_services._ENROLLMENT_GATE)
+        self.assertIsNot(prod_services._opportunistic_enrollment_gate(2), first)
+
+    def test_saturated_gate_with_existing_credential_defers_and_warns(self) -> None:
+        service, user, recorder = self.make_service(has_credential=True)
+        gate = prod_services._opportunistic_enrollment_gate(2)  # 容量 1
+        self.assertTrue(gate.acquire(blocking=False))
+        try:
+            with self.assertLogs("bbw_prod.services", level="WARNING") as logs:
+                enrolled = service._enroll_password_opportunistically(
+                    user_id=user.id,
+                    password="upstream-password",
+                    verified_at=datetime.now(UTC),
+                )
+        finally:
+            gate.release()
+
+        self.assertFalse(enrolled)
+        self.assertEqual(recorder.calls, [])
+        self.assertIn(str(user.id), logs.output[0])
+
+    def test_saturated_gate_without_credential_row_blocks_until_enrolled(self) -> None:
+        service, user, recorder = self.make_service(has_credential=False)
+        gate = prod_services._opportunistic_enrollment_gate(2)  # 容量 1
+        self.assertTrue(gate.acquire(blocking=False))
+        results: list[bool] = []
+        verified_at = datetime.now(UTC)
+        worker = threading.Thread(
+            target=lambda: results.append(
+                service._enroll_password_opportunistically(
+                    user_id=user.id,
+                    password="upstream-password",
+                    verified_at=verified_at,
+                )
+            ),
+            daemon=True,
+        )
+        worker.start()
+        try:
+            # 超过 1 秒短超时后仍未放弃：说明首次登记已升级为阻塞等待。
+            worker.join(timeout=1.4)
+            self.assertTrue(worker.is_alive())
+            self.assertEqual(recorder.calls, [])
+        finally:
+            gate.release()
+        worker.join(timeout=5.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(results, [True])
+        self.assertEqual(len(recorder.calls), 1)
+        self.assertEqual(recorder.calls[0]["user_id"], user.id)
+        self.assertEqual(recorder.calls[0]["password"], "upstream-password")
+        self.assertEqual(recorder.calls[0]["verified_at"], verified_at)
 
 
 @unittest.skipIf(

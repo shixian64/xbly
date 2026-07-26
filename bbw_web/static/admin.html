@@ -266,6 +266,7 @@
               <button id="admin-user-tab-media" type="button" role="tab" aria-controls="admin-user-detail-content" aria-selected="false" data-user-tab="media">媒体资源</button>
               <button id="admin-user-tab-relationships" type="button" role="tab" aria-controls="admin-user-detail-content" aria-selected="false" data-user-tab="relationships">关系</button>
               <button id="admin-user-tab-activities" type="button" role="tab" aria-controls="admin-user-detail-content" aria-selected="false" data-user-tab="activities">活动</button>
+              <button id="admin-user-tab-agent" type="button" role="tab" aria-controls="admin-user-detail-content" aria-selected="false" data-user-tab="agent">AI 助手记录</button>
               <span class="admin-tab-group-label" role="presentation">敏感数据</span>
               <button id="admin-user-tab-raw" type="button" role="tab" aria-controls="admin-user-detail-content" aria-selected="false" data-user-tab="raw">原始响应</button>
               <button id="admin-user-tab-credentials" type="button" role="tab" aria-controls="admin-user-detail-content" aria-selected="false" data-user-tab="credentials">登录凭据</button>
@@ -291,7 +292,8 @@
             <form id="admin-audit-filter-form" class="admin-filter-form admin-filter-form-wide" method="post" action="/admin">
               <div class="admin-field admin-field-compact">
                 <label for="admin-audit-action">操作类型</label>
-                <input id="admin-audit-action" name="action" type="search" maxlength="96" placeholder="例如 credentials.view" />
+                <input id="admin-audit-action" name="action" type="search" maxlength="96" placeholder="例如 credentials.view" list="admin-audit-action-options" />
+                <datalist id="admin-audit-action-options"></datalist>
               </div>
               <div class="admin-field admin-field-compact">
                 <label for="admin-audit-target">目标用户内部编号</label>
@@ -653,6 +655,6 @@
     </form>
   </dialog>
 
-  <script src="/static/admin.js?v=20260725-byok-autonomous-agent-v1"></script>
+  <script src="/static/admin.js?v=20260726-admin-agent-records-v1"></script>
 </body>
 </html>

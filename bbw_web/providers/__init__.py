@@ -15,6 +15,7 @@ from .contracts import (
     ProviderSession,
     ProviderSessionState,
     ProviderUnavailable,
+    ProviderUpstreamInterrupted,
     RuntimeProvider,
 )
 
@@ -28,6 +29,7 @@ __all__ = [
     "ProviderSession",
     "ProviderSessionState",
     "ProviderUnavailable",
+    "ProviderUpstreamInterrupted",
     "RuntimeProvider",
     "LEGACY_BANGHUA_PROVIDER_ID",
     "LegacyBanghuaProvider",

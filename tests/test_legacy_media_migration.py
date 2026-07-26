@@ -4,14 +4,17 @@ import io
 import inspect
 import hashlib
 import json
+import tempfile
 import unittest
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from bbw_web.legacy_media_reference import legacy_source_hash
+from bbw_web.media_archive import MediaArchiveError, _sniff
 from bbw_web.media_native.legacy_migration import (
     ArchivedMedia,
     ImportWindow,
@@ -719,6 +722,50 @@ class CliPrivacyTests(unittest.TestCase):
         self.assertNotIn(secret_uid, payload)
         self.assertNotIn(secret_url, payload)
         self.assertEqual(json.loads(payload)["accounts_completed"], 1)
+
+
+class MediaSniffTests(unittest.TestCase):
+    """媒体魔数嗅探契约：音频魔数必须先于 "#!" 活性内容拒绝命中，
+    且 ftyp 纯音频品牌不得被判为 video。"""
+
+    def sniff_bytes(self, head: bytes) -> tuple[str, str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "blob.bin"
+            target.write_bytes(head)
+            return _sniff(target)
+
+    def test_amr_magic_is_audio_and_wins_over_shebang_rejection(self) -> None:
+        content_type, extension = self.sniff_bytes(b"#!AMR\n" + b"\x3c\x54\x91" * 16)
+        self.assertEqual((content_type, extension), ("audio/amr", "amr"))
+
+    def test_amr_wb_magic_is_audio_and_wins_over_shebang_rejection(self) -> None:
+        content_type, extension = self.sniff_bytes(b"#!AMR-WB\n" + b"\x44\x35" * 16)
+        self.assertEqual((content_type, extension), ("audio/amr", "amr"))
+
+    def test_ftyp_pure_audio_brands_map_to_audio_mp4(self) -> None:
+        for brand in (b"M4A ", b"M4B "):
+            with self.subTest(brand=brand):
+                head = b"\x00\x00\x00\x20ftyp" + brand + b"\x00\x00\x00\x00mp42isom"
+                self.assertEqual(self.sniff_bytes(head), ("audio/mp4", "m4a"))
+
+    def test_ftyp_video_brands_keep_video_content_types(self) -> None:
+        quicktime = b"\x00\x00\x00\x14ftypqt  " + b"\x00" * 8
+        self.assertEqual(self.sniff_bytes(quicktime), ("video/quicktime", "mov"))
+        isom = b"\x00\x00\x00\x18ftypisom" + b"\x00\x00\x02\x00isomiso2"
+        self.assertEqual(self.sniff_bytes(isom), ("video/mp4", "mp4"))
+
+    def test_plain_shebang_is_still_rejected_as_active_content(self) -> None:
+        with self.assertRaises(MediaArchiveError):
+            self.sniff_bytes(b"#!/bin/sh\nrm -rf /\n")
+        # 前置空白不能绕开活性内容拒绝。
+        with self.assertRaises(MediaArchiveError):
+            self.sniff_bytes(b"  #!/usr/bin/env python\nprint('x')\n")
+
+    def test_amr_carveout_is_exact_and_does_not_leak_to_other_shebangs(self) -> None:
+        # 只有完整魔数 "#!AMR\n" / "#!AMR-WB\n" 可以豁免；
+        # 伪装前缀（缺少换行）仍必须按活性内容拒绝。
+        with self.assertRaises(MediaArchiveError):
+            self.sniff_bytes(b"#!AMRfake\necho pwned\n")
 
 
 if __name__ == "__main__":

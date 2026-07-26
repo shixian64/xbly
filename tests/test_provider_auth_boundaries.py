@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import httpx  # noqa: E402
 from starlette.requests import Request  # noqa: E402
 
 from bbw_prod.services import PermissionDenied  # noqa: E402
@@ -20,6 +21,7 @@ from bbw_web.providers import (  # noqa: E402
     ProviderAuthenticationRejected,
     ProviderRuntime,
     ProviderUnavailable,
+    ProviderUpstreamInterrupted,
 )
 from bbw_web.store import SessionStore  # noqa: E402
 
@@ -153,6 +155,24 @@ class SessionStoreAuthenticationBoundaryTests(unittest.TestCase):
         assert provider.runtime is not None
         self.assertEqual(provider.runtime.app.client.close_calls, 1)
 
+    def test_unfolded_transport_interruption_maps_to_interrupted(self) -> None:
+        # 协议层只折算超时/网络/代理故障；RemoteProtocolError（陈旧
+        # keep-alive 被上游先行关闭）会原样上抛到 store 层，应包装为
+        # 专用的 ProviderUpstreamInterrupted 而非 ProviderUnavailable。
+        original = httpx.RemoteProtocolError(
+            "Server disconnected without sending a response."
+        )
+
+        error, provider, store = self._login_error(original)
+
+        self.assertIsInstance(error, ProviderUpstreamInterrupted)
+        self.assertNotIsInstance(error, ProviderUnavailable)
+        self.assertIs(getattr(error, "retryable", False), True)
+        self.assertIs(error.__cause__, original)
+        self.assertEqual(store.users, {})
+        assert provider.runtime is not None
+        self.assertEqual(provider.runtime.app.client.close_calls, 1)
+
 
 class BffAuthenticationBoundaryTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -222,6 +242,18 @@ class BffAuthenticationBoundaryTests(unittest.TestCase):
 
         self.assertEqual(status, 400)
         self.assertNotEqual(payload.get("code"), "UPSTREAM_AUTH_UNAVAILABLE")
+
+    def test_interruption_has_retryable_signal_distinct_from_unavailable(self) -> None:
+        # 瞬态连接中断必须呈现为 503 可重试，且 code 不能等于
+        # UPSTREAM_AUTH_UNAVAILABLE，否则会误触发本地密码回退闸门。
+        status, payload = self._request(
+            ProviderUpstreamInterrupted("stale keep-alive connection closed")
+        )
+
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["code"], "UPSTREAM_AUTH_INTERRUPTED")
+        self.assertNotEqual(payload["code"], "UPSTREAM_AUTH_UNAVAILABLE")
+        self.assertIs(payload["retryable"], True)
 
 
 class ApiLocalFallbackBoundaryTests(unittest.TestCase):
@@ -330,8 +362,10 @@ class ApiLocalFallbackBoundaryTests(unittest.TestCase):
         *,
         local_error: Exception | None = None,
         account_error: Exception | None = None,
-    ) -> tuple[object, Store, Persistence]:
-        store = ApiLocalFallbackBoundaryTests.Store(upstream_error)
+        store: object | None = None,
+    ) -> tuple[object, object, Persistence]:
+        if store is None:
+            store = ApiLocalFallbackBoundaryTests.Store(upstream_error)
         persistence = ApiLocalFallbackBoundaryTests.Persistence(
             local_error,
             account_error,
@@ -461,6 +495,33 @@ class ApiLocalFallbackBoundaryTests(unittest.TestCase):
         self.assertEqual(persistence.account_precheck_calls, [])
         self.assertEqual(persistence.local_login_calls, [])
         self.assertEqual(store.put_calls, [])
+        self.assertNotIn(bff_server.COOKIE_NAME, response.headers.get("set-cookie", ""))
+
+    def test_remote_protocol_error_is_retryable_and_never_falls_back(self) -> None:
+        # 端到端：真实 SessionStore 的上游登录抛 RemoteProtocolError（陈旧
+        # keep-alive 被上游先行关闭）→ store 包装为 ProviderUpstreamInterrupted
+        # → BFF 返回 503 可重试；api.py 的本地密码回退闸门只认
+        # UPSTREAM_AUTH_UNAVAILABLE，因此不得进入本地密码回退。
+        provider = _Provider(
+            httpx.RemoteProtocolError(
+                "Server disconnected without sending a response."
+            )
+        )
+        real_store = SessionStore(runtime_provider=provider, auto_heartbeat=False)
+        self.addCleanup(real_store.close)
+
+        response, store, persistence = self._request(None, store=real_store)
+
+        payload = json.loads(bytes(response.body).decode("utf-8"))
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(payload["code"], "UPSTREAM_AUTH_INTERRUPTED")
+        self.assertNotEqual(payload["code"], "UPSTREAM_AUTH_UNAVAILABLE")
+        self.assertIs(payload["retryable"], True)
+        # 未进入本地密码回退，也未留下会话或 cookie。
+        self.assertEqual(persistence.local_login_calls, [])
+        self.assertEqual(persistence.public_precheck_calls, [])
+        self.assertEqual(persistence.account_precheck_calls, [])
+        self.assertEqual(store.users, {})
         self.assertNotIn(bff_server.COOKIE_NAME, response.headers.get("set-cookie", ""))
 
 

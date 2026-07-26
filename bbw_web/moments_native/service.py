@@ -284,19 +284,19 @@ def _comment_payload_digest(
 
 
 def _legacy_payload_digest(item: LegacyPostInput) -> str:
+    # digest 只纳入稳定的身份与内容字段：点赞/评论计数、作者快照、metadata
+    # 与相对时间（"N分钟前"）解析出的 source_created_at 在两次运行之间会漂移，
+    # 纳入 digest 会让失败重跑与停服前最后一轮必然触发幂等冲突。
     return _digest(
         {
-            "author_snapshot": item.author_snapshot or {},
             "author_upstream_uid": item.author_upstream_uid,
             "author_user_id": str(item.author_user_id or ""),
             "body": item.body,
             "comment_policy": item.comment_policy,
             "hide_comments": item.hide_comments,
             "media": item.media,
-            "metadata": item.metadata or {},
             "provider": item.provider,
             "schema": LOCAL_SOCIAL_SCHEMA,
-            "source_created_at": _ensure_aware(item.source_created_at).isoformat(),
             "title": item.title,
             "topics": item.topics,
             "upstream_id": item.upstream_id,
@@ -306,21 +306,17 @@ def _legacy_payload_digest(item: LegacyPostInput) -> str:
 
 
 def _legacy_comment_payload_digest(item: LegacyCommentInput) -> str:
+    # 同 _legacy_payload_digest：只保留稳定身份与内容，可变计数、状态、
+    # 快照与相对时间不参与幂等判定。
     return _digest(
         {
-            "author_snapshot": item.author_snapshot or {},
             "author_upstream_uid": item.author_upstream_uid,
             "author_user_id": str(item.author_user_id or ""),
             "body": item.body,
-            "like_count": item.like_count,
-            "metadata": item.metadata or {},
             "parent_upstream_id": item.parent_upstream_id,
             "post_upstream_id": item.post_upstream_id,
             "provider": item.provider,
-            "reply_count": item.reply_count,
             "schema": LOCAL_SOCIAL_SCHEMA,
-            "source_created_at": _ensure_aware(item.source_created_at).isoformat(),
-            "status": item.status,
             "upstream_id": item.upstream_id,
         }
     )
@@ -849,8 +845,12 @@ class LocalMomentsService:
     def delete_comment(
         self, *, principal: SocialPrincipal, comment_public_id: object
     ) -> SocialCommentMutation:
+        # 全部评论写路径的锁序固定为「先 Post 后 Comment」（与 comment()
+        # 一致），否则与并发回复互为反序会造成数据库死锁。先无锁预读定位
+        # 所属 Post，再按序加锁。
+        preview = self._require_comment(comment_public_id)
+        post = self._require_post(preview.post_public_id, for_update=True)
         comment = self._require_comment(comment_public_id, for_update=True)
-        post = self._require_post(comment.post_public_id, for_update=True)
         if comment.author_user_id != principal.user_id and not self._owns(principal, post):
             raise SocialContentForbidden("无权删除该评论")
         now = _ensure_aware(self.clock())
@@ -883,8 +883,10 @@ class LocalMomentsService:
         comment_public_id: object,
         hidden: bool,
     ) -> SocialCommentMutation:
+        # 锁序同 delete_comment：先 Post 后 Comment，避免与并发回复死锁。
+        preview = self._require_comment(comment_public_id)
+        post = self._require_post(preview.post_public_id, for_update=True)
         comment = self._require_comment(comment_public_id, for_update=True)
-        post = self._require_post(comment.post_public_id, for_update=True)
         if not self._owns(principal, post) or comment.status == "deleted":
             raise SocialContentForbidden("只有动态作者可以禁用评论")
         status = "hidden" if hidden else "active"
@@ -925,10 +927,12 @@ class LocalMomentsService:
             target_id = post.id
             public_id = post.public_id
         elif normalized_type == "comment":
+            # 锁序同 delete_comment：先 Post 后 Comment，避免与并发回复死锁。
+            preview = self._require_comment(target_public_id)
+            post = self._require_post(preview.post_public_id, for_update=True)
             comment = self._require_comment(target_public_id, for_update=True)
             if comment.status != "active":
                 raise SocialContentForbidden("评论已不可用")
-            post = self._require_post(comment.post_public_id, for_update=True)
             self._require_visible(principal, post)
             target_id = comment.id
             public_id = comment.public_id

@@ -368,7 +368,11 @@ class ProtocolClient:
             raw = response.content.decode("utf-8", errors="replace")
             rh = {k: v for k, v in response.headers.items()}
             result = _parse_result(response.status_code, raw, rh)
-        except Exception as e:
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.ProxyError) as e:
+            # 只有真正的连接/超时/代理层失败才能折算为 status=-1
+            # （下游会把 -1 视为「上游不可用」并允许本地密码回退）。
+            # 可达服务器返回的畸形响应（RemoteProtocolError 等）和其他
+            # 未分类异常必须原样上抛，走不允许回退的通用失败路径。
             result = ApiResult(False, -1, f"EXC:{e}", kind="error", message=str(e))
 
         self.last = result

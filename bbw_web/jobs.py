@@ -1816,6 +1816,31 @@ def _claim_media_outboxes(
     now = utcnow()
     selected = list(outbox_ids or [])
     with session_scope() as db:
+        # watchdog：worker 崩溃会留下 processing 且预算耗尽的行，认领条件
+        # attempt_count < max_attempts 永远选不中它们，也没有其他路径转
+        # failed。这里把「锁已过期 + 预算耗尽」的死行转为 failed，使其可被
+        # 观测与人工处理（readiness 仍计入 unfinished，不放行切流）。
+        dead_rows = list(
+            db.scalars(
+                select(OperationOutbox)
+                .where(
+                    OperationOutbox.operation_type == MEDIA_OPERATION,
+                    OperationOutbox.status == "processing",
+                    OperationOutbox.attempt_count >= OperationOutbox.max_attempts,
+                    OperationOutbox.locked_until.is_not(None),
+                    OperationOutbox.locked_until <= now,
+                )
+                .with_for_update(skip_locked=True)
+                .limit(100)
+            )
+        )
+        for row in dead_rows:
+            row.status = "failed"
+            row.locked_by = None
+            row.locked_until = None
+            # 说明文字不得命中 MEDIA_CONFIGURATION_ERROR_MARKERS，避免被
+            # 配置错误恢复通道误复活。
+            row.last_error = row.last_error or "media archive retry budget exhausted"
         due_state = or_(
             and_(
                 OperationOutbox.status.in_(("pending", "retry")),
@@ -1868,6 +1893,10 @@ def _reset_outbox_dispatch(outbox_id: uuid.UUID, error: Exception) -> None:
 def _dispatch_media_outboxes(
     outbox_ids: Iterable[uuid.UUID] | None = None, *, limit: int = 20
 ) -> int:
+    # media.archive 需要访问遗留上游；paused/retired 下不得外呼，
+    # 行保持 pending 且不消耗重试预算（retirement 也不会取消它们）。
+    if compatibility_mode() is not CompatibilityMode.ENABLED:
+        return 0
     claimed = _claim_media_outboxes(outbox_ids=outbox_ids, limit=limit)
     if not claimed:
         return 0
@@ -4212,6 +4241,29 @@ def _defer_outbox_configuration_error(outbox_id: uuid.UUID, exc: Exception) -> b
         )
 
 
+def _release_disabled_media_outbox(outbox_id: uuid.UUID, mode: CompatibilityMode) -> None:
+    """兼容模式非 enabled 时，把已被派发 claim 的行退回 retry 并补回预算。"""
+
+    with session_scope() as db:
+        row = db.scalar(
+            select(OperationOutbox).where(OperationOutbox.id == outbox_id).with_for_update()
+        )
+        if row is None or row.status in {"completed", "failed"}:
+            return
+        # 派发阶段 _claim_media_outboxes 已把行置为 processing 并消耗一次
+        # attempt；模式切换导致的放弃不应占用瞬时错误的重试预算。这里抬高
+        # max_attempts（而非回退 attempt_count）保持 attempt 序号单调，
+        # 后续 RQ job id 仍然唯一。
+        row.max_attempts = max(int(row.max_attempts or 0) + 1, int(row.attempt_count or 0) + 1)
+        row.status = "retry"
+        row.available_at = utcnow()
+        row.locked_by = None
+        row.locked_until = None
+        # 说明文字不得命中 MEDIA_CONFIGURATION_ERROR_MARKERS，
+        # 避免被配置错误恢复流程误判为 R2 凭据问题。
+        row.last_error = f"兼容模式为 {mode.value}，归档任务退回等待重新派发"[:2000]
+
+
 def _permanent_media_error(exc: Exception) -> bool:
     if isinstance(exc, NotFoundError):
         return True
@@ -4270,6 +4322,20 @@ def archive_media_job(outbox_id: str) -> dict[str, Any]:
     """Download, validate and copy one media object to a private R2 bucket."""
 
     operation_id = _uuid(outbox_id, field="outbox_id")
+    mode = compatibility_mode()
+    if mode is not CompatibilityMode.ENABLED:
+        # 已入队但模式已切换的任务直接放弃执行。行在派发时已被
+        # _claim_media_outboxes 置为 processing 并消耗一次 attempt，
+        # 必须退回 retry 并补回预算，否则反复暂停/恢复会耗尽
+        # MEDIA_MAX_ATTEMPTS，行永久卡在 processing 无人再派发。
+        _release_disabled_media_outbox(operation_id, mode)
+        return {
+            "ok": True,
+            "ignored": True,
+            "outbox_id": str(operation_id),
+            "reason": "legacy compatibility dispatch is disabled",
+            "compatibility_mode": mode.value,
+        }
     loaded = _outbox_payload(operation_id)
     if loaded is None:
         return {"ok": True, "ignored": True}
@@ -4707,6 +4773,19 @@ def cleanup_expired_data() -> dict[str, Any]:
             delete(OperationOutbox).where(
                 OperationOutbox.status.in_(("completed", "failed", "cancelled")),
                 OperationOutbox.updated_at <= outbox_cutoff,
+                # media.archive 门禁只认 completed 为终态（文档 §4.5 不得
+                # 直接取消）；failed/cancelled 的归档行必须保留，否则
+                # retention 会让 migration_readiness 的 media_archive
+                # 门禁在归档从未完成时静默转绿。
+                or_(
+                    OperationOutbox.status == "completed",
+                    and_(
+                        OperationOutbox.operation_type != MEDIA_OPERATION,
+                        OperationOutbox.operation_type.not_like(
+                            "compatibility.media.archive%"
+                        ),
+                    ),
+                ),
             )
         )
         outboxes_deleted = int(result.rowcount or 0)

@@ -662,6 +662,135 @@ class BanghuaMomentsReaderTests(unittest.TestCase):
             ),
         )
 
+    @staticmethod
+    def _page(data, *, raw=""):
+        return SimpleNamespace(ok=True, status=200, raw=raw, data=data)
+
+    @staticmethod
+    def _reader(result):
+        social = SimpleNamespace(
+            user_posts=lambda _uid, page: result,
+            main_comments=lambda _post, _author, **_kwargs: result,
+        )
+        return BanghuaMomentsReader(social, upstream_uid="42")
+
+    def test_unknown_page_structure_fails_closed_instead_of_reading_empty(self) -> None:
+        # 未知包裹结构（字段改名/新增包装层）不得被静默当作空页读完，
+        # 否则会伪造 complete Marker。帖子与评论两个入口共用同一守卫。
+        result = self._page(
+            {"unknownWrap": "opaque-token"},
+            raw='{"unknownWrap":"opaque-token"}',
+        )
+        reader = self._reader(result)
+        with self.assertRaisesRegex(
+            LegacyMomentsDataError, "legacy_page_structure_unknown"
+        ):
+            reader.fetch_post_page(1)
+        with self.assertRaisesRegex(
+            LegacyMomentsDataError, "legacy_page_structure_unknown"
+        ):
+            reader.fetch_comment_page(
+                post_upstream_id="101",
+                author_upstream_uid="42",
+                hide_comments=False,
+                page=1,
+            )
+
+    def test_partially_unparseable_page_items_fail_closed(self) -> None:
+        # 页内 3 条原始条目、其中 1 条无法被 normalizer 解析：静默丢弃会让
+        # 导入计数与真实历史不一致，必须失败关闭而不是只导入 2 条。
+        raw_items = [
+            post_item(post_id="301", created_at=NOW - timedelta(days=3)),
+            post_item(post_id="302", created_at=NOW - timedelta(days=2)),
+            {"corrupted": "payload"},
+        ]
+        reader = self._reader(self._page({"list": raw_items}))
+        with self.assertRaisesRegex(
+            LegacyMomentsDataError, "legacy_page_item_unparseable"
+        ):
+            reader.fetch_post_page(1)
+
+    def test_explicit_empty_shapes_still_read_as_empty(self) -> None:
+        # 服务端明确的空形态仍然允许被当作「已读到结束」。
+        cases = (
+            ("dict-empty-list", {"list": []}, '{"list":[]}'),
+            ("dict-empty", {}, "{}"),
+            ("empty-list", [], "[]"),
+            ("json-empty-array-string", "[]", "[]"),
+            ("empty-string", "", ""),
+        )
+        for label, data, raw in cases:
+            with self.subTest(label=label):
+                reader = self._reader(self._page(data, raw=raw))
+                self.assertEqual(reader.fetch_post_page(1), ())
+
+    def test_renamed_or_shadowed_page_lists_must_not_read_as_empty(self) -> None:
+        # 回归守卫：非空数据被空的白名单键遮蔽（list 为空但条目在 posts），
+        # 或列表字段整体改名（luntanList），都必须失败关闭，不得伪造空页。
+        shadowed = {
+            "list": [],
+            "posts": [
+                post_item(
+                    post_id=str(400 + index),
+                    created_at=NOW - timedelta(days=1),
+                )
+                for index in range(10)
+            ],
+        }
+        renamed = {
+            "luntanList": [
+                post_item(post_id="501", created_at=NOW - timedelta(days=1))
+            ],
+            "banners": [],
+        }
+        for label, data in (("shadowed", shadowed), ("renamed", renamed)):
+            with self.subTest(label=label):
+                reader = self._reader(self._page(data))
+                with self.assertRaisesRegex(
+                    LegacyMomentsDataError, "legacy_page_structure_unknown"
+                ):
+                    reader.fetch_post_page(1)
+
+    def test_nonempty_list_beside_empty_ads_never_returns_empty(self) -> None:
+        # "result" 属于 extract_list 白名单：条目必须被完整解析返回，
+        # 绝不能因为同页存在空的 "ads" 列表而被误判为空页。
+        parsed_reader = self._reader(
+            self._page(
+                {
+                    "result": [
+                        post_item(
+                            post_id="601", created_at=NOW - timedelta(days=1)
+                        ),
+                        post_item(
+                            post_id="602", created_at=NOW - timedelta(days=2)
+                        ),
+                    ],
+                    "ads": [],
+                }
+            )
+        )
+        items = parsed_reader.fetch_post_page(1)
+        self.assertEqual([item["id"] for item in items], ["601", "602"])
+
+        # 白名单外的非空列表（ads）承载条目时，读取端解析不出任何内容，
+        # 必须失败关闭而不是把空的白名单键 "result" 当作空页读完。
+        unknown_reader = self._reader(
+            self._page(
+                {
+                    "ads": [
+                        post_item(
+                            post_id="603", created_at=NOW - timedelta(days=1)
+                        )
+                    ],
+                    "result": [],
+                }
+            )
+        )
+        with self.assertRaisesRegex(
+            LegacyMomentsDataError, "legacy_page_structure_unknown"
+        ):
+            unknown_reader.fetch_post_page(1)
+
 
 class LegacyMomentsCliTests(unittest.TestCase):
     def test_all_active_cli_emits_only_aggregate_counts(self) -> None:

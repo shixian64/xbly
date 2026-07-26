@@ -317,6 +317,84 @@ class CompatibilityDispatchGateTests(unittest.TestCase):
         scanner.assert_not_called()
         queue.assert_not_called()
 
+    def test_paused_archive_media_job_returns_claimed_outbox_to_retry(self) -> None:
+        # 行在派发阶段已被 _claim_media_outboxes 置为 processing 并消耗
+        # 一次 attempt；paused 下放弃执行必须退回 retry 并补回预算，
+        # 否则反复暂停/恢复会耗尽预算，行永久卡在 processing。
+        row = types.SimpleNamespace(
+            status="processing",
+            attempt_count=3,
+            max_attempts=8,
+            available_at=None,
+            locked_by="worker-one",
+            locked_until=NOW,
+            last_error=None,
+        )
+
+        class FakeDb:
+            def scalar(self, _statement: object) -> object:
+                return row
+
+        @contextmanager
+        def fake_session_scope():
+            yield FakeDb()
+
+        with (
+            patch.dict(
+                "os.environ", {"BBW_COMPATIBILITY_MODE": "paused"}, clear=False
+            ),
+            patch.object(jobs, "session_scope", fake_session_scope),
+        ):
+            result = jobs.archive_media_job(str(uuid.uuid4()))
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["ignored"])
+        self.assertEqual(result["compatibility_mode"], "paused")
+        self.assertEqual(row.status, "retry")
+        # 补回本次 claim 消耗的预算而非回退 attempt_count，
+        # 保持 attempt 序号单调、RQ job id 唯一。
+        self.assertEqual(row.attempt_count, 3)
+        self.assertEqual(row.max_attempts, 9)
+        self.assertIsNotNone(row.available_at)
+        self.assertIsNone(row.locked_by)
+        self.assertIsNone(row.locked_until)
+        # 说明文字不得命中配置错误标记，避免被凭据恢复流程误判。
+        self.assertTrue(row.last_error)
+        for marker in jobs.MEDIA_CONFIGURATION_ERROR_MARKERS:
+            self.assertNotIn(marker, str(row.last_error).lower())
+
+    def test_paused_archive_media_job_keeps_terminal_outbox_untouched(self) -> None:
+        row = types.SimpleNamespace(
+            status="failed",
+            attempt_count=8,
+            max_attempts=8,
+            available_at=None,
+            locked_by=None,
+            locked_until=None,
+            last_error="permanent error",
+        )
+
+        class FakeDb:
+            def scalar(self, _statement: object) -> object:
+                return row
+
+        @contextmanager
+        def fake_session_scope():
+            yield FakeDb()
+
+        with (
+            patch.dict(
+                "os.environ", {"BBW_COMPATIBILITY_MODE": "paused"}, clear=False
+            ),
+            patch.object(jobs, "session_scope", fake_session_scope),
+        ):
+            result = jobs.archive_media_job(str(uuid.uuid4()))
+
+        self.assertTrue(result["ignored"])
+        self.assertEqual(row.status, "failed")
+        self.assertEqual(row.max_attempts, 8)
+        self.assertEqual(row.last_error, "permanent error")
+
 
 class RetirementCliTests(unittest.TestCase):
     def test_preview_is_aggregate_only_and_default_cli_is_read_only(self) -> None:

@@ -807,6 +807,24 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         self.assertIn('if (!autonomy?.visible) return "";', section)
         self.assertIn("后台调度", section)
         self.assertIn("agentAutonomySectionHtml(autonomy)", page)
+        self.assertIn('data-action="agent-refresh-autonomy-tasks"', section)
+        self.assertIn('id="agent-autonomy-tasks"', section)
+        self.assertIn('"/api/agent/autonomy/tasks?limit=50"', app)
+        refresh_handler = self.fragment(
+            app,
+            'if (action === "agent-refresh-autonomy-tasks") {',
+            'if (action === "match-tab") {',
+        )
+        self.assertIn(
+            'await agentAutonomyApi("/api/agent/autonomy/tasks?limit=50"',
+            refresh_handler,
+        )
+        self.assertNotIn("await agentApi(", refresh_handler)
+        self.assertIn(
+            'if ($("agent-autonomy-tasks") === container) container.innerHTML = previous;',
+            refresh_handler,
+        )
+        self.assertIn("if (refreshed !== container) return;", refresh_handler)
 
         index = self.read("bbw_web/static/index.html")
         match = re.search(r'/static/app\.js\?v=([0-9a-f]{16})', index)

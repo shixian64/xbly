@@ -53,6 +53,29 @@ class ProviderUnavailable(RuntimeError):
         self.upstream_code = str(upstream_code or "")
 
 
+class ProviderUpstreamInterrupted(RuntimeError):
+    """上游连接在请求中途被中断（典型如陈旧 keep-alive 连接被对端先行关闭）。
+
+    这是可重试的瞬态故障信号，但它证明上游是「可达」的——只是本次连接被
+    打断——所以绝不能触发本地密码回退（回退闸门只认
+    ``UPSTREAM_AUTH_UNAVAILABLE``，见 docs/17 的安全取舍）。它也刻意不
+    继承 :class:`ProviderUnavailable`，避免任何按类型判断的回退路径误收。
+    """
+
+    retryable = True
+
+    def __init__(
+        self,
+        message: str = "provider upstream interrupted",
+        *,
+        upstream_status: int = 0,
+        upstream_code: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.upstream_status = int(upstream_status)
+        self.upstream_code = str(upstream_code or "")
+
+
 @runtime_checkable
 class ProviderSession(Protocol):
     """Minimum session surface shared by provider-backed runtimes."""

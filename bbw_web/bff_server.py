@@ -32,6 +32,7 @@ from bbw_web.message_quote import encode_message_quote, normalize_message_quote 
 from bbw_web.providers import (  # noqa: E402
     ProviderAuthenticationRejected,
     ProviderUnavailable,
+    ProviderUpstreamInterrupted,
 )
 from bbw_web.store import SessionStore  # noqa: E402
 
@@ -3591,6 +3592,22 @@ class Handler(BaseHTTPRequestHandler):
                         "retryable": False,
                     },
                     401,
+                )
+            except ProviderUpstreamInterrupted as e:
+                # 上游连接中途被打断（如陈旧 keep-alive 被对端关闭）。
+                # 给出可重试信号；code 刻意区别于 UPSTREAM_AUTH_UNAVAILABLE，
+                # 确保 api.py 的本地密码回退闸门不被瞬态连接中断触发。
+                return self.ok(
+                    {
+                        "ok": False,
+                        "code": "UPSTREAM_AUTH_INTERRUPTED",
+                        "error": _safe_error(
+                            e,
+                            "登录服务连接中断，请稍后重试",
+                        ),
+                        "retryable": True,
+                    },
+                    503,
                 )
             except Exception as e:
                 return self.ok({"ok": False, "error": _safe_error(e, "登录失败")}, 400)

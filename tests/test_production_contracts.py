@@ -1103,6 +1103,93 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn("blacklist", param_text)
         self.assertIn("blacklisted_by", param_text)
 
+    def test_recipient_legacy_block_snapshots_deny_proactive_private_message(self) -> None:
+        try:
+            from sqlalchemy.dialects import postgresql
+
+            from bbw_web.private_message_policy import (
+                private_message_permission_query,
+            )
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        sender_user_id = uuid.uuid4()
+        recipient_user_id = uuid.uuid4()
+        compiled = private_message_permission_query(
+            sender_user_id=sender_user_id,
+            sender_upstream_uid="42",
+            recipient_user_id=recipient_user_id,
+            recipient_upstream_uid="9",
+            proactive_private_message=True,
+        ).compile(dialect=postgresql.dialect())
+        sql = str(compiled).replace("\n", " ")
+
+        # 拉黑判定必须同时覆盖六个方向:双方 local override 各一条,
+        # 发送方名下 legacy blacklist/blacklisted_by 各一条,以及收件人
+        # 名下 legacy blacklist/blacklisted_by 各一条。少任何一条都视为回退。
+        self.assertEqual(sql.count("relationships.owner_user_id ="), 6)
+        # 两条 local override 豁免子查询各被两个 legacy 分支引用一次。
+        self.assertEqual(
+            sql.count("policy_peer_block_override.owner_user_id ="), 2
+        )
+        self.assertEqual(
+            sql.count("policy_own_block_override.owner_user_id ="), 2
+        )
+
+        # 把绑定参数代回编译文本,做结构性断言而非整段快照。
+        resolved = sql
+        for key in sorted(compiled.params, key=len, reverse=True):
+            resolved = resolved.replace(
+                f"%({key})s", repr(str(compiled.params[key]))
+            )
+        branches = resolved.split(" OR ")
+        self.assertEqual(len(branches), 6)
+
+        def branch_count(*, owner: uuid.UUID, kind: str, guard: str) -> int:
+            return sum(
+                1
+                for branch in branches
+                if f"relationships.owner_user_id = '{owner}'" in branch
+                and "relationships.provider = 'beibeiwu'" in branch
+                and "relationships.subject_upstream_uid = '42'" in branch
+                and f"relationships.kind = '{kind}'" in branch
+                and guard in branch
+            )
+
+        # 收件人名下 legacy blacklist(收件人拉黑发送人)分支,
+        # 由 peer local override 豁免。
+        self.assertEqual(
+            branch_count(
+                owner=recipient_user_id,
+                kind="blacklist",
+                guard="policy_peer_block_override",
+            ),
+            1,
+        )
+        # 收件人名下 legacy blacklisted_by(发送人拉黑收件人的对端快照)
+        # 分支,由发送方 own local override 豁免。
+        self.assertEqual(
+            branch_count(
+                owner=recipient_user_id,
+                kind="blacklisted_by",
+                guard="policy_own_block_override",
+            ),
+            1,
+        )
+
+        # 收件人 user_id 需绑定在:local 分支、peer 豁免子查询以及
+        # 两条新 legacy 分支上;legacy provider 需绑定在四条 legacy 分支上。
+        recipient_bind_count = sum(
+            1
+            for value in compiled.params.values()
+            if value == recipient_user_id
+        )
+        self.assertGreaterEqual(recipient_bind_count, 4)
+        legacy_bind_count = sum(
+            1 for value in compiled.params.values() if value == "beibeiwu"
+        )
+        self.assertGreaterEqual(legacy_bind_count, 4)
+
     def test_blacklisted_by_snapshot_is_persisted_as_a_message_block(self) -> None:
         try:
             from bbw_web.persistence import RuntimePersistence, UserIdentity

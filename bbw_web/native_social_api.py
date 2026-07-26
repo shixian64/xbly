@@ -1191,6 +1191,14 @@ def _dispatch_post(
         path=path,
         body=body,
         target_uid=target_uid,
+        # 拒绝/撤销好友申请没有可安全映射的上游语义（worker 端只会以
+        # PermanentCompatibilityError 收场）。与头像一致：直接写 cancelled
+        # + 稳定原因，不虚报 pending，也不污染 failed 统计。
+        not_mappable_reason=(
+            "friend_request_resolution_not_mappable"
+            if path in {"/api/social/reject-friend", "/api/social/cancel-friend"}
+            else ""
+        ),
     )
     response["compatibility_sync"] = compatibility_status
     return _response(response)

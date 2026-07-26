@@ -4,6 +4,7 @@ import importlib.util
 import sys
 import unittest
 import uuid
+from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,12 +19,15 @@ try:
 
     from bbw_agent.repositories import (
         AgentActionExecutionRepository,
+        AgentAutonomyDailyUsageRepository,
+        AgentAutonomySettingRepository,
         AgentExecutionSettingRepository,
         SUPPORTED_ACCOUNT_ACTION_TYPES,
         _normalize_action_type,
     )
     from bbw_prod.models import (
         AiAgentActionExecution,
+        AiAgentAutonomySetting,
         AiAgentExecutionSetting,
         AiModelRunnerSystemSetting,
         User,
@@ -448,6 +452,138 @@ class ByokAccountActionRepositoryTests(unittest.TestCase):
         self.assertIn("cancelled", params.values())
         self.assertIn("access_revoked", params.values())
         self.assertNotIn("running", params.values())
+
+
+@unittest.skipIf(
+    DEPENDENCY_IMPORT_ERROR is not None,
+    f"production dependencies are not installed: {DEPENDENCY_IMPORT_ERROR}",
+)
+class ByokAutonomySettingRepositoryTests(unittest.TestCase):
+    _POLICY_KWARGS = {
+        "user_enabled": True,
+        "auto_reply_enabled": True,
+        "scheduled_post_enabled": False,
+        "managed_relationships_enabled": False,
+        "allowed_actions": ["send_private_message"],
+        "operation_brief": "维持既有联系",
+        "managed_target_uids": [],
+        "timezone": "UTC",
+        "active_start_minute": 0,
+        "active_end_minute": 0,
+        "minimum_action_interval_seconds": 300,
+        "daily_total_limit": 20,
+        "daily_reply_limit": 10,
+        "daily_post_limit": 1,
+        "daily_relationship_limit": 5,
+        "post_interval_minutes": 1440,
+        "consecutive_failure_limit": 3,
+    }
+
+    def _existing_row(self, owner_id: uuid.UUID) -> AiAgentAutonomySetting:
+        return AiAgentAutonomySetting(
+            id=uuid.uuid4(),
+            owner_user_id=owner_id,
+            consecutive_failures=0,
+            version=7,
+            **self._POLICY_KWARGS,
+        )
+
+    def test_resubmitting_unchanged_policy_clears_halt_without_version_bump(self) -> None:
+        owner_id = uuid.uuid4()
+        row = self._existing_row(owner_id)
+        row.consecutive_failures = 3
+        row.halted_at = datetime(2026, 7, 25, 12, 0, tzinfo=UTC)
+        row.halted_reason = "worker_lost"
+        row.next_run_at = None
+        session = _ScalarSession(row)
+
+        result = AgentAutonomySettingRepository(session).configure(
+            owner_id, **self._POLICY_KWARGS
+        )
+
+        self.assertIs(result, row)
+        self.assertIsNone(row.halted_at)
+        self.assertIsNone(row.halted_reason)
+        self.assertEqual(row.consecutive_failures, 0)
+        self.assertEqual(row.version, 7)
+        self.assertIsNotNone(row.next_run_at)
+        self.assertEqual(session.flushed, 1)
+
+    def test_resubmitting_unchanged_policy_without_halt_is_a_noop(self) -> None:
+        owner_id = uuid.uuid4()
+        row = self._existing_row(owner_id)
+        original_next_run = datetime(2026, 7, 25, 13, 0, tzinfo=UTC)
+        row.next_run_at = original_next_run
+        session = _ScalarSession(row)
+
+        result = AgentAutonomySettingRepository(session).configure(
+            owner_id, **self._POLICY_KWARGS
+        )
+
+        self.assertIs(result, row)
+        self.assertEqual(row.version, 7)
+        self.assertEqual(row.next_run_at, original_next_run)
+        self.assertEqual(session.flushed, 0)
+
+    def test_changed_policy_still_bumps_version_and_clears_halt(self) -> None:
+        owner_id = uuid.uuid4()
+        row = self._existing_row(owner_id)
+        row.halted_at = datetime(2026, 7, 25, 12, 0, tzinfo=UTC)
+        row.halted_reason = "consecutive_failures"
+        row.consecutive_failures = 5
+        session = _ScalarSession(row)
+        changed_kwargs = dict(self._POLICY_KWARGS, operation_brief="新的运营目标")
+
+        result = AgentAutonomySettingRepository(session).configure(
+            owner_id, **changed_kwargs
+        )
+
+        self.assertIs(result, row)
+        self.assertEqual(row.version, 8)
+        self.assertIsNone(row.halted_at)
+        self.assertIsNone(row.halted_reason)
+        self.assertEqual(row.consecutive_failures, 0)
+        self.assertEqual(session.flushed, 1)
+
+
+class _ScalarsSession:
+    def __init__(self, rows: list[object]) -> None:
+        self.rows = rows
+        self.calls = 0
+
+    def scalars(self, _statement: object) -> list[object]:
+        self.calls += 1
+        return self.rows
+
+
+@unittest.skipIf(
+    DEPENDENCY_IMPORT_ERROR is not None,
+    f"production dependencies are not installed: {DEPENDENCY_IMPORT_ERROR}",
+)
+class ByokAutonomyDailyUsageRepositoryTests(unittest.TestCase):
+    def test_get_many_pairs_rows_by_owner_and_local_date(self) -> None:
+        owner_a = uuid.uuid4()
+        owner_b = uuid.uuid4()
+        matching = SimpleNamespace(owner_user_id=owner_a, usage_date=date(2026, 7, 26))
+        # IN 超集会带回 owner_b 在 owner_a 本地日期的行；owner_b 期望的是
+        # 另一个本地日期，必须被精确配对过滤掉。
+        cross_pair = SimpleNamespace(owner_user_id=owner_b, usage_date=date(2026, 7, 26))
+        session = _ScalarsSession([matching, cross_pair])
+
+        result = AgentAutonomyDailyUsageRepository(session).get_many(
+            {owner_a: date(2026, 7, 26), owner_b: date(2026, 7, 25)}
+        )
+
+        self.assertEqual(result, {owner_a: matching})
+        self.assertEqual(session.calls, 1)
+
+    def test_get_many_without_keys_skips_the_query(self) -> None:
+        session = _ScalarsSession([])
+
+        result = AgentAutonomyDailyUsageRepository(session).get_many({})
+
+        self.assertEqual(result, {})
+        self.assertEqual(session.calls, 0)
 
 
 if __name__ == "__main__":

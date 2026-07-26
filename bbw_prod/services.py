@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import threading
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -50,6 +52,9 @@ from .security import (
     keyed_identifier_hash,
     normalize_username,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class RedisClient(Protocol):
@@ -103,6 +108,37 @@ WEB_LOCAL_PROFILE_UPDATED_AT_KEY = "_web_local_updated_at"
 WEB_LOCAL_PROFILE_FIELDS = frozenset(
     {"nickname", "avatar", "signature", "city", "gender", "privacy"}
 )
+# 与 bbw_web.legacy_media_reference.LOCAL_MEDIA_KEY 保持一致（bbw_prod 不能
+# 反向依赖 bbw_web）。媒体迁移器写入的 sidecar 是本地权威投影，上游快照
+# 合并时必须保留，否则一次上游登录就会丢弃已归档媒体的本地引用。
+LOCAL_MEDIA_SIDECAR_KEY = "_local_media"
+_PRESERVED_LOCAL_PROFILE_KEYS = frozenset({LOCAL_MEDIA_SIDECAR_KEY})
+
+# 机会式凭据登记与 bbw_web 的本地认证闸门（_LocalPasswordAuthGate）是同进程
+# 内两个独立的信号量：同进程 Argon2 峰值为 bbw_web 本地认证闸门容量 + 本闸门
+# 容量之和；本闸门取配置值的一半（至少 1）以控制总内存预算。登记失败不影响
+# 上游登录成功，处置策略见 _enroll_password_opportunistically。进程级单例，
+# 容量与本地认证闸门同源配置。
+_ENROLLMENT_GATE_LOCK = threading.Lock()
+_ENROLLMENT_GATE: threading.BoundedSemaphore | None = None
+
+
+def _opportunistic_enrollment_gate(capacity: int) -> threading.BoundedSemaphore:
+    global _ENROLLMENT_GATE
+    with _ENROLLMENT_GATE_LOCK:
+        if _ENROLLMENT_GATE is None:
+            _ENROLLMENT_GATE = threading.BoundedSemaphore(
+                max(1, min(8, int(capacity)) // 2)
+            )
+        return _ENROLLMENT_GATE
+
+
+def _reset_enrollment_gate_for_tests() -> None:
+    """仅供测试重置进程级闸门单例；生产代码不得调用。"""
+
+    global _ENROLLMENT_GATE
+    with _ENROLLMENT_GATE_LOCK:
+        _ENROLLMENT_GATE = None
 
 
 def merge_provider_profile_preserving_local(
@@ -140,7 +176,7 @@ def merge_provider_profile_preserving_local(
         if (
             str(key).startswith("_web_")
             and key != WEB_LOCAL_PROFILE_FIELDS_KEY
-        ):
+        ) or str(key) in _PRESERVED_LOCAL_PROFILE_KEYS:
             merged[key] = value
     return merged
 
@@ -938,7 +974,7 @@ class LoginAccountService:
             if invite is not None:
                 self.invites.consume_locked(invite)
             if password and password_verified:
-                self.user_credentials.enroll_verified_password(
+                self._enroll_password_opportunistically(
                     user_id=user.id,
                     password=password,
                     verified_at=authenticated_at,
@@ -994,7 +1030,7 @@ class LoginAccountService:
         self.db.flush()
         self.db.add(account)
         if password and password_verified:
-            self.user_credentials.enroll_verified_password(
+            self._enroll_password_opportunistically(
                 user_id=user.id,
                 password=password,
                 verified_at=authenticated_at,
@@ -1003,6 +1039,50 @@ class LoginAccountService:
             self.invites.consume_locked(invite)
         self.db.flush()
         return LoginCompletion(user, account, True)
+
+    def _enroll_password_opportunistically(
+        self,
+        *,
+        user_id: uuid.UUID,
+        password: str,
+        verified_at: datetime,
+    ) -> bool:
+        """在进程级闸门内执行机会式登记的 Argon2 运算。
+
+        登录本身已由上游认证成功，不能为登记让内存硬哈希在闸门之外无界并
+        发。闸门短暂拥挤（短超时未取得槽位）时按用户是否已有凭据行区分：
+
+        - 已有凭据行：仅推迟摘要刷新并记 WARNING（否则用户改密后旧摘要在
+          本地兜底路径静默保留且无迹可查），下一次可信密码登录自动重试；
+        - 尚无凭据行（新注册或存量未迁移用户）：升级为阻塞等待后强制登记，
+          保证任何成功登录的用户至少有一行本地凭据，否则私信、媒体等依赖
+          凭据行的主体解析全部失效，本地兜底登录也无从建立。等待上界为
+          槽位数 × 单次 Argon2 时长，秒级。
+        """
+
+        gate = _opportunistic_enrollment_gate(
+            int(getattr(self.settings, "local_password_auth_concurrency", 2))
+        )
+        if not gate.acquire(timeout=1.0):
+            existing = self.user_credentials.credentials.get_for_user(user_id)
+            if existing is not None:
+                LOGGER.warning(
+                    "opportunistic credential refresh deferred for user %s: "
+                    "enrollment gate is saturated; the stale local digest is "
+                    "kept and will be refreshed on the next verified login",
+                    user_id,
+                )
+                return False
+            gate.acquire()
+        try:
+            self.user_credentials.enroll_verified_password(
+                user_id=user_id,
+                password=password,
+                verified_at=verified_at,
+            )
+            return True
+        finally:
+            gate.release()
 
 
 @dataclass(frozen=True, slots=True)

@@ -1932,7 +1932,17 @@ function clearAgentApiKeyInputs(scope = document) {
     });
 }
 
+let aiAgentConfirmationCountdownTimer = 0;
+
+function stopAiAgentConfirmationCountdown() {
+  if (aiAgentConfirmationCountdownTimer) {
+    clearInterval(aiAgentConfirmationCountdownTimer);
+    aiAgentConfirmationCountdownTimer = 0;
+  }
+}
+
 function clearAiAgentPendingExecution({ clearPanel = true } = {}) {
+  stopAiAgentConfirmationCountdown();
   S.aiAgentExecutionGeneration += 1;
   S.aiAgentPendingExecution = null;
   if (!clearPanel) return;
@@ -2015,6 +2025,18 @@ function normalizedAiAgentAutonomyStatus(status) {
         .slice(0, 12)
         .map((task) => Object.freeze({ ...task }))
     : [];
+  const usageSource =
+    source.usage_today && typeof source.usage_today === "object" ? source.usage_today : null;
+  const usageToday = usageSource
+    ? Object.freeze({
+        total_actions: boundedInteger(usageSource.total_actions, 0, 0, 1000000),
+        reply_actions: boundedInteger(usageSource.reply_actions, 0, 0, 1000000),
+        post_actions: boundedInteger(usageSource.post_actions, 0, 0, 1000000),
+        relationship_actions: boundedInteger(usageSource.relationship_actions, 0, 0, 1000000),
+        failed_actions: boundedInteger(usageSource.failed_actions, 0, 0, 1000000),
+        outcome_unknown_actions: boundedInteger(usageSource.outcome_unknown_actions, 0, 0, 1000000),
+      })
+    : null;
   return Object.freeze({
     visible: true,
     available: source.available === true,
@@ -2047,6 +2069,7 @@ function normalizedAiAgentAutonomyStatus(status) {
     post_interval_minutes: boundedInteger(source.post_interval_minutes, 1440, 60, 10080),
     consecutive_failure_limit: boundedInteger(source.consecutive_failure_limit, 3, 1, 20),
     recent_tasks: Object.freeze(recentTasks),
+    usage_today: usageToday,
   });
 }
 
@@ -15716,6 +15739,7 @@ function agentExecutionActionReview(action, target, content) {
 function renderAiAgentExecutionConfirmation() {
   const panel = $("agent-execution-confirmation");
   const pending = S.aiAgentPendingExecution;
+  stopAiAgentConfirmationCountdown();
   if (!panel) return;
   if (
     !pending ||
@@ -15741,12 +15765,37 @@ function renderAiAgentExecutionConfirmation() {
     directReply
       ? "确认后服务端会生成新回复并立即发送，最终发送文本不会先以草稿形式返回。"
       : "这是实际账号操作，不是草稿生成。服务端一次性确认凭证有效期为 5 分钟，请再次核对目标和内容。"
-  }</div></div>
+  }</div>${directReply ? "" : '<div id="agent-execution-countdown"></div>'}</div>
+    ${
+      !directReply && pending.serverSummary
+        ? `<div class="kv-list"><div class="kv-row"><span>服务端确认摘要</span><strong>${esc(pending.serverSummary)}</strong></div></div>`
+        : ""
+    }
     ${pending.target ? `<div class="kv-list"><div class="kv-row"><span>目标用户编号</span><strong>${esc(pending.target)}</strong></div></div>` : ""}
     ${contentReview}${objectiveReview}
     <div class="button-row"><button type="button" class="btn primary" data-action="agent-confirm-execution">${esc(
       directReply ? "确认生成并发送" : `确认${aiAgentExecutionActionLabel(pending.action)}`
     )}</button><button type="button" class="btn secondary" data-action="agent-cancel-execution">取消本次执行</button></div>`;
+  if (!directReply && Number(pending.expiresAt) > 0) {
+    const updateCountdown = () => {
+      const el = $("agent-execution-countdown");
+      if (!el || S.aiAgentPendingExecution !== pending) {
+        stopAiAgentConfirmationCountdown();
+        return;
+      }
+      const remaining = Math.max(0, Math.ceil((Number(pending.expiresAt) - Date.now()) / 1000));
+      if (remaining <= 0) {
+        clearAiAgentPendingExecution();
+        toast("一次性确认凭证已过期，请重新检查执行内容");
+        return;
+      }
+      el.textContent = `确认凭证剩余有效时间 ${Math.floor(remaining / 60)} 分 ${String(remaining % 60).padStart(2, "0")} 秒`;
+    };
+    updateCountdown();
+    if (S.aiAgentPendingExecution === pending) {
+      aiAgentConfirmationCountdownTimer = setInterval(updateCountdown, 1000);
+    }
+  }
 }
 
 async function stageAiAgentExecution({ kind, action, target = "", content = "", objective = "" }) {
@@ -15767,6 +15816,7 @@ async function stageAiAgentExecution({ kind, action, target = "", content = "", 
   const idempotencyKey = newAgentIdempotencyKey();
   let confirmationToken = "";
   let expiresAt = 0;
+  let serverSummary = "";
   if (!directReply) {
     const body = { action, idempotency_key: idempotencyKey };
     if (reviewed.target) body.target_upstream_uid = reviewed.target;
@@ -15794,6 +15844,7 @@ async function stageAiAgentExecution({ kind, action, target = "", content = "", 
       throw new Error("服务端未返回有效的一次性确认凭证");
     }
     expiresAt = Date.now() + expiresIn * 1000;
+    serverSummary = String(prepared.summary || "").trim().slice(0, 500);
   }
   S.aiAgentPendingExecution = Object.freeze({
     sessionGeneration: generation,
@@ -15806,6 +15857,7 @@ async function stageAiAgentExecution({ kind, action, target = "", content = "", 
     idempotencyKey,
     confirmationToken,
     expiresAt,
+    serverSummary,
   });
   renderAiAgentExecutionConfirmation();
   $("agent-execution-confirmation")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -16083,10 +16135,16 @@ function agentAutonomySectionHtml(autonomy) {
   const haltedReason = autonomy.halted_reason
     ? `<div>停机原因：${esc(autonomy.halted_reason)}</div>`
     : "";
+  const usage = autonomy.usage_today;
+  const usageLine = usage
+    ? `<div>今日预算用量：总量 ${usage.total_actions}/${autonomy.daily_total_limit} · 回复 ${usage.reply_actions}/${autonomy.daily_reply_limit} · 动态 ${usage.post_actions}/${autonomy.daily_post_limit} · 关系 ${usage.relationship_actions}/${autonomy.daily_relationship_limit}${
+        usage.failed_actions ? ` · 失败 ${usage.failed_actions}` : ""
+      }${usage.outcome_unknown_actions ? ` · 结果未知 ${usage.outcome_unknown_actions}` : ""}</div>`
+    : "";
   return `<section class="section" id="agent-autonomy-section"><div class="section-head"><div><h2>无人值守运行</h2><p>该区域与手动二次确认执行相互独立，只有全部门禁同时满足时才会在后台运行</p></div></div>
     <div class="notice${autonomy.halted || !autonomy.effective_enabled ? " warn" : ""}"><strong>${esc(
       activeTitle
-    )}</strong><div>${esc(statusDetail)}</div>${haltedReason}</div>
+    )}</strong><div>${esc(statusDetail)}</div>${usageLine}${haltedReason}</div>
     <div class="notice mt-sm"><strong>自动化边界</strong><div>自动回复只处理当前仍待回复的入站文字消息；如果你已经回复或会话最新消息发生变化，任务会失效。关系动作只对精确用户编号白名单生效，不支持通配符。无人值守动作只以 Web 本地权威事务成功为准，兼容镜像异步处理且失败不会回滚本地结果。任何结果未知的操作都不会自动重试，而会等待人工检查。</div></div>
     <div class="form-grid mt-md">
       <form class="surface-card" data-form="agent-autonomy-settings" autocomplete="off"><div class="section-head"><div><h2>后台策略</h2><p>默认全部关闭，可按动作和预算逐项启用</p></div></div>
@@ -16145,9 +16203,9 @@ function agentAutonomySectionHtml(autonomy) {
         </div>
         <button type="submit" class="btn primary full mt-sm" ${controlDisabled}>保存无人值守策略</button>
       </form>
-      <div class="surface-card"><div class="section-head"><div><h2>最近任务</h2><p>仅展示非敏感状态；结果未知的任务需要人工检查</p></div></div>${agentAutonomyRecentTasksHtml(
+      <div class="surface-card"><div class="section-head"><div><h2>最近任务</h2><p>仅展示非敏感状态；结果未知的任务需要人工检查</p></div><button type="button" class="btn secondary small" data-action="agent-refresh-autonomy-tasks">刷新任务</button></div><div id="agent-autonomy-tasks">${agentAutonomyRecentTasksHtml(
         autonomy.recent_tasks
-      )}</div>
+      )}</div></div>
     </div>
   </section>`;
 }
@@ -18330,6 +18388,29 @@ async function handleAction(action, button) {
   if (action === "agent-cancel-execution") {
     clearAiAgentPendingExecution();
     toast("已取消本次账号执行", "info");
+    return;
+  }
+  if (action === "agent-refresh-autonomy-tasks") {
+    const container = $("agent-autonomy-tasks");
+    if (!container || !S.aiAgentAutonomyStatus) return;
+    const previous = container.innerHTML;
+    container.innerHTML = loadingState("正在读取最近任务…");
+    let data;
+    try {
+      data = await agentAutonomyApi("/api/agent/autonomy/tasks?limit=50", { timeout: 30000 });
+    } catch (error) {
+      if ($("agent-autonomy-tasks") === container) container.innerHTML = previous;
+      throw error;
+    }
+    const tasks = Array.isArray(data.items)
+      ? data.items
+          .filter((task) => task && typeof task === "object")
+          .slice(0, 50)
+          .map((task) => Object.freeze({ ...task }))
+      : [];
+    const refreshed = $("agent-autonomy-tasks");
+    if (refreshed !== container) return;
+    container.innerHTML = agentAutonomyRecentTasksHtml(tasks);
     return;
   }
   if (action === "match-tab") {

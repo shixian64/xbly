@@ -105,9 +105,19 @@ def _sniff(path: Path) -> tuple[str, str]:
         return "image/webp", "webp"
     if head.startswith(b"BM"):
         return "image/bmp", "bmp"
+    # AMR 语音（TIM 历史语音常见容器）的魔数 "#!AMR" 必须先于通用的
+    # "#!" 活性内容判定识别，否则语音归档会被误判为可执行内容。
+    if head.startswith((b"#!AMR\n", b"#!AMR-WB\n")):
+        return "audio/amr", "amr"
     if len(head) >= 12 and head[4:8] == b"ftyp":
         brand = head[8:12].lower()
-        return ("video/quicktime", "mov") if brand == b"qt  " else ("video/mp4", "mp4")
+        if brand == b"qt  ":
+            return "video/quicktime", "mov"
+        # M4A/M4B 是纯音频的 MP4 容器品牌，判成 video 会让语音历史
+        # 在 _validate_kind 处失败关闭。
+        if brand in {b"m4a ", b"m4b "}:
+            return "audio/mp4", "m4a"
+        return "video/mp4", "mp4"
     if head.startswith(b"ID3") or (len(head) > 2 and head[0] == 0xFF and head[1] & 0xE0 == 0xE0):
         return "audio/mpeg", "mp3"
     if head.startswith(b"RIFF") and head[8:12] == b"WAVE":

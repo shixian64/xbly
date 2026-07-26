@@ -85,7 +85,11 @@ class _LocalPasswordAuthGate:
 
 
 def _local_password_auth_gate(request: Request) -> _LocalPasswordAuthGate:
-    """Return the one Argon2 admission gate shared by this worker process."""
+    """Return this worker's Argon2 admission gate for local password checks.
+
+    bbw_prod 侧另有独立的机会式凭据登记闸门（容量为本闸门配置的一半），
+    同进程 Argon2 峰值并发为两闸门容量之和。
+    """
 
     state = request.app.state
     gate = getattr(state, "local_password_auth_gate", None)

@@ -4537,6 +4537,7 @@ function clearViewCacheKey() {}
 function clearViewCachePrefix() {}
 function syncPrivateMessageControls() {}
 function updateImConnectionStatus() {}
+function webLocalDependencyMode() { return false; }
 function cleanupIM() {
   S.imMode = "";
   S.chat = null;
@@ -4628,11 +4629,11 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
             "function chatComposerQuoteHtml", 1
         )[0]
         self.assertIn(
-            "const directMediaActions = S.directImCredentialsEnabled && S.messagePolicyReady",
+            "const directMediaActions = S.messagePolicyReady",
             composer_panel,
         )
         self.assertIn(
-            "const stickerAction = S.directImCredentialsEnabled && S.messagePolicyReady",
+            "const stickerAction = !webLocalDependencyMode() && S.directImCredentialsEnabled && S.messagePolicyReady",
             composer_panel,
         )
         self.assertIn('data-kind="flash"', composer_panel)
@@ -5322,6 +5323,7 @@ const S = {
   imMessageLoadingPeers: new Set(),
   imMessageLoadedPeers: new Set(),
   imArchiveLoadedPeers: new Set(),
+  imMessageArchiveCursors: new Map(),
   imMessageOlderLoadingPeers: new Set(),
   imMessageHistoryExhaustedPeers: new Set(),
 };
@@ -6950,6 +6952,10 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
             prepare.index("S.aiAgentPendingExecution = Object.freeze"),
         )
         self.assertNotIn("confirmationToken", review)
+        self.assertIn("prepared.summary", prepare)
+        self.assertIn("serverSummary", review)
+        self.assertIn("agent-execution-countdown", review)
+        self.assertIn("一次性确认凭证已过期", review)
         self.assertIn("window.confirm(", execute)
         self.assertIn('agentExecutionApi("/api/agent/replies/send"', execute)
         self.assertIn('agentExecutionApi("/api/agent/actions/execute"', execute)

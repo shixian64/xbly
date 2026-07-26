@@ -371,13 +371,28 @@ class SqlAlchemyCanonicalSocialStore:
             )
         )
         if binding is not None:
-            if binding.payload_digest != payload_digest:
-                raise SocialIdempotencyConflict("上游动态 ID 已绑定到不同内容")
             existing = self.db.scalar(
                 select(SocialPost).where(SocialPost.id == binding.local_entity_id)
             )
             if existing is None:
                 raise SocialContentNotFound("历史动态绑定已失效")
+            if (
+                existing.author_user_id != item.author_user_id
+                or existing.author_upstream_uid != item.author_upstream_uid
+            ):
+                # digest 收敛只接受同作者的合法漂移；作者身份变化说明上游
+                # 动态 ID 被复用给了别人的内容，必须失败关闭。
+                raise SocialIdempotencyConflict("上游动态 ID 已绑定到其他作者")
+            if binding.payload_digest != payload_digest:
+                # provider+upstream_id 才是 legacy 导入的幂等身份；digest 漂移
+                # （上游内容微调或旧算法存量值）按已导入收敛并登记最新 digest，
+                # 不得让重跑把整账号迁移失败关闭。
+                binding.payload_digest = payload_digest
+                extra = dict(binding.extra_data or {})
+                extra["digest_refreshed_at"] = imported_at.isoformat()
+                binding.extra_data = extra
+                binding.updated_at = imported_at
+                self.db.flush()
             return self._post_view(existing), False
 
         legacy_metadata = dict(item.metadata or {})
@@ -463,14 +478,21 @@ class SqlAlchemyCanonicalSocialStore:
                 )
             )
         if for_update:
-            statement = statement.with_for_update()
+            # 服务层采用「无锁预读定位 → 按序加锁」模式；预读已把实体装进
+            # identity map，锁定重读必须强制以数据库行覆盖本地属性，否则
+            # 锁内校验（status/计数）用的是拿锁前的过期快照。
+            statement = statement.with_for_update().execution_options(
+                populate_existing=True
+            )
         row = self.db.scalar(statement)
         return self._post_view(row) if row is not None else None
 
     def _post_row(self, post_id: uuid.UUID, *, for_update: bool = True) -> SocialPost:
         statement = select(SocialPost).where(SocialPost.id == post_id)
         if for_update:
-            statement = statement.with_for_update()
+            statement = statement.with_for_update().execution_options(
+                populate_existing=True
+            )
         row = self.db.scalar(statement)
         if row is None:
             raise SocialContentNotFound("动态不存在")
@@ -640,8 +662,6 @@ class SqlAlchemyCanonicalSocialStore:
             )
         )
         if binding is not None:
-            if binding.payload_digest != payload_digest:
-                raise SocialIdempotencyConflict("上游评论 ID 已绑定到不同内容")
             existing = self.db.scalar(
                 select(SocialComment).where(
                     SocialComment.id == binding.local_entity_id
@@ -649,6 +669,21 @@ class SqlAlchemyCanonicalSocialStore:
             )
             if existing is None:
                 raise SocialContentNotFound("历史评论绑定已失效")
+            if existing.post_id != post.id or existing.parent_comment_id != (
+                parent.id if parent is not None else None
+            ):
+                # digest 收敛只接受同归属的合法漂移；所属动态或父评论变化
+                # 说明上游评论 ID 被复用，必须失败关闭。
+                raise SocialIdempotencyConflict("上游评论 ID 已绑定到其他动态或父评论")
+            if binding.payload_digest != payload_digest:
+                # 同 import_legacy_post：digest 漂移按已导入收敛，
+                # 幂等身份以 provider+upstream_id 为准。
+                binding.payload_digest = payload_digest
+                extra = dict(binding.extra_data or {})
+                extra["digest_refreshed_at"] = imported_at.isoformat()
+                binding.extra_data = extra
+                binding.updated_at = imported_at
+                self.db.flush()
             return self._comment_view(existing), False
 
         comment = SocialComment(
@@ -726,7 +761,10 @@ class SqlAlchemyCanonicalSocialStore:
                 )
             )
         if for_update:
-            statement = statement.with_for_update()
+            # 同 get_post：锁定重读强制刷新 identity map 中的过期实体。
+            statement = statement.with_for_update().execution_options(
+                populate_existing=True
+            )
         row = self.db.scalar(statement)
         return self._comment_view(row) if row is not None else None
 
@@ -737,6 +775,7 @@ class SqlAlchemyCanonicalSocialStore:
             select(SocialComment)
             .where(SocialComment.id == comment_id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if row is None:
             raise SocialContentNotFound("评论不存在")
@@ -755,6 +794,7 @@ class SqlAlchemyCanonicalSocialStore:
                         select(SocialComment)
                         .where(SocialComment.id == row.parent_comment_id)
                         .with_for_update()
+                        .execution_options(populate_existing=True)
                     )
                     if parent is not None:
                         parent.reply_count = max(
@@ -781,6 +821,7 @@ class SqlAlchemyCanonicalSocialStore:
                 select(SocialComment)
                 .where(SocialComment.id == target_id)
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
             if target is None:
                 raise SocialContentNotFound("评论不存在")
@@ -794,6 +835,7 @@ class SqlAlchemyCanonicalSocialStore:
                 SocialReaction.reaction_type == "like",
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if reaction is None and not active:
             return SocialReactionState(

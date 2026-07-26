@@ -35,7 +35,10 @@ from bbw_prod.db import session_scope
 from bbw_prod import models as prod_models
 from bbw_prod.models import (
     ActivityEvent,
+    AiAgentActionExecution,
+    AiAgentAutonomyTask,
     AiAgentExecutionSetting,
+    AiAgentRun,
     AiAgentSetting,
     AiModelConnection,
     AiModelRunnerSystemSetting,
@@ -61,6 +64,7 @@ from bbw_agent.repositories import (
     AgentSettingRepository,
     ModelRunnerSystemSettingRepository,
 )
+from bbw_agent.services import autonomy_task_public
 from bbw_prod.repositories import (
     AdminUserRepository,
     ExternalAccountRepository,
@@ -1407,6 +1411,46 @@ def _audit_public(row: AuditLog) -> dict[str, Any]:
     }
 
 
+def _agent_run_public(row: AiAgentRun) -> dict[str, Any]:
+    # 只暴露审计计数与结果元数据；model_snapshot/output_text/idempotency_key
+    # 属敏感字段，管理端一律不返回。
+    return {
+        "id": str(row.id),
+        "run_type": row.run_type,
+        "status": row.status,
+        "peer_upstream_uid": row.peer_upstream_uid,
+        "source_message_count": int(row.source_message_count or 0),
+        "prompt_char_count": int(row.prompt_char_count or 0),
+        "output_char_count": int(row.output_char_count or 0),
+        "input_tokens": row.input_tokens,
+        "output_tokens": row.output_tokens,
+        "latency_ms": row.latency_ms,
+        "failure_code": row.failure_code,
+        "started_at": _iso(row.started_at),
+        "completed_at": _iso(row.completed_at),
+        "created_at": _iso(row.created_at),
+    }
+
+
+def _agent_action_public(row: AiAgentActionExecution) -> dict[str, Any]:
+    # target_snapshot/parameter_snapshot/external_result_id/idempotency_key
+    # 可能包含正文或外部标识，管理端只读列表不返回。
+    return {
+        "id": str(row.id),
+        "action_type": row.action_type,
+        "status": row.status,
+        "approval_source": row.approval_source,
+        "trigger_source": row.trigger_source,
+        "execution_setting_version": int(row.execution_setting_version or 0),
+        "stable_error_code": row.stable_error_code,
+        "queued_at": _iso(row.queued_at),
+        "started_at": _iso(row.started_at),
+        "completed_at": _iso(row.completed_at),
+        "cancelled_at": _iso(row.cancelled_at),
+        "created_at": _iso(row.created_at),
+    }
+
+
 def _require_user(db: Any, user_id: uuid.UUID, *, for_update: bool = False) -> User:
     user = UserRepository(db).get(user_id, for_update=for_update)
     if user is None:
@@ -2589,6 +2633,41 @@ def user_detail(
                     )
                     or 0
                 ),
+                "agent_runs": int(
+                    db.scalar(
+                        select(func.count())
+                        .select_from(AiAgentRun)
+                        .where(AiAgentRun.owner_user_id == user_id)
+                    )
+                    or 0
+                ),
+                "agent_actions": int(
+                    db.scalar(
+                        select(func.count())
+                        .select_from(AiAgentActionExecution)
+                        .where(AiAgentActionExecution.owner_user_id == user_id)
+                    )
+                    or 0
+                ),
+                "autonomy_tasks": int(
+                    db.scalar(
+                        select(func.count())
+                        .select_from(AiAgentAutonomyTask)
+                        .where(AiAgentAutonomyTask.owner_user_id == user_id)
+                    )
+                    or 0
+                ),
+                "autonomy_manual_review": int(
+                    db.scalar(
+                        select(func.count())
+                        .select_from(AiAgentAutonomyTask)
+                        .where(
+                            AiAgentAutonomyTask.owner_user_id == user_id,
+                            AiAgentAutonomyTask.status == "manual_review",
+                        )
+                    )
+                    or 0
+                ),
             }
             item = {
                 **_user_public(user, account),
@@ -3235,6 +3314,166 @@ def view_user_credentials(
         _raise_service_error(failure)
     assert result is not None
     return {"ok": True, "credentials": result}
+
+
+@router.get("/users/{user_id}/agent-runs")
+def list_user_agent_runs(
+    user_id: uuid.UUID,
+    request: Request,
+    page: int = Query(1, ge=1, le=_MAX_PAGE),
+    limit: int = Query(50, ge=1, le=_MAX_LIMIT),
+    status: str = Query("", max_length=24),
+    run_type: str = Query("", max_length=32),
+    context: AdminContext = Depends(_admin_context),
+) -> dict[str, Any]:
+    try:
+        with session_scope() as db:
+            _require_user(db, user_id)
+            conditions: list[Any] = [AiAgentRun.owner_user_id == user_id]
+            if status.strip():
+                conditions.append(AiAgentRun.status == status.strip())
+            if run_type.strip():
+                conditions.append(AiAgentRun.run_type == run_type.strip())
+            rows = list(
+                db.scalars(
+                    select(AiAgentRun)
+                    .where(*conditions)
+                    .order_by(AiAgentRun.created_at.desc(), AiAgentRun.id.desc())
+                    .offset(_offset(page, limit))
+                    .limit(limit)
+                )
+            )
+            total = int(
+                db.scalar(
+                    select(func.count()).select_from(AiAgentRun).where(*conditions)
+                )
+                or 0
+            )
+            _record_read(
+                _audit_service(db, request),
+                context,
+                action="agent_run.list",
+                target_user_id=user_id,
+                resource_type="ai_agent_run",
+                details={
+                    "page": page,
+                    "limit": limit,
+                    "status": status.strip(),
+                    "run_type": run_type.strip(),
+                },
+            )
+            items = [_agent_run_public(row) for row in rows]
+    except Exception as exc:
+        if isinstance(exc, ServiceError):
+            _raise_service_error(exc)
+        raise
+    return {"ok": True, "items": items, "total": total, "page": page, "limit": limit}
+
+
+@router.get("/users/{user_id}/agent-actions")
+def list_user_agent_actions(
+    user_id: uuid.UUID,
+    request: Request,
+    page: int = Query(1, ge=1, le=_MAX_PAGE),
+    limit: int = Query(50, ge=1, le=_MAX_LIMIT),
+    status: str = Query("", max_length=24),
+    context: AdminContext = Depends(_admin_context),
+) -> dict[str, Any]:
+    try:
+        with session_scope() as db:
+            _require_user(db, user_id)
+            conditions: list[Any] = [
+                AiAgentActionExecution.owner_user_id == user_id
+            ]
+            if status.strip():
+                conditions.append(AiAgentActionExecution.status == status.strip())
+            rows = list(
+                db.scalars(
+                    select(AiAgentActionExecution)
+                    .where(*conditions)
+                    .order_by(
+                        AiAgentActionExecution.created_at.desc(),
+                        AiAgentActionExecution.id.desc(),
+                    )
+                    .offset(_offset(page, limit))
+                    .limit(limit)
+                )
+            )
+            total = int(
+                db.scalar(
+                    select(func.count())
+                    .select_from(AiAgentActionExecution)
+                    .where(*conditions)
+                )
+                or 0
+            )
+            _record_read(
+                _audit_service(db, request),
+                context,
+                action="agent_action.list",
+                target_user_id=user_id,
+                resource_type="ai_agent_action_execution",
+                details={"page": page, "limit": limit, "status": status.strip()},
+            )
+            items = [_agent_action_public(row) for row in rows]
+    except Exception as exc:
+        if isinstance(exc, ServiceError):
+            _raise_service_error(exc)
+        raise
+    return {"ok": True, "items": items, "total": total, "page": page, "limit": limit}
+
+
+@router.get("/users/{user_id}/autonomy-tasks")
+def list_user_autonomy_tasks(
+    user_id: uuid.UUID,
+    request: Request,
+    page: int = Query(1, ge=1, le=_MAX_PAGE),
+    limit: int = Query(50, ge=1, le=_MAX_LIMIT),
+    status: str = Query("", max_length=24),
+    context: AdminContext = Depends(_admin_context),
+) -> dict[str, Any]:
+    try:
+        with session_scope() as db:
+            _require_user(db, user_id)
+            conditions: list[Any] = [
+                AiAgentAutonomyTask.owner_user_id == user_id
+            ]
+            if status.strip():
+                conditions.append(AiAgentAutonomyTask.status == status.strip())
+            rows = list(
+                db.scalars(
+                    select(AiAgentAutonomyTask)
+                    .where(*conditions)
+                    .order_by(
+                        AiAgentAutonomyTask.created_at.desc(),
+                        AiAgentAutonomyTask.id.desc(),
+                    )
+                    .offset(_offset(page, limit))
+                    .limit(limit)
+                )
+            )
+            total = int(
+                db.scalar(
+                    select(func.count())
+                    .select_from(AiAgentAutonomyTask)
+                    .where(*conditions)
+                )
+                or 0
+            )
+            _record_read(
+                _audit_service(db, request),
+                context,
+                action="autonomy_task.list",
+                target_user_id=user_id,
+                resource_type="ai_agent_autonomy_task",
+                details={"page": page, "limit": limit, "status": status.strip()},
+            )
+            items = [autonomy_task_public(row) for row in rows]
+    except Exception as exc:
+        if isinstance(exc, ServiceError):
+            _raise_service_error(exc)
+        raise
+    return {"ok": True, "items": items, "total": total, "page": page, "limit": limit}
 
 
 @router.get("/users/{user_id}/conversations")

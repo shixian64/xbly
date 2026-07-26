@@ -297,9 +297,10 @@ docker compose exec app python -m bbw_prod.migration_readiness --require-ready
 | 账号与消息核心 | `local_login_ready_accounts`、`local_message_identity_ready_accounts`、`block_snapshot_ready_accounts`、`message_peer_snapshot_ready_accounts`、`local_core_ready_accounts`、`local_core_ready` | 已迁移账号在双死亡时能本地登录并按可信策略进行 Web-Web 私聊 |
 | 领域历史 | `social_ready_accounts`、`moments_ready_accounts`、`discovery_ready_accounts`、`media_ready_accounts`、`all_domains_ready_accounts`、`domain_data_ready` | 每个领域均有账号绑定、范围、计数、摘要和水位有效的完整 Marker |
 | APK 兼容退役 | `compatibility_outbox_pending`、`compatibility_outbox_retry`、`compatibility_outbox_processing`、`compatibility_outbox_failed`、`compatibility_outbox_unfinished`、`compatibility_outbox_ready` | 尚有兼容写未完成时，Web-local 可继续服务，但不能宣称外部 Provider 已可永久删除 |
+| 历史媒体归档退役 | `media_archive_outbox_pending`、`media_archive_outbox_retry`、`media_archive_outbox_processing`、`media_archive_outbox_failed`、`media_archive_outbox_unfinished`、`media_archive_outbox_ready` | `media.archive` 待办只认复验后的 `completed` 为终态（§4.5 不得直接取消，`cancelled` 一并计入未完成）；媒体 Marker 只在写入时点校验，Marker 之后新产生的待办由本层独立把关 |
 | TIM 镜像退役 | `tim_delivery_pending`、`tim_delivery_retry`、`tim_delivery_processing`、`tim_delivery_failed`、`tim_delivery_other_unfinished`、`tim_delivery_unfinished`、`tim_delivery_ready` | 尚有 TIM 镜像或补偿动作未结束时不影响 Web-local 成功结果，但不能关闭兼容链路 |
 | R2 当前能力 | `r2_write_ready`、`r2_read_ready`、`r2_delete_ready`、`r2_storage_ready`、`r2_capability_error_code` | 不是检查配置是否存在，而是以一次完整 PUT、HEAD/GET、DELETE 和删除后不存在校验确认生产私有媒体仍可读写和清理 |
-| 最终切流 | `cutover_ready_accounts`、`cutover_ready`、`ready` | 全部 active 账号完成核心和四领域迁移，R2 当前能力通过，兼容 Outbox 与 TIM delivery 均无未完成项 |
+| 最终切流 | `cutover_ready_accounts`、`cutover_ready`、`ready` | 全部 active 账号完成核心和四领域迁移，R2 当前能力通过，兼容 Outbox、`media.archive` 归档与 TIM delivery 均无未完成项 |
 
 `r2_capability_error_code` 成功时为 `null`；失败时只输出稳定代码：`r2_initialization_failed`、`r2_write_failed`、`r2_write_verification_failed`、`r2_head_failed`、`r2_head_verification_failed`、`r2_get_failed`、`r2_get_verification_failed`、`r2_delete_failed`、`r2_delete_confirmation_failed` 或 `r2_delete_verification_failed`。报告不会包含 Provider 异常原文。`r2_probe_not_checked` 只用于未执行真实探针的内部评估调用；正式 CLI 每次都会执行探针，因此该值同样令最终 readiness 失败。
 
@@ -399,6 +400,11 @@ SELECT
   count(*) FILTER (WHERE status <> 'completed') AS compatibility_outbox_unfinished
 FROM operation_outbox
 WHERE operation_type LIKE 'compatibility.%';
+
+SELECT
+  count(*) FILTER (WHERE status <> 'completed') AS media_archive_outbox_unfinished
+FROM operation_outbox
+WHERE operation_type = 'media.archive';
 ```
 
 TIM 最终退役检查应单独确认未完成数量；`cancelled` 是本地撤回产生的受控终态，其他未识别状态一律阻止切流：
@@ -412,7 +418,7 @@ FROM message_deliveries
 WHERE channel = 'tim';
 ```
 
-TIM 长期死亡时，pending/retry/failed 增长是预期降级，不应把它误判为 Web 本地消息失败；但必须监控表增长和保留策略。正式退役时，`compatibility_outbox_unfinished` 和 `tim_delivery_unfinished` 都必须为 0，并以统一 readiness 命令结果为最终判断。
+TIM 长期死亡时，pending/retry/failed 增长是预期降级，不应把它误判为 Web 本地消息失败；但必须监控表增长和保留策略。正式退役时，`compatibility_outbox_unfinished`、`media_archive_outbox_unfinished` 和 `tim_delivery_unfinished` 都必须为 0，并以统一 readiness 命令结果为最终判断。
 
 ### 9.1 Cloudflare R2 Bucket CORS
 
@@ -484,7 +490,7 @@ CORS 更新可能存在边缘传播时间，浏览器还会按 `MaxAgeSeconds` �
 3. Web 与 APK 并行期的 TIM mirror、历史回流、canonical 去重和未读对账稳定，失败 Outbox 可恢复。
 4. Banghua/TIM 停服前已通过服务端可信 `/api/im/conversations` 同步计划保留账号的已有会话，并核验 `web-policy/message_peer` 授权与 `message-peer-snapshot` 完成标记覆盖率；任何浏览器 TIM 归档或浏览器上报数据均未被用于反推、补造私聊授权或伪造完成标记。
 5. 所有 active 账号的 `migration-domain:social`、`migration-domain:moments`、`migration-domain:discovery`、`migration-domain:media` Marker 均存在且通过账号绑定、范围、计数、摘要和水位校验；不能以人工插入 Marker 代替完整导入证据。
-6. `compatibility_outbox_unfinished=0` 且 `tim_delivery_unfinished=0`；pending、retry、processing、failed 和未知状态均已处置；`r2_write_ready=true`、`r2_read_ready=true`、`r2_delete_ready=true` 且 `r2_storage_ready=true`，最终 `python -m bbw_prod.migration_readiness --require-ready` 返回 0。
+6. `compatibility_outbox_unfinished=0`、`media_archive_outbox_unfinished=0` 且 `tim_delivery_unfinished=0`；pending、retry、processing、failed 和未知状态均已处置；`r2_write_ready=true`、`r2_read_ready=true`、`r2_delete_ready=true` 且 `r2_storage_ready=true`，最终 `python -m bbw_prod.migration_readiness --require-ready` 返回 0。
 7. 资料、关系、黑名单、动态、文本匹配、媒体及其他保留产品能力已经建立本地权威；房间、群聊本轮明确下线或不再从 Web 路由，其他未迁移能力也已显式处置，而不是静默失效。
 8. 注册、找回和新用户策略已单独实现或明确产品停止新增用户。本阶段确认的“死亡后仅密码登录”不能长期替代完整账号生命周期。
 9. 默认 Provider 已替换为 Web-native 实现，生产 Web、Worker、Scheduler、恢复脚本和部署镜像不再需要 `bbw_protocol`。

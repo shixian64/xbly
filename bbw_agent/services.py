@@ -37,6 +37,7 @@ from .action_executor import (
     UNFOLLOW_USER,
 )
 from .repositories import (
+    AgentAutonomyDailyUsageRepository,
     AgentAutonomySettingRepository,
     AgentAutonomyTaskRepository,
     AgentExecutionSettingRepository,
@@ -447,6 +448,7 @@ def autonomy_public(
     execution: Mapping[str, Any],
     background_enabled: bool = False,
     recent_tasks: Sequence[AiAgentAutonomyTask] = (),
+    usage_today: Any | None = None,
 ) -> dict[str, Any]:
     defaults: dict[str, Any] = {
         "visible": bool(access.visible),
@@ -480,6 +482,7 @@ def autonomy_public(
         "last_action_at": None,
         "last_post_at": None,
         "recent_tasks": [],
+        "usage_today": None,
     }
     if not access.visible:
         return {"visible": False}
@@ -540,7 +543,33 @@ def autonomy_public(
     defaults["recent_tasks"] = [
         autonomy_task_public(task) for task in recent_tasks
     ]
+    if usage_today is not None:
+        defaults["usage_today"] = {
+            "usage_date": usage_today.usage_date.isoformat(),
+            "total_actions": int(usage_today.total_actions),
+            "reply_actions": int(usage_today.reply_actions),
+            "post_actions": int(usage_today.post_actions),
+            "relationship_actions": int(usage_today.relationship_actions),
+            "failed_actions": int(usage_today.failed_actions),
+            "outcome_unknown_actions": int(usage_today.outcome_unknown_actions),
+        }
     return defaults
+
+
+def autonomy_usage_today(
+    db: Session,
+    owner_user_id: uuid.UUID,
+    setting: AiAgentAutonomySetting | None,
+) -> Any | None:
+    """按策略时区取当天的自治预算用量；时区异常时回退 UTC 日期。"""
+    if setting is None:
+        return None
+    try:
+        zone = ZoneInfo(str(setting.timezone or "UTC"))
+    except (ZoneInfoNotFoundError, ValueError):
+        zone = ZoneInfo("UTC")
+    today = utcnow().astimezone(zone).date()
+    return AgentAutonomyDailyUsageRepository(db).get(owner_user_id, today)
 
 
 def style_public(row: AiStyleProfile | None) -> dict[str, Any] | None:
@@ -606,6 +635,7 @@ def load_status(
         execution=public_execution,
         background_enabled=background_enabled,
         recent_tasks=recent_autonomy_tasks,
+        usage_today=autonomy_usage_today(db, owner_user_id, autonomy_setting),
     )
     return {
         "available": True,

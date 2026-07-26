@@ -100,6 +100,24 @@ def private_message_permission_query(
                     Relationship.kind == BLACKLISTED_BY_KIND,
                     ~peer_has_local_block,
                 ),
+                # 收件人名下的 legacy 快照同样是「任一方向」的一部分：
+                # 收件人拉黑发送人（blacklist），或收件人快照记录了发送人
+                # 拉黑收件人（blacklisted_by）。与 messaging.block_between_query
+                # 的双向语义保持一致，local override 豁免方向也相同。
+                and_(
+                    Relationship.owner_user_id == recipient_user_id,
+                    Relationship.provider == LEGACY_RELATIONSHIP_PROVIDER,
+                    Relationship.subject_upstream_uid == sender_upstream_uid,
+                    Relationship.kind == BLACKLIST_KIND,
+                    ~peer_has_local_block,
+                ),
+                and_(
+                    Relationship.owner_user_id == recipient_user_id,
+                    Relationship.provider == LEGACY_RELATIONSHIP_PROVIDER,
+                    Relationship.subject_upstream_uid == sender_upstream_uid,
+                    Relationship.kind == BLACKLISTED_BY_KIND,
+                    ~own_has_local_block,
+                ),
             ),
         )
         .exists()

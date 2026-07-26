@@ -58,6 +58,7 @@ from bbw_web.legacy_media_reference import (
     local_media_references,
 )
 from bbw_web.media_archive import download_and_prepare
+from bbw_web.media_native.references import native_media_content_asset_id
 from bbw_web.normalize import normalize_messages
 from bbw_web.r2 import R2Storage
 
@@ -374,6 +375,10 @@ def _source(
 ) -> LegacyMediaSource | None:
     url = str(source_url or "").strip()
     if not url:
+        return None
+    if native_media_content_asset_id(url) is not None:
+        # 已经是 Web-native 私有媒体的同源鉴权路径（例如迁移后更换的头像），
+        # 原文件本就在私有 R2，无需也不可能按上游 URL 归档。
         return None
     normalized_slot = str(slot or "").strip()
     if (
@@ -998,6 +1003,36 @@ class SqlAlchemyLegacyMediaWriter:
             "phase": phase,
         }
 
+    def _has_complete_marker(self, db: Any, plan: LegacyMediaPlan) -> bool:
+        """本地宽校验：既有 Marker 是否是本账号的 complete 记录。
+
+        媒体 Marker 的完整严格校验（prerequisite 摘要、peer 数）由
+        migration_readiness 负责；这里只判断"是否存在成功收尾的 complete
+        Marker"，用于阻止重跑失败时把它降级为 history/failed。
+        """
+
+        cursor = SyncCursorRepository(db).get(
+            plan.account.owner_user_id, LEGACY_PROVIDER, MEDIA_STREAM
+        )
+        if (
+            cursor is None
+            or cursor.last_succeeded_at is None
+            or str(cursor.last_error or "").strip()
+        ):
+            return False
+        try:
+            marker = json.loads(str(cursor.cursor or ""))
+        except (TypeError, ValueError):
+            return False
+        return (
+            isinstance(marker, Mapping)
+            and str(marker.get("phase") or "") == "complete"
+            and marker.get("complete") is True
+            and str(marker.get("external_account_id") or "")
+            == str(plan.account.external_account_id)
+            and str(marker.get("upstream_uid") or "") == plan.account.upstream_uid
+        )
+
     def _write_cursor(
         self,
         db: Any,
@@ -1007,6 +1042,13 @@ class SqlAlchemyLegacyMediaWriter:
         succeeded_at: datetime | None,
         error: str | None,
     ) -> None:
+        if str(dict(marker).get("phase") or "") != "complete" and (
+            self._has_complete_marker(db, plan)
+        ):
+            # 已有成功收尾的 complete Marker 时，history/failed 写入一律
+            # 跳过：校验性重跑中途失败必须保留既有完整性证明，成功时
+            # 仍以新 complete Marker 收尾。
+            return
         attempted_at = _as_utc(self.clock())
         SyncCursorRepository(db).upsert(
             owner_user_id=plan.account.owner_user_id,

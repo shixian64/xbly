@@ -56,6 +56,7 @@ from .services import (
     autonomy_access,
     autonomy_public,
     autonomy_task_public,
+    autonomy_usage_today,
     build_reply_draft_plan,
     build_style_analysis_plan,
     connection_public,
@@ -1187,6 +1188,9 @@ def update_autonomy_settings(
                     getattr(_settings(request), "ai_agent_background_enabled", False)
                 ),
                 recent_tasks=recent_tasks,
+                usage_today=autonomy_usage_today(
+                    db, context.owner_user_id, row
+                ),
             )
             _audit(db, request).record(
                 actor_type="user",

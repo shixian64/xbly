@@ -32,6 +32,7 @@ from bbw_prod.migration_readiness import (
     DOMAIN_MARKER_SCOPES,
     DOMAIN_MARKER_STREAMS,
     MOMENTS_HISTORY_DAYS,
+    _valid_domain_marker,
 )
 from bbw_prod.models import (
     ExternalAccount,
@@ -45,7 +46,7 @@ from bbw_prod.models import (
     utcnow,
 )
 from bbw_prod.repositories import SyncCursorRepository
-from bbw_web.normalize import normalize_comments, normalize_posts
+from bbw_web.normalize import extract_list, normalize_comments, normalize_posts
 from bbw_web.providers import (
     ProviderAuthenticationRejected,
     ProviderSessionState,
@@ -482,6 +483,33 @@ def _comment_record(
     )
 
 
+def _explicit_empty_page(data: Any) -> bool:
+    """只有服务端明确的空形态才允许被当作「已读到结束」。
+
+    未知结构 fail-open 会让 normalizer 静默返回空列表，被误判为空页并
+    伪造 complete Marker；因此这里对空结果做白名单判定，其余一律由
+    调用方失败关闭。
+    """
+
+    if isinstance(data, (list, tuple)):
+        return len(data) == 0
+    if isinstance(data, str):
+        return data.strip().lower() in {"", "[]", "false", "null"}
+    if isinstance(data, Mapping):
+        if not data:
+            return True
+        values = list(data.values())
+        if any(isinstance(value, (list, tuple)) and len(value) > 0 for value in values):
+            # 存在未被 extract_list/normalizer 解析出的非空列表，说明结构已
+            # 变化（字段改名或被空的白名单键遮蔽），不得当作空页读完。
+            return False
+        return any(
+            isinstance(value, (list, tuple)) and len(value) == 0
+            for value in values
+        )
+    return False
+
+
 def _page_signature(items: Sequence[Mapping[str, Any]]) -> str:
     identities = [str(item.get("id") or "") for item in items]
     return hashlib.sha256(
@@ -508,10 +536,23 @@ class BanghuaMomentsReader:
             raise LegacyMomentsProviderError(
                 f"legacy_provider_read_failed.{status}"
             )
-        items = normalizer(getattr(result, "data", None))
+        data = getattr(result, "data", None)
+        items = normalizer(data)
         if len(items) > MAX_PAGE_ITEMS:
             raise LegacyMomentsLimitError("legacy_page_item_limit_exceeded")
-        return tuple(items)
+        raw_items = extract_list(data)
+        if raw_items:
+            if len(items) != len(raw_items):
+                # 页内存在 normalizer 无法解析的条目；静默丢弃会让计数与
+                # 真实历史不一致，必须失败关闭。
+                raise LegacyMomentsDataError("legacy_page_item_unparseable")
+            return tuple(items)
+        if items:
+            return tuple(items)
+        if _explicit_empty_page(data):
+            return ()
+        # 结构不可识别（字段改名、包裹层变化等）不得被当作空页读完。
+        raise LegacyMomentsDataError("legacy_page_structure_unknown")
 
     def fetch_post_page(self, page: int) -> Sequence[Mapping[str, Any]]:
         try:
@@ -589,6 +630,13 @@ class SqlAlchemyLegacyMomentsWriter:
         succeeded_at: datetime | None,
         error: str | None,
     ) -> None:
+        if str(dict(marker).get("phase") or "") != "complete" and (
+            self._has_valid_complete_marker(db, account)
+        ):
+            # 已有通过严格校验的 complete Marker 时，非 complete 写入
+            # （begin/逐页进度/failed）一律跳过：校验性重跑中途失败必须
+            # 保留既有完整性证明，成功时仍以新 complete Marker 收尾。
+            return
         attempted_at = _as_utc(self.clock())
         SyncCursorRepository(db).upsert(
             owner_user_id=account.owner_user_id,
@@ -602,6 +650,19 @@ class SqlAlchemyLegacyMomentsWriter:
             last_attempted_at=attempted_at,
             last_succeeded_at=succeeded_at,
             last_error=error,
+        )
+
+    def _has_valid_complete_marker(
+        self, db: Any, account: LegacyMomentsAccount
+    ) -> bool:
+        cursor = SyncCursorRepository(db).get(
+            account.owner_user_id, LEGACY_PROVIDER, MOMENTS_STREAM
+        )
+        return _valid_domain_marker(
+            cursor,
+            domain="moments",
+            external_account_id=account.external_account_id,
+            upstream_uid=account.upstream_uid,
         )
 
     def begin(self, account: LegacyMomentsAccount, window: ImportWindow) -> None:

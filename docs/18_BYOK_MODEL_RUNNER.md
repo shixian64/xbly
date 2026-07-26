@@ -74,6 +74,9 @@
 | `POST /api/admin/users/{user_id}/byok-account-actions` | 授予或撤销单个用户的账号动作权限 |
 | `GET/POST /api/admin/byok-autonomous-agent` | 查看或修改无人值守 Agent 全局开关 |
 | `POST /api/admin/users/{user_id}/byok-autonomous-agent` | 授予或撤销单个用户的无人值守权限 |
+| `GET /api/admin/users/{user_id}/agent-runs` | 只读查询单个用户的模型运行审计（可按状态/运行类型筛选，不含提示词、密钥与输出正文） |
+| `GET /api/admin/users/{user_id}/agent-actions` | 只读查询单个用户的账号动作执行审计（可按状态筛选，不含目标/参数快照） |
+| `GET /api/admin/users/{user_id}/autonomy-tasks` | 只读查询单个用户的无人值守任务（可按状态筛选，含 `manual_review` 人工核对项） |
 
 账号动作全局开关依赖模型运行器全局开关；逐用户账号动作授权依赖该用户已经获得模型
 运行器授权，且账号未停用。无人值守全局开关依赖前两项全局能力；逐用户自治授权依赖
