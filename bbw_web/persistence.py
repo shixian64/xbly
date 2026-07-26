@@ -11,22 +11,31 @@ import re
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from redis import Redis
 from rq import Queue
 from rq.exceptions import InvalidJobOperation
 from sqlalchemy import and_, func, literal, or_, select, text, union_all
+from sqlalchemy.orm import aliased
 
 from bbw_prod.config import Settings
 from bbw_prod.crypto import CredentialCipher, normalize_phone
 from bbw_prod.db import session_scope
-from bbw_prod.models import Conversation, ExternalAccount, Relationship, utcnow
+from bbw_prod.models import (
+    Conversation,
+    ExternalAccount,
+    Relationship,
+    SyncCursor,
+    utcnow,
+)
 from bbw_prod.repositories import (
     ConversationRepository,
     ExternalAccountRepository,
     RelationshipRepository,
+    SyncCursorRepository,
     UserRepository,
 )
 from bbw_prod.security import SessionTokenManager, keyed_identifier_hash
@@ -38,18 +47,45 @@ from bbw_prod.services import (
     LoginPrecheck,
     PermissionDenied,
     RawResponseService,
+    UserCredentialService,
     UserSessionService,
 )
-from bbw_protocol.adapters import NativeBundle
-from bbw_protocol.app import BeibeiwuApp
-from bbw_protocol.client import ApiResult
-from bbw_protocol.session import Session
 from bbw_web.match_history import load_match_history, record_match_history_response
+from bbw_web.dependency_health import (
+    DependencyErrorKind,
+    DependencyFailure,
+    DependencyStatusRegistry,
+)
+from bbw_web.providers import (
+    ProviderApiResult,
+    ProviderApplication,
+    ProviderSessionState,
+    RuntimeProvider,
+)
+from bbw_web.private_message_policy import private_message_permission_query
 from bbw_web.store import WebUser
 from bbw_web.turnstile import TurnstileVerifier
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _default_local_runtime_provider(
+    account_provider_id: str = "beibeiwu",
+) -> RuntimeProvider:
+    from bbw_web.providers import WebNativeProvider
+
+    return WebNativeProvider(account_provider_id=account_provider_id)
+
+
+def _default_runtime_provider(settings: Settings | None = None) -> RuntimeProvider:
+    """Resolve a provider without importing the protocol core in local-only mode."""
+
+    if str(getattr(settings, "upstream_auth_mode", "") or "").lower() == "local-only":
+        return _default_local_runtime_provider()
+    from bbw_web.providers import LegacyBanghuaProvider
+
+    return LegacyBanghuaProvider()
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +95,7 @@ class UserIdentity:
     upstream_uid: str
     match_pool_online_list_enabled: bool = False
     nearby_custom_city_enabled: bool = False
+    auth_source: str = "provider"
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +116,15 @@ class PendingLoginRejected(PermissionError):
 
 class PendingLoginConflict(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class LocalPasswordLoginCompletion:
+    """A durable Web session issued after conservative local fallback."""
+
+    raw_sid: str
+    identity: UserIdentity
+    web_user: WebUser
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,7 +204,17 @@ def _history_response_digest(
 MESSAGE_POLICY_PROVIDER = "web-policy"
 MESSAGE_POLICY_MATCH_KIND = "match"
 MESSAGE_POLICY_CONVERSATION_KIND = "message_peer"
+MESSAGE_PEER_SNAPSHOT_SCHEMA = 1
+MESSAGE_PEER_SNAPSHOT_SOURCE = "beibeiwu"
+MESSAGE_PEER_SNAPSHOT_STREAM = "message-peer-snapshot"
+MESSAGE_PEER_SNAPSHOT_PATH = "/api/im/conversations"
+MESSAGE_PEER_SNAPSHOT_MAX_PEERS = 5000
 SOCIAL_RELATIONSHIP_PROVIDER = "beibeiwu"
+SOCIAL_CANONICAL_PROVIDER = "web-local"
+SOCIAL_MESSAGE_POLICY_PROVIDERS = (
+    SOCIAL_RELATIONSHIP_PROVIDER,
+    SOCIAL_CANONICAL_PROVIDER,
+)
 SOCIAL_FRIEND_KIND = "friend"
 SOCIAL_BLACKLIST_KIND = "blacklist"
 SOCIAL_BLACKLISTED_BY_KIND = "blacklisted_by"
@@ -166,6 +222,43 @@ SOCIAL_MESSAGE_BLOCK_KINDS = (
     SOCIAL_BLACKLIST_KIND,
     SOCIAL_BLACKLISTED_BY_KIND,
 )
+MESSAGE_BLOCK_SNAPSHOT_SOURCE = SOCIAL_RELATIONSHIP_PROVIDER
+MESSAGE_BLOCK_SNAPSHOT_SCHEMA = 1
+MESSAGE_BLOCK_SNAPSHOT_MAX_PEERS = 5000
+MESSAGE_BLOCK_SNAPSHOT_PATHS = {
+    SOCIAL_BLACKLIST_KIND: "/api/social/blacklist",
+    SOCIAL_BLACKLISTED_BY_KIND: "/api/social/blacklist-me",
+}
+MESSAGE_BLOCK_SNAPSHOT_STREAMS = {
+    kind: f"message-block-snapshot:{kind}" for kind in SOCIAL_MESSAGE_BLOCK_KINDS
+}
+MESSAGE_BLOCK_TRUSTED_SOURCES = {
+    SOCIAL_BLACKLIST_KIND: frozenset(
+        {
+            "/api/social/blacklist",
+            "/api/social/blacklist-add",
+            "/api/social/blacklist-del",
+        }
+    ),
+    SOCIAL_BLACKLISTED_BY_KIND: frozenset({"/api/social/blacklist-me"}),
+}
+
+
+def _message_peer_snapshot_digest(peers: Iterable[str]) -> str:
+    normalized = sorted(
+        set(
+            str(peer or "").strip()
+            for peer in peers
+            if str(peer or "").strip()
+        )
+    )
+    return hashlib.sha256(
+        json.dumps(
+            normalized,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _message_peer_uid(value: Any) -> str:
@@ -238,12 +331,20 @@ def _safe_json(raw: str) -> Any:
         return value
 
 
-def _redact_request(value: Any) -> Any:
-    blocked = {
+_REQUEST_SECRET_KEYS = frozenset(
+    re.sub(r"[^a-z0-9]", "", key.casefold())
+    for key in {
         "password",
         "userpassword",
         "passwd",
         "pwd",
+        "api_key",
+        "apikey",
+        "x-api-key",
+        "client_secret",
+        "clientsecret",
+        "confirmation_token",
+        "confirmationtoken",
         "token",
         "accesstoken",
         "refreshtoken",
@@ -269,14 +370,23 @@ def _redact_request(value: Any) -> Any:
         "order_params",
         "orderspec",
     }
+)
+_BYOK_SECRET_KEY_FRAGMENTS = ("apikey", "clientsecret", "confirmationtoken")
+
+
+def _is_sensitive_request_key(value: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(value).casefold())
+    return normalized in _REQUEST_SECRET_KEYS or any(
+        fragment in normalized for fragment in _BYOK_SECRET_KEY_FRAGMENTS
+    )
+
+
+def _redact_request(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
             str(key): (
                 "[REDACTED]"
-                if (
-                    str(key).casefold() in blocked
-                    or re.sub(r"[^a-z0-9]", "", str(key).casefold()) in blocked
-                )
+                if _is_sensitive_request_key(key)
                 else _redact_request(item)
             )
             for key, item in value.items()
@@ -293,6 +403,9 @@ _PROFILE_SECRET_KEYS = {
     "passwd",
     "pwd",
     "userpassword",
+    "apikey",
+    "xapikey",
+    "clientsecret",
     "token",
     "accesstoken",
     "refreshtoken",
@@ -324,6 +437,10 @@ def _sanitize_profile(value: Any) -> Any:
             result[key_text] = (
                 "[REDACTED]"
                 if normalized in _PROFILE_SECRET_KEYS
+                or any(
+                    fragment in normalized
+                    for fragment in _BYOK_SECRET_KEY_FRAGMENTS
+                )
                 else _sanitize_profile(item)
             )
         return result
@@ -399,8 +516,27 @@ redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
 return 1
 """
 
-    def __init__(self, settings: Settings):
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        runtime_provider: RuntimeProvider | None = None,
+        local_runtime_provider: RuntimeProvider | None = None,
+    ):
         self.settings = settings
+        self.runtime_provider = (
+            runtime_provider
+            if runtime_provider is not None
+            else _default_runtime_provider(settings)
+        )
+        self.local_runtime_provider = (
+            local_runtime_provider
+            if local_runtime_provider is not None
+            else _default_local_runtime_provider(
+                str(getattr(self.runtime_provider, "provider_id", "") or "beibeiwu")
+            )
+        )
+        self.dependency_status = DependencyStatusRegistry()
         self.redis = Redis.from_url(settings.redis_url, decode_responses=False)
         self.cipher = CredentialCipher.from_settings(settings)
         self.phone_hmac_key = settings.load_phone_hmac_key()
@@ -830,6 +966,7 @@ return 1
             "service": "bbw-web",
             "database": database_ok,
             "redis": redis_ok,
+            "dependencies": self.dependency_status.public_snapshot(),
             "raw_response_archive": {
                 "worker_alive": bool(
                     self._raw_response_thread
@@ -1191,6 +1328,41 @@ return 1
         client_ip: str,
         turnstile_token: str = "",
     ) -> LoginPrecheck:
+        self._precheck_login_abuse(
+            phone=phone,
+            client_ip=client_ip,
+            turnstile_token=turnstile_token,
+        )
+        return self.precheck_account(phone=phone)
+
+    def precheck_local_password_credentials(
+        self,
+        *,
+        phone: str,
+        client_ip: str,
+        turnstile_token: str = "",
+    ) -> str:
+        """Apply abuse controls without revealing local account state.
+
+        Local-only authentication must reach the Argon2 verifier for unknown,
+        suspended, disabled and not-yet-migrated accounts.  Querying the
+        account state here would expose those cases before the dummy verify.
+        """
+
+        self._precheck_login_abuse(
+            phone=phone,
+            client_ip=client_ip,
+            turnstile_token=turnstile_token,
+        )
+        return normalize_phone(phone)
+
+    def _precheck_login_abuse(
+        self,
+        *,
+        phone: str,
+        client_ip: str,
+        turnstile_token: str = "",
+    ) -> None:
         if not phone:
             raise PermissionError("请输入手机号")
         failures = self._login_failure_count(phone, client_ip)
@@ -1199,7 +1371,6 @@ return 1
         if failures >= 2 and self.turnstile.enabled:
             if not self.turnstile.verify(turnstile_token, remote_ip=client_ip):
                 raise PermissionError("需要完成人机验证后才能继续登录")
-        return self.precheck_account(phone=phone)
 
     def record_login_failure(self, *, phone: str, client_ip: str) -> None:
         if not phone:
@@ -1387,6 +1558,7 @@ return 1
                 phone=pending.phone,
                 invite_code=invite_code,
                 password=pending.password,
+                password_verified=pending.mode == "password",
                 login_context=None,
                 old_sid=old_sid,
                 client_ip=client_ip,
@@ -1422,6 +1594,7 @@ return 1
         old_sid: str | None,
         client_ip: str,
         user_agent: str,
+        password_verified: bool = False,
     ) -> UserIdentity:
         upstream = web_user.app.session
         if not upstream.logged_in:
@@ -1436,6 +1609,7 @@ return 1
                 upstream_uid=str(upstream.uid),
                 login_account=phone,
                 password=password,
+                password_verified=bool(password_verified),
                 token=str(upstream.token or "") or None,
                 display_name=str(upstream.nickname or "") or None,
                 profile=_sanitize_profile(dict(upstream.raw_user or {})),
@@ -1471,8 +1645,86 @@ return 1
             ),
         )
         web_user.clear_pending()
+        setattr(web_user, "authentication_source", "provider")
         self._attach_runtime(web_user, identity)
+        provider = str(getattr(self.runtime_provider, "provider_id", "") or "")
+        if provider:
+            self.dependency_status.mark_available(provider, "auth")
         return identity
+
+    def complete_local_password_login(
+        self,
+        *,
+        phone: str,
+        password: str,
+        old_sid: str | None,
+        client_ip: str,
+        user_agent: str,
+    ) -> LocalPasswordLoginCompletion:
+        """Issue a normal Web session from a migrated local password verifier.
+
+        The HTTP orchestration layer may call this method only after the
+        provider returned the explicit ``UPSTREAM_AUTH_UNAVAILABLE`` signal.
+        Keeping that decision outside the credential service prevents a stale
+        local password from bypassing an upstream rejection, suspension or
+        rate limit.
+        """
+
+        with session_scope() as db:
+            account_service = LoginAccountService(
+                db, self.settings, self.cipher, self.phone_hmac_key
+            )
+            authenticated = account_service.authenticate_local_password(
+                phone=phone,
+                password=password,
+                provider=str(self.runtime_provider.provider_id),
+            )
+            issued = UserSessionService(
+                db, self.redis, self.settings, self.session_hmac_key
+            ).issue(
+                user_id=authenticated.user.id,
+                external_account_id=authenticated.external_account.id,
+                client_ip=client_ip,
+                user_agent=user_agent,
+                auth_source="web-local",
+            )
+            identity = UserIdentity(
+                user_id=authenticated.user.id,
+                external_account_id=authenticated.external_account.id,
+                upstream_uid=str(authenticated.external_account.upstream_uid or ""),
+                match_pool_online_list_enabled=bool(
+                    authenticated.user.match_pool_online_list_enabled
+                ),
+                nearby_custom_city_enabled=bool(
+                    authenticated.user.nearby_custom_city_enabled
+                ),
+                auth_source="web-local",
+            )
+
+        try:
+            web_user = self.restore_web_user(issued.sid)
+            if web_user is None:
+                raise RuntimeError("local login session could not be restored")
+        except Exception:
+            self.revoke_session(issued.sid, reason="local_login_restore_failed")
+            raise
+
+        if old_sid and old_sid != issued.sid:
+            self.revoke_session(old_sid, reason="rotated")
+        self._clear_login_failures(phone=phone, client_ip=client_ip)
+        setattr(web_user, "authentication_source", "local")
+        provider = str(getattr(self.runtime_provider, "provider_id", "") or "")
+        if provider:
+            self.dependency_status.mark_degraded(
+                provider,
+                "auth",
+                failure=DependencyFailure(
+                    DependencyErrorKind.UPSTREAM,
+                    retryable=True,
+                    status_code=503,
+                ),
+            )
+        return LocalPasswordLoginCompletion(issued.sid, identity, web_user)
 
     def _decrypt_account(
         self, account: ExternalAccount, *, include_password: bool = True
@@ -1521,35 +1773,64 @@ return 1
                 sessions.revoke(sid, reason="account_unavailable")
                 return None
             user, account = binding
-            login, _password, token = self._decrypt_account(
-                account, include_password=False
+            if str(account.provider or "") != str(self.runtime_provider.provider_id):
+                sessions.revoke(sid, reason="provider_unavailable")
+                return None
+            stored_auth_source = str(
+                getattr(state, "auth_source", "provider") or "provider"
+            ).strip().lower()
+            use_local_runtime = (
+                stored_auth_source == "web-local"
+                or str(
+                    getattr(self.settings, "upstream_auth_mode", "provider-first")
+                    or "provider-first"
+                ).strip().lower()
+                == "local-only"
             )
+            if use_local_runtime:
+                # Local sessions do not need an APK token or reversible login
+                # field.  A missing, expired or undecryptable legacy token must
+                # not prevent Web session recovery after provider retirement.
+                login = ""
+                token = ""
+                runtime_provider = self.local_runtime_provider
+            else:
+                login, _password, token = self._decrypt_account(
+                    account, include_password=False
+                )
+                runtime_provider = self.runtime_provider
             data = dict(account.device_data or {})
-            protocol_session = Session(
-                uid=str(account.upstream_uid or "0"),
-                token=token or "0",
-                phone=login,
-                password="",
-                nickname=str(user.display_name or ""),
-                user_role=str(data.get("user_role") or ""),
-                rp_verify_time=str(data.get("rp_verify_time") or "0"),
-                vip=str(data.get("vip") or "0"),
-                svip=str(data.get("svip") or "0"),
-                portrait=str(data.get("portrait") or ""),
-                user_sign=str(data.get("user_sign") or ""),
-                login_id=str(data.get("login_id") or ""),
-                raw_user=dict(user.profile or {}),
+            runtime = runtime_provider.create_runtime_from_state(
+                ProviderSessionState(
+                    uid=str(account.upstream_uid or "0"),
+                    token=token,
+                    phone=login,
+                    nickname=str(user.display_name or ""),
+                    user_role=str(data.get("user_role") or ""),
+                    rp_verify_time=str(data.get("rp_verify_time") or "0"),
+                    vip=str(data.get("vip") or "0"),
+                    svip=str(data.get("svip") or "0"),
+                    money=str(data.get("money") or "0"),
+                    portrait=str(data.get("portrait") or ""),
+                    user_sign=str(data.get("user_sign") or ""),
+                    login_id=str(data.get("login_id") or ""),
+                    raw_user=dict(user.profile or {}),
+                    device_data=data,
+                )
             )
-            protocol_session.apply_device(data)
-            app = BeibeiwuApp(protocol_session)
             web_user = WebUser(
                 web_sid=sid,
-                app=app,
-                native=NativeBundle(app),
+                app=runtime.app,
+                native=runtime.native,
                 label=str(user.display_name or account.upstream_uid or ""),
                 created_at=state.created_at.timestamp(),
                 last_seen=state.last_seen_at.timestamp(),
                 persist_sessions=False,
+            )
+            setattr(
+                web_user,
+                "authentication_source",
+                "local" if use_local_runtime else "provider",
             )
             identity = UserIdentity(
                 user_id=user.id,
@@ -1559,6 +1840,7 @@ return 1
                     user.match_pool_online_list_enabled
                 ),
                 nearby_custom_city_enabled=bool(user.nearby_custom_city_enabled),
+                auth_source=stored_auth_source,
             )
         self._attach_runtime(web_user, identity)
         return web_user
@@ -1570,14 +1852,24 @@ return 1
             identity.match_pool_online_list_enabled
         )
         web_user.nearby_custom_city_enabled = bool(identity.nearby_custom_city_enabled)
-        web_user.app.client.response_hook = lambda meta, result: self.capture_upstream_response(
+        client = web_user.app.client
+        if str(getattr(web_user, "authentication_source", "") or "") == "local":
+            client.response_hook = None
+            client.reauth_callback = None
+            return
+        client.response_hook = lambda meta, result: self.capture_upstream_response(
             identity=identity, request_meta=meta, result=result
         )
-        web_user.app.client.reauth_callback = lambda: self._reauthenticate(
+        client.reauth_callback = lambda: self._reauthenticate(
             identity=identity, app=web_user.app
         )
 
-    def _reauthenticate(self, *, identity: UserIdentity, app: BeibeiwuApp) -> bool:
+    def _reauthenticate(
+        self,
+        *,
+        identity: UserIdentity,
+        app: ProviderApplication,
+    ) -> bool:
         with session_scope() as db:
             account = ExternalAccountRepository(db).get_for_user(identity.user_id)
             if account is None or account.id != identity.external_account_id:
@@ -1600,6 +1892,7 @@ return 1
                 upstream_uid=str(app.session.uid),
                 login_account=login,
                 password=password,
+                password_verified=True,
                 token=str(app.session.token or "") or None,
                 display_name=str(app.session.nickname or "") or None,
                 profile=_sanitize_profile(dict(app.session.raw_user or {})),
@@ -1632,6 +1925,9 @@ return 1
                     user.match_pool_online_list_enabled
                 ),
                 nearby_custom_city_enabled=bool(user.nearby_custom_city_enabled),
+                auth_source=str(
+                    getattr(state, "auth_source", "provider") or "provider"
+                ),
             )
 
     def revoke_session(self, sid: str, *, reason: str = "logout") -> bool:
@@ -1641,6 +1937,42 @@ return 1
             return UserSessionService(
                 db, self.redis, self.settings, self.session_hmac_key
             ).revoke(sid, reason=reason)
+
+    def change_local_password(
+        self,
+        *,
+        identity: UserIdentity,
+        current_password: str,
+        new_password: str,
+    ) -> int:
+        """Change the Web-local password and revoke every active session.
+
+        The current request is included in the revocation count.  Requiring a
+        fresh login after a credential change prevents another browser session
+        that already holds a valid cookie from silently surviving the change.
+        """
+
+        with session_scope() as db:
+            binding = ExternalAccountRepository(db).get_user_binding(
+                identity.user_id,
+                external_account_id=identity.external_account_id,
+                provider=str(self.runtime_provider.provider_id),
+                for_update=True,
+            )
+            if (
+                binding is None
+                or binding[0].status != "active"
+                or str(binding[1].upstream_uid or "") != str(identity.upstream_uid or "")
+            ):
+                raise PermissionDenied("账号当前不可用")
+            UserCredentialService(db).change_local_password(
+                user_id=identity.user_id,
+                current_password=current_password,
+                new_password=new_password,
+            )
+            return UserSessionService(
+                db, self.redis, self.settings, self.session_hmac_key
+            ).revoke_all_for_user(identity.user_id, reason="password_changed")
 
     def require_identity(self, sid: str) -> Optional[UserIdentity]:
         if not sid:
@@ -1666,6 +1998,9 @@ return 1
                     user.match_pool_online_list_enabled
                 ),
                 nearby_custom_city_enabled=bool(user.nearby_custom_city_enabled),
+                auth_source=str(
+                    getattr(state, "auth_source", "provider") or "provider"
+                ),
             )
 
     def grant_message_peers(
@@ -1675,6 +2010,7 @@ return 1
         peers: list[str] | tuple[str, ...] | set[str],
         kind: str,
         evidence: Mapping[str, Any] | None = None,
+        complete_snapshot: bool = False,
     ) -> list[str]:
         """Persist server-owned message grants used by the send guard.
 
@@ -1696,36 +2032,61 @@ return 1
                 if peer and peer != _message_peer_uid(identity.upstream_uid)
             )
         )
-        if not normalized:
+        if len(normalized) > MESSAGE_PEER_SNAPSHOT_MAX_PEERS:
+            raise ValueError("message peer snapshot exceeds the supported limit")
+        if complete_snapshot and kind != MESSAGE_POLICY_CONVERSATION_KIND:
+            raise ValueError("only message-peer grants support complete snapshots")
+        if not normalized and not complete_snapshot:
             return []
         safe_evidence = {
             str(key)[:80]: value
             for key, value in dict(evidence or {}).items()
             if isinstance(value, (str, int, float, bool)) or value is None
         }
+        if complete_snapshot and (
+            safe_evidence.get("source_path") != MESSAGE_PEER_SNAPSHOT_PATH
+            or safe_evidence.get("grant_reason") != "upstream_conversation"
+        ):
+            raise ValueError("complete message-peer snapshots require trusted evidence")
         now = utcnow()
         with session_scope() as db:
+            existing_query = select(Relationship).where(
+                Relationship.owner_user_id == identity.user_id,
+                Relationship.provider == MESSAGE_POLICY_PROVIDER,
+                Relationship.kind == kind,
+            )
+            if not complete_snapshot:
+                existing_query = existing_query.where(
+                    Relationship.subject_upstream_uid.in_(normalized)
+                )
             existing_rows = list(
                 db.scalars(
-                    select(Relationship).where(
-                        Relationship.owner_user_id == identity.user_id,
-                        Relationship.provider == MESSAGE_POLICY_PROVIDER,
-                        Relationship.subject_upstream_uid.in_(normalized),
-                        Relationship.kind == kind,
-                    )
+                    existing_query.limit(MESSAGE_PEER_SNAPSHOT_MAX_PEERS + 1)
                 )
             )
+            if len(existing_rows) > MESSAGE_PEER_SNAPSHOT_MAX_PEERS:
+                raise ValueError("stored message peer grants exceed the supported limit")
             existing_by_peer = {
                 _message_peer_uid(row.subject_upstream_uid): row
                 for row in existing_rows
                 if _message_peer_uid(row.subject_upstream_uid)
             }
             pending_rows: list[dict[str, Any]] = []
+            normalized_set = set(normalized)
             for peer in normalized:
                 existing = existing_by_peer.get(peer)
                 metadata = dict(existing.extra_data or {}) if existing else {}
                 metadata.update(safe_evidence)
                 metadata["server_owned"] = True
+                if complete_snapshot:
+                    metadata.update(
+                        {
+                            "upstream_conversation_snapshot": True,
+                            "upstream_conversation_source_path": (
+                                MESSAGE_PEER_SNAPSHOT_PATH
+                            ),
+                        }
+                    )
                 if (
                     existing is not None
                     and existing.status == "active"
@@ -1745,8 +2106,60 @@ return 1
                         "extra_data": metadata,
                     }
                 )
+            if complete_snapshot:
+                # A later full trusted snapshot must remove stale membership
+                # from the retirement proof without deleting another valid
+                # grant reason such as an already-authorized local send.
+                for peer, existing in existing_by_peer.items():
+                    if peer in normalized_set:
+                        continue
+                    metadata = dict(existing.extra_data or {})
+                    if metadata.get("upstream_conversation_snapshot") is not True:
+                        continue
+                    metadata["upstream_conversation_snapshot"] = False
+                    pending_rows.append(
+                        {
+                            "owner_user_id": identity.user_id,
+                            "provider": MESSAGE_POLICY_PROVIDER,
+                            "subject_upstream_uid": peer,
+                            "kind": kind,
+                            "status": existing.status,
+                            "started_at": existing.started_at,
+                            "ended_at": existing.ended_at,
+                            "extra_data": metadata,
+                        }
+                    )
             repo = RelationshipRepository(db)
             repo.upsert_many(pending_rows)
+            if complete_snapshot:
+                SyncCursorRepository(db).upsert(
+                    owner_user_id=identity.user_id,
+                    source=MESSAGE_PEER_SNAPSHOT_SOURCE,
+                    stream=MESSAGE_PEER_SNAPSHOT_STREAM,
+                    cursor=json.dumps(
+                        {
+                            "complete": True,
+                            "external_account_id": str(identity.external_account_id),
+                            "peer_count": len(normalized_set),
+                            "peer_digest": _message_peer_snapshot_digest(
+                                normalized_set
+                            ),
+                            "schema": MESSAGE_PEER_SNAPSHOT_SCHEMA,
+                            "source_path": MESSAGE_PEER_SNAPSHOT_PATH,
+                            "upstream_uid": _message_peer_uid(
+                                identity.upstream_uid
+                            ),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    watermark_at=now,
+                    next_sync_at=None,
+                    last_attempted_at=now,
+                    last_succeeded_at=now,
+                    last_error=None,
+                    version=1,
+                )
         return normalized
 
     def replace_social_message_relationships(
@@ -1854,7 +2267,137 @@ return 1
                         }
                     )
             RelationshipRepository(db).upsert_many(pending_rows)
+            expected_snapshot_path = MESSAGE_BLOCK_SNAPSHOT_PATHS.get(kind)
+            if (
+                deactivate_missing
+                and expected_snapshot_path is not None
+                and source_path == expected_snapshot_path
+            ):
+                # A relationship row cannot prove that a successfully fetched
+                # blacklist was empty.  Record completion in the existing
+                # durable cursor table in the same transaction as the rows so
+                # session recovery never has to guess from row presence.
+                SyncCursorRepository(db).upsert(
+                    owner_user_id=identity.user_id,
+                    source=MESSAGE_BLOCK_SNAPSHOT_SOURCE,
+                    stream=MESSAGE_BLOCK_SNAPSHOT_STREAMS[kind],
+                    cursor=json.dumps(
+                        {
+                            "complete": True,
+                            "external_account_id": str(identity.external_account_id),
+                            "kind": kind,
+                            "schema": MESSAGE_BLOCK_SNAPSHOT_SCHEMA,
+                            "source_path": source_path,
+                            "upstream_uid": _message_peer_uid(identity.upstream_uid),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    watermark_at=now,
+                    next_sync_at=None,
+                    last_attempted_at=now,
+                    last_succeeded_at=now,
+                    last_error=None,
+                    version=1,
+                )
         return normalized
+
+    def trusted_message_block_snapshot(
+        self,
+        identity: UserIdentity,
+    ) -> Optional[dict[str, list[str]]]:
+        """Restore both complete block directions from trusted durable state.
+
+        A direction is usable only after a successful full snapshot wrote its
+        dedicated ``SyncCursor`` marker.  Old relationship rows without those
+        markers, partial pages, failed writes and browser-derived rows are not
+        treated as proof of a complete blacklist.  ``None`` therefore means
+        fail closed or refresh from the authenticated upstream; a dictionary
+        with two empty lists is a valid, previously synchronized snapshot.
+        """
+
+        streams = set(MESSAGE_BLOCK_SNAPSHOT_STREAMS.values())
+        own_peer = _message_peer_uid(identity.upstream_uid)
+        if not own_peer:
+            return None
+        with session_scope() as db:
+            cursor_rows = list(
+                db.scalars(
+                    select(SyncCursor).where(
+                        SyncCursor.owner_user_id == identity.user_id,
+                        SyncCursor.source == MESSAGE_BLOCK_SNAPSHOT_SOURCE,
+                        SyncCursor.stream.in_(streams),
+                    )
+                )
+            )
+            cursors_by_stream = {str(row.stream or ""): row for row in cursor_rows}
+            for kind in SOCIAL_MESSAGE_BLOCK_KINDS:
+                stream = MESSAGE_BLOCK_SNAPSHOT_STREAMS[kind]
+                cursor_row = cursors_by_stream.get(stream)
+                if (
+                    cursor_row is None
+                    or cursor_row.last_succeeded_at is None
+                    or cursor_row.watermark_at is None
+                    or bool(str(cursor_row.last_error or "").strip())
+                ):
+                    return None
+                try:
+                    marker = json.loads(str(cursor_row.cursor or ""))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return None
+                if not isinstance(marker, Mapping) or marker.get("complete") is not True:
+                    return None
+                if (
+                    marker.get("schema") != MESSAGE_BLOCK_SNAPSHOT_SCHEMA
+                    or marker.get("external_account_id")
+                    != str(identity.external_account_id)
+                    or marker.get("kind") != kind
+                    or marker.get("source_path") != MESSAGE_BLOCK_SNAPSHOT_PATHS[kind]
+                    or marker.get("upstream_uid") != own_peer
+                ):
+                    return None
+
+            relationship_rows = list(
+                db.scalars(
+                    select(Relationship)
+                    .where(
+                        Relationship.owner_user_id == identity.user_id,
+                        Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                        Relationship.kind.in_(SOCIAL_MESSAGE_BLOCK_KINDS),
+                        Relationship.status == "active",
+                        Relationship.ended_at.is_(None),
+                    )
+                    .limit(MESSAGE_BLOCK_SNAPSHOT_MAX_PEERS + 1)
+                )
+            )
+        if len(relationship_rows) > MESSAGE_BLOCK_SNAPSHOT_MAX_PEERS:
+            return None
+
+        snapshot = {
+            SOCIAL_BLACKLIST_KIND: [],
+            SOCIAL_BLACKLISTED_BY_KIND: [],
+        }
+        for row in relationship_rows:
+            kind = str(row.kind or "")
+            metadata = dict(row.extra_data or {})
+            peer = _message_peer_uid(row.subject_upstream_uid)
+            if (
+                kind not in snapshot
+                or not peer
+                or peer == own_peer
+                or metadata.get("server_owned") is not True
+                or metadata.get("message_policy_source")
+                not in MESSAGE_BLOCK_TRUSTED_SOURCES[kind]
+            ):
+                return None
+            snapshot[kind].append(peer)
+        snapshot[SOCIAL_BLACKLIST_KIND] = sorted(
+            set(snapshot[SOCIAL_BLACKLIST_KIND])
+        )
+        snapshot[SOCIAL_BLACKLISTED_BY_KIND] = sorted(
+            set(snapshot[SOCIAL_BLACKLISTED_BY_KIND])
+        )
+        return snapshot
 
     def set_social_message_relationship(
         self,
@@ -1903,6 +2446,164 @@ return 1
             )
         return [target]
 
+    def send_local_text_message(
+        self,
+        *,
+        identity: UserIdentity,
+        peer: Any,
+        client_message_id: Any,
+        text_value: Any,
+        quote: Any = None,
+        expected_source_message_identity: Any = "",
+        db: Any | None = None,
+    ) -> Any:
+        """Write one Web-to-Web text message in the caller's transaction."""
+
+        from bbw_web.message_quote import normalize_message_quote
+        from bbw_web.messaging import LocalMessagingService, LocalPrincipal
+        from bbw_web.messaging.repository import SqlAlchemyCanonicalMessageStore
+
+        owns_transaction = db is None
+        with (session_scope() if owns_transaction else nullcontext(db)) as action_db:
+            result = LocalMessagingService(
+                SqlAlchemyCanonicalMessageStore(
+                    action_db,
+                    compatibility_mode=str(
+                        getattr(self.settings, "compatibility_mode", "enabled")
+                        or "enabled"
+                    ),
+                )
+            ).send_text(
+                principal=LocalPrincipal(
+                    user_id=identity.user_id,
+                    external_account_id=identity.external_account_id,
+                    upstream_uid=identity.upstream_uid,
+                    account_provider=str(self.runtime_provider.provider_id),
+                ),
+                peer_upstream_uid=peer,
+                client_message_id=client_message_id,
+                text=text_value,
+                quote=normalize_message_quote(quote),
+                expected_source_message_identity=expected_source_message_identity,
+            )
+
+        # A caller-owned transaction has not committed yet.  The durable mirror
+        # scheduler will enqueue the pending delivery after commit, avoiding a
+        # worker racing ahead of the authoritative message transaction.
+        if not owns_transaction:
+            return result
+
+        # The required local delivery is committed. Queueing the optional
+        # legacy mirror must never turn that success into a failed Web message;
+        # the scheduler also redispatches due rows after enqueue loss.
+        if (
+            str(result.tim_mirror.status or "") == "pending"
+            and str(getattr(self.settings, "compatibility_mode", "enabled"))
+            == "enabled"
+        ):
+            try:
+                self.default_queue.enqueue(
+                    "bbw_web.jobs.mirror_tim_message_delivery",
+                    str(result.tim_mirror.delivery_id),
+                    job_id=f"mirror-tim-message-{result.tim_mirror.delivery_id}",
+                    job_timeout=60,
+                    result_ttl=300,
+                    failure_ttl=86400,
+                )
+            except InvalidJobOperation:
+                pass
+            except Exception as exc:
+                if "already exists" not in str(exc).lower():
+                    LOGGER.warning(
+                        "TIM mirror enqueue failed; delivery_id=%s",
+                        result.tim_mirror.delivery_id,
+                    )
+        return result
+
+    def mark_local_conversation_read(
+        self,
+        *,
+        identity: UserIdentity,
+        peer: Any,
+    ) -> int:
+        """Mark the canonical local thread read without contacting TIM."""
+
+        from bbw_web.messaging import LocalMessagingService, LocalPrincipal
+        from bbw_web.messaging.repository import SqlAlchemyCanonicalMessageStore
+
+        with session_scope() as db:
+            return LocalMessagingService(
+                SqlAlchemyCanonicalMessageStore(db)
+            ).mark_direct_read(
+                principal=LocalPrincipal(
+                    user_id=identity.user_id,
+                    external_account_id=identity.external_account_id,
+                    upstream_uid=identity.upstream_uid,
+                    account_provider=str(self.runtime_provider.provider_id),
+                ),
+                peer_upstream_uid=peer,
+            )
+
+    def revoke_local_text_message(
+        self,
+        *,
+        identity: UserIdentity,
+        peer: Any,
+        canonical_message_id: Any,
+        db: Any | None = None,
+    ) -> Any:
+        """Revoke one canonical Web text message without depending on TIM."""
+
+        from bbw_web.messaging import LocalMessagingService, LocalPrincipal
+        from bbw_web.messaging.repository import SqlAlchemyCanonicalMessageStore
+
+        owns_transaction = db is None
+        with (session_scope() if owns_transaction else nullcontext(db)) as action_db:
+            result = LocalMessagingService(
+                SqlAlchemyCanonicalMessageStore(
+                    action_db,
+                    compatibility_mode=str(
+                        getattr(self.settings, "compatibility_mode", "enabled")
+                        or "enabled"
+                    ),
+                )
+            ).revoke_text(
+                principal=LocalPrincipal(
+                    user_id=identity.user_id,
+                    external_account_id=identity.external_account_id,
+                    upstream_uid=identity.upstream_uid,
+                    account_provider=str(self.runtime_provider.provider_id),
+                ),
+                peer_upstream_uid=peer,
+                canonical_message_id=canonical_message_id,
+            )
+
+        if not owns_transaction or result.tim_mirror is None:
+            return result
+        if (
+            str(result.tim_mirror.status or "") == "pending"
+            and str(getattr(self.settings, "compatibility_mode", "enabled"))
+            == "enabled"
+        ):
+            try:
+                self.default_queue.enqueue(
+                    "bbw_web.jobs.mirror_tim_message_delivery",
+                    str(result.tim_mirror.delivery_id),
+                    job_id=f"mirror-tim-message-{result.tim_mirror.delivery_id}",
+                    job_timeout=60,
+                    result_ttl=300,
+                    failure_ttl=86400,
+                )
+            except InvalidJobOperation:
+                pass
+            except Exception as exc:
+                if "already exists" not in str(exc).lower():
+                    LOGGER.warning(
+                        "TIM text revoke enqueue failed; delivery_id=%s",
+                        result.tim_mirror.delivery_id,
+                    )
+        return result
+
     def can_message_peer(self, identity: UserIdentity, peer: Any) -> bool:
         """Authorize one private-message target from live durable state."""
 
@@ -1910,62 +2611,26 @@ return 1
         if not target or target == _message_peer_uid(identity.upstream_uid):
             return False
         with session_scope() as db:
-            blocked_exists = (
-                select(Relationship.id)
+            peer_user_id = (
+                select(ExternalAccount.user_id)
                 .where(
-                    Relationship.owner_user_id == identity.user_id,
-                    Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
-                    Relationship.subject_upstream_uid == target,
-                    Relationship.kind.in_(SOCIAL_MESSAGE_BLOCK_KINDS),
-                    Relationship.status == "active",
-                    Relationship.ended_at.is_(None),
+                    ExternalAccount.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                    ExternalAccount.upstream_uid == target,
                 )
-                .exists()
-            )
-            if identity.match_pool_online_list_enabled:
-                return bool(db.scalar(select(~blocked_exists)))
-            grant_exists = (
-                select(Relationship.id)
-                .where(
-                    Relationship.owner_user_id == identity.user_id,
-                    Relationship.subject_upstream_uid == target,
-                    or_(
-                        and_(
-                            Relationship.provider == MESSAGE_POLICY_PROVIDER,
-                            Relationship.kind.in_(
-                                [
-                                    MESSAGE_POLICY_MATCH_KIND,
-                                    MESSAGE_POLICY_CONVERSATION_KIND,
-                                ]
-                            ),
-                        ),
-                        and_(
-                            Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
-                            Relationship.kind == SOCIAL_FRIEND_KIND,
-                        ),
-                    ),
-                    Relationship.status == "active",
-                    Relationship.ended_at.is_(None),
-                )
-                .exists()
-            )
-            conversation_exists = (
-                select(Conversation.id)
-                .where(
-                    Conversation.owner_user_id == identity.user_id,
-                    Conversation.provider == "tim",
-                    Conversation.peer_upstream_uid == target,
-                    Conversation.kind == "direct",
-                )
-                .exists()
+                .scalar_subquery()
             )
             return bool(
                 db.scalar(
-                    select(
-                        and_(
-                            ~blocked_exists,
-                            or_(grant_exists, conversation_exists),
-                        )
+                    private_message_permission_query(
+                        sender_user_id=identity.user_id,
+                        sender_upstream_uid=_message_peer_uid(
+                            identity.upstream_uid
+                        ),
+                        recipient_user_id=peer_user_id,
+                        recipient_upstream_uid=target,
+                        proactive_private_message=bool(
+                            identity.match_pool_online_list_enabled
+                        ),
                     )
                 )
             )
@@ -1977,22 +2642,142 @@ return 1
 
         bounded_limit = max(1, min(int(limit), 5000))
         own_peer = _message_peer_uid(identity.upstream_uid)
-        blocked_latest = (
-            select(
-                Relationship.subject_upstream_uid.label("peer"),
-                func.max(Relationship.updated_at).label("observed_at"),
+        outgoing_block_override = aliased(
+            Relationship, name="snapshot_outgoing_block_override"
+        )
+        incoming_block_override = aliased(
+            Relationship, name="snapshot_incoming_block_override"
+        )
+        incoming_block_account = aliased(
+            ExternalAccount, name="snapshot_incoming_block_account"
+        )
+        outgoing_has_local_block = (
+            select(outgoing_block_override.id)
+            .where(
+                outgoing_block_override.owner_user_id == identity.user_id,
+                outgoing_block_override.provider == SOCIAL_CANONICAL_PROVIDER,
+                outgoing_block_override.subject_upstream_uid
+                == Relationship.subject_upstream_uid,
+                outgoing_block_override.kind == SOCIAL_BLACKLIST_KIND,
+            )
+            .exists()
+        )
+        incoming_has_local_block = (
+            select(incoming_block_override.id)
+            .join(
+                incoming_block_account,
+                incoming_block_account.user_id
+                == incoming_block_override.owner_user_id,
             )
             .where(
-                Relationship.owner_user_id == identity.user_id,
-                Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
-                Relationship.kind.in_(SOCIAL_MESSAGE_BLOCK_KINDS),
+                incoming_block_account.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                incoming_block_account.upstream_uid
+                == Relationship.subject_upstream_uid,
+                incoming_block_override.provider == SOCIAL_CANONICAL_PROVIDER,
+                incoming_block_override.subject_upstream_uid == own_peer,
+                incoming_block_override.kind == SOCIAL_BLACKLIST_KIND,
+            )
+            .exists()
+        )
+        owner_block_candidates = select(
+            Relationship.subject_upstream_uid.label("peer"),
+            Relationship.updated_at.label("observed_at"),
+        ).where(
+            Relationship.owner_user_id == identity.user_id,
+            Relationship.status == "active",
+            Relationship.ended_at.is_(None),
+            or_(
+                and_(
+                    Relationship.provider == SOCIAL_CANONICAL_PROVIDER,
+                    Relationship.kind == SOCIAL_BLACKLIST_KIND,
+                ),
+                and_(
+                    Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                    Relationship.kind == SOCIAL_BLACKLIST_KIND,
+                    ~outgoing_has_local_block,
+                ),
+                and_(
+                    Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                    Relationship.kind == SOCIAL_BLACKLISTED_BY_KIND,
+                    ~incoming_has_local_block,
+                ),
+            ),
+        )
+        incoming_local_block_candidates = (
+            select(
+                ExternalAccount.upstream_uid.label("peer"),
+                Relationship.updated_at.label("observed_at"),
+            )
+            .join(
+                ExternalAccount,
+                ExternalAccount.user_id == Relationship.owner_user_id,
+            )
+            .where(
+                Relationship.provider == SOCIAL_CANONICAL_PROVIDER,
+                Relationship.kind == SOCIAL_BLACKLIST_KIND,
+                Relationship.subject_upstream_uid == own_peer,
                 Relationship.status == "active",
                 Relationship.ended_at.is_(None),
+                ExternalAccount.provider == SOCIAL_RELATIONSHIP_PROVIDER,
             )
-            .group_by(Relationship.subject_upstream_uid)
+        )
+        blocked_candidates = union_all(
+            owner_block_candidates,
+            incoming_local_block_candidates,
+        ).cte("message_policy_blocked_candidates")
+        blocked_latest = (
+            select(
+                blocked_candidates.c.peer,
+                func.max(blocked_candidates.c.observed_at).label("observed_at"),
+            )
+            .where(blocked_candidates.c.peer.is_not(None))
+            .group_by(blocked_candidates.c.peer)
             .cte("message_policy_blocked_latest")
         )
         blocked_peer_ids = select(blocked_latest.c.peer)
+        snapshot_friend_override = aliased(
+            Relationship, name="snapshot_friend_override"
+        )
+        snapshot_peer_friend_tombstone = aliased(
+            Relationship, name="snapshot_peer_friend_tombstone"
+        )
+        snapshot_peer_friend_account = aliased(
+            ExternalAccount, name="snapshot_peer_friend_account"
+        )
+        snapshot_has_local_friend = (
+            select(snapshot_friend_override.id)
+            .where(
+                snapshot_friend_override.owner_user_id == identity.user_id,
+                snapshot_friend_override.provider == SOCIAL_CANONICAL_PROVIDER,
+                snapshot_friend_override.subject_upstream_uid
+                == Relationship.subject_upstream_uid,
+                snapshot_friend_override.kind == SOCIAL_FRIEND_KIND,
+            )
+            .exists()
+        )
+        snapshot_peer_has_friend_tombstone = (
+            select(snapshot_peer_friend_tombstone.id)
+            .join(
+                snapshot_peer_friend_account,
+                snapshot_peer_friend_account.user_id
+                == snapshot_peer_friend_tombstone.owner_user_id,
+            )
+            .where(
+                snapshot_peer_friend_account.provider
+                == SOCIAL_RELATIONSHIP_PROVIDER,
+                snapshot_peer_friend_account.upstream_uid
+                == Relationship.subject_upstream_uid,
+                snapshot_peer_friend_tombstone.provider
+                == SOCIAL_CANONICAL_PROVIDER,
+                snapshot_peer_friend_tombstone.subject_upstream_uid == own_peer,
+                snapshot_peer_friend_tombstone.kind == SOCIAL_FRIEND_KIND,
+                or_(
+                    snapshot_peer_friend_tombstone.status != "active",
+                    snapshot_peer_friend_tombstone.ended_at.is_not(None),
+                ),
+            )
+            .exists()
+        )
         relationship_allowed = select(
             Relationship.subject_upstream_uid.label("peer"),
             Relationship.updated_at.label("observed_at"),
@@ -2009,24 +2794,95 @@ return 1
                     ),
                 ),
                 and_(
-                    Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
                     Relationship.kind == SOCIAL_FRIEND_KIND,
+                    or_(
+                        and_(
+                            Relationship.provider == SOCIAL_CANONICAL_PROVIDER,
+                            ~snapshot_peer_has_friend_tombstone,
+                        ),
+                        and_(
+                            Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                            ~snapshot_has_local_friend,
+                            ~snapshot_peer_has_friend_tombstone,
+                        ),
+                    ),
                 ),
             ),
             Relationship.status == "active",
             Relationship.ended_at.is_(None),
+        )
+        reverse_friend_account = aliased(
+            ExternalAccount, name="snapshot_reverse_friend_account"
+        )
+        reverse_own_friend_override = aliased(
+            Relationship, name="snapshot_reverse_own_friend_override"
+        )
+        reverse_peer_friend_tombstone = aliased(
+            Relationship, name="snapshot_reverse_peer_friend_tombstone"
+        )
+        reverse_has_own_override = (
+            select(reverse_own_friend_override.id)
+            .where(
+                reverse_own_friend_override.owner_user_id == identity.user_id,
+                reverse_own_friend_override.provider == SOCIAL_CANONICAL_PROVIDER,
+                reverse_own_friend_override.subject_upstream_uid
+                == reverse_friend_account.upstream_uid,
+                reverse_own_friend_override.kind == SOCIAL_FRIEND_KIND,
+            )
+            .exists()
+        )
+        reverse_has_peer_tombstone = (
+            select(reverse_peer_friend_tombstone.id)
+            .where(
+                reverse_peer_friend_tombstone.owner_user_id
+                == Relationship.owner_user_id,
+                reverse_peer_friend_tombstone.provider
+                == SOCIAL_CANONICAL_PROVIDER,
+                reverse_peer_friend_tombstone.subject_upstream_uid == own_peer,
+                reverse_peer_friend_tombstone.kind == SOCIAL_FRIEND_KIND,
+                or_(
+                    reverse_peer_friend_tombstone.status != "active",
+                    reverse_peer_friend_tombstone.ended_at.is_not(None),
+                ),
+            )
+            .exists()
+        )
+        reverse_legacy_friend_allowed = (
+            select(
+                reverse_friend_account.upstream_uid.label("peer"),
+                Relationship.updated_at.label("observed_at"),
+            )
+            .join(
+                reverse_friend_account,
+                reverse_friend_account.user_id == Relationship.owner_user_id,
+            )
+            .where(
+                Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                Relationship.kind == SOCIAL_FRIEND_KIND,
+                Relationship.subject_upstream_uid == own_peer,
+                Relationship.status == "active",
+                Relationship.ended_at.is_(None),
+                reverse_friend_account.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                ~reverse_has_own_override,
+                ~reverse_has_peer_tombstone,
+            )
         )
         conversation_allowed = select(
             Conversation.peer_upstream_uid.label("peer"),
             Conversation.updated_at.label("observed_at"),
         ).where(
             Conversation.owner_user_id == identity.user_id,
-            Conversation.provider == "tim",
+            # TIM compatibility conversations may originate from untrusted
+            # browser archive reports.  Trusted upstream synchronization is
+            # represented by a server-owned web-policy/message_peer grant;
+            # only canonical local conversations are authoritative directly.
+            Conversation.provider == "web-local",
             Conversation.kind == "direct",
             Conversation.peer_upstream_uid.is_not(None),
         )
         allowed_candidates = union_all(
             relationship_allowed,
+            reverse_legacy_friend_allowed,
             conversation_allowed,
         ).cte("message_policy_allowed_candidates")
         allowed_latest = (
@@ -2200,6 +3056,8 @@ return 1
                 evidence={"source_path": path, "grant_reason": "match_result"},
             )
         if method_upper == "GET" and path == "/api/im/conversations":
+            if not _response_has_item_list(response_data):
+                return []
             peers = [_item_peer_uid(item) for item in _response_items(response_data)]
             return self.grant_message_peers(
                 identity=identity,
@@ -2209,6 +3067,7 @@ return 1
                     "source_path": path,
                     "grant_reason": "upstream_conversation",
                 },
+                complete_snapshot=response_data.get("snapshot_complete") is True,
             )
         if method_upper == "POST" and path in {
             "/api/im/rest/send",
@@ -2410,8 +3269,9 @@ return 1
         *,
         identity: UserIdentity,
         request_meta: dict[str, Any],
-        result: ApiResult,
+        result: ProviderApiResult,
     ) -> None:
+        self._observe_provider_response(result)
         pending = getattr(self, "_raw_response_queue", None)
         thread = getattr(self, "_raw_response_thread", None)
         if (
@@ -2442,6 +3302,54 @@ return 1
                     self._raw_response_dropped,
                     self.RAW_RESPONSE_QUEUE_MAX,
                 )
+
+    def _observe_provider_response(self, result: ProviderApiResult) -> None:
+        """Record coarse provider reachability without retaining response data."""
+
+        registry = getattr(self, "dependency_status", None)
+        provider = str(
+            getattr(getattr(self, "runtime_provider", None), "provider_id", "") or ""
+        )
+        if not isinstance(registry, DependencyStatusRegistry) or not provider:
+            return
+        try:
+            status = int(getattr(result, "status", 0) or 0)
+        except (TypeError, ValueError):
+            status = 0
+        if status <= 0:
+            registry.mark_unavailable(
+                provider,
+                "api",
+                failure=DependencyFailure(
+                    DependencyErrorKind.CONNECTION,
+                    retryable=True,
+                ),
+            )
+        elif status == 429:
+            registry.mark_degraded(
+                provider,
+                "api",
+                failure=DependencyFailure(
+                    DependencyErrorKind.RATE_LIMITED,
+                    retryable=True,
+                    status_code=status,
+                ),
+            )
+        elif status >= 500:
+            registry.mark_unavailable(
+                provider,
+                "api",
+                failure=DependencyFailure(
+                    DependencyErrorKind.UPSTREAM,
+                    retryable=True,
+                    status_code=status,
+                ),
+            )
+        else:
+            # Business rejections still prove that the provider transport and
+            # response contract are reachable; account-level authorization is
+            # handled separately and must not poison global dependency health.
+            registry.mark_available(provider, "api")
 
     def capture_product_response(
         self,

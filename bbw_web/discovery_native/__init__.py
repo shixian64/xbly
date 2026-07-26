@@ -1,0 +1,53 @@
+"""城市级发现与本地文本匹配核心。"""
+
+from .contracts import (
+    DISCOVERY_PROVIDER,
+    FILTER_GENDERS,
+    LEGACY_ACCOUNT_PROVIDER,
+    MATCH_CITY_SCOPES,
+    MATCH_STATUS_ACTIVE,
+    PROFILE_GENDERS,
+    QUEUE_STATUS_MATCHED,
+    QUEUE_STATUS_WAITING,
+    TEXT_MATCH_KIND,
+    DirectMessageAuthorizationIntent,
+    DiscoveryAccount,
+    DiscoveryCandidate,
+    DiscoveryCard,
+    DiscoveryContractViolation,
+    DiscoveryFilters,
+    DiscoveryIdentityUnavailable,
+    DiscoveryList,
+    DiscoveryLocationRequired,
+    DiscoveryNativeError,
+    DiscoveryNativeStore,
+    DiscoveryPrincipal,
+    DiscoveryProfile,
+    DiscoveryProfileUnavailable,
+    InvalidDiscoveryRequest,
+    LocalMatchResult,
+    MatchCandidate,
+    MatchFrequencyDecision,
+    MatchPreference,
+    MatchPreferenceConflict,
+    MatchPreferenceUnavailable,
+    MatchQueueEntry,
+    MatchRateLimited,
+    MatchRequestConflict,
+    PeerMessageGrant,
+    TextMatchCommitPlan,
+    TextMatchOutcome,
+)
+from .service import (
+    DISCOVERY_SCAN_LIMIT,
+    MAX_DISCOVERY_LIST_SIZE,
+    ONLINE_WINDOW_SECONDS,
+    TEXT_MATCH_QUEUE_TTL_SECONDS,
+    TEXT_MATCH_RATE_LIMIT,
+    TEXT_MATCH_RATE_WINDOW_SECONDS,
+    DiscoveryNativeService,
+    canonical_match_key,
+)
+from .repository import SqlAlchemyDiscoveryStore, normalized_city_code
+
+__all__ = [name for name in globals() if not name.startswith("_")]

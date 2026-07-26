@@ -37,7 +37,7 @@ class ProductionContractTests(unittest.TestCase):
         return (ROOT / relative).read_text(encoding="utf-8-sig")
 
     def test_production_python_sources_parse(self) -> None:
-        roots = ("bbw_prod", "bbw_web", "migrations")
+        roots = ("bbw_agent", "bbw_prod", "bbw_web", "migrations")
         parsed = 0
         for root in roots:
             for path in (ROOT / root).rglob("*.py"):
@@ -144,6 +144,7 @@ class ProductionContractTests(unittest.TestCase):
 
     def test_authenticated_identity_uses_one_joined_binding_lookup(self) -> None:
         persistence = self.read("bbw_web/persistence.py")
+        private_policy = self.read("bbw_web/private_message_policy.py")
         repositories = self.read("bbw_prod/repositories.py")
         jobs = self.read("bbw_web/jobs.py")
         require_identity = persistence.split("def require_identity", 1)[1].split(
@@ -403,6 +404,7 @@ class ProductionContractTests(unittest.TestCase):
 
     def test_private_message_policy_uses_server_owned_match_and_conversation_grants(self) -> None:
         persistence = self.read("bbw_web/persistence.py")
+        private_policy = self.read("bbw_web/private_message_policy.py")
         repositories = self.read("bbw_prod/repositories.py")
         api = self.read("bbw_web/api.py")
         bff_server = self.read("bbw_web/bff_server.py")
@@ -418,6 +420,7 @@ class ProductionContractTests(unittest.TestCase):
             "SOCIAL_MESSAGE_BLOCK_KINDS = (",
             "def grant_message_peers(",
             "def replace_social_message_relationships(",
+            "def trusted_message_block_snapshot(",
             "def set_social_message_relationship(",
             "def can_message_peer(",
             "def message_policy_snapshot(",
@@ -434,8 +437,17 @@ class ProductionContractTests(unittest.TestCase):
             self.assertIn(marker, persistence)
         self.assertIn("identity.match_pool_online_list_enabled", persistence)
         self.assertIn("metadata[\"server_owned\"] = True", persistence)
-        self.assertIn("conversation_exists = (", persistence)
-        self.assertIn("or_(grant_exists, conversation_exists)", persistence)
+        self.assertIn("private_message_permission_query(", persistence)
+        self.assertIn("conversation_exists = (", private_policy)
+        self.assertIn("or_(grant_exists, conversation_exists)", private_policy)
+        self.assertIn(
+            "Conversation.provider == LOCAL_RELATIONSHIP_PROVIDER",
+            private_policy,
+        )
+        self.assertNotIn(
+            'Conversation.provider.in_(("tim", "web-local"))',
+            private_policy,
+        )
         self.assertIn("def exists_for_peer(", repositories)
         self.assertIn("Conversation.peer_upstream_uid == peer_upstream_uid", repositories)
         self.assertIn('Conversation.kind == kind', repositories)
@@ -446,10 +458,192 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn("CONVERSATION_DM_GRANT_PERSISTENCE_FAILED", api)
         self.assertIn('"/api/social/blacklist-me": "blacklisted_by"', api)
         self.assertIn("message_block_snapshot_guard", api)
+        self.assertIn("message_block_snapshot_loader", api)
         self.assertIn(":message-block-snapshot:", api)
         self.assertIn("persistence.redis.lock(", api)
+        self.assertIn("_restore_durable_message_block_snapshots", bff_server)
         self.assertIn("with guard_factory(path):", bff_server)
         self.assertIn("persistence.remember_message_policy_response(", api)
+
+    def test_provider_health_is_observed_without_affecting_service_readiness(self) -> None:
+        persistence_source = self.read("bbw_web/persistence.py")
+        health_body = persistence_source.split("def health", 1)[1].split(
+            "def _limit_key", 1
+        )[0]
+        self.assertIn('"ok": bool(database_ok and redis_ok)', health_body)
+        self.assertIn('"dependencies": self.dependency_status.public_snapshot()', health_body)
+        admin_api = self.read("bbw_web/admin_api.py")
+        self.assertIn('"dependencies": (', admin_api)
+        self.assertIn(
+            "request.app.state.persistence.dependency_status.public_snapshot()",
+            admin_api,
+        )
+        admin_js = self.read("bbw_web/static/admin.js")
+        self.assertIn("overview.dependencies", admin_js)
+        self.assertIn('"外部依赖"', admin_js)
+        self.assertIn('unavailable: "不可用"', admin_js)
+
+        try:
+            from bbw_web.dependency_health import DependencyStatusRegistry
+            from bbw_web.persistence import RuntimePersistence
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        runtime = RuntimePersistence.__new__(RuntimePersistence)
+        runtime.runtime_provider = types.SimpleNamespace(provider_id="beibeiwu")
+        runtime.dependency_status = DependencyStatusRegistry()
+
+        runtime._observe_provider_response(types.SimpleNamespace(status=-1))
+        unavailable = runtime.dependency_status.get("beibeiwu", "api")
+        self.assertIsNotNone(unavailable)
+        self.assertEqual(unavailable.availability.value, "unavailable")
+        self.assertEqual(unavailable.failure.kind.value, "connection")
+
+        runtime._observe_provider_response(types.SimpleNamespace(status=429))
+        degraded = runtime.dependency_status.get("beibeiwu", "api")
+        self.assertEqual(degraded.availability.value, "degraded")
+        self.assertEqual(degraded.failure.kind.value, "rate_limited")
+
+        runtime._observe_provider_response(types.SimpleNamespace(status=200))
+        available = runtime.dependency_status.get("beibeiwu", "api")
+        self.assertEqual(available.availability.value, "available")
+        self.assertIsNone(available.failure)
+
+    def test_durable_session_restore_is_composed_by_the_selected_provider(self) -> None:
+        try:
+            from datetime import UTC, datetime
+
+            from bbw_web.persistence import RuntimePersistence
+            from bbw_web.providers import ProviderRuntime, ProviderSessionState
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        user_id = uuid.uuid4()
+        account_id = uuid.uuid4()
+        recovered_state = types.SimpleNamespace(
+            user_id=user_id,
+            external_account_id=account_id,
+            created_at=datetime(2026, 7, 25, 10, 0, tzinfo=UTC),
+            last_seen_at=datetime(2026, 7, 25, 10, 5, tzinfo=UTC),
+        )
+        user = types.SimpleNamespace(
+            id=user_id,
+            status="active",
+            display_name="恢复用户",
+            profile={"id": "42", "nickname": "恢复用户"},
+            match_pool_online_list_enabled=True,
+            nearby_custom_city_enabled=False,
+        )
+        account = types.SimpleNamespace(
+            id=account_id,
+            provider="beibeiwu",
+            upstream_uid="42",
+            device_data={
+                "phonebrand": "Web",
+                "device_id": "device-42",
+                "user_role": "member",
+                "vip": "2",
+            },
+        )
+
+        class FakeUserSessionService:
+            revoked: list[tuple[str, str]] = []
+
+            def __init__(self, *_args: object) -> None:
+                pass
+
+            def recover(self, sid: str) -> object:
+                self.sid = sid
+                return recovered_state
+
+            def revoke(self, sid: str, *, reason: str) -> None:
+                self.revoked.append((sid, reason))
+
+        class FakeExternalAccountRepository:
+            def __init__(self, _db: object) -> None:
+                pass
+
+            def get_user_binding(self, *_args: object, **_kwargs: object):
+                return user, account
+
+        class RecordingProvider:
+            provider_id = "beibeiwu"
+
+            def __init__(self) -> None:
+                self.states: list[ProviderSessionState] = []
+                self.runtime: ProviderRuntime | None = None
+
+            def create_runtime_from_state(
+                self,
+                state: ProviderSessionState,
+            ) -> ProviderRuntime:
+                self.states.append(state)
+                app = types.SimpleNamespace(
+                    session=types.SimpleNamespace(uid=state.uid),
+                    client=types.SimpleNamespace(
+                        response_hook=None,
+                        reauth_callback=None,
+                    ),
+                )
+                self.runtime = ProviderRuntime(
+                    provider_id=self.provider_id,
+                    app=app,
+                    native=types.SimpleNamespace(app=app),
+                )
+                return self.runtime
+
+        @contextmanager
+        def fake_session_scope():
+            yield object()
+
+        provider = RecordingProvider()
+        runtime = RuntimePersistence.__new__(RuntimePersistence)
+        runtime.runtime_provider = provider
+        runtime.redis = object()
+        runtime.settings = object()
+        runtime.session_hmac_key = b"session-key"
+
+        with (
+            patch("bbw_web.persistence.session_scope", fake_session_scope),
+            patch(
+                "bbw_web.persistence.UserSessionService",
+                FakeUserSessionService,
+            ),
+            patch(
+                "bbw_web.persistence.ExternalAccountRepository",
+                FakeExternalAccountRepository,
+            ),
+            patch.object(
+                runtime,
+                "_decrypt_account",
+                return_value=("19100000000", "", "token-42"),
+            ),
+        ):
+            restored = runtime.restore_web_user("sid-42")
+
+            self.assertIsNotNone(restored)
+            assert restored is not None
+            self.assertIs(restored.app, provider.runtime.app)
+            self.assertIs(restored.native, provider.runtime.native)
+            self.assertEqual(len(provider.states), 1)
+            state = provider.states[0]
+            self.assertEqual(state.uid, "42")
+            self.assertEqual(state.token, "token-42")
+            self.assertEqual(state.phone, "19100000000")
+            self.assertEqual(state.device_data["device_id"], "device-42")
+            self.assertNotIn("token-42", repr(state))
+            self.assertTrue(callable(restored.app.client.response_hook))
+            self.assertTrue(callable(restored.app.client.reauth_callback))
+
+            account.provider = "other-provider"
+            rejected = runtime.restore_web_user("sid-other")
+
+        self.assertIsNone(rejected)
+        self.assertEqual(
+            FakeUserSessionService.revoked,
+            [("sid-other", "provider_unavailable")],
+        )
+        self.assertEqual(len(provider.states), 1)
 
     def test_message_peer_grants_use_one_lookup_and_one_batch_upsert(self) -> None:
         try:
@@ -635,20 +829,89 @@ class ProductionContractTests(unittest.TestCase):
             },
         )
 
-    def test_archived_direct_conversation_authorizes_private_message_peer(self) -> None:
+    def test_browser_archived_tim_conversation_is_not_an_authorization_source(self) -> None:
         try:
             from bbw_web.persistence import RuntimePersistence, UserIdentity
         except ImportError as exc:
             self.skipTest(f"production dependencies are not installed: {exc}")
 
         class FakeDb:
-            def __init__(self, allowed: bool) -> None:
-                self.allowed = allowed
+            def __init__(self) -> None:
                 self.statements: list[object] = []
 
             def scalar(self, statement: object) -> bool:
                 self.statements.append(statement)
-                return self.allowed
+                return False
+
+        runtime = RuntimePersistence.__new__(RuntimePersistence)
+        identity = UserIdentity(
+            user_id=uuid.uuid4(),
+            external_account_id=uuid.uuid4(),
+            upstream_uid="42",
+        )
+        db = FakeDb()
+
+        @contextmanager
+        def fake_session_scope():
+            yield db
+
+        with patch("bbw_web.persistence.session_scope", fake_session_scope):
+            self.assertFalse(runtime.can_message_peer(identity, "9"))
+
+        self.assertEqual(len(db.statements), 1)
+        statement = db.statements[0]
+        sql = str(statement)
+        self.assertIn("conversations", sql)
+        self.assertIn("relationships", sql)
+        self.assertIn("policy_friend_override", sql)
+        self.assertIn("policy_peer_friend_override", sql)
+        self.assertIn("policy_own_block_override", sql)
+        self.assertIn("policy_peer_block_override", sql)
+        params = {str(value) for value in statement.compile().params.values()}
+        self.assertIn("web-local", params)
+        self.assertIn("beibeiwu", params)
+        self.assertIn("friend", params)
+        self.assertNotIn("tim", params)
+
+    def test_web_local_canonical_conversation_remains_an_authorization_source(self) -> None:
+        try:
+            from bbw_web.persistence import RuntimePersistence, UserIdentity
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        class FakeDb:
+            def __init__(self) -> None:
+                self.statements: list[object] = []
+
+            def scalar(self, statement: object) -> bool:
+                self.statements.append(statement)
+                return True
+
+        runtime = RuntimePersistence.__new__(RuntimePersistence)
+        identity = UserIdentity(
+            user_id=uuid.uuid4(),
+            external_account_id=uuid.uuid4(),
+            upstream_uid="42",
+        )
+        db = FakeDb()
+
+        @contextmanager
+        def fake_session_scope():
+            yield db
+
+        with patch("bbw_web.persistence.session_scope", fake_session_scope):
+            self.assertTrue(runtime.can_message_peer(identity, "9"))
+
+        self.assertEqual(len(db.statements), 1)
+        params = {str(value) for value in db.statements[0].compile().params.values()}
+        self.assertIn("web-local", params)
+        self.assertNotIn("tim", params)
+
+    def test_trusted_upstream_conversation_response_creates_message_peer_grant(self) -> None:
+        try:
+            from bbw_web.persistence import RuntimePersistence, UserIdentity
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
 
         runtime = RuntimePersistence.__new__(RuntimePersistence)
         identity = UserIdentity(
@@ -657,20 +920,115 @@ class ProductionContractTests(unittest.TestCase):
             upstream_uid="42",
         )
 
-        for expected in (True, False):
-            with self.subTest(archived_conversation=expected):
-                db = FakeDb(expected)
+        with patch.object(
+            runtime,
+            "grant_message_peers",
+            return_value=["9"],
+        ) as grant_message_peers:
+            result = runtime.remember_message_policy_response(
+                identity=identity,
+                method="GET",
+                path="/api/im/conversations",
+                request_data={},
+                response_data={"ok": True, "items": [{"peer_id": "9"}]},
+                status=200,
+            )
 
-                @contextmanager
-                def fake_session_scope():
-                    yield db
+        self.assertEqual(result, ["9"])
+        grant_message_peers.assert_called_once_with(
+            identity=identity,
+            peers=["9"],
+            kind="message_peer",
+            evidence={
+                "source_path": "/api/im/conversations",
+                "grant_reason": "upstream_conversation",
+            },
+            complete_snapshot=False,
+        )
 
-                with patch("bbw_web.persistence.session_scope", fake_session_scope):
-                    self.assertIs(runtime.can_message_peer(identity, "9"), expected)
-                self.assertEqual(len(db.statements), 1)
-                statement = str(db.statements[0])
-                self.assertIn("conversations", statement)
-                self.assertIn("relationships", statement)
+    def test_complete_trusted_conversation_snapshot_writes_atomic_marker(self) -> None:
+        try:
+            from bbw_web.persistence import RuntimePersistence, UserIdentity
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        class FakeDb:
+            def scalars(self, _statement: object) -> list[object]:
+                return []
+
+        class FakeRelationshipRepository:
+            def __init__(self) -> None:
+                self.batches: list[list[dict[str, object]]] = []
+
+            def upsert_many(self, rows: list[dict[str, object]]) -> None:
+                self.batches.append(rows)
+
+        class FakeSyncCursorRepository:
+            def __init__(self) -> None:
+                self.rows: list[dict[str, object]] = []
+
+            def upsert(self, **values: object) -> object:
+                self.rows.append(values)
+                return object()
+
+        runtime = RuntimePersistence.__new__(RuntimePersistence)
+        identity = UserIdentity(
+            user_id=uuid.uuid4(),
+            external_account_id=uuid.uuid4(),
+            upstream_uid="42",
+        )
+        relationships = FakeRelationshipRepository()
+        cursors = FakeSyncCursorRepository()
+
+        @contextmanager
+        def fake_session_scope():
+            yield FakeDb()
+
+        with (
+            patch("bbw_web.persistence.session_scope", fake_session_scope),
+            patch(
+                "bbw_web.persistence.RelationshipRepository",
+                return_value=relationships,
+            ),
+            patch(
+                "bbw_web.persistence.SyncCursorRepository",
+                return_value=cursors,
+            ),
+        ):
+            peers = runtime.grant_message_peers(
+                identity=identity,
+                peers=["9", "10"],
+                kind="message_peer",
+                evidence={
+                    "source_path": "/api/im/conversations",
+                    "grant_reason": "upstream_conversation",
+                },
+                complete_snapshot=True,
+            )
+
+        self.assertEqual(peers, ["9", "10"])
+        self.assertEqual(len(relationships.batches), 1)
+        self.assertEqual(
+            [row["subject_upstream_uid"] for row in relationships.batches[0]],
+            ["9", "10"],
+        )
+        for row in relationships.batches[0]:
+            metadata = row["extra_data"]
+            self.assertTrue(metadata["server_owned"])
+            self.assertTrue(metadata["upstream_conversation_snapshot"])
+            self.assertEqual(
+                metadata["upstream_conversation_source_path"],
+                "/api/im/conversations",
+            )
+        self.assertEqual(len(cursors.rows), 1)
+        marker = cursors.rows[0]
+        self.assertEqual(marker["source"], "beibeiwu")
+        self.assertEqual(marker["stream"], "message-peer-snapshot")
+        payload = json.loads(str(marker["cursor"]))
+        self.assertEqual(payload["peer_count"], 2)
+        self.assertEqual(payload["external_account_id"], str(identity.external_account_id))
+        self.assertEqual(payload["upstream_uid"], "42")
+        self.assertEqual(len(payload["peer_digest"]), 64)
 
     def test_active_friend_relationship_authorizes_private_message_peer(self) -> None:
         try:
@@ -824,6 +1182,244 @@ class ProductionContractTests(unittest.TestCase):
             )
             replace_snapshot.assert_called_once()
 
+    def test_complete_block_snapshots_write_sync_cursor_markers_even_when_empty(self) -> None:
+        try:
+            from bbw_web.persistence import RuntimePersistence, UserIdentity
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        class FakeDb:
+            def scalars(self, _statement: object) -> list[object]:
+                return []
+
+        class FakeRelationshipRepository:
+            def __init__(self) -> None:
+                self.batches: list[list[dict[str, object]]] = []
+
+            def upsert_many(self, rows: list[dict[str, object]]) -> None:
+                self.batches.append(rows)
+
+        class FakeSyncCursorRepository:
+            def __init__(self) -> None:
+                self.rows: list[dict[str, object]] = []
+
+            def upsert(self, **values: object) -> object:
+                self.rows.append(values)
+                return object()
+
+        runtime = RuntimePersistence.__new__(RuntimePersistence)
+        identity = UserIdentity(
+            user_id=uuid.uuid4(),
+            external_account_id=uuid.uuid4(),
+            upstream_uid="42",
+        )
+
+        for kind, path in (
+            ("blacklist", "/api/social/blacklist"),
+            ("blacklisted_by", "/api/social/blacklist-me"),
+        ):
+            with self.subTest(kind=kind):
+                relationships = FakeRelationshipRepository()
+                cursors = FakeSyncCursorRepository()
+
+                @contextmanager
+                def fake_session_scope():
+                    yield FakeDb()
+
+                with (
+                    patch("bbw_web.persistence.session_scope", fake_session_scope),
+                    patch(
+                        "bbw_web.persistence.RelationshipRepository",
+                        return_value=relationships,
+                    ),
+                    patch(
+                        "bbw_web.persistence.SyncCursorRepository",
+                        return_value=cursors,
+                    ),
+                ):
+                    result = runtime.replace_social_message_relationships(
+                        identity=identity,
+                        peers=[],
+                        kind=kind,
+                        deactivate_missing=True,
+                        source_path=path,
+                    )
+
+                self.assertEqual(result, [])
+                self.assertEqual(relationships.batches, [[]])
+                self.assertEqual(len(cursors.rows), 1)
+                marker = cursors.rows[0]
+                self.assertEqual(marker["source"], "beibeiwu")
+                self.assertEqual(
+                    marker["stream"],
+                    f"message-block-snapshot:{kind}",
+                )
+                self.assertIsNotNone(marker["last_succeeded_at"])
+                self.assertIsNone(marker["last_error"])
+                self.assertEqual(
+                    json.loads(str(marker["cursor"])),
+                    {
+                        "complete": True,
+                        "external_account_id": str(identity.external_account_id),
+                        "kind": kind,
+                        "schema": 1,
+                        "source_path": path,
+                        "upstream_uid": "42",
+                    },
+                )
+
+        partial_relationships = FakeRelationshipRepository()
+        partial_cursors = FakeSyncCursorRepository()
+
+        @contextmanager
+        def partial_session_scope():
+            yield FakeDb()
+
+        with (
+            patch("bbw_web.persistence.session_scope", partial_session_scope),
+            patch(
+                "bbw_web.persistence.RelationshipRepository",
+                return_value=partial_relationships,
+            ),
+            patch(
+                "bbw_web.persistence.SyncCursorRepository",
+                return_value=partial_cursors,
+            ),
+        ):
+            runtime.replace_social_message_relationships(
+                identity=identity,
+                peers=["9"],
+                kind="blacklist",
+                deactivate_missing=False,
+                source_path="/api/social/blacklist",
+            )
+
+        self.assertEqual(len(partial_relationships.batches), 1)
+        self.assertEqual(partial_cursors.rows, [])
+
+    def test_trusted_block_snapshot_requires_both_completion_markers(self) -> None:
+        try:
+            from bbw_web.persistence import RuntimePersistence, UserIdentity
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        runtime = RuntimePersistence.__new__(RuntimePersistence)
+        identity = UserIdentity(
+            user_id=uuid.uuid4(),
+            external_account_id=uuid.uuid4(),
+            upstream_uid="42",
+        )
+
+        def cursor(kind: str, path: str) -> object:
+            return types.SimpleNamespace(
+                stream=f"message-block-snapshot:{kind}",
+                cursor=json.dumps(
+                    {
+                        "complete": True,
+                        "external_account_id": str(identity.external_account_id),
+                        "kind": kind,
+                        "schema": 1,
+                        "source_path": path,
+                        "upstream_uid": "42",
+                    }
+                ),
+                watermark_at=object(),
+                last_succeeded_at=object(),
+                last_error=None,
+            )
+
+        complete_cursors = [
+            cursor("blacklist", "/api/social/blacklist"),
+            cursor("blacklisted_by", "/api/social/blacklist-me"),
+        ]
+
+        class FakeDb:
+            def __init__(
+                self,
+                cursors: list[object],
+                relationships: list[object],
+            ) -> None:
+                self.cursors = cursors
+                self.relationships = relationships
+                self.calls = 0
+
+            def scalars(self, statement: object) -> list[object]:
+                self.calls += 1
+                if "sync_cursors" in str(statement):
+                    return self.cursors
+                return self.relationships
+
+        def load_with(db: FakeDb):
+            @contextmanager
+            def fake_session_scope():
+                yield db
+
+            with patch("bbw_web.persistence.session_scope", fake_session_scope):
+                return runtime.trusted_message_block_snapshot(identity)
+
+        # Both success markers make an empty/empty snapshot authoritative.
+        empty_db = FakeDb(complete_cursors, [])
+        self.assertEqual(
+            load_with(empty_db),
+            {"blacklist": [], "blacklisted_by": []},
+        )
+        self.assertEqual(empty_db.calls, 2)
+
+        # Old relationship data with only one marker remains untrusted.
+        incomplete_db = FakeDb(complete_cursors[:1], [])
+        self.assertIsNone(load_with(incomplete_db))
+        self.assertEqual(incomplete_db.calls, 1)
+
+        wrong_account_cursors = list(complete_cursors)
+        wrong_account_cursors[0] = types.SimpleNamespace(
+            **{
+                **vars(complete_cursors[0]),
+                "cursor": json.dumps(
+                    {
+                        "complete": True,
+                        "external_account_id": str(uuid.uuid4()),
+                        "kind": "blacklist",
+                        "schema": 1,
+                        "source_path": "/api/social/blacklist",
+                        "upstream_uid": "42",
+                    }
+                ),
+            }
+        )
+        self.assertIsNone(load_with(FakeDb(wrong_account_cursors, [])))
+
+        trusted_rows = [
+            types.SimpleNamespace(
+                kind="blacklist",
+                subject_upstream_uid="9",
+                extra_data={
+                    "server_owned": True,
+                    "message_policy_source": "/api/social/blacklist",
+                },
+            ),
+            types.SimpleNamespace(
+                kind="blacklisted_by",
+                subject_upstream_uid="10",
+                extra_data={
+                    "server_owned": True,
+                    "message_policy_source": "/api/social/blacklist-me",
+                },
+            ),
+        ]
+        self.assertEqual(
+            load_with(FakeDb(complete_cursors, trusted_rows)),
+            {"blacklist": ["9"], "blacklisted_by": ["10"]},
+        )
+
+        untrusted_rows = [
+            types.SimpleNamespace(
+                kind="blacklist",
+                subject_upstream_uid="9",
+                extra_data={"source_path": "/api/social/blacklist"},
+            )
+        ]
+        self.assertIsNone(load_with(FakeDb(complete_cursors, untrusted_rows)))
+
     def test_message_policy_snapshot_loads_all_lists_in_one_database_round_trip(self) -> None:
         try:
             from bbw_web.persistence import RuntimePersistence, UserIdentity
@@ -874,8 +1470,16 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn("beibeiwu", params)
         self.assertIn("friend", params)
         self.assertIn("web-policy", params)
-        self.assertIn("conversations.peer_upstream_uid", str(db.statements[0]))
-        self.assertIn("tim", params)
+        sql = str(db.statements[0])
+        self.assertIn("conversations.peer_upstream_uid", sql)
+        self.assertIn("snapshot_friend_override", sql)
+        self.assertIn("snapshot_reverse_friend_account", sql)
+        self.assertIn("snapshot_reverse_own_friend_override", sql)
+        self.assertIn("snapshot_outgoing_block_override", sql)
+        self.assertIn("snapshot_incoming_block_override", sql)
+        self.assertIn("message_policy_blocked_candidates", sql)
+        self.assertIn("web-local", params)
+        self.assertNotIn("tim", params)
         self.assertIn("direct", params)
 
     def test_archived_messages_are_returned_for_the_authenticated_owner(self) -> None:
@@ -894,7 +1498,6 @@ class ProductionContractTests(unittest.TestCase):
             external_account_id=uuid.uuid4(),
             upstream_uid="42",
         )
-        conversation = types.SimpleNamespace(id=conversation_id)
         newer = types.SimpleNamespace(
             id=uuid.uuid4(),
             upstream_message_id="newer-message",
@@ -919,8 +1522,6 @@ class ProductionContractTests(unittest.TestCase):
             status="sent",
             occurred_at=datetime(2026, 7, 17, 15, 30, tzinfo=UTC),
         )
-        conversation_calls: list[tuple[object, str]] = []
-        message_calls: list[tuple[object, object, object, int]] = []
         persistence = types.SimpleNamespace(
             require_identity=lambda sid: identity if sid == "sid" else None,
             rate_limit=lambda *_args, **_kwargs: True,
@@ -932,33 +1533,21 @@ class ProductionContractTests(unittest.TestCase):
             ),
         )
 
+        class FakeDb:
+            def __init__(self) -> None:
+                self.statements: list[object] = []
+
+            def scalars(self, statement: object) -> list[object]:
+                self.statements.append(statement)
+                return [conversation_id] if len(self.statements) == 1 else [newer, older]
+
+        fake_db = FakeDb()
+
         @contextmanager
         def fake_session_scope():
-            yield object()
+            yield fake_db
 
-        conversation_repo = types.SimpleNamespace(
-            get_by_peer=lambda user_id, peer: conversation_calls.append((user_id, peer))
-            or conversation
-        )
-
-        def list_for_conversation(user_id, target_conversation_id, *, before, limit):
-            message_calls.append((user_id, target_conversation_id, before, limit))
-            return [newer, older]
-
-        message_repo = types.SimpleNamespace(
-            list_for_conversation=list_for_conversation
-        )
-        with (
-            patch("bbw_web.archive_api.session_scope", fake_session_scope),
-            patch(
-                "bbw_web.archive_api.ConversationRepository",
-                return_value=conversation_repo,
-            ),
-            patch(
-                "bbw_web.archive_api.MessageRepository",
-                return_value=message_repo,
-            ),
-        ):
+        with patch("bbw_web.archive_api.session_scope", fake_session_scope):
             payload = archive_api.archived_messages(
                 request,
                 peer="9",
@@ -966,8 +1555,7 @@ class ProductionContractTests(unittest.TestCase):
                 before=None,
             )
 
-        self.assertEqual(conversation_calls, [(owner_id, "9")])
-        self.assertEqual(message_calls, [(owner_id, conversation_id, None, 200)])
+        self.assertEqual(len(fake_db.statements), 2)
         self.assertEqual(
             [item["id"] for item in payload["items"]],
             ["older-message", "newer-message"],
@@ -978,7 +1566,253 @@ class ProductionContractTests(unittest.TestCase):
         self.assertTrue(payload["items"][1]["is_peer_read"])
         self.assertFalse(payload["has_more"])
 
+    def test_archived_message_cursor_does_not_skip_deduplicated_rows(self) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        try:
+            from bbw_web import archive_api
+            from bbw_web.persistence import UserIdentity
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        owner_id = uuid.uuid4()
+        conversation_id = uuid.uuid4()
+        identity = UserIdentity(
+            user_id=owner_id,
+            external_account_id=uuid.uuid4(),
+            upstream_uid="42",
+        )
+        base_time = datetime(2026, 7, 17, 15, 30, tzinfo=UTC)
+
+        def projected_message(
+            *, canonical_id: str, occurred_at: datetime, provider: str
+        ) -> object:
+            return types.SimpleNamespace(
+                id=uuid.uuid4(),
+                provider=provider,
+                upstream_message_id=(
+                    canonical_id if provider == "web-local" else f"tim-{canonical_id}"
+                ),
+                extra_data={"canonical_message_id": canonical_id},
+                body=canonical_id,
+                message_type="text",
+                sender_upstream_uid="9",
+                recipient_upstream_uid="42",
+                direction="incoming",
+                status="received",
+                occurred_at=occurred_at,
+                created_at=occurred_at,
+            )
+
+        raw_rows: list[object] = []
+        for offset, canonical_id in reversed(
+            list(enumerate(("oldest", "middle", "newest")))
+        ):
+            occurred_at = base_time + timedelta(minutes=offset)
+            raw_rows.extend(
+                (
+                    projected_message(
+                        canonical_id=canonical_id,
+                        occurred_at=occurred_at,
+                        provider="web-local",
+                    ),
+                    projected_message(
+                        canonical_id=canonical_id,
+                        occurred_at=occurred_at,
+                        provider="tim",
+                    ),
+                )
+            )
+
+        persistence = types.SimpleNamespace(
+            require_identity=lambda sid: identity if sid == "sid" else None,
+            rate_limit=lambda *_args, **_kwargs: True,
+        )
+        request = types.SimpleNamespace(
+            cookies={archive_api.legacy.COOKIE_NAME: "sid"},
+            app=types.SimpleNamespace(
+                state=types.SimpleNamespace(persistence=persistence)
+            ),
+        )
+
+        class FakeDb:
+            def __init__(self) -> None:
+                self.statements: list[object] = []
+
+            def scalars(self, statement: object) -> list[object]:
+                self.statements.append(statement)
+                return [conversation_id] if len(self.statements) == 1 else raw_rows
+
+        @contextmanager
+        def fake_session_scope():
+            yield FakeDb()
+
+        with patch("bbw_web.archive_api.session_scope", fake_session_scope):
+            payload = archive_api.archived_messages(
+                request,
+                peer="9",
+                limit=2,
+                before=None,
+            )
+
+        self.assertEqual(
+            [item["canonical_message_id"] for item in payload["items"]],
+            ["middle", "newest"],
+        )
+        self.assertTrue(payload["has_more"])
+        self.assertEqual(
+            payload["next_before"],
+            (base_time + timedelta(minutes=1)).isoformat(),
+        )
+        cursor_occurred_at, cursor_created_at, cursor_id = (
+            archive_api._decode_archive_message_cursor(payload["next_cursor"])
+        )
+        self.assertEqual(cursor_occurred_at, base_time + timedelta(minutes=1))
+        self.assertEqual(cursor_created_at, base_time + timedelta(minutes=1))
+        middle_projection_ids = {
+            row.id
+            for row in raw_rows
+            if row.extra_data["canonical_message_id"] == "middle"
+        }
+        self.assertIn(cursor_id, middle_projection_ids)
+        self.assertTrue(
+            all("_archive_cursor" not in item for item in payload["items"])
+        )
+
+    def test_archive_cursor_and_read_merge_are_monotonic(self) -> None:
+        from datetime import UTC, datetime
+
+        try:
+            from bbw_web import archive_api
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        occurred_at = datetime(2026, 7, 25, 8, 30, tzinfo=UTC)
+        created_at = datetime(2026, 7, 25, 8, 31, tzinfo=UTC)
+        message_id = uuid.uuid4()
+        cursor = archive_api._encode_archive_message_cursor(
+            types.SimpleNamespace(
+                id=message_id,
+                occurred_at=occurred_at,
+                created_at=created_at,
+            )
+        )
+        self.assertEqual(
+            archive_api._decode_archive_message_cursor(cursor),
+            (occurred_at, created_at, message_id),
+        )
+
+        canonical = {
+            "id": str(message_id),
+            "canonical_message_id": str(message_id),
+            "provider": "web-local",
+            "flow": "out",
+            "from": "42",
+            "to": "9",
+            "is_peer_read": True,
+            "read_at": occurred_at.isoformat(),
+        }
+        compatibility = {
+            **canonical,
+            "id": "tim-message-key",
+            "provider": "tim",
+            "message_random": "778899",
+            "is_peer_read": False,
+            "read_at": "",
+        }
+        merged = archive_api._merge_archived_message_items(
+            canonical,
+            compatibility,
+        )
+        self.assertTrue(merged["is_peer_read"])
+        self.assertEqual(merged["read_at"], occurred_at.isoformat())
+
+        source = self.read("bbw_web/archive_api.py")
+        self.assertIn("Message.created_at < cursor_created_at", source)
+        self.assertIn("Message.id < cursor_id", source)
+        self.assertIn('"next_cursor": next_cursor', source)
+
+    def test_archive_merge_uses_canonical_revoke_state(self) -> None:
+        try:
+            from bbw_web import archive_api
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        canonical = {
+            "id": "canonical-message",
+            "canonical_message_id": "canonical-message",
+            "provider": "web-local",
+            "flow": "out",
+            "from": "42",
+            "to": "9",
+            "status": "sent",
+            "revoked": False,
+        }
+        compatibility = {
+            **canonical,
+            "id": "tim-message-key",
+            "provider": "tim",
+            "message_random": "778899",
+            "status": "revoked",
+            "revoked": True,
+        }
+
+        active = archive_api._merge_archived_message_items(
+            canonical,
+            compatibility,
+        )
+        self.assertFalse(active["revoked"])
+        self.assertEqual(active["status"], "sent")
+
+        revoked = archive_api._merge_archived_message_items(
+            {
+                **canonical,
+                "status": "revoked",
+                "revoked": True,
+                "text": "",
+                "body": "",
+                "recalled_text": "仅发送者可重新编辑",
+            },
+            {
+                **compatibility,
+                "status": "sent",
+                "revoked": False,
+                "text": "不能从 TIM 副本恢复的原文",
+                "body": "不能从 TIM 副本恢复的原文",
+            },
+        )
+        self.assertTrue(revoked["revoked"])
+        self.assertEqual(revoked["status"], "revoked")
+        self.assertEqual(revoked["text"], "")
+        self.assertEqual(revoked["body"], "")
+        self.assertEqual(revoked["recalled_text"], "仅发送者可重新编辑")
+
+        recipient = archive_api._merge_archived_message_items(
+            {
+                **canonical,
+                "flow": "in",
+                "status": "revoked",
+                "revoked": True,
+                "text": "",
+                "body": "",
+                "recalled_text": "",
+            },
+            {
+                **compatibility,
+                "flow": "in",
+                "status": "sent",
+                "revoked": False,
+                "text": "接收方不能再得到的原文",
+                "body": "接收方不能再得到的原文",
+            },
+        )
+        self.assertEqual(recipient["text"], "")
+        self.assertEqual(recipient["body"], "")
+        self.assertEqual(recipient["recalled_text"], "")
+
     def test_archived_conversation_prefers_current_local_profile_over_snapshot(self) -> None:
+        from datetime import UTC, datetime
+
         try:
             from bbw_web import archive_api
             from bbw_web.persistence import UserIdentity
@@ -994,6 +1828,7 @@ class ProductionContractTests(unittest.TestCase):
         )
         conversation = types.SimpleNamespace(
             id=conversation_id,
+            provider="web-local",
             upstream_conversation_id="C2C9",
             peer_upstream_uid="9",
             title="游客",
@@ -1004,12 +1839,31 @@ class ProductionContractTests(unittest.TestCase):
                     "avatar": "https://example.invalid/old.jpg",
                 },
             },
-            last_message_at=None,
-            unread_count=0,
-            unread_observed_at=None,
+            last_message_at=datetime(2026, 7, 25, tzinfo=UTC),
+            unread_count=4,
+            unread_observed_at=datetime(2026, 7, 24, tzinfo=UTC),
+        )
+        local_revoked_message = types.SimpleNamespace(
+            body=None,
+            message_type="text",
+            status="revoked",
+            occurred_at=datetime(2026, 7, 25, tzinfo=UTC),
+            extra_data={"revoked": True},
+        )
+        newer_tim_projection = types.SimpleNamespace(
+            id=uuid.uuid4(),
+            provider="tim",
+            upstream_conversation_id="C2C9",
+            peer_upstream_uid="9",
+            title="旧快照昵称",
+            extra_data={"last_message": "TIM 兼容预览"},
+            last_message_at=datetime(2026, 7, 25, tzinfo=UTC),
+            unread_count=99,
+            unread_observed_at=datetime(2026, 7, 25, tzinfo=UTC),
         )
         unresolved_conversation = types.SimpleNamespace(
             id=uuid.uuid4(),
+            provider="tim",
             upstream_conversation_id="C2C10",
             peer_upstream_uid="10",
             title="游客",
@@ -1020,6 +1874,7 @@ class ProductionContractTests(unittest.TestCase):
         )
         partial_name_conversation = types.SimpleNamespace(
             id=uuid.uuid4(),
+            provider="tim",
             upstream_conversation_id="C2C11",
             peer_upstream_uid="11",
             title="旧昵称",
@@ -1030,6 +1885,7 @@ class ProductionContractTests(unittest.TestCase):
         )
         partial_avatar_conversation = types.SimpleNamespace(
             id=uuid.uuid4(),
+            provider="tim",
             upstream_conversation_id="C2C12",
             peer_upstream_uid="12",
             title="旧昵称",
@@ -1056,13 +1912,16 @@ class ProductionContractTests(unittest.TestCase):
         conversation_repo = types.SimpleNamespace(
             list_for_owner=lambda user_id, limit: [
                 conversation,
+                newer_tim_projection,
                 unresolved_conversation,
                 partial_name_conversation,
                 partial_avatar_conversation,
             ]
         )
         message_repo = types.SimpleNamespace(
-            latest_for_conversations=lambda user_id, conversation_ids: {}
+            latest_for_conversations=lambda user_id, conversation_ids: {
+                conversation_id: local_revoked_message
+            }
         )
         with (
             patch("bbw_web.archive_api.session_scope", fake_session_scope),
@@ -1099,9 +1958,15 @@ class ProductionContractTests(unittest.TestCase):
         self.assertEqual(item["avatar"], "https://example.invalid/current.jpg")
         self.assertEqual(item["user"]["nickname"], "真实昵称")
         self.assertTrue(item["profile_resolved"])
+        self.assertEqual(item["provider"], "web-local")
+        self.assertEqual(item["unread_count"], 4)
+        self.assertTrue(item["unread_authoritative"])
+        self.assertEqual(item["last_message"], "消息已撤回")
+        self.assertEqual(item["content"], "消息已撤回")
         unresolved_item = payload["items"][1]
         self.assertEqual(unresolved_item["nickname"], "10")
         self.assertFalse(unresolved_item["profile_resolved"])
+        self.assertFalse(unresolved_item["unread_authoritative"])
         partial_name_item = payload["items"][2]
         self.assertEqual(partial_name_item["nickname"], "新昵称")
         self.assertEqual(partial_name_item["avatar"], "https://example.invalid/old-11.jpg")

@@ -26,10 +26,14 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from bbw_web.store import SessionStore  # noqa: E402
 from bbw_web import normalize as N  # noqa: E402
 from bbw_web import flash_photo as F  # noqa: E402
 from bbw_web.message_quote import encode_message_quote, normalize_message_quote  # noqa: E402
+from bbw_web.providers import (  # noqa: E402
+    ProviderAuthenticationRejected,
+    ProviderUnavailable,
+)
+from bbw_web.store import SessionStore  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 COOKIE_NAME = "bbw_sid"
@@ -1596,6 +1600,7 @@ def _tim_recent_conversation_envelope(
     seen: Set[str] = set()
     previous_cursor: Optional[Tuple[int, int, int, int]] = None
     observed_at = time.time()
+    snapshot_complete = False
     for _page in range(max(1, min(int(max_pages), 10))):
         result = client.recent_contacts(
             account_uid,
@@ -1639,6 +1644,7 @@ def _tim_recent_conversation_envelope(
                 }
             )
         if int(data.get("CompleteFlag") or 0) == 1:
+            snapshot_complete = True
             break
         cursor = (
             max(0, int(data.get("TimeStamp") or timestamp)),
@@ -1678,6 +1684,11 @@ def _tim_recent_conversation_envelope(
         "entity": "conversation",
         "status": 200,
         "source": "tim_rest",
+        # Only a server-side cursor that explicitly reached CompleteFlag=1 can
+        # prove the account's existing-conversation snapshot is complete.  The
+        # persistence layer uses this marker for the retirement readiness gate;
+        # browser archives and truncated TIM pages never set it.
+        "snapshot_complete": snapshot_complete,
     }
 
 
@@ -2188,6 +2199,13 @@ class Handler(BaseHTTPRequestHandler):
                 "_request_nearby_custom_city_enabled",
                 None,
             ),
+            local_password_change_enabled=bool(
+                getattr(
+                    self,
+                    "_request_local_password_change_enabled",
+                    False,
+                )
+            ),
         )
 
     def _store_message_block_snapshot(
@@ -2269,6 +2287,54 @@ class Handler(BaseHTTPRequestHandler):
                 "error": "黑名单状态同步繁忙或暂时不可用，请稍后重试",
             }
 
+    def _restore_durable_message_block_snapshots(self, user: Any) -> bool:
+        """Seed both in-memory block directions from one trusted DB snapshot."""
+
+        loader = getattr(self, "_request_message_block_snapshot_loader", None)
+        if not callable(loader):
+            return False
+        try:
+            snapshot = loader()
+        except Exception:
+            return False
+        if not isinstance(snapshot, Mapping):
+            return False
+
+        session = getattr(getattr(user, "app", None), "session", None)
+        current_uid = str(getattr(session, "uid", "") or "").strip()
+
+        def trusted_peers(key: str) -> Optional[Set[str]]:
+            if key not in snapshot:
+                return None
+            values = snapshot.get(key)
+            if not isinstance(values, (list, tuple, set, frozenset)):
+                return None
+            peers: Set[str] = set()
+            for value in values:
+                peer = str(value or "").strip()
+                if (
+                    not peer
+                    or peer.lower() in {"0", "none", "null"}
+                    or len(peer) > 128
+                    or any(ord(char) < 33 for char in peer)
+                    or peer == current_uid
+                ):
+                    return None
+                peers.add(peer)
+            return peers
+
+        own_peers = trusted_peers("blacklist")
+        incoming_peers = trusted_peers("blacklisted_by")
+        if own_peers is None or incoming_peers is None:
+            return False
+        restored_at = time.monotonic()
+        setattr(user, "blocked_message_peers", own_peers)
+        setattr(user, "blocked_by_message_peers", incoming_peers)
+        setattr(user, "blocked_message_peers_snapshot_at", restored_at)
+        setattr(user, "blocked_by_message_peers_snapshot_at", restored_at)
+        setattr(user, "message_blocks_retry_at", 0.0)
+        return True
+
     def ensure_message_blocks_loaded(self, user: Any) -> bool:
         """Load both blacklist directions before authorizing any private message."""
 
@@ -2279,6 +2345,21 @@ class Handler(BaseHTTPRequestHandler):
         incoming_snapshot_at = float(
             getattr(user, "blocked_by_message_peers_snapshot_at", 0.0) or 0.0
         )
+        if own_snapshot_at <= 0 or incoming_snapshot_at <= 0:
+            if Handler._restore_durable_message_block_snapshots(self, user):
+                now = time.monotonic()
+                own_snapshot_at = float(
+                    getattr(user, "blocked_message_peers_snapshot_at", 0.0) or 0.0
+                )
+                incoming_snapshot_at = float(
+                    getattr(user, "blocked_by_message_peers_snapshot_at", 0.0) or 0.0
+                )
+        if str(getattr(user, "authentication_source", "") or "") == "local":
+            # A local-password session exists specifically because the provider
+            # is unavailable.  Reuse the last complete, account-bound snapshot
+            # without introducing a synchronous network timeout.  Missing
+            # snapshots still fail closed.
+            return own_snapshot_at > 0 and incoming_snapshot_at > 0
         own_fresh = own_snapshot_at > 0 and now - own_snapshot_at < MESSAGE_BLOCK_SNAPSHOT_TTL_SEC
         incoming_fresh = (
             incoming_snapshot_at > 0
@@ -2353,12 +2434,32 @@ class Handler(BaseHTTPRequestHandler):
             return False
         if not Handler.ensure_message_blocks_loaded(self, user):
             return False
+        authorizer = getattr(self, "_request_message_peer_authorizer", None)
+        if callable(authorizer) and bool(
+            getattr(self, "_request_message_peer_authorizer_canonical", False)
+        ):
+            # PostgreSQL is the live authority after migration. The in-memory
+            # sets only prove both directions were loaded; they must not keep a
+            # later Web-local unblock denied for the lifetime of this session.
+            # A zero timestamp means a newly observed block was not persisted,
+            # in which case the safe behavior remains fail-closed.
+            if any(
+                float(getattr(user, attribute, 0.0) or 0.0) <= 0
+                for attribute in (
+                    "blocked_message_peers_snapshot_at",
+                    "blocked_by_message_peers_snapshot_at",
+                )
+            ):
+                return False
+            try:
+                return bool(authorizer(target))
+            except Exception:
+                return False
         if target in (
             set(getattr(user, "blocked_message_peers", set()) or set())
             | set(getattr(user, "blocked_by_message_peers", set()) or set())
         ):
             return False
-        authorizer = getattr(self, "_request_message_peer_authorizer", None)
         if callable(authorizer):
             try:
                 return bool(authorizer(target))
@@ -2486,11 +2587,22 @@ class Handler(BaseHTTPRequestHandler):
             with u.lock:
                 pub = u.public()
                 user_dto = N.session_user_dto(u.app.whoami())
+                authentication_source = str(
+                    getattr(u, "authentication_source", "web-session")
+                    or "web-session"
+                )
+                local_authentication = authentication_source == "local"
             return self.ok(
                 {
                     "ok": True,
                     **pub,
                     "user": user_dto,
+                    "auth_source": (
+                        "web-local" if local_authentication else authentication_source
+                    ),
+                    "dependency_mode": (
+                        "degraded" if local_authentication else "provider"
+                    ),
                     "features": _features(),
                     "capabilities": {
                         "roomkit_list": True,
@@ -3457,6 +3569,29 @@ class Handler(BaseHTTPRequestHandler):
                     user = STORE.login_password(
                         sid, phone, password, label=str(data.get("label") or "")
                     )
+            except ProviderUnavailable as e:
+                return self.ok(
+                    {
+                        "ok": False,
+                        "code": "UPSTREAM_AUTH_UNAVAILABLE",
+                        "error": _safe_error(
+                            e,
+                            "登录服务暂时不可用，请稍后重试",
+                        ),
+                        "retryable": True,
+                    },
+                    503,
+                )
+            except ProviderAuthenticationRejected as e:
+                return self.ok(
+                    {
+                        "ok": False,
+                        "code": "UPSTREAM_AUTH_REJECTED",
+                        "error": _safe_error(e, "账号或密码验证失败"),
+                        "retryable": False,
+                    },
+                    401,
+                )
             except Exception as e:
                 return self.ok({"ok": False, "error": _safe_error(e, "登录失败")}, 400)
             # Login response latency must depend only on authentication and
@@ -3488,8 +3623,6 @@ class Handler(BaseHTTPRequestHandler):
             return self.ok({"ok": True, "remote_logout_ok": False}, clear_cookie=True)
 
         if path == "/api/auth/sms-send":
-            from bbw_protocol import BeibeiwuApp
-
             phone = str(data.get("phone") or "").strip()
             if not phone:
                 return self.ok({"ok": False, "error": "请输入手机号"}, 400)
@@ -3497,11 +3630,9 @@ class Handler(BaseHTTPRequestHandler):
                 "sms-send", phone, limit=3, window_sec=300.0
             ):
                 return
-            return self.ok(R(BeibeiwuApp().auth.send_sms(phone), empty_ok=True))
+            return self.ok(R(STORE.send_sms(phone), empty_ok=True))
 
         if path == "/api/auth/sms-login":
-            from bbw_protocol.device import build_device_profile
-
             phone = str(data.get("phone") or "").strip()
             code = str(data.get("code") or "").strip()
             if not phone or not code:
@@ -3516,7 +3647,7 @@ class Handler(BaseHTTPRequestHandler):
                 if user is None:
                     user = STORE.create(label=phone)
                 with user.lock:
-                    user.app.session.apply_device(build_device_profile(seed=phone))
+                    user.app.set_device(seed=phone)
                     r = user.app.auth.sms_login(phone, code)
                     if not r.ok or not user.app.session.logged_in:
                         if created:
@@ -3569,11 +3700,7 @@ class Handler(BaseHTTPRequestHandler):
                 u.stop_heartbeat()
                 return self.ok({"ok": True, "running": False})
             if path == "/api/heartbeat/once":
-                if not u.heartbeat:
-                    from bbw_protocol.heartbeat import Heartbeat
-
-                    u.heartbeat = Heartbeat(app)
-                return self.ok(u.heartbeat.once())
+                return self.ok(u.heartbeat_once())
 
             if path == "/api/call":
                 if not LAB_ENABLED:
@@ -3722,6 +3849,69 @@ class Handler(BaseHTTPRequestHandler):
                     if len(peer_uids) == 1 and isinstance(supplied_receipts, list)
                     else []
                 )
+                local_read_peers: List[str] = []
+                local_read_counts: Dict[str, int] = {}
+                local_only_mode = (
+                    str(getattr(u, "authentication_source", "") or "")
+                    == "local"
+                )
+                local_read_marker = getattr(
+                    self, "_request_local_read_marker", None
+                )
+                if local_only_mode and not callable(local_read_marker):
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "code": "LOCAL_READ_SERVICE_UNAVAILABLE",
+                            "error": "Web 本地已读服务未就绪",
+                            "retryable": True,
+                        },
+                        503,
+                    )
+                if callable(local_read_marker):
+                    try:
+                        for peer_uid in peer_uids:
+                            local_count = local_read_marker(peer_uid)
+                            if local_count is None:
+                                continue
+                            local_read_peers.append(peer_uid)
+                            local_read_counts[peer_uid] = max(
+                                0, int(local_count or 0)
+                            )
+                    except Exception:
+                        return self.ok(
+                            {
+                                "ok": False,
+                                "code": "LOCAL_READ_SERVICE_UNAVAILABLE",
+                                "error": "Web 本地已读状态暂时无法保存",
+                                "retryable": True,
+                            },
+                            503,
+                        )
+                local_unavailable_peers = [
+                    peer_uid
+                    for peer_uid in peer_uids
+                    if peer_uid not in local_read_peers
+                ]
+                if local_only_mode and local_unavailable_peers:
+                    # A Web-local session must never fall through to the TIM
+                    # compatibility client.  The peer may only have a legacy
+                    # archive and therefore has no canonical unread state to
+                    # mutate locally.
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "code": "PEER_NOT_MIGRATED",
+                            "error": "部分聊天对象尚未完成 Web 消息迁移",
+                            "retryable": False,
+                            "read_peers": local_read_peers,
+                            "failed_peers": local_unavailable_peers,
+                            "local_read_peers": local_read_peers,
+                            "local_read_counts": local_read_counts,
+                            "compatibility_sync_skipped_peers": peer_uids,
+                        },
+                        409,
+                    )
                 read_peers: List[str] = []
                 conversation_read_peers: List[str] = []
                 receipt_synced_peers: List[str] = []
@@ -3729,6 +3919,14 @@ class Handler(BaseHTTPRequestHandler):
                 conversation_failed_peers: List[str] = []
                 receipt_failed_peers: List[str] = []
                 receipt_counts: Dict[str, int] = {}
+                skipped_compatibility_peers = (
+                    list(local_read_peers) if local_only_mode else []
+                )
+                remote_read_peers = [
+                    peer_uid
+                    for peer_uid in peer_uids
+                    if peer_uid not in skipped_compatibility_peers
+                ]
 
                 def mark_peer_read(peer_uid: str) -> Tuple[str, Any, Any]:
                     conversation_result = u.native.tim_rest.mark_c2c_read(
@@ -3742,11 +3940,18 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return peer_uid, conversation_result, receipt_result
 
-                if len(peer_uids) == 1:
-                    read_results = [mark_peer_read(peer_uids[0])]
+                if len(remote_read_peers) == 1:
+                    read_results = [mark_peer_read(remote_read_peers[0])]
+                elif not remote_read_peers:
+                    read_results = []
                 else:
-                    with ThreadPoolExecutor(max_workers=min(5, len(peer_uids))) as executor:
-                        read_results = list(executor.map(mark_peer_read, peer_uids))
+                    with ThreadPoolExecutor(
+                        max_workers=min(5, len(remote_read_peers))
+                    ) as executor:
+                        read_results = list(
+                            executor.map(mark_peer_read, remote_read_peers)
+                        )
+                read_peers.extend(skipped_compatibility_peers)
                 for peer_uid, conversation_result, receipt_result in read_results:
                     conversation_ok = bool(getattr(conversation_result, "ok", False))
                     receipt_ok = bool(getattr(receipt_result, "ok", False))
@@ -3767,7 +3972,9 @@ class Handler(BaseHTTPRequestHandler):
                         )
                     except (TypeError, ValueError, OverflowError):
                         receipt_counts[peer_uid] = 0
-                    if conversation_ok and receipt_ok:
+                    if (
+                        conversation_ok and receipt_ok
+                    ) or peer_uid in local_read_peers:
                         read_peers.append(peer_uid)
                     else:
                         failed_peers.append(peer_uid)
@@ -3783,6 +3990,9 @@ class Handler(BaseHTTPRequestHandler):
                             "conversation_failed_peers": conversation_failed_peers,
                             "receipt_synced_peers": receipt_synced_peers,
                             "receipt_failed_peers": receipt_failed_peers,
+                            "local_read_peers": local_read_peers,
+                            "local_read_counts": local_read_counts,
+                            "compatibility_sync_skipped_peers": skipped_compatibility_peers,
                             "receipt_counts": receipt_counts,
                             "receipt_count": sum(receipt_counts.values()),
                         },
@@ -3795,6 +4005,9 @@ class Handler(BaseHTTPRequestHandler):
                         "read_peers": read_peers,
                         "count": len(read_peers),
                         "conversation_read_peers": conversation_read_peers,
+                        "local_read_peers": local_read_peers,
+                        "local_read_counts": local_read_counts,
+                        "compatibility_sync_skipped_peers": skipped_compatibility_peers,
                         "receipt_synced_peers": receipt_synced_peers,
                         "receipt_counts": receipt_counts,
                         "receipt_count": sum(receipt_counts.values()),
@@ -3826,6 +4039,107 @@ class Handler(BaseHTTPRequestHandler):
                 if not Handler.can_message_peer(self, u, to_uid):
                     return Handler.deny_private_message(self, capabilities)
                 quote = normalize_message_quote(data.get("quote"))
+                client_message_id = str(
+                    data.get("client_message_id")
+                    or data.get("client_message_key")
+                    or data.get("idempotency_key")
+                    or ""
+                ).strip()
+                if not client_message_id:
+                    entropy = (
+                        f"{from_uid}\x00{to_uid}\x00{text}\x00{time.time_ns()}"
+                    ).encode("utf-8")
+                    client_message_id = (
+                        "legacy-web-" + hashlib.sha256(entropy).hexdigest()[:48]
+                    )
+
+                local_fallback_reason = ""
+                local_sender = getattr(self, "_request_local_text_sender", None)
+                local_only_mode = (
+                    str(getattr(u, "authentication_source", "") or "")
+                    == "local"
+                )
+                if local_only_mode and not callable(local_sender):
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "code": "LOCAL_MESSAGE_SERVICE_UNAVAILABLE",
+                            "error": "Web 本地消息服务未就绪",
+                            "retryable": True,
+                        },
+                        503,
+                    )
+                if callable(local_sender):
+                    try:
+                        local_outcome = local_sender(
+                            to_uid,
+                            text,
+                            client_message_id,
+                            quote,
+                        )
+                    except Exception:
+                        return self.ok(
+                            {
+                                "ok": False,
+                                "code": "LOCAL_MESSAGE_SERVICE_UNAVAILABLE",
+                                "error": "Web 本地消息服务暂时不可用，请稍后重试",
+                                "retryable": True,
+                            },
+                            503,
+                        )
+                    if isinstance(local_outcome, Mapping):
+                        if local_outcome.get("handled") is True:
+                            local_payload = dict(local_outcome.get("payload") or {})
+                            local_status = int(local_outcome.get("status") or 200)
+                            if local_payload.get("ok") is True:
+                                conversation_peers = getattr(
+                                    u, "conversation_message_peers", None
+                                )
+                                if conversation_peers is None:
+                                    conversation_peers = set()
+                                    setattr(
+                                        u,
+                                        "conversation_message_peers",
+                                        conversation_peers,
+                                    )
+                                conversation_peers.add(to_uid)
+                            return self.ok(local_payload, local_status)
+                        local_fallback_reason = str(
+                            local_outcome.get("reason") or ""
+                        ).strip()
+
+                if local_only_mode:
+                    if not local_fallback_reason:
+                        return self.ok(
+                            {
+                                "ok": False,
+                                "code": "LOCAL_MESSAGE_SERVICE_UNAVAILABLE",
+                                "error": "Web 本地消息服务未返回有效结果",
+                                "retryable": True,
+                            },
+                            503,
+                        )
+                    peer_not_migrated = (
+                        local_fallback_reason == "peer_not_migrated"
+                    )
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "code": (
+                                "PEER_NOT_MIGRATED"
+                                if peer_not_migrated
+                                else "LOCAL_MESSAGE_IDENTITY_NOT_READY"
+                            ),
+                            "error": (
+                                "对方尚未完成 Web 消息迁移，本地通道无法投递"
+                                if peer_not_migrated
+                                else "当前账号尚未完成 Web 消息迁移"
+                            ),
+                            "retryable": False,
+                        },
+                        409,
+                    )
+
                 quote_cloud_data = encode_message_quote(quote)
                 send_options = (
                     {"cloud_custom_data": quote_cloud_data}
@@ -3874,12 +4188,31 @@ class Handler(BaseHTTPRequestHandler):
                         conversation_peers = set()
                         setattr(u, "conversation_message_peers", conversation_peers)
                     conversation_peers.add(to_uid)
-                return self.ok(out, 200 if r.ok else 400)
+                elif local_fallback_reason:
+                    out["code"] = (
+                        "PEER_NOT_MIGRATED"
+                        if local_fallback_reason == "peer_not_migrated"
+                        else "LOCAL_MESSAGE_IDENTITY_NOT_READY"
+                    )
+                    out["error"] = (
+                        "对方尚未完成 Web 消息迁移，当前外部消息通道也无法投递"
+                        if local_fallback_reason == "peer_not_migrated"
+                        else "当前账号尚未完成 Web 消息迁移，且外部消息通道暂时不可用"
+                    )
+                    out["retryable"] = True
+                return self.ok(
+                    out,
+                    200 if r.ok else (409 if local_fallback_reason else 400),
+                )
 
             if path == "/api/im/rest/revoke":
                 to_uid = str(data.get("to") or data.get("peer") or data.get("uid") or "").strip()
+                canonical_message_id = str(
+                    data.get("canonical_message_id") or ""
+                ).strip()
                 msg_key = str(
-                    data.get("msg_key")
+                    canonical_message_id
+                    or data.get("msg_key")
                     or data.get("MsgKey")
                     or data.get("message_id")
                     or ""
@@ -3891,6 +4224,62 @@ class Handler(BaseHTTPRequestHandler):
                     return self.ok({"ok": False, "error": "缺少对方 UID 或消息标识"}, 400)
                 if len(to_uid) > 128 or len(msg_key) > 512:
                     return self.ok({"ok": False, "error": "消息标识不合法"}, 400)
+                local_revoker = getattr(self, "_request_local_text_revoker", None)
+                local_only_mode = (
+                    str(getattr(u, "authentication_source", "") or "") == "local"
+                )
+                local_fallback_reason = ""
+                if callable(local_revoker):
+                    try:
+                        local_outcome = local_revoker(to_uid, msg_key)
+                    except Exception:
+                        return self.ok(
+                            {
+                                "ok": False,
+                                "code": "LOCAL_MESSAGE_REVOKE_UNAVAILABLE",
+                                "error": "Web 本地消息撤回服务暂时不可用，请稍后重试",
+                                "retryable": True,
+                            },
+                            503,
+                        )
+                    if isinstance(local_outcome, Mapping):
+                        if local_outcome.get("handled") is True:
+                            return self.ok(
+                                dict(local_outcome.get("payload") or {}),
+                                int(local_outcome.get("status") or 200),
+                            )
+                        local_fallback_reason = str(
+                            local_outcome.get("reason") or ""
+                        ).strip()
+
+                if canonical_message_id:
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "code": (
+                                "LOCAL_MESSAGE_IDENTITY_NOT_READY"
+                                if local_fallback_reason == "sender_not_migrated"
+                                else "LOCAL_MESSAGE_NOT_FOUND"
+                            ),
+                            "error": (
+                                "当前账号尚未完成 Web 消息迁移"
+                                if local_fallback_reason == "sender_not_migrated"
+                                else "Web 本地消息不存在"
+                            ),
+                            "retryable": False,
+                        },
+                        409 if local_fallback_reason == "sender_not_migrated" else 404,
+                    )
+                if local_only_mode:
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "code": "LEGACY_MESSAGE_REVOKE_UNAVAILABLE",
+                            "error": "当前消息没有 Web 本地记录，且外部消息通道已停用",
+                            "retryable": False,
+                        },
+                        409,
+                    )
                 result = u.native.tim_rest.revoke_c2c(from_uid, to_uid, msg_key)
                 out = result.to_dict()
                 out.update({"from": from_uid, "to": to_uid, "msg_key": msg_key})
@@ -5060,6 +5449,7 @@ def _web_user_capabilities(
     *,
     match_pool_online_list_enabled: Optional[bool] = None,
     nearby_custom_city_enabled: Optional[bool] = None,
+    local_password_change_enabled: bool = False,
 ) -> Dict[str, bool]:
     enabled = (
         bool(getattr(user, "match_pool_online_list_enabled", False))
@@ -5079,6 +5469,7 @@ def _web_user_capabilities(
             if nearby_custom_city_enabled is None
             else bool(nearby_custom_city_enabled)
         ),
+        "local_password_change": bool(local_password_change_enabled),
     }
 
 

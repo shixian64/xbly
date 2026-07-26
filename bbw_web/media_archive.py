@@ -19,10 +19,10 @@ from PIL import Image, UnidentifiedImageError
 
 Image.MAX_IMAGE_PIXELS = 40_000_000
 
-IMAGE_LIMIT = 10 * 1024 * 1024
-AUDIO_LIMIT = 10 * 1024 * 1024
-VIDEO_LIMIT = 50 * 1024 * 1024
-FILE_LIMIT = 20 * 1024 * 1024
+IMAGE_LIMIT = 20 * 1024 * 1024
+AUDIO_LIMIT = 20 * 1024 * 1024
+VIDEO_LIMIT = 100 * 1024 * 1024
+FILE_LIMIT = 40 * 1024 * 1024
 
 
 class MediaArchiveError(ValueError):

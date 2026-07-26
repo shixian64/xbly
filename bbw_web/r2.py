@@ -155,6 +155,49 @@ class R2Storage:
             "metadata": {str(key)[:128]: str(value)[:1024] for key, value in metadata.items()},
         }
 
+    def get_bytes(self, key: str, *, max_bytes: int = 1024 * 1024) -> bytes | None:
+        """Return one bounded private object, or ``None`` when it is absent.
+
+        This intentionally does not return response headers or a presigned URL.
+        Callers that only need a capability or integrity check therefore cannot
+        accidentally retain provider-specific response data.
+        """
+
+        limit = int(max_bytes)
+        if limit < 1:
+            raise ValueError("R2 download limit must be positive")
+        try:
+            response = self.client.get_object(Bucket=self.bucket, Key=key)
+        except ClientError as exc:
+            error = exc.response.get("Error") or {}
+            code = str(error.get("Code") or "")
+            status = int(
+                (exc.response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+                or 0
+            )
+            if status == 404 or code in {"404", "NoSuchKey", "NotFound"}:
+                return None
+            raise
+
+        body = response.get("Body")
+        if body is None or not callable(getattr(body, "read", None)):
+            raise RuntimeError("R2 object response body is unavailable")
+        try:
+            declared_size = int(response.get("ContentLength") or 0)
+            if declared_size < 0 or declared_size > limit:
+                raise RuntimeError("R2 object exceeds bounded download limit")
+            data = body.read(limit + 1)
+        finally:
+            close = getattr(body, "close", None)
+            if callable(close):
+                close()
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise RuntimeError("R2 object response body is invalid")
+        result = bytes(data)
+        if len(result) > limit:
+            raise RuntimeError("R2 object exceeds bounded download limit")
+        return result
+
     def delete(self, key: str) -> None:
         self.client.delete_object(Bucket=self.bucket, Key=key)
 

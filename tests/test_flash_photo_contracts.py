@@ -50,7 +50,7 @@ class FlashMultipartTests(unittest.TestCase):
         with self.assertRaisesRegex(flash.FlashPhotoError, "JPEG"):
             flash.inspect_image(b"<svg onload=alert(1)>")
         with patch.object(flash, "MAX_FLASH_GIF_BYTES", 8):
-            with self.assertRaisesRegex(flash.FlashPhotoError, "10MB"):
+            with self.assertRaisesRegex(flash.FlashPhotoError, "20MB"):
                 flash.inspect_image(b"GIF89a123")
 
 

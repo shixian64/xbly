@@ -27,12 +27,11 @@ OSS_BUCKET = "newecs"
 OSS_ENDPOINT = "oss-cn-shanghai.aliyuncs.com"
 OSS_PUBLIC_ORIGIN = "https://oss.banghua.xin"
 
-# Mirrors the limits enforced by the Android chat path: GIF is capped at 10
-# MiB; other images use TUIKit's 29,360,128-byte image limit.  Multipart
-# overhead is bounded separately so an upload cannot bypass the file limit by
-# adding arbitrary form fields.
-MAX_FLASH_GIF_BYTES = 10_485_760
-MAX_FLASH_IMAGE_BYTES = 29_360_128
+# Web-local media uses one image limit for every supported format.  Keeping a
+# smaller GIF cap or the old TUIKit-specific ceiling would make the result
+# depend on whether the request happened to use the legacy flash-photo route.
+MAX_FLASH_GIF_BYTES = 20 * 1024 * 1024
+MAX_FLASH_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_FLASH_MULTIPART_BYTES = MAX_FLASH_IMAGE_BYTES + 64 * 1024
 
 
@@ -183,7 +182,7 @@ def inspect_image(data: bytes) -> ImageInfo:
         raise FlashPhotoError("仅支持 JPEG、PNG、GIF 或 WebP 图片")
 
     if extension == "gif" and size > MAX_FLASH_GIF_BYTES:
-        raise FlashPhotoError("GIF 闪图不能超过 10MB", status=413)
+        raise FlashPhotoError("GIF 闪图不能超过 20MB", status=413)
     return ImageInfo(extension=extension, content_type=content_type, size=size)
 
 

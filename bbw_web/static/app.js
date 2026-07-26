@@ -26,6 +26,13 @@ const MINE_NAV = [
   ...(PRIMARY_NAV.find((item) => item.id === "me")?.children || []),
 ];
 
+const AI_AGENT_NAV = { id: "agent", name: "模型助手", desc: "配置个人模型并生成审核草稿" };
+const AI_AGENT_EXECUTION_ACTIONS = Object.freeze({
+  send_private_message: Object.freeze({ label: "发送私信", needsTarget: true, needsContent: true }),
+  publish_text_post: Object.freeze({ label: "发布公开文字动态", needsTarget: false, needsContent: true }),
+  follow_user: Object.freeze({ label: "关注用户", needsTarget: true, needsContent: false }),
+  unfollow_user: Object.freeze({ label: "取消关注用户", needsTarget: true, needsContent: false }),
+});
 const LAB_NAV = { id: "lab", name: "协议台", desc: "仅限已启用的调试环境" };
 const LEGACY_RELATION_ROUTES = { friends: "friends", visitors: "visitors" };
 const SOCIAL_TABS = ["friends", "apply", "follows", "fans", "visitors", "black"];
@@ -133,12 +140,22 @@ const DISCOVERY_AGES = ["不限", "18-24", "25-34", "35-44", "45+"];
 const S = {
   user: null,
   authenticated: false,
+  authenticationSource: "",
+  dependencyMode: "provider",
   sessionGeneration: 0,
   route: "nearby",
   loginMode: "password",
   loginStage: "credentials",
   inviteLoginAvailable: null,
   labEnabled: false,
+  aiAgentAccessEnabled: false,
+  aiAgentAccessRefreshSeq: 0,
+  aiAgentModelReady: false,
+  aiAgentExecutionAccessEnabled: false,
+  aiAgentExecutionStatus: null,
+  aiAgentAutonomyStatus: null,
+  aiAgentPendingExecution: null,
+  aiAgentExecutionGeneration: 0,
   proactivePrivateMessageEnabled: false,
   directImCredentialsEnabled: false,
   messagePolicyReady: false,
@@ -148,6 +165,7 @@ const S = {
   messagePolicyCleanupGeneration: 0,
   nearbyCustomCityEnabled: false,
   momentVideoCompatEnabled: false,
+  localPasswordChangeEnabled: false,
   privateMessagePeers: new Set(),
   matchMessagePeers: new Set(),
   blockedPrivateMessagePeers: new Set(),
@@ -184,12 +202,16 @@ const S = {
     online: { gender: "不限", property: "不限", age: "不限", city: "" },
     nearby: { gender: "不限", property: "不限", age: "不限", city: "" },
   },
-  nearbyLocation: null,
   nearbyLoadSeq: 0,
   nearbyController: null,
   momentsTab: "推荐",
   momentsSearch: "",
   momentsFeedSeq: 0,
+  profileAvatarDraft: null,
+  momentMediaDraft: [],
+  momentMediaUploading: false,
+  momentPublishRequestId: "",
+  composeObjectUrls: new Set(),
   momentViewObserver: null,
   momentViewRetryTimers: new Set(),
   momentViewScanScheduled: false,
@@ -256,6 +278,7 @@ const S = {
   imArchiveLoadedPeers: new Set(),
   imMessageOlderLoadingPeers: new Set(),
   imMessageHistoryExhaustedPeers: new Set(),
+  imMessageArchiveCursors: new Map(),
   imMessageRenderLimits: new Map(),
   messageSearchOpen: false,
   messageSearchRootScope: "global",
@@ -456,8 +479,8 @@ function usesCoarsePointer() {
 }
 
 function voiceRecordingAvailability() {
-  if (!(S.directImCredentialsEnabled && S.messagePolicyReady)) {
-    return { available: false, reason: "当前账号使用受控消息通道，暂不支持发送语音消息" };
+  if (!S.messagePolicyReady) {
+    return { available: false, reason: "私聊安全策略尚未就绪，请稍后重试" };
   }
   if (!window.isSecureContext) {
     return { available: false, reason: "录音需要安全网页环境或本机访问" };
@@ -636,11 +659,14 @@ const INVALID_AVATAR_VALUES = new Set([
   "{}",
   "[object object]",
 ]);
+const LOCAL_PRIVATE_MEDIA_PATH_RE =
+  /^\/api\/media\/(?:native\/)?[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/content(?:[?#].*)?$/i;
 
 function mediaUrl(value) {
   const raw = String(value || "").trim();
   if (!raw || raw === "null" || raw === "undefined") return "";
   if (/^(?:blob:|data:(?:image|audio|video)\/)/i.test(raw)) return raw;
+  if (LOCAL_PRIVATE_MEDIA_PATH_RE.test(raw)) return raw;
   const canonical = raw.replace(APK_MEDIA_ORIGIN_RE, MEDIA_BASE);
   if (canonical !== raw) return canonical;
   if (raw.startsWith("//")) return `https:${raw}`;
@@ -826,8 +852,9 @@ function ensureTimUploadPluginLoaded() {
 
 function imConnectionStatusText() {
   if (S.imConnecting) return "正在连接消息服务…";
+  if (webLocalDependencyMode()) return "Web 本地消息模式（文字和媒体可用，外部兼容同步不影响本地收发）";
   if (S.imConnected && S.imMode === "sdk") return "实时消息已连接";
-  if (S.imConnected && S.imMode === "rest") return "定时同步模式（约 8 秒，仅支持文本发送）";
+  if (S.imConnected && S.imMode === "rest") return "定时同步模式（约 8 秒，Web 本地文字和媒体可用）";
   return localizedUiText(S.imLastError || "消息服务尚未连接");
 }
 
@@ -857,6 +884,30 @@ function toast(message, type = "info", ms = 2600) {
 
 function errorInfo(data, fallback = "请求未成功") {
   if (!data) return { title: localizedSystemText(fallback, "请求未成功"), detail: "请稍后重试" };
+  const fastApiDetail = data.detail;
+  if (fastApiDetail && typeof fastApiDetail === "object" && !Array.isArray(fastApiDetail)) {
+    const message = String(fastApiDetail.message || fastApiDetail.title || fastApiDetail.detail || "").trim();
+    return {
+      title: localizedSystemText(message || fallback, localizedSystemText(fallback, "请求未成功")),
+      detail: message ? "" : "请稍后重试",
+      action: String(fastApiDetail.action || ""),
+      code: String(fastApiDetail.code || ""),
+      retryable: fastApiDetail.retryable === true,
+    };
+  }
+  if (Array.isArray(fastApiDetail)) {
+    const detail = fastApiDetail
+      .map((item) => String(item?.msg || item?.message || item || "").trim())
+      .filter(Boolean)
+      .slice(0, 3)
+      .join("；");
+    return {
+      title: localizedSystemText(fallback, "请求未成功"),
+      detail: localizedSystemText(detail, "请求参数不正确"),
+      action: "",
+      code: "validation_error",
+    };
+  }
   if (typeof data.error === "string") {
     return {
       title: localizedSystemText(data.error || fallback, localizedSystemText(fallback, "请求未成功")),
@@ -994,6 +1045,7 @@ async function api(path, options = {}) {
     if (response.status === 401 && !authOptional && !path.includes("/api/auth/")) {
       S.authenticated = false;
       S.sessionGeneration += 1;
+      setAiAgentAccess(false, null, { redirect: false });
       S.user = null;
       S.meStats = null;
       S.meStatsAt = 0;
@@ -1012,6 +1064,7 @@ async function api(path, options = {}) {
       clearFlashAckDeliveryState();
       S._imConnecting = null;
       S.imConnectingGeneration = -1;
+      clearComposeDrafts();
       scrubAuthenticatedDom();
       applyUser(null);
       if (VOICE_MATCH_ENABLED) void cleanupVoiceMatch({ disconnect: true });
@@ -1702,12 +1755,43 @@ function showLogin(show, clearSecrets = false) {
   }
 }
 
+function webLocalDependencyMode(value = S.dependencyMode) {
+  const mode = String(value || "").trim().toLowerCase();
+  return mode === "degraded" || mode === "local" || mode.includes("web-local");
+}
+
+function applyDependencyMode(data) {
+  if (!data || typeof data !== "object") return false;
+  const hasMode = Object.prototype.hasOwnProperty.call(data, "dependency_mode");
+  const hasSource = Object.prototype.hasOwnProperty.call(data, "auth_source");
+  if (!hasMode && !hasSource) return webLocalDependencyMode();
+  const authenticationSource = String(data.auth_source || "").trim().toLowerCase();
+  const dependencyMode = String(data.dependency_mode || "").trim().toLowerCase();
+  const local = webLocalDependencyMode(dependencyMode) || authenticationSource === "web-local";
+  S.authenticationSource = authenticationSource;
+  S.dependencyMode = local ? "web-local/degraded" : dependencyMode || "provider";
+  if (local) {
+    S.directImCredentialsEnabled = false;
+    S.imComposerPanel = "";
+    S.imVoiceMode = false;
+    S.imConnected = true;
+    S.imMode = "rest";
+    S.imConnecting = false;
+    S.imNextReconnectAt = 0;
+    S.imLastError = "";
+    updateImConnectionStatus();
+  }
+  return local;
+}
+
 function applyUser(user) {
   S.user = user || null;
   syncDismissedConversationAccount();
   syncConversationProfileAccount();
   const avatar = $("side-avatar");
   if (!user) {
+    S.authenticationSource = "";
+    S.dependencyMode = "provider";
     avatar.replaceChildren();
     avatar.hidden = true;
     S.proactivePrivateMessageEnabled = false;
@@ -1770,11 +1854,13 @@ function applyCapabilities(
   const previousDirectCredentials = S.directImCredentialsEnabled;
   const previousNearbyCustomCity = S.nearbyCustomCityEnabled;
   const previousMomentVideoCompat = S.momentVideoCompatEnabled;
+  const previousLocalPasswordChange = S.localPasswordChangeEnabled;
   if (Object.prototype.hasOwnProperty.call(capabilities, "proactive_private_message")) {
     S.proactivePrivateMessageEnabled = capabilities.proactive_private_message === true;
   }
   if (Object.prototype.hasOwnProperty.call(capabilities, "direct_im_credentials")) {
-    S.directImCredentialsEnabled = capabilities.direct_im_credentials === true;
+    S.directImCredentialsEnabled =
+      capabilities.direct_im_credentials === true && !webLocalDependencyMode();
   }
   if (Object.prototype.hasOwnProperty.call(capabilities, "nearby_custom_city")) {
     S.nearbyCustomCityEnabled = capabilities.nearby_custom_city === true;
@@ -1782,12 +1868,17 @@ function applyCapabilities(
   if (Object.prototype.hasOwnProperty.call(capabilities, "moment_video_compat")) {
     S.momentVideoCompatEnabled = capabilities.moment_video_compat === true;
   }
+  if (Object.prototype.hasOwnProperty.call(capabilities, "local_password_change")) {
+    S.localPasswordChangeEnabled = capabilities.local_password_change === true;
+  }
   const proactiveChanged = previousProactive !== S.proactivePrivateMessageEnabled;
   const directCredentialsChanged =
     previousDirectCredentials !== S.directImCredentialsEnabled;
   const nearbyCustomCityChanged = previousNearbyCustomCity !== S.nearbyCustomCityEnabled;
   const momentVideoCompatChanged = previousMomentVideoCompat !== S.momentVideoCompatEnabled;
-  if (!proactiveChanged && !directCredentialsChanged && !nearbyCustomCityChanged && !momentVideoCompatChanged) {
+  const localPasswordChangeChanged =
+    previousLocalPasswordChange !== S.localPasswordChangeEnabled;
+  if (!proactiveChanged && !directCredentialsChanged && !nearbyCustomCityChanged && !momentVideoCompatChanged && !localPasswordChangeChanged) {
     return false;
   }
   const messageCapabilitiesChanged = proactiveChanged || directCredentialsChanged;
@@ -1804,6 +1895,7 @@ function applyCapabilities(
       message: "当前运行模式不支持视频兼容转换",
     });
   }
+  if (localPasswordChangeChanged) clearViewCacheKey("me");
   if (messageCapabilitiesChanged) {
     S.messagePolicyGeneration += 1;
   }
@@ -1829,6 +1921,254 @@ function applyCapabilities(
     });
   }
   return messageCapabilitiesChanged;
+}
+
+function clearAgentApiKeyInputs(scope = document) {
+  if (!scope || typeof scope.querySelectorAll !== "function") return;
+  scope
+    .querySelectorAll('form[data-form="agent-connection"] input[name="api_key"]')
+    .forEach((input) => {
+      input.value = "";
+    });
+}
+
+function clearAiAgentPendingExecution({ clearPanel = true } = {}) {
+  S.aiAgentExecutionGeneration += 1;
+  S.aiAgentPendingExecution = null;
+  if (!clearPanel) return;
+  const panel = $("agent-execution-confirmation");
+  if (panel) panel.replaceChildren();
+}
+
+function normalizedAiAgentExecutionStatus(status) {
+  const source = status?.execution;
+  if (
+    !source ||
+    typeof source !== "object" ||
+    source.available !== true ||
+    source.admin_granted !== true ||
+    source.system_enabled !== true
+  ) {
+    return null;
+  }
+  const allowedActions = [...new Set(Array.isArray(source.allowed_actions) ? source.allowed_actions : [])]
+    .map((action) => String(action || "").trim())
+    .filter((action) => Object.prototype.hasOwnProperty.call(AI_AGENT_EXECUTION_ACTIONS, action));
+  const allowedSet = new Set(allowedActions);
+  const selectedActions = [...new Set(Array.isArray(source.selected_actions) ? source.selected_actions : [])]
+    .map((action) => String(action || "").trim())
+    .filter((action) => allowedSet.has(action));
+  return Object.freeze({
+    available: true,
+    admin_granted: true,
+    system_enabled: true,
+    user_enabled: source.user_enabled === true,
+    auto_send_enabled: source.auto_send_enabled === true,
+    allowed_actions: Object.freeze(allowedActions),
+    selected_actions: Object.freeze(selectedActions),
+  });
+}
+
+function setAiAgentExecutionStatus(status) {
+  const previous = S.aiAgentExecutionStatus;
+  const next = normalizedAiAgentExecutionStatus(status);
+  const statusChanged =
+    previous?.user_enabled !== next?.user_enabled ||
+    previous?.auto_send_enabled !== next?.auto_send_enabled ||
+    previous?.allowed_actions?.join("\u0000") !== next?.allowed_actions?.join("\u0000") ||
+    previous?.selected_actions?.join("\u0000") !== next?.selected_actions?.join("\u0000");
+  S.aiAgentExecutionAccessEnabled = Boolean(next);
+  S.aiAgentExecutionStatus = next;
+  const pending = S.aiAgentPendingExecution;
+  const pendingAllowed =
+    next?.user_enabled === true &&
+    S.aiAgentModelReady &&
+    pending?.sessionGeneration === S.sessionGeneration &&
+    pending?.executionGeneration === S.aiAgentExecutionGeneration &&
+    (pending.kind === "reply_send"
+      ? S.aiAgentModelReady &&
+        next.auto_send_enabled === true &&
+        next.selected_actions.includes("send_private_message")
+      : next.selected_actions.includes(pending.action));
+  if (statusChanged || (pending && !pendingAllowed)) clearAiAgentPendingExecution();
+  if (!next) $("agent-execution-section")?.remove();
+}
+
+function normalizedAiAgentAutonomyStatus(status) {
+  const source = status?.autonomy;
+  if (!source || typeof source !== "object" || source.visible !== true) return null;
+  const boundedInteger = (value, fallback, minimum, maximum) => {
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed)) return fallback;
+    return Math.min(maximum, Math.max(minimum, parsed));
+  };
+  const allowedActions = [...new Set(Array.isArray(source.allowed_actions) ? source.allowed_actions : [])]
+    .map((action) => String(action || "").trim())
+    .filter((action) => Object.prototype.hasOwnProperty.call(AI_AGENT_EXECUTION_ACTIONS, action));
+  const managedTargets = [...new Set(Array.isArray(source.managed_target_uids) ? source.managed_target_uids : [])]
+    .map((uid) => String(uid || "").trim())
+    .filter((uid) => uid && uid.length <= 128)
+    .slice(0, 100);
+  const recentTasks = Array.isArray(source.recent_tasks)
+    ? source.recent_tasks
+        .filter((task) => task && typeof task === "object")
+        .slice(0, 12)
+        .map((task) => Object.freeze({ ...task }))
+    : [];
+  return Object.freeze({
+    visible: true,
+    available: source.available === true,
+    system_enabled: source.system_enabled === true,
+    user_authorized: source.user_authorized === true,
+    background_enabled: source.background_enabled === true,
+    user_enabled: source.user_enabled === true,
+    effective_enabled: source.effective_enabled === true,
+    halted: source.halted === true,
+    halted_reason: String(source.halted_reason || "").trim().slice(0, 500),
+    auto_reply_enabled: source.auto_reply_enabled === true,
+    scheduled_post_enabled: source.scheduled_post_enabled === true,
+    managed_relationships_enabled: source.managed_relationships_enabled === true,
+    allowed_actions: Object.freeze(allowedActions),
+    operation_brief: String(source.operation_brief || "").slice(0, 4000),
+    managed_target_uids: Object.freeze(managedTargets),
+    timezone: String(source.timezone || "UTC").trim().slice(0, 64) || "UTC",
+    active_start_minute: boundedInteger(source.active_start_minute, 0, 0, 1439),
+    active_end_minute: boundedInteger(source.active_end_minute, 0, 0, 1439),
+    minimum_action_interval_seconds: boundedInteger(
+      source.minimum_action_interval_seconds,
+      300,
+      60,
+      86400
+    ),
+    daily_total_limit: boundedInteger(source.daily_total_limit, 20, 1, 200),
+    daily_reply_limit: boundedInteger(source.daily_reply_limit, 10, 0, 200),
+    daily_post_limit: boundedInteger(source.daily_post_limit, 1, 0, 20),
+    daily_relationship_limit: boundedInteger(source.daily_relationship_limit, 5, 0, 100),
+    post_interval_minutes: boundedInteger(source.post_interval_minutes, 1440, 60, 10080),
+    consecutive_failure_limit: boundedInteger(source.consecutive_failure_limit, 3, 1, 20),
+    recent_tasks: Object.freeze(recentTasks),
+  });
+}
+
+function setAiAgentAutonomyStatus(status) {
+  const next = normalizedAiAgentAutonomyStatus(status);
+  S.aiAgentAutonomyStatus = next;
+  if (!next) $("agent-autonomy-section")?.remove();
+}
+
+function setAiAgentAccess(enabled, status = null, { redirect = true } = {}) {
+  S.aiAgentAccessRefreshSeq += 1;
+  const nextEnabled = enabled === true;
+  const changed = S.aiAgentAccessEnabled !== nextEnabled;
+  S.aiAgentAccessEnabled = nextEnabled;
+  S.aiAgentModelReady = nextEnabled && status?.settings?.ready === true;
+  setAiAgentExecutionStatus(nextEnabled ? status : null);
+  setAiAgentAutonomyStatus(nextEnabled ? status : null);
+  if (!nextEnabled) {
+    clearAgentApiKeyInputs(document);
+    clearViewCacheKey("agent");
+  }
+  if (changed) buildNav();
+  if (!nextEnabled && redirect && S.authenticated && S.route === "agent") {
+    go("me", { replace: true, force: true });
+  }
+  return changed;
+}
+
+function agentErrorMessage(data, fallback = "模型助手请求未成功") {
+  const detail = data?.detail;
+  if (typeof detail === "string" && detail.trim()) return detail.trim();
+  if (detail && typeof detail === "object") {
+    const nested = detail.message || detail.error || detail.detail;
+    if (typeof nested === "string" && nested.trim()) return nested.trim();
+  }
+  if (typeof data?.message === "string" && data.message.trim()) return data.message.trim();
+  if (typeof data?.error === "string" && data.error.trim()) return data.error.trim();
+  return fallback;
+}
+
+async function refreshAiAgentAccess({ redirect = true, signal = null } = {}) {
+  const generation = S.sessionGeneration;
+  const requestSeq = ++S.aiAgentAccessRefreshSeq;
+  if (!S.authenticated) {
+    setAiAgentAccess(false, null, { redirect: false });
+    return null;
+  }
+  const responseIsCurrent = () =>
+    S.authenticated &&
+    generation === S.sessionGeneration &&
+    requestSeq === S.aiAgentAccessRefreshSeq;
+  try {
+    const result = await api("/api/agent/status", {
+      authOptional: true,
+      timeout: 5000,
+      priority: "low",
+      signal,
+    });
+    if (!responseIsCurrent()) return null;
+    if (result.status === 200 && result.data?.ok && result.data?.available === true) {
+      setAiAgentAccess(true, result.data, { redirect: false });
+      return result.data;
+    }
+    if ([401, 403, 404].includes(result.status)) {
+      setAiAgentAccess(false, null, { redirect });
+    }
+  } catch (error) {
+    if (error?.name === "AbortError") throw error;
+  }
+  return null;
+}
+
+async function agentApi(path, options = {}) {
+  const result = await api(path, options);
+  if (!result.ok || result.data?.ok === false) {
+    if ([403, 404].includes(result.status)) {
+      setAiAgentAccess(false, null, { redirect: true });
+    }
+    throw new Error(agentErrorMessage(result.data));
+  }
+  return result.data;
+}
+
+async function agentExecutionApi(path, options = {}) {
+  if (!S.aiAgentExecutionAccessEnabled) throw new Error("账号执行功能当前不可用");
+  const result = await api(path, options);
+  if (!result.ok || result.data?.ok === false) {
+    if ([403, 404].includes(result.status)) {
+      setAiAgentExecutionStatus(null);
+      void refreshAiAgentAccess({ redirect: true }).catch(() => {});
+    }
+    const requestError = new Error(agentErrorMessage(result.data, "账号执行请求未成功"));
+    requestError.status = Number(result.status || 0);
+    throw requestError;
+  }
+  if (result.data?.execution && typeof result.data.execution === "object") {
+    setAiAgentExecutionStatus({ execution: result.data.execution });
+  }
+  return result.data;
+}
+
+async function agentAutonomyApi(path, options = {}) {
+  if (!S.aiAgentAutonomyStatus?.visible) throw new Error("无人值守 Agent 当前不可用");
+  const result = await api(path, options);
+  if (!result.ok || result.data?.ok === false) {
+    if ([403, 404].includes(result.status)) {
+      setAiAgentAutonomyStatus(null);
+      void refreshAiAgentAccess({ redirect: false }).catch(() => {});
+    }
+    const requestError = new Error(agentErrorMessage(result.data, "无人值守 Agent 设置未保存"));
+    requestError.status = Number(result.status || 0);
+    throw requestError;
+  }
+  if (result.data?.autonomy && typeof result.data.autonomy === "object") {
+    setAiAgentAutonomyStatus({ autonomy: result.data.autonomy });
+  }
+  return result.data;
+}
+
+function newAgentIdempotencyKey() {
+  if (typeof window.crypto?.randomUUID === "function") return window.crypto.randomUUID();
+  return `agent-${Date.now()}-${Math.random().toString(36).slice(2, 14)}`;
 }
 
 function setLoginMode(mode) {
@@ -1862,8 +2202,23 @@ function setLoginStage(stage) {
   }
 }
 
+function mineNavItems() {
+  return S.aiAgentAccessEnabled ? [...MINE_NAV, AI_AGENT_NAV] : MINE_NAV;
+}
+
+function visiblePrimaryNav() {
+  return PRIMARY_NAV.map((item) =>
+    item.id === "me" && S.aiAgentAccessEnabled
+      ? { ...item, children: [...(item.children || []), AI_AGENT_NAV] }
+      : item
+  );
+}
+
 function navItems() {
-  return [...PRIMARY_NAV.flatMap((item) => [item, ...(item.children || [])]), ...(S.labEnabled ? [LAB_NAV] : [])];
+  return [
+    ...visiblePrimaryNav().flatMap((item) => [item, ...(item.children || [])]),
+    ...(S.labEnabled ? [LAB_NAV] : []),
+  ];
 }
 
 function isRouteAllowed(id) {
@@ -1872,7 +2227,7 @@ function isRouteAllowed(id) {
 
 function navParentRoute(id) {
   if (id === "lab" && S.labEnabled) return "me";
-  const parent = PRIMARY_NAV.find(
+  const parent = visiblePrimaryNav().find(
     (item) => item.id === id || (item.children || []).some((child) => child.id === id)
   );
   return parent?.id || id;
@@ -1880,7 +2235,7 @@ function navParentRoute(id) {
 
 function navButton(item, bottom = false) {
   const current = item.id === S.route;
-  const branchOn = PRIMARY_NAV.some((nav) => nav.id === item.id) && navParentRoute(S.route) === item.id;
+  const branchOn = visiblePrimaryNav().some((nav) => nav.id === item.id) && navParentRoute(S.route) === item.id;
   const on = current || branchOn;
   const unread = item.id === "msg" ? `<small class="nav-unread${S.unreadTotal ? "" : " hide"}" data-unread-badge>${esc(
     S.unreadTotal > 99 ? "99+" : S.unreadTotal
@@ -1909,11 +2264,12 @@ function navGroup(item) {
 }
 
 function isMineRoute(id) {
-  return MINE_NAV.some((item) => item.id === id) || (id === "lab" && S.labEnabled);
+  return mineNavItems().some((item) => item.id === id) || (id === "lab" && S.labEnabled);
 }
 
 function mineSubnavHtml(activeRoute = S.route) {
-  const items = S.labEnabled ? [...MINE_NAV, LAB_NAV] : MINE_NAV;
+  const visibleMine = mineNavItems();
+  const items = S.labEnabled ? [...visibleMine, LAB_NAV] : visibleMine;
   return `<nav class="mine-subnav tab-row ui-scrollbar ui-scrollbar--compact" role="tablist" aria-label="我的功能">${items
     .map((item) => {
       const active = item.id === activeRoute;
@@ -2278,6 +2634,7 @@ async function loadConversationPreview(peer, activityTimestamp, { refreshList = 
   const target = String(peer || "").trim();
   const activity = Math.max(0, Number(activityTimestamp || 0));
   const generation = S.sessionGeneration;
+  if (webLocalDependencyMode()) return false;
   if (!target || !activity || S.conversationPreviewLoadingPeers.has(target)) return false;
   S.conversationPreviewLoadingPeers.add(target);
   try {
@@ -2405,6 +2762,9 @@ function loadArchivedConversationSummary({ force = false } = {}) {
 }
 
 function refreshConversationSummary({ force = false } = {}) {
+  if (webLocalDependencyMode()) {
+    return loadArchivedConversationSummary({ force: true });
+  }
   const now = Date.now();
   if (S.conversationRefreshPromise) return S.conversationRefreshPromise;
   if (now < S.conversationNextRefreshAt) return Promise.resolve(S.conversations);
@@ -2450,6 +2810,7 @@ function syncConversationSummaryInBackground({ force = false } = {}) {
     S.messageLastSummarySyncAt = now;
     return Promise.allSettled([
       refreshConversationSummary({ force }),
+      loadArchivedConversationSummary({ force: true }),
       refreshVisiblePeerPresence(),
     ]);
   }
@@ -2544,10 +2905,11 @@ function scheduleAuthenticatedServices(delay = 250) {
 }
 
 function buildNav() {
-  $("primary-nav").innerHTML = PRIMARY_NAV.map(navGroup).join("");
+  const primaryItems = visiblePrimaryNav();
+  $("primary-nav").innerHTML = primaryItems.map(navGroup).join("");
   $("secondary-nav").innerHTML = S.labEnabled ? navButton(LAB_NAV) : "";
   $("tools-nav-section").classList.toggle("hide", !S.labEnabled);
-  $("bottom-nav").innerHTML = PRIMARY_NAV.map((item) => navButton(item, true)).join("");
+  $("bottom-nav").innerHTML = primaryItems.map((item) => navButton(item, true)).join("");
 }
 
 function syncMessageReadAction() {
@@ -2566,7 +2928,7 @@ function syncNav() {
   document.querySelectorAll("#primary-nav [data-route], #secondary-nav [data-route], #bottom-nav [data-route]").forEach((button) => {
     const route = button.dataset.route;
     const current = route === S.route;
-    const branchOn = PRIMARY_NAV.some((item) => item.id === route) && navParentRoute(S.route) === route;
+    const branchOn = visiblePrimaryNav().some((item) => item.id === route) && navParentRoute(S.route) === route;
     const bottomBranchOn = button.classList.contains("bottom-item") && branchOn;
     button.classList.toggle("on", current || bottomBranchOn);
     button.classList.toggle("branch-on", !button.classList.contains("bottom-item") && !current && branchOn);
@@ -2728,6 +3090,10 @@ async function switchMineTab(id, { force = false, replace = false } = {}) {
     S.nearbyController = null;
   }
   if (target === S.route && !force) return;
+  if (S.route === "agent" && target !== "agent") {
+    clearAgentApiKeyInputs(panel);
+    clearAiAgentPendingExecution();
+  }
 
   const previousRoute = S.route;
   const previousRouteKey = routeCacheKey(previousRoute);
@@ -2829,6 +3195,11 @@ function minePanelCacheKey(route) {
   return `mine:${routeCacheKey(route)}`;
 }
 
+function isSensitiveRouteCacheKey(key) {
+  const normalized = String(key || "");
+  return normalized === "agent" || normalized === "mine:agent";
+}
+
 function viewCacheTtl(key) {
   const normalized = String(key || "");
   if (
@@ -2846,6 +3217,10 @@ function viewCacheTtl(key) {
 }
 
 function reusableCacheEntry(cache, key) {
+  if (isSensitiveRouteCacheKey(key)) {
+    cache.delete(key);
+    return null;
+  }
   const entry = cache.get(key);
   if (!entry) return null;
   const age = Date.now() - Number(entry.time || 0);
@@ -2869,6 +3244,10 @@ function trimDomCache(cache, limit) {
 function rememberRouteDomSnapshot(key = S.routeDomKey) {
   const page = root();
   const target = String(key || "");
+  if (isSensitiveRouteCacheKey(target)) {
+    clearViewCacheKey("agent");
+    return;
+  }
   if (!page || !target || !page.childNodes.length) return;
   S.routeDomCache.delete(target);
   S.routeDomCache.set(target, {
@@ -2916,6 +3295,10 @@ function restoreRouteDomSnapshot(key, entry) {
 
 function rememberPanelDomSnapshot(key, panel) {
   const target = String(key || "");
+  if (isSensitiveRouteCacheKey(target)) {
+    S.panelDomCache.delete(target);
+    return;
+  }
   if (!target || !panel || !panel.childNodes.length) return;
   S.panelDomCache.delete(target);
   S.panelDomCache.set(target, {
@@ -2964,6 +3347,11 @@ function discardCurrentMinePanelDomSnapshot() {
 }
 
 function rememberPanelSnapshot(key, html, metadata = {}) {
+  if (isSensitiveRouteCacheKey(key)) {
+    S.panelCache.delete(key);
+    S.panelDomCache.delete(key);
+    return;
+  }
   S.panelCache.set(key, { html, metadata, time: Date.now() });
   S.panelDomCache.delete(key);
   while (S.panelCache.size > PANEL_CACHE_LIMIT) {
@@ -2976,6 +3364,10 @@ function rememberPanelSnapshot(key, html, metadata = {}) {
 
 function rememberCurrentPageSnapshot(key = routeCacheKey(S.route)) {
   if (!root()) return;
+  if (S.route === "agent" || isSensitiveRouteCacheKey(key)) {
+    clearViewCacheKey("agent");
+    return;
+  }
   if (S.route !== "msg") {
     S.pageCache.set(key, { html: root().innerHTML, time: Date.now() });
     trimDomCache(S.pageCache, PAGE_CACHE_LIMIT);
@@ -3054,6 +3446,7 @@ async function hydrateMeStats(signal, { force = false } = {}) {
 
 function hydrateRenderedRoute(route, signal, seq) {
   if (route === "me") {
+    renderProfileAvatarDraft();
     void hydrateMeStats(signal).catch((error) => {
       if (error?.name !== "AbortError" && seq === S.routeSeq && S.route === "me") {
         console.info("[me-stats]", error?.message || error);
@@ -3067,7 +3460,25 @@ function hydrateRenderedRoute(route, signal, seq) {
       }
     });
   }
-  if (route === "moments") observeMomentCards();
+  if (route === "moments") {
+    setMomentComposeLocked(
+      document.querySelector('form[data-form="moment-publish"]'),
+      S.momentMediaUploading
+    );
+    observeMomentCards();
+  }
+  if (route === "agent") {
+    document
+      .querySelectorAll('form[data-form="agent-action-review"]')
+      .forEach((form) => syncAgentExecutionActionForm(form));
+    document
+      .querySelectorAll('form[data-form="agent-execution-settings"]')
+      .forEach((form) => syncAgentExecutionSettingsForm(form));
+    document
+      .querySelectorAll('form[data-form="agent-autonomy-settings"]')
+      .forEach((form) => syncAgentAutonomySettingsForm(form));
+    renderAiAgentExecutionConfirmation();
+  }
   if (S.authenticatedServicesPending) scheduleAuthenticatedServices(1000);
 }
 
@@ -3110,6 +3521,10 @@ async function activateRoute(id, { force = false } = {}) {
   }
   const cacheKey = routeCacheKey(target);
   const previousDomKey = S.routeDomKey;
+  if (S.route === "agent" && target !== "agent") {
+    clearAgentApiKeyInputs(root());
+    clearAiAgentPendingExecution();
+  }
   if (previousDomKey && (previousDomKey !== cacheKey || force)) {
     suspendMomentVideos(root(), { cancelCompat: true });
   }
@@ -3194,7 +3609,7 @@ async function activateRoute(id, { force = false } = {}) {
     const rendered = `<div class="page-enter">${withMineSubnav(target, html)}</div>`;
     if (!routeDomRestored || cached?.html !== rendered) root().innerHTML = rendered;
     S.routeDomKey = cacheKey;
-    if (target !== "msg") {
+    if (target !== "msg" && target !== "agent") {
       S.pageCache.set(cacheKey, { html: rendered, time: Date.now() });
       trimDomCache(S.pageCache, PAGE_CACHE_LIMIT);
       if (isMineRoute(target)) {
@@ -3221,7 +3636,7 @@ async function activateRoute(id, { force = false } = {}) {
         }
       });
     }
-    rememberRouteDomSnapshot(cacheKey);
+    if (target !== "agent") rememberRouteDomSnapshot(cacheKey);
   } catch (error) {
     if (error && error.name === "AbortError") return;
     if (error instanceof AuthExpiredError) return;
@@ -3235,7 +3650,7 @@ async function activateRoute(id, { force = false } = {}) {
       errorState(error.message || String(error), target)
     );
     S.routeDomKey = cacheKey;
-    rememberRouteDomSnapshot(cacheKey);
+    if (target !== "agent") rememberRouteDomSnapshot(cacheKey);
     if (S.authenticatedServicesPending) scheduleAuthenticatedServices(1000);
   } finally {
     if (seq === S.routeSeq) {
@@ -4207,11 +4622,14 @@ function conversationUnreadAuthoritative(item) {
 function normalizeConversationSummary(item, { authority = "live", observedAt = Date.now() } = {}) {
   const conversation = item && typeof item === "object" ? { ...item } : {};
   const source = String(conversation.source || authority || "").toLowerCase();
+  const provider = String(conversation.provider || "").toLowerCase();
   const preview = conversationPreview(conversation);
   const previewTimestamp = conversationPreviewTimestamp(conversation);
   const archive = authority === "archive" || source === "archive";
+  const localArchiveUnread =
+    archive && provider === "web-local" && conversation.unread_authoritative === true;
   const unreadAuthoritative = archive
-    ? false
+    ? localArchiveUnread
     : conversation.unread_authoritative == null
       ? true
       : conversation.unread_authoritative === true;
@@ -4865,6 +5283,285 @@ function clearMomentCache() {
   clearViewCacheKey("me");
 }
 
+function newComposeRequestId(prefix = "compose") {
+  if (typeof window.crypto?.randomUUID === "function") return `${prefix}-${window.crypto.randomUUID()}`;
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 14)}`;
+}
+
+function createComposeObjectUrl(file) {
+  const url = URL.createObjectURL(file);
+  S.composeObjectUrls.add(url);
+  return url;
+}
+
+function revokeComposeObjectUrl(url) {
+  const value = String(url || "");
+  if (!value || !S.composeObjectUrls.has(value)) return;
+  URL.revokeObjectURL(value);
+  S.composeObjectUrls.delete(value);
+}
+
+function revokeAllComposeObjectUrls() {
+  [...S.composeObjectUrls].forEach((url) => URL.revokeObjectURL(url));
+  S.composeObjectUrls.clear();
+}
+
+function profileAvatarPreviewHtml(user = S.user) {
+  const draft = S.profileAvatarDraft;
+  const src = String(draft?.previewUrl || mediaUrl(validAvatarValue(user?.avatar, user?.portrait)) || "");
+  if (!src) return "";
+  return `<img src="${esc(src)}" alt="${draft ? "所选头像预览" : "当前头像"}" loading="eager" decoding="async" referrerpolicy="no-referrer" />`;
+}
+
+function profileAvatarDraftStatus() {
+  const draft = S.profileAvatarDraft;
+  if (!draft) return "请选择本地图片作为新头像";
+  if (draft.uploading) return `正在上传 ${Math.round(Math.max(0, Math.min(1, Number(draft.progress || 0))) * 100)}%`;
+  if (draft.assetId) return "图片已上传，正在等待保存或可直接重试保存";
+  if (draft.error) return String(draft.error);
+  return `${draft.file?.name || "所选图片"} · ${formatFileSize(draft.file?.size || 0)}`;
+}
+
+function renderProfileAvatarDraft({ refreshPreview = true } = {}) {
+  const preview = document.querySelector("[data-profile-avatar-preview]");
+  if (preview && refreshPreview) {
+    const html = profileAvatarPreviewHtml();
+    preview.innerHTML = html;
+    preview.hidden = !html;
+  }
+  const status = document.querySelector("[data-profile-avatar-status]");
+  if (status) status.textContent = profileAvatarDraftStatus();
+  const progress = document.querySelector("[data-profile-avatar-progress]");
+  if (progress) {
+    progress.value = Math.round(Math.max(0, Math.min(1, Number(S.profileAvatarDraft?.progress || 0))) * 100);
+    progress.hidden = !S.profileAvatarDraft?.uploading;
+  }
+  const remove = document.querySelector('[data-action="profile-avatar-remove"]');
+  if (remove) {
+    const locked = !S.profileAvatarDraft || Boolean(S.profileAvatarDraft.uploading);
+    remove.dataset.locked = String(locked);
+    remove.disabled = locked;
+  }
+  const submit = document.querySelector("[data-profile-avatar-submit]");
+  if (submit) {
+    const locked = !S.profileAvatarDraft || Boolean(S.profileAvatarDraft.uploading);
+    submit.dataset.locked = String(locked);
+    if (submit.dataset.pending !== "true") submit.disabled = locked;
+  }
+}
+
+function clearProfileAvatarDraft({ render = true } = {}) {
+  revokeComposeObjectUrl(S.profileAvatarDraft?.previewUrl);
+  S.profileAvatarDraft = null;
+  const input = document.querySelector("input[data-profile-avatar]");
+  if (input) input.value = "";
+  if (render) renderProfileAvatarDraft();
+}
+
+function selectProfileAvatarFile(rawFile) {
+  const file = normalizeChatPickerFile("image", rawFile);
+  validateChatFile("image", file);
+  clearProfileAvatarDraft({ render: false });
+  S.profileAvatarDraft = {
+    file,
+    previewUrl: createComposeObjectUrl(file),
+    assetId: "",
+    progress: 0,
+    uploading: false,
+    error: "",
+  };
+  renderProfileAvatarDraft();
+}
+
+function momentMediaDraftStatus(draft) {
+  if (draft.uploading) return `正在上传 ${Math.round(Math.max(0, Math.min(1, Number(draft.progress || 0))) * 100)}%`;
+  if (draft.assetId) return "已上传，等待发布";
+  if (draft.error) return String(draft.error);
+  return `${draft.file?.name || (draft.kind === "video" ? "所选视频" : "所选图片")} · ${formatFileSize(
+    draft.file?.size || 0
+  )}`;
+}
+
+function momentMediaDraftHtml() {
+  return S.momentMediaDraft
+    .map((draft) => {
+      const media =
+        draft.kind === "video"
+          ? `<video src="${esc(draft.previewUrl)}" controls controlslist="nodownload noremoteplayback" disablepictureinpicture disableremoteplayback muted playsinline preload="metadata"></video>`
+          : `<img src="${esc(draft.previewUrl)}" alt="所选动态图片预览" loading="eager" decoding="async" />`;
+      return `<article class="moment-compose-preview-item" data-moment-draft-id="${esc(draft.id)}">
+        <div class="moment-compose-preview-media">${media}</div>
+        <div class="moment-compose-preview-meta"><span>${esc(momentMediaDraftStatus(draft))}</span><button type="button" class="btn soft small" data-action="moment-media-remove" data-draft-id="${esc(
+          draft.id
+        )}" ${S.momentMediaUploading ? "disabled" : ""}>移除</button></div>
+        <progress class="media-upload-track" data-moment-draft-progress max="100" value="${Math.round(
+          Math.max(0, Math.min(1, Number(draft.progress || 0))) * 100
+        )}" ${draft.uploading ? "" : "hidden"}></progress>
+      </article>`;
+    })
+    .join("");
+}
+
+function renderMomentMediaDraft() {
+  const preview = document.querySelector("[data-moment-media-preview]");
+  if (preview) {
+    preview.innerHTML = momentMediaDraftHtml();
+    preview.hidden = !S.momentMediaDraft.length;
+  }
+  const status = document.querySelector("[data-moment-media-status]");
+  if (status) {
+    const pictures = S.momentMediaDraft.filter((draft) => draft.kind === "image").length;
+    const videos = S.momentMediaDraft.filter((draft) => draft.kind === "video").length;
+    status.textContent = videos ? "已选择 1 个视频" : pictures ? `已选择 ${pictures} 张图片，最多 9 张` : "可选择最多 9 张图片，或 1 个视频";
+  }
+  const clear = document.querySelector('[data-action="moment-media-clear"]');
+  if (clear) {
+    const locked = !S.momentMediaDraft.length || S.momentMediaUploading;
+    clear.dataset.locked = String(locked);
+    clear.disabled = locked;
+  }
+}
+
+function updateMomentMediaDraftProgress(draft) {
+  const item = [...document.querySelectorAll("[data-moment-draft-id]")].find(
+    (element) => element.dataset.momentDraftId === draft.id
+  );
+  if (!item) return;
+  const status = item.querySelector(".moment-compose-preview-meta span");
+  if (status) status.textContent = momentMediaDraftStatus(draft);
+  const progress = item.querySelector("[data-moment-draft-progress]");
+  if (progress) {
+    progress.value = Math.round(Math.max(0, Math.min(1, Number(draft.progress || 0))) * 100);
+    progress.hidden = !draft.uploading;
+  }
+}
+
+function clearMomentMediaDraft({ render = true } = {}) {
+  S.momentMediaDraft.forEach((draft) => revokeComposeObjectUrl(draft.previewUrl));
+  S.momentMediaDraft = [];
+  S.momentPublishRequestId = "";
+  document.querySelectorAll("input[data-moment-media]").forEach((input) => {
+    input.value = "";
+  });
+  if (render) renderMomentMediaDraft();
+}
+
+function removeMomentMediaDraft(draftId) {
+  const target = String(draftId || "");
+  const draft = S.momentMediaDraft.find((item) => item.id === target);
+  if (!draft) return;
+  revokeComposeObjectUrl(draft.previewUrl);
+  S.momentMediaDraft = S.momentMediaDraft.filter((item) => item !== draft);
+  S.momentPublishRequestId = "";
+  renderMomentMediaDraft();
+}
+
+function selectMomentMediaFiles(kind, rawFiles) {
+  if (S.momentMediaUploading) throw new Error("媒体正在上传，请等待当前发布结束");
+  const files = [...(rawFiles || [])].map((file) => normalizeChatPickerFile(kind, file));
+  if (!files.length) return;
+  if (kind === "video") {
+    if (files.length !== 1) throw new Error("动态视频每次只能选择 1 个");
+    if (S.momentMediaDraft.length) throw new Error("图片和视频不能同时发布，请先清除已选媒体");
+  } else {
+    if (S.momentMediaDraft.some((draft) => draft.kind === "video")) {
+      throw new Error("图片和视频不能同时发布，请先清除已选视频");
+    }
+    if (S.momentMediaDraft.length + files.length > 9) throw new Error("动态图片最多选择 9 张");
+  }
+  files.forEach((file) => validateChatFile(kind, file));
+  const fingerprints = new Set(
+    S.momentMediaDraft.map((draft) => `${draft.file?.name || ""}:${draft.file?.size || 0}:${draft.file?.lastModified || 0}`)
+  );
+  files.forEach((file) => {
+    const fingerprint = `${file.name || ""}:${file.size || 0}:${file.lastModified || 0}`;
+    if (fingerprints.has(fingerprint)) throw new Error("不能重复选择同一个媒体文件");
+    fingerprints.add(fingerprint);
+  });
+  S.momentMediaDraft.push(
+    ...files.map((file) => ({
+      id: newComposeRequestId("moment-media"),
+      kind,
+      file,
+      previewUrl: createComposeObjectUrl(file),
+      assetId: "",
+      progress: 0,
+      uploading: false,
+      error: "",
+    }))
+  );
+  S.momentPublishRequestId = "";
+  renderMomentMediaDraft();
+}
+
+function setMomentComposeLocked(form, locked) {
+  S.momentMediaUploading = Boolean(locked);
+  if (!form) return;
+  const wasLocked = form.dataset.composeLocked === "true";
+  if (wasLocked === Boolean(locked)) {
+    renderMomentMediaDraft();
+    return;
+  }
+  form.dataset.composeLocked = String(Boolean(locked));
+  form.classList.toggle("is-uploading", Boolean(locked));
+  form.setAttribute("aria-busy", String(Boolean(locked)));
+  form.querySelectorAll("input, textarea, select, button").forEach((control) => {
+    if (locked) {
+      control.dataset.composeWasDisabled = control.disabled ? "1" : "0";
+      control.disabled = true;
+    } else {
+      control.disabled = control.dataset.composeWasDisabled === "1";
+      delete control.dataset.composeWasDisabled;
+    }
+  });
+  renderMomentMediaDraft();
+}
+
+async function ensureMomentMediaAssets() {
+  const drafts = [...S.momentMediaDraft];
+  const pending = drafts.filter((draft) => !draft.assetId);
+  const failures = [];
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < pending.length) {
+      const index = cursor;
+      cursor += 1;
+      const draft = pending[index];
+      draft.uploading = true;
+      draft.error = "";
+      renderMomentMediaDraft();
+      try {
+        const asset = await createNativeMediaAsset(draft.kind, draft.file, (progress) => {
+          draft.progress = progress;
+          updateMomentMediaDraftProgress(draft);
+        });
+        draft.assetId = String(asset.asset_id || "");
+        draft.progress = 1;
+        if (!draft.assetId) throw new Error("媒体上传完成但未返回可用资产编号");
+      } catch (error) {
+        draft.error = String(error?.message || error || "媒体上传失败");
+        failures.push(error instanceof Error ? error : new Error(draft.error));
+      } finally {
+        draft.uploading = false;
+        renderMomentMediaDraft();
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(3, pending.length) }, () => worker()));
+  if (failures.length) throw failures[0];
+  const assetIds = drafts.map((draft) => String(draft.assetId || ""));
+  if (assetIds.some((assetId) => !assetId)) throw new Error("仍有媒体尚未上传完成");
+  if (new Set(assetIds).size !== assetIds.length) throw new Error("不能重复发布相同的媒体内容，请移除重复项后重试");
+  return assetIds;
+}
+
+function clearComposeDrafts() {
+  clearProfileAvatarDraft({ render: false });
+  clearMomentMediaDraft({ render: false });
+  S.momentMediaUploading = false;
+  revokeAllComposeObjectUrls();
+}
+
 function resetMomentViewTaskAssist() {
   S.momentViewTaskAssistState = "idle";
   S.momentViewTaskAssistSeq += 1;
@@ -4976,8 +5673,9 @@ function updateMomentCardVisibility(card, visible) {
 
 async function reportMomentView(card) {
   const postId = String(card?.dataset.postId || "").trim();
+  const validPostId = /^\d{1,32}$/.test(postId) || /^pst_[0-9a-f]{32}$/.test(postId);
   if (
-    !/^\d{1,32}$/.test(postId) ||
+    !validPostId ||
     postId === "0" ||
     !card?.isConnected ||
     S.route !== "moments" ||
@@ -5124,7 +5822,7 @@ function momentMediaHtml(post) {
         )
         .join("")}</div>`
     : "";
-  const video = mediaUrl(post.video);
+  const video = pictures.length ? "" : mediaUrl(post.video);
   const cover = mediaUrl(post.cover);
   const videoHtml = video
     ? `<div class="moment-video-wrap" data-playback-wrap><video class="moment-video" controls controlslist="nodownload noremoteplayback" disablepictureinpicture disableremoteplayback draggable="false" preload="none" playsinline referrerpolicy="no-referrer" data-media-playback data-moment-video="true" data-post-id="${esc(
@@ -5133,7 +5831,7 @@ function momentMediaHtml(post) {
         video
       )}" data-video-state="poster" data-video-frame-required="true" ${cover ? `poster="${esc(cover)}"` : ""}></video><button type="button" class="moment-video-start" data-action="play-moment-video">播放视频</button><div class="chat-playback-fallback moment-playback-fallback" data-playback-fallback hidden><span>视频加载失败</span><button type="button" data-action="retry-chat-playback">重试</button></div></div>`
     : "";
-  return pictureHtml || videoHtml ? `<div class="moment-media">${pictureHtml}${videoHtml}</div>` : "";
+  return pictureHtml || videoHtml ? `<div class="moment-media">${pictureHtml || videoHtml}</div>` : "";
 }
 
 function momentOwnershipMenu(post) {
@@ -5193,7 +5891,7 @@ function renderMomentCard(item, { showAuthor = true } = {}) {
     </header>
     ${flags ? `<div class="moment-flags">${flags}</div>` : ""}
     ${post.title ? `<h3 class="moment-title">${esc(post.title)}</h3>` : ""}
-    <p class="moment-content">${esc(post.content || "这条动态没有文字内容")}</p>
+    ${String(post.content || "").trim() ? `<p class="moment-content">${esc(post.content)}</p>` : ""}
     ${topics.length ? `<div class="moment-topics">${topics.map((topic) => `<span>话题 ${esc(topic)}</span>`).join("")}</div>` : ""}
     ${momentMediaHtml(post)}
     <footer class="moment-actions">
@@ -5360,7 +6058,7 @@ function valueCard(item) {
   )}</strong><span>${esc(detail)}</span></div></article>`;
 }
 
-const SENSITIVE_KEY = /(password|token|user_?sig|secret|web_?sid|cert_?no|raw|sign(?:ature)?|prepay|order_?(?:string|params))/i;
+const SENSITIVE_KEY = /(password|token|api[-_]?key|x[-_]?api[-_]?key|client[-_]?secret|user_?sig|secret|web_?sid|cert_?no|raw|sign(?:ature)?|prepay|order_?(?:string|params))/i;
 
 const DISPLAY_FIELD_LABELS = Object.freeze({
   uid: "UID",
@@ -5938,28 +6636,30 @@ const TUI_EMOJI_TOKEN_RE = /\[TUIEmoji_([A-Za-z0-9]+)\]/g;
 const TUI_EMOJI_STICKER_GROUP_ID = "built-in-tuiemoji";
 
 const CHAT_MEDIA_LIMITS = {
-  image: 29360128,
-  gif: 10485760,
+  image: 20 * 1024 * 1024,
+  gif: 20 * 1024 * 1024,
+  audio: 20 * 1024 * 1024,
   video: 100 * 1024 * 1024,
-  file: 100 * 1024 * 1024,
-  flash: 29360128,
+  file: 40 * 1024 * 1024,
+  flash: 20 * 1024 * 1024,
 };
-const TIM_VIDEO_MIME_TYPES = new Set(["video/mp4", "video/quicktime", "video/mov"]);
-const TIM_VIDEO_FILE_EXTENSION_RE = /\.(?:mp4|mov)$/i;
-const TIM_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/bmp", "image/webp"]);
-const TIM_IMAGE_FILE_EXTENSION_RE = /\.(?:jpe?g|png|gif|bmp|webp)$/i;
-const FLASH_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
-const FLASH_IMAGE_FILE_EXTENSION_RE = /\.(?:jpe?g|png|gif|webp)$/i;
+const TIM_VIDEO_MIME_TYPES = new Set(["video/mp4", "video/quicktime", "video/webm"]);
+const TIM_VIDEO_FILE_EXTENSION_RE = /\.(?:mp4|mov|webm)$/i;
+const TIM_IMAGE_MIME_TYPES = new Set(["image/avif", "image/jpeg", "image/png", "image/gif", "image/webp"]);
+const TIM_IMAGE_FILE_EXTENSION_RE = /\.(?:avif|jpe?g|png|gif|webp)$/i;
+const FLASH_IMAGE_MIME_TYPES = new Set(["image/avif", "image/jpeg", "image/png", "image/gif", "image/webp"]);
+const FLASH_IMAGE_FILE_EXTENSION_RE = /\.(?:avif|jpe?g|png|gif|webp)$/i;
 const GENERIC_PICKER_MIME_TYPES = new Set(["", "application/octet-stream"]);
 const CHAT_FILE_MIME_BY_EXTENSION = {
   jpg: "image/jpeg",
   jpeg: "image/jpeg",
   png: "image/png",
   gif: "image/gif",
-  bmp: "image/bmp",
   webp: "image/webp",
   mp4: "video/mp4",
   mov: "video/quicktime",
+  webm: "video/webm",
+  avif: "image/avif",
 };
 
 function parseJsonValue(value) {
@@ -6294,6 +6994,54 @@ function firstMessageValue(objects, keys, fallback = "") {
   return fallback;
 }
 
+function canonicalMessageID(message, payload = messagePayload(message), cloud = messageCloudCustomData(message, payload)) {
+  const parsedCloud =
+    message?.cloudCustomDataParsed && typeof message.cloudCustomDataParsed === "object"
+      ? message.cloudCustomDataParsed
+      : cloud?.parsed;
+  const nestedMessage =
+    message?.message && typeof message.message === "object" && !Array.isArray(message.message)
+      ? message.message
+      : null;
+  const namespaces = [
+    message?.bbw_message,
+    message?.bbwMessage,
+    payload?.bbw_message,
+    payload?.bbwMessage,
+    parsedCloud?.bbw_message,
+    parsedCloud?.bbwMessage,
+  ];
+  const direct = firstMessageValue(
+    [message, nestedMessage, payload],
+    ["canonicalMessageId", "canonical_message_id"],
+    ""
+  );
+  if (direct) return String(direct).trim();
+  return String(firstMessageValue(namespaces, ["message_id", "messageId"], "")).trim();
+}
+
+function isWebLocalCanonicalMessage(entry) {
+  if (!canonicalMessageID(entry)) return false;
+  const provider = String(entry?.provider || "").trim().toLowerCase();
+  const source = String(entry?.source || "").trim().toLowerCase();
+  return entry?.canonicalAuthority === true || provider === "web-local" || source === "web-local";
+}
+
+function preferredCanonicalMessageAuthority(previous, incoming) {
+  if (isWebLocalCanonicalMessage(incoming)) return incoming;
+  if (isWebLocalCanonicalMessage(previous)) return previous;
+  return null;
+}
+
+function mergedMessageRevoked(previous, incoming) {
+  const authority = preferredCanonicalMessageAuthority(previous, incoming);
+  return authority ? Boolean(authority.revoked) : Boolean(previous?.revoked || incoming?.revoked);
+}
+
+function shouldApplyCompatibilityRevocation(previous, revoked) {
+  return !isWebLocalCanonicalMessage(previous) || isWebLocalCanonicalMessage(revoked);
+}
+
 function numericMessageValue(value, fallback = 0) {
   const number = Number(value);
   return Number.isFinite(number) && number >= 0 ? number : fallback;
@@ -6453,12 +7201,37 @@ function normalizeImageMedia(payload, message) {
     height: original?.height || thumbnail?.height || numericMessageValue(payload.height),
     size: original?.size || numericMessageValue(payload.size),
     uuid: String(firstMessageValue([payload, message], ["UUID", "uuid"], "")),
+    ...normalizeNativeMediaIdentity([message?.media, payload, message]),
+  };
+}
+
+function normalizeNativeMediaIdentity(objects) {
+  const attachmentId = String(
+    firstMessageValue(objects, ["attachment_id", "attachmentId", "flash_id", "flashId"], "")
+  ).trim();
+  const assetId = String(firstMessageValue(objects, ["asset_id", "assetId"], "")).trim();
+  const contentType = String(
+    firstMessageValue(objects, ["content_type", "contentType", "mime"], "")
+  ).trim();
+  const sha256 = String(firstMessageValue(objects, ["sha256"], "")).trim();
+  return {
+    attachmentId,
+    assetId,
+    contentType,
+    sha256,
+    native: Boolean(attachmentId && assetId),
   };
 }
 
 function normalizeEntryMedia(kind, payload, message) {
   const objects = [message?.media, payload, message];
   if (kind === "image") return normalizeImageMedia(payload, message);
+  if (kind === "flash") {
+    return {
+      ...(message?.media && typeof message.media === "object" ? message.media : {}),
+      ...normalizeNativeMediaIdentity(objects),
+    };
+  }
   if (kind === "audio") {
     const sdkObjects = [payload, message, message?.media];
     return {
@@ -6468,6 +7241,8 @@ function normalizeEntryMedia(kind, payload, message) {
       duration: numericMessageValue(firstMessageValue(sdkObjects, ["second", "duration", "audioSecond", "audio_second"], 0)),
       size: numericMessageValue(firstMessageValue(sdkObjects, ["size", "fileSize", "file_size"], 0)),
       uuid: String(firstMessageValue(sdkObjects, ["UUID", "uuid"], "")),
+      name: String(firstMessageValue(sdkObjects, ["name", "filename", "fileName", "file_name"], "语音")),
+      ...normalizeNativeMediaIdentity(sdkObjects),
     };
   }
   if (kind === "video") {
@@ -6488,6 +7263,8 @@ function normalizeEntryMedia(kind, payload, message) {
       width: numericMessageValue(firstMessageValue(sdkObjects, ["snapshotWidth", "snapshot_width", "thumbWidth", "width"], 0)),
       height: numericMessageValue(firstMessageValue(sdkObjects, ["snapshotHeight", "snapshot_height", "thumbHeight", "height"], 0)),
       uuid: String(firstMessageValue(sdkObjects, ["videoUUID", "video_uuid", "UUID", "uuid"], "")),
+      name: String(firstMessageValue(sdkObjects, ["name", "filename", "fileName", "file_name"], "视频")),
+      ...normalizeNativeMediaIdentity(sdkObjects),
     };
   }
   if (kind === "file") {
@@ -6496,6 +7273,7 @@ function normalizeEntryMedia(kind, payload, message) {
       name: String(firstMessageValue(objects, ["fileName", "file_name", "name"], "文件")),
       size: numericMessageValue(firstMessageValue(objects, ["fileSize", "file_size", "size"], 0)),
       uuid: String(firstMessageValue(objects, ["UUID", "uuid"], "")),
+      ...normalizeNativeMediaIdentity(objects),
     };
   }
   if (kind === "face") {
@@ -6869,6 +7647,8 @@ function timMessageDirection(message, me = String(S.user?.uid || S.user?.id || "
 function messageIdentityKey(entry) {
   const peer = String(entry?.peer || "");
   const direction = timMessageDirection(entry) || "unknown";
+  const canonicalID = canonicalMessageID(entry);
+  if (canonicalID) return `canonical|${canonicalID}`;
   const messageRandom = String(entry?.messageRandom || timMessageRandom(entry) || "");
   if (peer && messageRandom) return `tim|${peer}|${direction}|${messageRandom}`;
   const messageKey = String(entry?.msgKey || "");
@@ -6877,7 +7657,14 @@ function messageIdentityKey(entry) {
   }
   const id = String(entry?.id || "");
   if (id) return `id|${id}`;
-  const mediaIdentity = entry?.media?.url || entry?.media?.uuid || entry?.media?.data || entry?.flashId || "";
+  const mediaIdentity =
+    entry?.attachmentId ||
+    entry?.media?.attachmentId ||
+    entry?.media?.url ||
+    entry?.media?.uuid ||
+    entry?.media?.data ||
+    entry?.flashId ||
+    "";
   return `fallback|${peer}|${direction}|${entry?.kind || "text"}|${entry?.timestamp || ""}|${entry?.text || ""}|${mediaIdentity}`;
 }
 
@@ -6889,9 +7676,13 @@ function messagesReferToSameMessage(left, right) {
   const leftDirection = timMessageDirection(left);
   const rightDirection = timMessageDirection(right);
   if (leftDirection && rightDirection && leftDirection !== rightDirection) return false;
+  const leftCanonicalID = canonicalMessageID(left);
+  const rightCanonicalID = canonicalMessageID(right);
+  if (leftCanonicalID && rightCanonicalID) return leftCanonicalID === rightCanonicalID;
   const leftIdentity = messageIdentityKey(left);
   if (leftIdentity === messageIdentityKey(right) && !leftIdentity.startsWith("fallback|")) return true;
   const identities = [
+    [left.clientMessageId || left.client_message_id, right.clientMessageId || right.client_message_id],
     [left.messageRandom || timMessageRandom(left), right.messageRandom || timMessageRandom(right)],
     [left.msgKey, right.msgKey],
     [left.id, right.id],
@@ -6978,6 +7769,15 @@ function timMessageEntry(message, peer = "", me = String(S.user?.uid || S.user?.
   const status = String(message?.status || message?.send_status || "").toLowerCase();
   const payload = messagePayload(message);
   const cloud = messageCloudCustomData(message, payload);
+  const canonicalID = canonicalMessageID(message, payload, cloud);
+  const source = String(message?.source || "tim");
+  const provider = String(message?.provider || "");
+  const canonicalAuthority = Boolean(
+    canonicalID &&
+      (message?.canonicalAuthority === true ||
+        provider.trim().toLowerCase() === "web-local" ||
+        source.trim().toLowerCase() === "web-local")
+  );
   const rawText = firstMessageValue(
     [payload, message],
     ["text", "Text", "content", "message", "body"],
@@ -6988,10 +7788,21 @@ function timMessageEntry(message, peer = "", me = String(S.user?.uid || S.user?.
   const customText = kind === "custom" ? customMessageText(payload) : "";
   const revoked = timMessageRevoked(message);
   const displayText = text || customText || (kind === "custom" ? "自定义消息" : "");
+  const media = normalizeEntryMedia(kind, payload, message);
   const entry = {
     id: String(
-      message?.ID || message?.id || message?.messageID || message?.messageId || message?.sequence || message?.MsgKey || message?.msg_uid || ""
+      canonicalID ||
+        message?.ID ||
+        message?.id ||
+        message?.messageID ||
+        message?.messageId ||
+        message?.sequence ||
+        message?.MsgKey ||
+        message?.msg_uid ||
+        ""
     ),
+    canonicalMessageId: canonicalID,
+    clientMessageId: String(message?.clientMessageId || message?.client_message_id || message?.client_message_key || ""),
     msgKey: String(message?.MsgKey || message?.msg_key || message?.messageKey || message?.message_key || ""),
     sequence: timMessageSequence(message),
     messageRandom: timMessageRandom(message),
@@ -7002,13 +7813,23 @@ function timMessageEntry(message, peer = "", me = String(S.user?.uid || S.user?.
     cloudCustomData: cloud.raw,
     cloudCustomDataParsed: cloud.parsed,
     quote: messageQuoteFrom(message, payload, cloud),
-    media: normalizeEntryMedia(kind, payload, message),
+    media,
+    attachmentId: String(media.attachmentId || message?.attachment_id || message?.attachmentId || ""),
+    assetId: String(media.assetId || message?.asset_id || message?.assetId || ""),
     flashId: kind === "flash" ? messageFlashID(message, payload, cloud) : "",
+    nativeFlashClaimed: Boolean(
+      message?.native_flash_claimed ||
+        message?.nativeFlashClaimed ||
+        message?.flash_claimed ||
+        message?.flashClaimed
+    ),
     type: outgoing ? "mine" : "",
     direction,
     peer: target,
     timestamp: timMessageTimestamp(message),
-    source: message?.source || "tim",
+    source,
+    provider,
+    canonicalAuthority,
     rawMessage: ["http", "archive"].includes(String(message?.source || "")) ? null : message,
     recalledText: revoked && kind === "text" ? displayText : "",
     revoked,
@@ -7016,6 +7837,8 @@ function timMessageEntry(message, peer = "", me = String(S.user?.uid || S.user?.
     readAt: timMessageReadTimestamp(message),
     delivery: status.includes("fail") ? "failed" : status.includes("sending") || status.includes("unsend") ? "sending" : "sent",
     progress: numericMessageValue(message?.progress, status.includes("sending") ? 0 : 1),
+    compatibility_sync: message?.compatibility_sync ?? message?.compatibilitySync ?? null,
+    tim_mirror_status: String(message?.tim_mirror_status || message?.timMirrorStatus || ""),
   };
   hydrateVoiceTranscript(entry, message, payload);
   entry.preview = String(message?.preview || messagePreview(entry));
@@ -7146,6 +7969,20 @@ function chatImageDimensionAttributes(media) {
   return width && height ? ` width="${width}" height="${height}"` : "";
 }
 
+function nativeMediaAttachmentId(entry) {
+  return String(entry?.attachmentId || entry?.media?.attachmentId || "").trim();
+}
+
+function nativeMediaLoadButton(entry, label, kind = entry?.kind || "file") {
+  const attachmentId = nativeMediaAttachmentId(entry);
+  if (!attachmentId) return "";
+  return `<button type="button" class="chat-file" data-action="open-native-media" data-message-id="${esc(
+    entry.id
+  )}" data-attachment-id="${esc(attachmentId)}" data-media-kind="${esc(kind)}"><strong>${esc(
+    label
+  )}</strong><span>点击安全加载</span></button>`;
+}
+
 function chatMessageBodyHtml(entry) {
   if (entry.revoked) {
     if (canEditRevokedMessage(entry)) {
@@ -7161,9 +7998,11 @@ function chatMessageBodyHtml(entry) {
   if (entry.kind === "image") {
     const url = media.url || media.thumbnail;
     const thumbnail = media.thumbnail || media.url;
-    if (!url) return `<span class="chat-message-text">图片暂不可用</span>`;
+    if (!url) return nativeMediaLoadButton(entry, "图片", "image") || `<span class="chat-message-text">图片暂不可用</span>`;
     return `<button type="button" class="chat-image-button" data-action="open-chat-media" data-media-kind="image" data-url="${esc(
       url
+    )}" data-native-attachment-id="${esc(nativeMediaAttachmentId(entry))}" data-message-id="${esc(
+      entry.id
     )}" aria-label="查看原图"><img src="${esc(thumbnail)}"${chatImageDimensionAttributes(
       media
     )} alt="聊天图片" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-media data-media-source="${esc(
@@ -7173,9 +8012,11 @@ function chatMessageBodyHtml(entry) {
   if (entry.kind === "audio") {
     const played = entry.type === "mine" || isAudioPlayed(entry.id);
     if (!media.url) {
-      return `<span class="chat-message-text">语音消息 · ${esc(
-        Math.max(1, Math.round(Number(media.duration) || 1))
-      )} 秒</span>${chatVoiceTranscriptHtml(entry)}`;
+      return `${nativeMediaLoadButton(
+        entry,
+        `语音消息 · ${Math.max(1, Math.round(Number(media.duration) || 1))} 秒`,
+        "audio"
+      ) || `<span class="chat-message-text">语音暂不可用</span>`}${chatVoiceTranscriptHtml(entry)}`;
     }
     const duration = Math.max(1, Math.round(Number(media.duration) || 1));
     const sourceNeedsRefresh = isUnauthenticatedTencentRichMediaUrl(media.url);
@@ -7193,20 +8034,25 @@ function chatMessageBodyHtml(entry) {
       entry.sequence || timMessageSequence(entry)
     )}" data-audio-message-time="${esc(entry.timestamp)}" data-audio-peer="${esc(entry.peer)}" data-audio-source-needs-refresh="${sourceNeedsRefresh ? "1" : "0"}" data-media-playback data-media-source="${esc(
       media.url
-    )}"${sourceNeedsRefresh ? "" : ` src="${esc(media.url)}"`}></audio><div class="chat-playback-fallback" data-playback-fallback hidden><span>语音加载失败</span><button type="button" data-action="retry-chat-playback">重试</button></div>${chatVoiceTranscriptHtml(
+    )}" data-native-attachment-id="${esc(nativeMediaAttachmentId(entry))}"${sourceNeedsRefresh ? "" : ` src="${esc(media.url)}"`}></audio><div class="chat-playback-fallback" data-playback-fallback hidden><span>语音加载失败</span><button type="button" data-action="retry-chat-playback">重试</button></div>${chatVoiceTranscriptHtml(
       entry
     )}</div>`;
   }
   if (entry.kind === "video") {
-    if (!media.url) return `<span class="chat-message-text">视频暂不可用</span>`;
+    if (!media.url) return nativeMediaLoadButton(entry, "视频", "video") || `<span class="chat-message-text">视频暂不可用</span>`;
     return `<div class="chat-video" data-playback-wrap><video controls preload="metadata" playsinline data-media-playback data-media-source="${esc(
       media.url
-    )}" ${
+    )}" data-native-attachment-id="${esc(nativeMediaAttachmentId(entry))}" data-message-id="${esc(entry.id)}" ${
       media.poster ? `poster="${esc(media.poster)}"` : ""
     } src="${esc(media.url)}"></video>${media.duration ? `<span>${esc(formatMediaDuration(media.duration))}</span>` : ""}<div class="chat-playback-fallback" data-playback-fallback hidden><span>视频加载失败</span><button type="button" data-action="retry-chat-playback">重试</button></div></div>`;
   }
   if (entry.kind === "file") {
     const body = `<strong>${esc(media.name || "文件")}</strong><span>${esc(formatFileSize(media.size))}${media.url ? " · 下载或打开" : " · 暂不可下载"}</span>`;
+    if (nativeMediaAttachmentId(entry)) {
+      return `<button type="button" class="chat-file" data-action="open-native-media" data-message-id="${esc(
+        entry.id
+      )}" data-attachment-id="${esc(nativeMediaAttachmentId(entry))}" data-media-kind="file">${body}</button>`;
+    }
     return media.url
       ? `<a class="chat-file" href="${esc(media.url)}" target="_blank" rel="noopener noreferrer" download="${esc(media.name || "")}">${body}</a>`
       : `<span class="chat-file is-disabled">${body}</span>`;
@@ -7222,7 +8068,11 @@ function chatMessageBodyHtml(entry) {
     return `<span class="chat-message-text">${esc(media.data || "[表情包]")}</span>`;
   }
   if (entry.kind === "flash") {
-    const canView = Boolean(entry.flashId);
+    const nativeFlash = Boolean(
+      nativeMediaAttachmentId(entry) &&
+        [entry.source, entry.provider].some((value) => String(value || "").toLowerCase() === "web-local")
+    );
+    const canView = Boolean(entry.flashId && (!nativeFlash || entry.type !== "mine") && !entry.nativeFlashClaimed);
     return `<div class="chat-flash"><strong>5 秒闪图</strong><span>${
       canView ? "按住下方按钮查看，松手立即隐藏" : entry.type === "mine" ? "闪图已发送" : "闪图凭证不可用"
     }</span><button type="button" class="chat-flash-button" data-action="flash-hold" data-flash-id="${esc(
@@ -7935,10 +8785,14 @@ function messageIdentityLookupKeys(entry) {
   const keys = new Set();
   const primary = messageIdentityKey(entry);
   if (primary && !primary.startsWith("fallback|")) keys.add(`primary|${primary}`);
+  const canonicalID = canonicalMessageID(entry);
+  const clientMessageID = String(entry?.clientMessageId || entry?.client_message_id || "").trim();
   const messageRandom = String(entry?.messageRandom || timMessageRandom(entry) || "").trim();
   const messageKey = String(entry?.msgKey || "").trim();
   const id = String(entry?.id || "").trim();
   const sequence = String(entry?.sequence || timMessageSequence(entry) || "").trim();
+  if (canonicalID) keys.add(`canonical|${canonicalID}`);
+  if (clientMessageID) keys.add(`client-message|${clientMessageID}`);
   if (messageRandom) keys.add(`random|${messageRandom}`);
   if (messageKey) keys.add(`message-key|${messageKey}`);
   if (id) keys.add(`id-sequence|${id}`);
@@ -7986,6 +8840,8 @@ function peerMessageRevision(peer, entries = S.imMessages) {
     if (String(entry.peer || "") !== target) return;
     const value = [
       entry.id,
+      canonicalMessageID(entry),
+      entry.clientMessageId || entry.client_message_id,
       entry.msgKey,
       entry.sequence,
       entry.messageRandom,
@@ -8002,6 +8858,8 @@ function peerMessageRevision(peer, entries = S.imMessages) {
       entry.flashId,
       entry.voiceText,
       entry.voiceTextStatus,
+      entry.tim_mirror_status || entry.timMirrorStatus,
+      JSON.stringify(entry.compatibility_sync ?? entry.compatibilitySync ?? null),
       JSON.stringify(normalizeMessageQuote(entry.quote) || null),
       entry.media?.url,
       entry.media?.thumbnail,
@@ -8045,31 +8903,86 @@ function mergePeerMessages(peer, incoming) {
     const matched = findIndexedMessage(identityIndex, byKey, orderByKey, entry, key);
     const previousKey = matched?.[0] || "";
     const previous = matched?.[1];
+    const canonicalID = canonicalMessageID(entry) || canonicalMessageID(previous);
+    const authority = previous
+      ? preferredCanonicalMessageAuthority(previous, entry)
+      : isWebLocalCanonicalMessage(entry)
+        ? entry
+        : null;
+    const authorityOwnsRevocationState = Boolean(
+      authority && Boolean(previous?.revoked) !== Boolean(entry?.revoked)
+    );
     const merged = previous
       ? {
             ...previous,
             ...entry,
             id:
-              entry.messageRandom || timMessageRandom(entry) || !(previous.messageRandom || timMessageRandom(previous))
+              canonicalID ||
+              (entry.messageRandom || timMessageRandom(entry) || !(previous.messageRandom || timMessageRandom(previous))
                 ? entry.id || previous.id || ""
-                : previous.id || entry.id || "",
+                : previous.id || entry.id || ""),
+            canonicalMessageId: canonicalID,
+            clientMessageId:
+              entry.clientMessageId ||
+              entry.client_message_id ||
+              previous.clientMessageId ||
+              previous.client_message_id ||
+              "",
             rawMessage: entry.rawMessage || previous.rawMessage || null,
             msgKey: entry.msgKey || previous.msgKey || "",
             sequence: entry.sequence || previous.sequence || "",
             messageRandom: entry.messageRandom || previous.messageRandom || "",
             direction: timMessageDirection(entry) || timMessageDirection(previous),
-            revoked: Boolean(previous.revoked || entry.revoked),
-            recalledText:
-              entry.recalledText ||
-              previous.recalledText ||
-              (previous.revoked && previous.kind === "text" ? String(previous.text || "") : "") ||
-              (entry.revoked && entry.kind === "text" ? String(entry.text || "") : ""),
+            source: authority
+              ? String(authority.source || "web-local")
+              : String(entry.source || previous.source || ""),
+            provider: authority
+              ? String(authority.provider || "web-local")
+              : String(entry.provider || previous.provider || ""),
+            canonicalAuthority: Boolean(authority),
+            revoked: mergedMessageRevoked(previous, entry),
+            text: authorityOwnsRevocationState
+              ? String(authority.text || "")
+              : String(entry.text ?? previous.text ?? ""),
+            payload: authorityOwnsRevocationState
+              ? authority.payload || {}
+              : entry.payload ?? previous.payload ?? {},
+            media: authorityOwnsRevocationState
+              ? authority.media || {}
+              : entry.media ?? previous.media ?? {},
+            flashId: authorityOwnsRevocationState
+              ? String(authority.flashId || "")
+              : String(entry.flashId ?? previous.flashId ?? ""),
+            preview: authorityOwnsRevocationState
+              ? String(authority.preview || messagePreview(authority))
+              : String(entry.preview ?? previous.preview ?? ""),
+            recalledText: authorityOwnsRevocationState
+              ? String(authority.recalledText || "")
+              : entry.recalledText ||
+                previous.recalledText ||
+                (previous.revoked && previous.kind === "text" ? String(previous.text || "") : "") ||
+                (entry.revoked && entry.kind === "text" ? String(entry.text || "") : ""),
             peerRead: previous.peerRead === true || entry.peerRead === true ? true : entry.peerRead ?? previous.peerRead,
             readAt: Math.max(Number(previous.readAt || 0), Number(entry.readAt || 0)),
             retryFile: entry.delivery === "sent" ? null : entry.retryFile ?? previous.retryFile ?? null,
             retryMeta: entry.delivery === "sent" ? null : entry.retryMeta ?? previous.retryMeta ?? null,
             retryError: entry.delivery === "sent" ? "" : entry.retryError ?? previous.retryError ?? "",
-            quote: normalizeMessageQuote(entry.quote) || normalizeMessageQuote(previous.quote),
+            compatibility_sync:
+              entry.compatibility_sync ??
+              entry.compatibilitySync ??
+              previous.compatibility_sync ??
+              previous.compatibilitySync ??
+              null,
+            tim_mirror_status: String(
+              entry.tim_mirror_status ||
+                entry.timMirrorStatus ||
+                previous.tim_mirror_status ||
+                previous.timMirrorStatus ||
+                ""
+            ),
+            quote: authorityOwnsRevocationState
+              ? normalizeMessageQuote(authority.quote)
+              : normalizeMessageQuote(entry.quote) || normalizeMessageQuote(previous.quote),
             voiceText: entry.voiceText || previous.voiceText || "",
             voiceTextStatus:
               entry.voiceText || Number(entry.voiceTextStatus)
@@ -8098,27 +9011,35 @@ function mergePeerMessages(peer, incoming) {
   return !peerMessageRevisionEquals(previousRevision, peerMessageRevision(target));
 }
 
-async function loadConversationMessages(peer, { force = false } = {}) {
+async function loadConversationMessages(peer, { force = false, archiveOnly = false } = {}) {
   const target = String(peer || "").trim();
   if (!target || S.imMessageLoadingPeers.has(target)) return;
   if (!force && S.imMessageLoadedPeers.has(target)) return;
   const wasLoaded = S.imMessageLoadedPeers.has(target);
-  const shouldLoadArchive = !S.imArchiveLoadedPeers.has(target);
+  const shouldLoadArchive = force || !S.imArchiveLoadedPeers.has(target);
+  const localOnly = archiveOnly || webLocalDependencyMode();
   S.imMessageLoadingPeers.add(target);
   if (!wasLoaded && S.activePeer === target) refreshChatLog();
   const me = String(S.user?.uid || S.user?.id || "");
-  const tasks = [
-    api(`/api/im/messages?peer=${encodeURIComponent(target)}`, { timeout: 10000 }).then(({ data, ok }) => {
-      if (!ok || data?.ok === false) throw new Error("服务器聊天记录暂时不可用");
-      return itemsOf(data).map((item) => timMessageEntry({ ...item, source: "http" }, target, me));
-    }),
-  ];
+  const tasks = [];
+  if (!localOnly) {
+    tasks.push(
+      api(`/api/im/messages?peer=${encodeURIComponent(target)}`, { timeout: 10000 }).then(({ data, ok }) => {
+        if (!ok || data?.ok === false) throw new Error("服务器聊天记录暂时不可用");
+        return itemsOf(data).map((item) => timMessageEntry({ ...item, source: "http" }, target, me));
+      })
+    );
+  }
   if (shouldLoadArchive) {
     tasks.push(
       api(`/api/archive/messages?peer=${encodeURIComponent(target)}&limit=200`, { timeout: 6000 }).then(
         ({ data, ok }) => {
           if (!ok || data?.ok === false) throw new Error("归档聊天记录暂时不可用");
           S.imArchiveLoadedPeers.add(target);
+          if (!S.imMessageArchiveCursors.has(target)) {
+            const nextCursor = String(data?.next_cursor || "").trim();
+            if (nextCursor) S.imMessageArchiveCursors.set(target, nextCursor);
+          }
           return itemsOf(data).map((item) =>
             timMessageEntry({ ...item, source: "archive" }, target, me)
           );
@@ -8126,7 +9047,7 @@ async function loadConversationMessages(peer, { force = false } = {}) {
       )
     );
   }
-  if (S.imMode === "sdk" && S.chat && typeof S.chat.getMessageList === "function") {
+  if (!localOnly && S.imMode === "sdk" && S.chat && typeof S.chat.getMessageList === "function") {
     tasks.push(
       withTimeout(
         S.chat.getMessageList({ conversationID: `C2C${target}`, count: 30 }),
@@ -8149,6 +9070,8 @@ async function loadConversationMessages(peer, { force = false } = {}) {
       fulfilled.flat()
     );
     const changed = mergePeerMessages(target, incoming);
+    const receivedMessageChanged =
+      changed && incoming.some((entry) => entry.type !== "mine" && entry.type !== "system");
     const archiveCandidates = new Map();
     incoming.forEach((entry) => {
       if (["archive", "http", "history"].includes(String(entry.source || "").toLowerCase())) return;
@@ -8164,6 +9087,18 @@ async function loadConversationMessages(peer, { force = false } = {}) {
     S.imMessageLoadedPeers.add(target);
     if (S.activePeer === target) {
       if (changed) refreshChatLog();
+      if (
+        localOnly &&
+        receivedMessageChanged &&
+        S.route === "msg" &&
+        !document.hidden
+      ) {
+        // In Web-local mode there is no realtime SDK event to close the read
+        // loop. Treat newly-polled incoming messages as read while their
+        // conversation is already open, matching the realtime branch.
+        markConversationRead(target);
+        refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
+      }
       scheduleSdkMessageReadReceipts(target);
     }
   } finally {
@@ -8238,30 +9173,48 @@ async function loadOlderConversationMessages(peer, log = $("im-log")) {
   log.insertAdjacentHTML("afterbegin", chatHistoryStatusHtml());
 
   const pageSize = 200;
-  const tasks = [
+  const localOnly = webLocalDependencyMode();
+  const tasks = [];
+  if (!localOnly) {
+    tasks.push(
+      api(
+        `/api/im/messages?peer=${encodeURIComponent(target)}&before=${encodeURIComponent(beforeSeconds)}`,
+        { timeout: 12000 }
+      ).then(({ data, ok }) => {
+        if (!ok || data?.ok === false) throw new Error("服务器聊天记录暂时不可用");
+        const items = itemsOf(data);
+        return {
+          entries: items.map((item) => timMessageEntry({ ...item, source: "http" }, target, me)),
+          hasMore: data?.has_more === true || items.length >= pageSize,
+        };
+      })
+    );
+  }
+  const archiveParams = new URLSearchParams({
+    peer: target,
+    limit: String(pageSize),
+  });
+  const archiveCursor = String(S.imMessageArchiveCursors.get(target) || "").trim();
+  if (archiveCursor) archiveParams.set("cursor", archiveCursor);
+  else archiveParams.set("before", beforeIso);
+  tasks.push(
     api(
-      `/api/im/messages?peer=${encodeURIComponent(target)}&before=${encodeURIComponent(beforeSeconds)}`,
-      { timeout: 12000 }
-    ).then(({ data, ok }) => {
-      if (!ok || data?.ok === false) throw new Error("服务器聊天记录暂时不可用");
-      const items = itemsOf(data);
-      return {
-        entries: items.map((item) => timMessageEntry({ ...item, source: "http" }, target, me)),
-        hasMore: data?.has_more === true || items.length >= pageSize,
-      };
-    }),
-    api(
-      `/api/archive/messages?peer=${encodeURIComponent(target)}&limit=${pageSize}&before=${encodeURIComponent(beforeIso)}`,
+      `/api/archive/messages?${archiveParams.toString()}`,
       { timeout: 8000 }
     ).then(({ data, ok }) => {
       if (!ok || data?.ok === false) throw new Error("归档聊天记录暂时不可用");
       const items = itemsOf(data);
+      const nextCursor = String(data?.next_cursor || "").trim();
+      if (nextCursor) S.imMessageArchiveCursors.set(target, nextCursor);
+      else S.imMessageArchiveCursors.delete(target);
       return {
         entries: items.map((item) => timMessageEntry({ ...item, source: "archive" }, target, me)),
-        hasMore: data?.has_more === true || items.length >= pageSize,
+        hasMore:
+          data?.has_more === true ||
+          (typeof data?.has_more !== "boolean" && items.length >= pageSize),
       };
-    }),
-  ];
+    })
+  );
 
   try {
     const results = await Promise.allSettled(tasks);
@@ -9488,6 +10441,7 @@ function removeConversationListItems(peers) {
     S.imQuoteDrafts.delete(peer);
     S.imMessageOlderLoadingPeers.delete(peer);
     S.imMessageHistoryExhaustedPeers.delete(peer);
+    S.imMessageArchiveCursors.delete(peer);
     S.imMessageRenderLimits.delete(peer);
   });
   const wasActive = targets.has(String(S.activePeer || ""));
@@ -9711,6 +10665,7 @@ function chatTuiEmojiItemHtml(emoji) {
 
 function chatComposerPanelHtml() {
   if (S.imComposerPanel === "sticker") {
+    if (webLocalDependencyMode()) return "";
     const groups = chatStickerGroups();
     const activeGroup = activeStickerGroup();
     const body = activeGroup
@@ -9734,17 +10689,20 @@ function chatComposerPanelHtml() {
     }>${S.imStickersLoading ? "正在加载" : "重新加载"}</button></div>${body}</section>`;
   }
   if (S.imComposerPanel === "more") {
-    const directMediaActions = S.directImCredentialsEnabled && S.messagePolicyReady
+    const directMediaActions = S.messagePolicyReady
       ? `<button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="image"><strong>图片与动图</strong><span>从相册或文件中选择</span></button>
       <button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="video"><strong>视频</strong><span>发送短视频文件</span></button>
       <button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="file"><strong>文件</strong><span>发送其他类型文件</span></button>`
       : "";
-    const stickerAction = S.directImCredentialsEnabled && S.messagePolicyReady
+    const flashAction = S.messagePolicyReady
+      ? '<button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="flash"><strong>闪图</strong><span>阅后失效的图片</span></button>'
+      : "";
+    const stickerAction = !webLocalDependencyMode() && S.directImCredentialsEnabled && S.messagePolicyReady
       ? '<button type="button" class="chat-more-action" data-action="toggle-chat-panel" data-panel="sticker"><strong>表情包</strong><span>内置表情与收藏表情</span></button>'
       : "";
     return `<section class="chat-composer-panel chat-more-panel ui-scrollbar" aria-label="更多消息功能"><div class="chat-panel-head"><strong>更多功能</strong><span>选择要发送的内容</span></div><div class="chat-more-grid">
       ${directMediaActions}
-      <button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="flash"><strong>闪图</strong><span>阅后失效的图片</span></button>
+      ${flashAction}
       ${stickerAction}
     </div></section>`;
   }
@@ -9763,6 +10721,7 @@ function chatComposerHtml() {
   const recording = S.imRecordingState;
   const recordingAvailability = voiceRecordingAvailability();
   const voiceMode = S.imVoiceMode && recordingAvailability.available;
+  const richMessageActionsAvailable = S.messagePolicyReady;
   return `<form class="chat-composer${voiceMode ? " voice-mode" : ""}${recording?.active ? " is-recording" : ""}${
     S.imComposerPanel ? " panel-open" : ""
   }" data-form="im-send"><input type="hidden" name="peer" value="${esc(
@@ -9784,9 +10743,13 @@ function chatComposerHtml() {
           recordingAvailability.reason
         )}">${recording?.active ? (recording.cancel ? "松手取消" : "松手发送") : "按住说话"}</button>
       </div>
-      <button type="button" class="chat-tool-button chat-more-toggle${S.imComposerPanel === "more" ? " on" : ""}" data-action="toggle-chat-panel" data-panel="more" aria-expanded="${
-        S.imComposerPanel === "more" ? "true" : "false"
-      }">更多</button>
+      ${
+        richMessageActionsAvailable
+          ? `<button type="button" class="chat-tool-button chat-more-toggle${S.imComposerPanel === "more" ? " on" : ""}" data-action="toggle-chat-panel" data-panel="more" aria-expanded="${
+              S.imComposerPanel === "more" ? "true" : "false"
+            }">更多</button>`
+          : ""
+      }
       <button type="submit" class="btn primary chat-send-button" title="按 Ctrl+回车发送" ${
         S.imConnecting ? "disabled" : ""
       }>发送</button>
@@ -9801,10 +10764,10 @@ function chatComposerHtml() {
         : ""
     }</div>
     ${chatComposerPanelHtml()}
-    <input class="sr-only" type="file" id="im-file-image" data-chat-upload="image" accept=".jpg,.jpeg,.png,.gif,.bmp,.webp,image/jpeg,image/png,image/gif,image/bmp,image/webp" multiple />
-    <input class="sr-only" type="file" id="im-file-video" data-chat-upload="video" accept=".mp4,.mov,video/mp4,video/quicktime,video/mov" />
+    <input class="sr-only" type="file" id="im-file-image" data-chat-upload="image" accept=".jpg,.jpeg,.png,.gif,.webp,.avif,image/jpeg,image/png,image/gif,image/webp,image/avif" multiple />
+    <input class="sr-only" type="file" id="im-file-video" data-chat-upload="video" accept=".mp4,.mov,.webm,video/mp4,video/quicktime,video/webm" />
     <input class="sr-only" type="file" id="im-file-file" data-chat-upload="file" />
-    <input class="sr-only" type="file" id="im-file-flash" data-chat-upload="flash" accept=".jpg,.jpeg,.png,.gif,.webp,image/jpeg,image/png,image/gif,image/webp" />
+    <input class="sr-only" type="file" id="im-file-flash" data-chat-upload="flash" accept=".jpg,.jpeg,.png,.gif,.webp,.avif,image/jpeg,image/png,image/gif,image/webp,image/avif" />
   </form>`;
 }
 
@@ -10370,6 +11333,50 @@ function messageTimestampMs(entry) {
 }
 
 function revokeActionInfo(entry) {
+  const nativeAttachment = nativeMediaAttachmentId(entry);
+  const canonicalMessageId = String(
+    entry?.canonicalMessageId || entry?.canonical_message_id || entry?.id || ""
+  ).trim();
+  if (
+    entry?.canonicalMessageId ||
+    entry?.canonical_message_id ||
+    String(entry?.source || "").toLowerCase() === "web-local"
+  ) {
+    const eligible =
+      entry?.type === "mine" &&
+      canonicalMessageId &&
+      !entry?.revoked &&
+      entry?.delivery !== "sending" &&
+      entry?.delivery !== "failed";
+    if (!eligible) return null;
+    const timestamp = messageTimestampMs(entry);
+    const age = timestamp ? Math.max(0, Date.now() - timestamp) : 0;
+    const insideWindow = !timestamp || age <= MESSAGE_REVOKE_DEFAULT_WINDOW_MS;
+    if (
+      nativeAttachment &&
+      insideWindow
+    ) {
+      return {
+        label: "撤回",
+        title: "Web 本地媒体可在发送后 2 分钟内撤回",
+        mode: "native-media",
+        attachmentId: nativeAttachment,
+        outsideDefaultWindow: false,
+        hasRestKey: false,
+      };
+    }
+    if (entry?.kind === "text" && insideWindow) {
+      return {
+        label: "撤回",
+        title: "Web 本地文字可在发送后 2 分钟内撤回",
+        mode: "native-text",
+        canonicalMessageId,
+        outsideDefaultWindow: false,
+        hasRestKey: false,
+      };
+    }
+    return null;
+  }
   const eligible =
     entry &&
     entry.type === "mine" &&
@@ -10617,6 +11624,60 @@ async function revokeChatMessage(id) {
   if (!entry || !actionInfo) throw new Error("这条消息当前无法撤回");
   if (!window.confirm("确认撤回这条消息？")) return false;
 
+  if (actionInfo.mode === "native-text") {
+    const { data, ok } = await api("/api/im/rest/revoke", {
+      method: "POST",
+      body: JSON.stringify({
+        to: entry.peer,
+        canonical_message_id: actionInfo.canonicalMessageId,
+      }),
+      timeout: 15000,
+    });
+    if (!ok || data?.ok === false) {
+      const info = errorInfo(data, "撤回失败");
+      throw new Error([info.title, info.detail].filter(Boolean).join(" · "));
+    }
+    const canonicalMessageId = String(
+      data.canonical_message_id || actionInfo.canonicalMessageId || entry.canonicalMessageId || ""
+    );
+    const revoked = markLocalMessageRevoked(entry, {
+      id: canonicalMessageId || entry.id,
+      canonicalMessageId,
+      recalledText: String(data.recalled_text || entry.recalledText || entry.text || ""),
+      source: "web-local",
+      provider: "web-local",
+      canonicalAuthority: true,
+      tim_mirror_status: String(data.tim_mirror_status || ""),
+      compatibility_sync: data.compatibility_sync ?? null,
+    });
+    toast("消息已撤回");
+    void loadConversationMessages(entry.peer, { force: true, archiveOnly: true });
+    return Boolean(revoked);
+  }
+
+  if (actionInfo.mode === "native-media") {
+    const { data, ok } = await api(
+      `/api/im/media/attachments/${encodeURIComponent(actionInfo.attachmentId)}/revoke`,
+      { method: "POST", body: JSON.stringify({}), timeout: 15000 }
+    );
+    if (!ok || data?.ok === false) {
+      const info = errorInfo(data, "撤回失败");
+      throw new Error([info.title, info.detail].filter(Boolean).join(" · "));
+    }
+    const revoked = markLocalMessageRevoked(entry, {
+      canonicalMessageId: String(data.canonical_message_id || entry.canonicalMessageId || ""),
+      attachmentId: String(data.attachment_id || actionInfo.attachmentId),
+      source: "web-local",
+      provider: "web-local",
+      canonicalAuthority: true,
+      tim_mirror_status: String(data.tim_mirror_status || ""),
+      compatibility_sync: data.compatibility_sync ?? null,
+    });
+    toast("消息已撤回");
+    void loadConversationMessages(entry.peer, { force: true, archiveOnly: true });
+    return Boolean(revoked);
+  }
+
   const attempts = actionInfo.outsideDefaultWindow && entry.msgKey ? ["rest", "sdk"] : ["sdk", "rest"];
   const errors = [];
   for (const mode of attempts) {
@@ -10701,13 +11762,13 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
   if (!(await ensurePrivateChatPermission(target))) {
     throw new Error("该私信入口仅向管理员授权的用户开放");
   }
-  const policyGeneration = S.messagePolicyGeneration;
   const previous = retryMessageId ? findChatMessage(retryMessageId, target) : null;
   const messageQuote = normalizeMessageQuote(quote || previous?.quote);
   const pendingID = previous?.id || localMessageID("text");
   const pending = {
     ...(previous || {}),
     id: pendingID,
+    clientMessageId: pendingID,
     msgKey: "",
     text: content,
     kind: "text",
@@ -10736,61 +11797,95 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
   refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
 
   try {
-    let sentEntry;
-    if (S.imConnected && S.imMode === "sdk" && S.chat && resolveTimApi()) {
-      if (!S.messagePolicyReady || S.messagePolicyGeneration !== policyGeneration) {
-        throw new Error("私聊安全策略已更新，请重试");
-      }
-      const TIM = resolveTimApi();
-      const cloudCustomData = messageQuoteCloudCustomData(messageQuote);
-      const options = {
+    const wasDisconnected = !S.imConnected;
+    const { data, ok } = await api("/api/im/rest/send", {
+      method: "POST",
+      body: JSON.stringify({
         to: target,
-        conversationType: TIM.TYPES.CONV_C2C,
-        payload: { text: content },
-      };
-      if (cloudCustomData) options.cloudCustomData = cloudCustomData;
-      const message = S.chat.createTextMessage(options);
-      const result = await S.chat.sendMessage(message);
-      const sentMessage = result?.data?.message || result?.message || message;
-      sentEntry = timMessageEntry(sentMessage, target);
-      sentEntry.text = content;
-      sentEntry.type = "mine";
-      sentEntry.peerRead = timPeerReadState(sentMessage) ?? false;
-      sentEntry.delivery = "sent";
-    } else if (S.imMode === "rest" || !S.imConnected) {
-      const wasDisconnected = !S.imConnected;
-      const { data } = await api("/api/im/rest/send", {
-        method: "POST",
-        body: JSON.stringify({ to: target, text: content, quote: messageQuote }),
-        timeout: 15000,
-      });
-      if (!data.ok) {
-        const info = errorInfo(data, wasDisconnected ? "发送失败" : "文本备用通道发送失败");
-        throw new Error([info.title, info.detail || data.error_info].filter(Boolean).join(" · "));
-      }
-      if (wasDisconnected) {
-        S.imConnected = true;
-        S.imMode = "rest";
-        S.imLastError = "";
-        S.messageLastPeerSyncAt = 0;
-        updateImConnectionStatus();
-        toast("已通过文本备用通道发送");
-      }
-      sentEntry = {
-        id: String(data.message_id || data.msg_uid || ""),
-        msgKey: String(data.msg_key || data.message_id || data.msg_uid || ""),
         text: content,
-        type: "mine",
-        peer: target,
-        timestamp: Date.now(),
-        source: "rest",
-        peerRead: false,
-        delivery: "sent",
+        client_message_id: pendingID,
         quote: messageQuote,
-      };
-    } else {
-      throw new Error("消息通道尚未连接");
+      }),
+      timeout: 15000,
+    });
+    const response = data && typeof data === "object" ? data : {};
+    if (!ok || response.ok === false) {
+      const info = errorInfo(response, wasDisconnected ? "发送失败" : "Web 消息发送失败");
+      throw new Error([info.title, info.detail || response.error_info].filter(Boolean).join(" · "));
     }
+    if (wasDisconnected) {
+      S.imConnected = true;
+      S.imMode = "rest";
+      S.imLastError = "";
+      S.messageLastPeerSyncAt = 0;
+      updateImConnectionStatus();
+      toast("已通过 Web 消息通道发送");
+    }
+    const responseMessage =
+      response.message && typeof response.message === "object" && !Array.isArray(response.message)
+        ? response.message
+        : {};
+    const canonicalID = canonicalMessageID(response) || String(responseMessage.id || "").trim();
+    const responseMessageID = String(
+      canonicalID ||
+        response.message_id ||
+        response.msg_uid ||
+        responseMessage.message_id ||
+        responseMessage.msg_uid ||
+        responseMessage.ID ||
+        responseMessage.id ||
+        pendingID
+    );
+    const compatibilitySync = response.compatibility_sync ?? responseMessage.compatibility_sync ?? null;
+    const timMirrorStatus = String(
+      response.tim_mirror_status ||
+        responseMessage.tim_mirror_status ||
+        (compatibilitySync && typeof compatibilitySync === "object" ? compatibilitySync.status : "") ||
+        ""
+    );
+    const sentEntry = {
+      id: responseMessageID,
+      canonicalMessageId: canonicalID,
+      clientMessageId: String(
+        response.client_message_id || responseMessage.client_message_id || pendingID
+      ),
+      msgKey: String(
+        response.msg_key ||
+          responseMessage.msg_key ||
+          responseMessage.MsgKey ||
+          response.message_id ||
+          response.msg_uid ||
+          ""
+      ),
+      sequence: String(responseMessage.sequence || response.message_sequence || ""),
+      messageRandom: String(
+        responseMessage.messageRandom ||
+          responseMessage.message_random ||
+          response.message_random ||
+          ""
+      ),
+      text: content,
+      type: "mine",
+      direction: "out",
+      peer: target,
+      timestamp: timMessageTimestamp({
+        timestamp:
+          responseMessage.occurred_at ||
+          response.occurred_at ||
+          responseMessage.timestamp ||
+          response.timestamp ||
+          Date.now(),
+      }),
+      source: canonicalID ? "web-local" : "rest",
+      provider: canonicalID ? "web-local" : "",
+      canonicalAuthority: Boolean(canonicalID),
+      rawMessage: null,
+      peerRead: false,
+      delivery: "sent",
+      quote: messageQuote,
+      compatibility_sync: compatibilitySync,
+      tim_mirror_status: timMirrorStatus,
+    };
 
     const replacement = {
       ...pending,
@@ -10818,6 +11913,10 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
     });
     refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
     archiveMessageBestEffort(replacement, "outgoing");
+    if (canonicalID || webLocalDependencyMode()) {
+      void loadArchivedConversationSummary({ force: true });
+      void loadConversationMessages(target, { force: true, archiveOnly: true });
+    }
     return replacement;
   } catch (error) {
     updateLocalMessage(pendingID, {
@@ -10962,6 +12061,73 @@ function createLocalMedia(file, kind, meta = {}) {
   return { url, name: file.name || "文件", size: file.size };
 }
 
+async function sha256ChatFile(file) {
+  if (!window.crypto?.subtle || typeof file?.arrayBuffer !== "function") {
+    throw new Error("当前浏览器无法计算媒体摘要，请升级浏览器后重试");
+  }
+  const bytes = await file.arrayBuffer();
+  const digest = await window.crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+function uploadNativeMediaObject(target, file, onProgress) {
+  const uploadUrl = String(target?.upload_url || "").trim();
+  if (!uploadUrl) return Promise.reject(new Error("媒体上传地址不可用"));
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open(String(target.method || "PUT"), uploadUrl, true);
+    request.timeout = Math.max(120000, Math.min(20 * 60 * 1000, Math.ceil(file.size / (128 * 1024)) * 1000));
+    Object.entries(target.headers || {}).forEach(([name, value]) => {
+      request.setRequestHeader(String(name), String(value));
+    });
+    request.upload.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) onProgress?.(event.loaded / event.total);
+    };
+    request.onload = () => {
+      if (request.status >= 200 && request.status < 300) resolve(true);
+      else reject(new Error(`媒体上传失败，存储服务返回 ${request.status || "未知状态"}`));
+    };
+    request.onerror = () => reject(new Error("媒体上传网络失败"));
+    request.ontimeout = () => reject(new Error("媒体上传超时"));
+    request.onabort = () => reject(new DOMException("媒体上传已取消", "AbortError"));
+    request.send(file);
+  });
+}
+
+async function createNativeMediaAsset(kind, file, onProgress) {
+  onProgress?.(0.01);
+  const sha256 = await sha256ChatFile(file);
+  onProgress?.(0.05);
+  const contentType = String(file.type || "application/octet-stream").split(";", 1)[0].trim().toLowerCase();
+  const { data: intent, ok: intentOk } = await api("/api/im/media/uploads", {
+    method: "POST",
+    body: JSON.stringify({
+      kind,
+      filename: file.name || `${kind}-${Date.now()}`,
+      content_type: contentType || "application/octet-stream",
+      size_bytes: file.size,
+      sha256,
+    }),
+    timeout: 15000,
+  });
+  if (!intentOk || intent?.ok === false) {
+    const info = errorInfo(intent, "无法创建媒体上传任务");
+    throw new Error([info.title, info.detail].filter(Boolean).join(" · "));
+  }
+  await uploadNativeMediaObject(intent, file, (ratio) => onProgress?.(0.05 + ratio * 0.8));
+  onProgress?.(0.88);
+  const { data: asset, ok: completeOk } = await api(
+    `/api/im/media/uploads/${encodeURIComponent(String(intent.intent_id || ""))}/complete`,
+    { method: "POST", body: JSON.stringify({}), timeout: 120000 }
+  );
+  if (!completeOk || asset?.ok === false || !asset?.asset_id) {
+    const info = errorInfo(asset, "媒体校验失败");
+    throw new Error([info.title, info.detail].filter(Boolean).join(" · "));
+  }
+  onProgress?.(0.93);
+  return { ...asset, sha256: String(asset.sha256 || sha256) };
+}
+
 async function sendTimMediaFile(kind, file, meta = {}) {
   const peer = String(meta.peer || S.activePeer || "").trim();
   if (!peer) {
@@ -10988,6 +12154,7 @@ async function sendTimMediaFile(kind, file, meta = {}) {
     height: Number(meta.height || localMedia.height || 0),
     poster: String(meta.poster || localMedia.poster || ""),
     localUrl: String(localMedia.url || meta.localUrl || ""),
+    assetId: String(meta.assetId || previous?.retryMeta?.assetId || ""),
   };
   const pending = {
     ...(previous || {}),
@@ -11019,51 +12186,83 @@ async function sendTimMediaFile(kind, file, meta = {}) {
   });
   refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
   try {
-    const { chat, TIM } = await ensureTimMediaReady();
+    let asset = null;
+    const reusableAssetId = String(reusableMeta.assetId || "").trim();
+    if (reusableAssetId) {
+      asset = {
+        asset_id: reusableAssetId,
+        kind,
+        filename: file.name,
+        content_type: file.type || "application/octet-stream",
+        size_bytes: file.size,
+      };
+      updateLocalMessage(pendingID, (entry) => ({ ...entry, progress: 0.93 }));
+    } else {
+      asset = await createNativeMediaAsset(kind, file, (progress) =>
+        updateLocalMessage(pendingID, (entry) => ({ ...entry, progress }))
+      );
+      reusableMeta.assetId = String(asset.asset_id || "");
+      updateLocalMessage(pendingID, (entry) => ({
+        ...entry,
+        retryMeta: { ...(entry.retryMeta || reusableMeta), assetId: reusableMeta.assetId },
+        progress: 0.94,
+      }));
+    }
     if (!S.messagePolicyReady || S.messagePolicyGeneration !== policyGeneration) {
       throw new Error("私聊安全策略已更新，请重试");
     }
-    if (!TIM?.TYPES?.CONV_C2C) throw new Error("实时消息类型不可用");
-    const options = {
-      to: peer,
-      conversationType: TIM.TYPES.CONV_C2C,
-      payload: { file },
-      onProgress: (event) => updateLocalMessage(pendingID, (entry) => ({ ...entry, progress: progressRatio(event) })),
-    };
-    let message;
-    if (kind === "image") message = chat.createImageMessage(options);
-    else if (kind === "audio") message = chat.createAudioMessage(options);
-    else if (kind === "video") message = chat.createVideoMessage(options);
-    else message = chat.createFileMessage(options);
-    if (!message) throw new Error("未能创建媒体消息");
-    const sdkObjectUrls = collectBlobObjectUrls(message);
-    let result;
-    try {
-      result = await chat.sendMessage(message);
-    } finally {
-      revokeSdkTemporaryObjectUrls(sdkObjectUrls);
+    const { data: response, ok } = await api("/api/im/media/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        to: peer,
+        client_message_id: pendingID,
+        asset_id: asset.asset_id,
+        flash: false,
+      }),
+      timeout: 20000,
+    });
+    if (!ok || response?.ok === false) {
+      const info = errorInfo(response, "媒体发送失败");
+      throw new Error([info.title, info.detail].filter(Boolean).join(" · "));
     }
-    const sentMessage = result?.data?.message || result?.message || message;
-    const sent = timMessageEntry(sentMessage, peer);
-    const mergedMedia = replaceUploadedLocalMediaUrl(
-      localMedia.url,
-      mergeMediaResult(localMedia, sent.media),
-      sent.media
-    );
+    const attachmentId = String(response.attachment_id || response.media?.attachment_id || "");
+    const canonicalID = String(response.canonical_message_id || response.message_id || "");
+    const mergedMedia = {
+      ...localMedia,
+      ...(response.media || {}),
+      url: localMedia.url,
+      thumbnail: kind === "image" ? localMedia.thumbnail || localMedia.url : localMedia.thumbnail,
+      attachmentId,
+      assetId: String(response.media?.asset_id || asset.asset_id || ""),
+      contentType: String(response.media?.content_type || asset.content_type || file.type || ""),
+      sha256: String(response.media?.sha256 || asset.sha256 || ""),
+      native: true,
+    };
     const replacement = {
       ...pending,
-      ...sent,
-      id: sent.id || pendingID,
+      id: canonicalID || pendingID,
+      canonicalMessageId: canonicalID,
+      clientMessageId: String(response.client_message_id || pendingID),
       kind,
       media: mergedMedia,
+      attachmentId,
+      assetId: String(asset.asset_id || ""),
       type: "mine",
+      direction: "out",
       peer,
-      peerRead: timPeerReadState(sentMessage) ?? false,
+      timestamp: timMessageTimestamp({ timestamp: response.occurred_at || Date.now() }),
+      source: "web-local",
+      provider: "web-local",
+      canonicalAuthority: true,
+      rawMessage: null,
+      peerRead: false,
       delivery: "sent",
       progress: 1,
       retryFile: null,
       retryMeta: null,
       retryError: "",
+      compatibility_sync: response.compatibility_sync ?? null,
+      tim_mirror_status: String(response.tim_mirror_status || "pending"),
     };
     replacement.preview = messagePreview(replacement);
     updateLocalMessage(pendingID, replacement);
@@ -11074,13 +12273,15 @@ async function sendTimMediaFile(kind, file, meta = {}) {
       unreadCount: 0,
     });
     refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
-    archiveMessageBestEffort(replacement, "outgoing");
+    void loadArchivedConversationSummary({ force: true });
+    void loadConversationMessages(peer, { force: true, archiveOnly: true });
     return replacement;
   } catch (error) {
     updateLocalMessage(pendingID, {
       ...pending,
       delivery: "failed",
       progress: 0,
+      retryMeta: { ...reusableMeta },
       retryError: String(error?.message || error || "媒体发送失败"),
     });
     throw error;
@@ -11127,7 +12328,7 @@ async function readImageMetadata(file) {
           width: 0,
           height: 0,
           localUrl: url,
-          metadataWarning: "当前浏览器无法读取图片尺寸，仍将尝试通过实时消息通道发送",
+          metadataWarning: "当前浏览器无法读取图片尺寸，仍将上传并由服务端校验格式",
         });
       timer = setTimeout(
         () =>
@@ -11135,7 +12336,7 @@ async function readImageMetadata(file) {
             width: 0,
             height: 0,
             localUrl: url,
-            metadataWarning: "读取图片信息超时，仍将尝试通过实时消息通道发送",
+            metadataWarning: "读取图片信息超时，仍将上传并由服务端校验格式",
           }),
         10000
       );
@@ -11182,7 +12383,7 @@ async function readVideoMetadata(file) {
           width: 0,
           height: 0,
           localUrl: url,
-          metadataWarning: "当前浏览器无法预览该视频，仍将尝试通过实时消息通道发送",
+          metadataWarning: "当前浏览器无法预览该视频，仍将上传并由服务端校验格式",
         });
       timer = setTimeout(
         () =>
@@ -11191,7 +12392,7 @@ async function readVideoMetadata(file) {
             width: 0,
             height: 0,
             localUrl: url,
-            metadataWarning: "读取视频信息超时，仍将尝试通过实时消息通道发送",
+            metadataWarning: "读取视频信息超时，仍将上传并由服务端校验格式",
           }),
         10000
       );
@@ -11239,8 +12440,8 @@ function validateChatFile(kind, file) {
     if (!extensionAllowed) {
       throw new Error(
         isFlash
-          ? "闪图仅支持扩展名为 .jpg、.jpeg、.png、.gif 或 .webp 的图片"
-          : "图片仅支持 .jpg、.jpeg、.png、.gif、.bmp 或 .webp"
+          ? "闪图仅支持扩展名为 .jpg、.jpeg、.png、.gif、.webp 或 .avif 的图片"
+          : "图片仅支持 .jpg、.jpeg、.png、.gif、.webp 或 .avif"
       );
     }
     if (!mimeAllowed) {
@@ -11248,19 +12449,21 @@ function validateChatFile(kind, file) {
     }
     const isGif = mime === "image/gif" || /\.gif$/i.test(name);
     const limit = isGif ? CHAT_MEDIA_LIMITS.gif : CHAT_MEDIA_LIMITS[kind];
-    if (file.size > limit) throw new Error(isGif ? "动图不能超过 10 MB" : "图片不能超过 28 MB");
+    if (file.size > limit) throw new Error(isGif ? "动图不能超过 20 MB" : "图片不能超过 20 MB");
+  } else if (kind === "audio") {
+    if (file.size > CHAT_MEDIA_LIMITS.audio) throw new Error("语音不能超过 20 MB");
   } else if (kind === "video") {
     const name = String(file.name || "");
     const mime = String(file.type || "").trim().toLowerCase().split(";", 1)[0];
     if (!TIM_VIDEO_FILE_EXTENSION_RE.test(name)) {
-      throw new Error("视频仅支持扩展名为 .mp4 或 .mov 的文件");
+      throw new Error("视频仅支持扩展名为 .mp4、.mov 或 .webm 的文件");
     }
     if (!TIM_VIDEO_MIME_TYPES.has(mime)) {
-      throw new Error("视频格式不受支持，请选择 .mp4 或 .mov 文件");
+      throw new Error("视频格式不受支持，请选择 .mp4、.mov 或 .webm 文件");
     }
     if (file.size > CHAT_MEDIA_LIMITS.video) throw new Error("视频不能超过 100 MB");
   } else if (kind === "file" && file.size > CHAT_MEDIA_LIMITS.file) {
-    throw new Error("文件不能超过 100 MB");
+    throw new Error("文件不能超过 40 MB");
   }
 }
 
@@ -11271,6 +12474,8 @@ async function sendFlashPhoto(file, { retryMessageId = "", peer: requestedPeer =
   if (!(await ensurePrivateChatPermission(peer))) throw new Error("该私信入口仅向管理员授权的用户开放");
   const previous = retryMessageId ? findChatMessage(retryMessageId, peer) : null;
   const pendingID = previous?.id || localMessageID("flash");
+  const localMedia = previous?.media || createLocalMedia(file, "image");
+  const reusableAssetId = String(previous?.retryMeta?.assetId || "");
   const pending = {
     ...(previous || {}),
     id: pendingID,
@@ -11278,7 +12483,7 @@ async function sendFlashPhoto(file, { retryMessageId = "", peer: requestedPeer =
     kind: "flash",
     objectName: "TIMTextElem",
     payload: { text: "点击查看5秒闪图" },
-    media: {},
+    media: localMedia,
     flashId: "",
     type: "mine",
     peer,
@@ -11289,50 +12494,88 @@ async function sendFlashPhoto(file, { retryMessageId = "", peer: requestedPeer =
     progress: 0,
     preview: "[闪图]",
     retryFile: file,
-    retryMeta: { peer, kind: "flash" },
+    retryMeta: { peer, kind: "flash", assetId: reusableAssetId },
     retryError: "",
   };
   if (previous) updateLocalMessage(pendingID, pending);
   else appendLocalMessage(pending);
   updateConversationActivity(peer, { name: S.activePeerName || `用户 ${peer}`, lastMessage: "[闪图]", unreadCount: 0 });
   refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
-  const form = new FormData();
-  form.append("peer", peer);
-  form.append("targetId", peer);
-  form.append("target_id", peer);
-  form.append("file", file, file.name || `flash-${Date.now()}.jpg`);
   try {
-    const { data } = await api("/api/im/flash/send", { method: "POST", body: form, timeout: 90000 });
-    if (!data?.ok) {
+    const asset = reusableAssetId
+      ? {
+          asset_id: reusableAssetId,
+          content_type: file.type,
+          size_bytes: file.size,
+          filename: file.name,
+        }
+      : await createNativeMediaAsset("image", file, (progress) =>
+          updateLocalMessage(pendingID, (entry) => ({ ...entry, progress }))
+        );
+    pending.retryMeta.assetId = String(asset.asset_id || "");
+    updateLocalMessage(pendingID, (entry) => ({
+      ...entry,
+      retryMeta: { ...(entry.retryMeta || {}), assetId: String(asset.asset_id || "") },
+      progress: 0.94,
+    }));
+    const { data, ok } = await api("/api/im/media/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        to: peer,
+        client_message_id: pendingID,
+        asset_id: asset.asset_id,
+        flash: true,
+      }),
+      timeout: 20000,
+    });
+    if (!ok || !data?.ok) {
       const info = errorInfo(data, "闪图发送失败");
       throw new Error([info.title, info.detail].filter(Boolean).join(" · "));
     }
-    const flashId = String(data.uniqueid || data.unique_id || data.flash_id || data.flashId || "");
+    const flashId = String(data.attachment_id || data.flash_id || "");
+    const canonicalID = String(data.canonical_message_id || data.message_id || "");
     const archived = {
       ...pending,
-      id: String(data.message_id || data.msg_uid || pendingID),
+      id: canonicalID || pendingID,
+      canonicalMessageId: canonicalID,
+      clientMessageId: String(data.client_message_id || pendingID),
+      attachmentId: flashId,
+      assetId: String(data.media?.asset_id || asset.asset_id || ""),
       flashId,
       cloudCustomData: flashId,
       media: {
-        url: String(data.url || data.photo_url || ""),
-        name: String(file.name || "").slice(0, 255),
-        mime: String(data.content_type || file.type || "").slice(0, 128),
-        size: Math.max(0, Number(data.size || file.size || 0) || 0),
+        ...localMedia,
+        ...(data.media || {}),
+        url: localMedia.url,
+        thumbnail: localMedia.thumbnail || localMedia.url,
+        attachmentId: flashId,
+        assetId: String(data.media?.asset_id || asset.asset_id || ""),
+        native: true,
       },
+      source: "web-local",
+      provider: "web-local",
+      canonicalAuthority: true,
+      direction: "out",
+      timestamp: timMessageTimestamp({ timestamp: data.occurred_at || Date.now() }),
+      rawMessage: null,
       delivery: "sent",
       progress: 1,
       retryFile: null,
       retryMeta: null,
       retryError: "",
+      compatibility_sync: data.compatibility_sync ?? null,
+      tim_mirror_status: String(data.tim_mirror_status || "pending"),
     };
     updateLocalMessage(pendingID, archived);
-    archiveMessageBestEffort(archived, "outgoing");
+    void loadArchivedConversationSummary({ force: true });
+    void loadConversationMessages(peer, { force: true, archiveOnly: true });
     toast("闪图已发送");
   } catch (error) {
     updateLocalMessage(pendingID, {
       ...pending,
       delivery: "failed",
       progress: 0,
+      retryMeta: { ...pending.retryMeta },
       retryError: String(error?.message || error || "闪图发送失败"),
     });
     throw error;
@@ -12781,6 +14024,77 @@ function openChatMediaViewer(kind, url) {
   if (!dialog.open) dialog.showModal();
 }
 
+function nativeMediaMessageEntry(messageId, attachmentId = "") {
+  const id = String(messageId || "").trim();
+  const attachment = String(attachmentId || "").trim();
+  return (
+    S.imMessages.find(
+      (entry) =>
+        String(entry.peer || "") === String(S.activePeer || "") &&
+        ((id && String(entry.id || "") === id) ||
+          (attachment && nativeMediaAttachmentId(entry) === attachment))
+    ) || null
+  );
+}
+
+async function requestNativeMediaAccess(attachmentId) {
+  const id = String(attachmentId || "").trim();
+  if (!id) throw new Error("媒体附件标识不可用");
+  const { data, ok } = await api(`/api/im/media/attachments/${encodeURIComponent(id)}/access`, {
+    timeout: 15000,
+  });
+  if (!ok || data?.ok === false) {
+    const info = errorInfo(data, "媒体暂不可用");
+    throw new Error([info.title, info.detail].filter(Boolean).join(" · "));
+  }
+  const url = mediaUrl(data?.url);
+  if (!url) throw new Error("媒体读取地址不可用");
+  return { ...data, url };
+}
+
+async function openNativeMedia(messageId, attachmentId, kind) {
+  const entry = nativeMediaMessageEntry(messageId, attachmentId);
+  if (!entry) throw new Error("未找到对应媒体消息");
+  const attachment = nativeMediaAttachmentId(entry) || String(attachmentId || "").trim();
+  const grant = await requestNativeMediaAccess(attachment);
+  const nextMedia = {
+    ...(entry.media || {}),
+    attachmentId: attachment,
+    assetId: String(grant.asset_id || entry.media?.assetId || ""),
+    contentType: String(grant.content_type || entry.media?.contentType || ""),
+    size: Number(grant.size_bytes || entry.media?.size || 0),
+    url: grant.url,
+    native: true,
+    nativeAccessExpiresAt: String(grant.expires_at || ""),
+  };
+  if (kind === "image") nextMedia.thumbnail = grant.url;
+  const updated = updateLocalMessage(entry.id, { ...entry, media: nextMedia });
+  if (kind === "file") {
+    const anchor = document.createElement("a");
+    anchor.href = grant.url;
+    anchor.target = "_blank";
+    anchor.rel = "noopener noreferrer";
+    anchor.download = String(nextMedia.name || "");
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    return updated;
+  }
+  if (kind === "audio") {
+    const audio = [...document.querySelectorAll("audio[data-audio-message-id]")].find(
+      (item) => String(item.dataset.audioMessageId || "") === String(updated?.id || entry.id)
+    );
+    if (audio) {
+      audio.src = grant.url;
+      audio.dataset.mediaSource = grant.url;
+      await audio.play();
+    }
+    return updated;
+  }
+  openChatMediaViewer(kind === "video" ? "video" : "image", grant.url);
+  return updated;
+}
+
 function closeChatMediaViewer() {
   const dialog = $("chat-media-viewer");
   if (!dialog) return;
@@ -13099,7 +14413,18 @@ function flushPendingFlashAcknowledgements() {
 async function openFlashViewer(uniqueid) {
   const id = String(uniqueid || "").trim();
   if (!id) throw new Error("闪图凭证不可用");
-  if (flashRevealAwaitingAcknowledgement(id)) {
+  const entry = S.imMessages.find(
+    (item) => item?.kind === "flash" && String(item.flashId || "").trim() === id
+  );
+  const nativeFlash = Boolean(
+    entry &&
+      nativeMediaAttachmentId(entry) &&
+      [entry.source, entry.provider].some((value) => String(value || "").toLowerCase() === "web-local")
+  );
+  if (nativeFlash && entry.nativeFlashClaimed) {
+    throw new Error("闪图已经查看，不能再次领取");
+  }
+  if (!nativeFlash && flashRevealAwaitingAcknowledgement(id)) {
     throw new Error("闪图已查看，状态正在确认");
   }
   if (S.imFlashHold?.active) return;
@@ -13111,21 +14436,31 @@ async function openFlashViewer(uniqueid) {
   const image = previousImage.cloneNode(false);
   image.hidden = true;
   previousImage.replaceWith(image);
-  const hold = { id, active: true, image, timer: null, countdownTimer: null, acknowledged: false };
+  const hold = { id, active: true, image, timer: null, countdownTimer: null, acknowledged: false, native: nativeFlash };
   S.imFlashHold = hold;
   title.textContent = "正在读取闪图…";
   countdown.textContent = "画面保持隐藏，加载完成后开始 5 秒计时；松手立即关闭";
   viewer.classList.remove("hide");
   document.documentElement.classList.add("flash-viewing");
   try {
-    const { data } = await api("/api/im/flash/get", {
-      method: "POST",
-      body: JSON.stringify({ uniqueid: id }),
-      timeout: 15000,
-    });
-    if (!data?.ok) {
+    const { data, ok } = nativeFlash
+      ? await api(`/api/im/media/attachments/${encodeURIComponent(id)}/claim`, {
+          method: "POST",
+          body: JSON.stringify({}),
+          timeout: 15000,
+        })
+      : await api("/api/im/flash/get", {
+          method: "POST",
+          body: JSON.stringify({ uniqueid: id }),
+          timeout: 15000,
+        });
+    if (!ok || !data?.ok) {
       if (!hold.active || S.imFlashHold !== hold) return;
-      throw new Error(errorInfo(data, "闪图不可查看").title);
+      const info = errorInfo(data, "闪图不可查看");
+      if (nativeFlash && info.code === "flash_already_claimed" && entry) {
+        updateLocalMessage(entry.id, { ...entry, nativeFlashClaimed: true });
+      }
+      throw new Error([info.title, info.detail].filter(Boolean).join(" · "));
     }
     const rawUrl = firstMessageValue(
       [data, data.info, data.data, data.message],
@@ -13137,7 +14472,11 @@ async function openFlashViewer(uniqueid) {
       if (!hold.active || S.imFlashHold !== hold) return;
       throw new Error("闪图地址不可用或已失效");
     }
-    archiveRevealedFlashPhoto(id, url);
+    if (nativeFlash && entry) {
+      updateLocalMessage(entry.id, { ...entry, nativeFlashClaimed: true });
+    } else {
+      archiveRevealedFlashPhoto(id, url);
+    }
     if (!hold.active || S.imFlashHold !== hold) return;
     title.textContent = "正在安全加载闪图…";
     countdown.textContent = "画面保持隐藏，加载完成后开始 5 秒计时；松手立即关闭";
@@ -13145,7 +14484,7 @@ async function openFlashViewer(uniqueid) {
       if (!hold.active || S.imFlashHold !== hold) return;
       image.onload = null;
       image.onerror = null;
-      queueFlashRevealAcknowledgement(id);
+      if (!nativeFlash) queueFlashRevealAcknowledgement(id);
       image.hidden = false;
       title.textContent = "5 秒闪图";
       const started = Date.now();
@@ -13235,7 +14574,7 @@ function discoveryUserCard(item, tab) {
   });
 }
 
-function discoveryPanelHtml(data, tab, { locationError = "" } = {}) {
+function discoveryPanelHtml(data, tab) {
   const activeTab = normalizeDiscoveryTab(tab);
   const filters = discoveryFilterState(activeTab);
   const isNearby = activeTab === "nearby";
@@ -13254,13 +14593,16 @@ function discoveryPanelHtml(data, tab, { locationError = "" } = {}) {
     isNearby && S.nearbyCustomCityEnabled
       ? `<label class="discovery-filter-field discovery-city-field"><span>城市</span><input name="city" value="${esc(
           filters.city
-        )}" maxlength="40" placeholder="留空使用资料城市或当前位置" autocomplete="address-level2" /></label>`
+        )}" maxlength="40" placeholder="留空使用资料城市" autocomplete="address-level2" /></label>`
       : "";
   let content;
   if (data?.location_required) {
-    content = `<div class="empty-state discovery-location-state"><div><strong>需要获取位置信息</strong><span>${esc(
-      locationError || data?.error?.detail || "资料中没有配置城市，请允许浏览器获取当前位置后继续。"
-    )}</span><button type="button" class="btn primary small" data-action="nearby-request-location">获取当前位置</button></div></div>`;
+    content = `<div class="empty-state discovery-location-state"><div><strong>需要城市信息</strong><span>${esc(
+      data?.error?.detail ||
+        (S.nearbyCustomCityEnabled
+          ? "资料中没有配置城市，请在上方填写城市后应用筛选，或先完善个人资料。"
+          : "资料中没有配置城市，请先完善个人资料中的城市信息。")
+    )}</span></div></div>`;
   } else if (data && data.ok === false) {
     const info = errorInfo(data, `${title}加载失败`);
     content = `<div class="error-state"><div><strong>${esc(info.title)}</strong><span>${esc(
@@ -13300,7 +14642,7 @@ function discoveryPanelHtml(data, tab, { locationError = "" } = {}) {
   </section>`;
 }
 
-function discoveryRequestPath(tab, filters, location = S.nearbyLocation) {
+function discoveryRequestPath(tab, filters) {
   const activeTab = normalizeDiscoveryTab(tab);
   const params = new URLSearchParams({
     page: "1",
@@ -13310,10 +14652,6 @@ function discoveryRequestPath(tab, filters, location = S.nearbyLocation) {
   });
   if (activeTab === "nearby") {
     if (S.nearbyCustomCityEnabled && filters.city) params.set("city", filters.city);
-    if (!filters.city && location?.latitude != null && location?.longitude != null) {
-      params.set("latitude", String(location.latitude));
-      params.set("longitude", String(location.longitude));
-    }
   }
   const endpoint = activeTab === "nearby" ? "/api/match/nearby-users" : "/api/match/online-users";
   return `${endpoint}?${params.toString()}`;
@@ -13325,32 +14663,6 @@ async function fetchDiscoveryPeople(tab, { signal } = {}) {
   const { data } = await api(discoveryRequestPath(activeTab, filters), { signal });
   applyCapabilities(data?.capabilities);
   return data;
-}
-
-function requestNearbyLocation() {
-  if (!navigator.geolocation) return Promise.reject(new Error("当前浏览器不支持位置获取"));
-  return new Promise((resolve, reject) => {
-    navigator.geolocation.getCurrentPosition(
-      (position) => {
-        const latitude = Number(position.coords?.latitude);
-        const longitude = Number(position.coords?.longitude);
-        if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
-          reject(new Error("浏览器返回的位置信息无效"));
-          return;
-        }
-        resolve({ latitude, longitude, accuracy: Number(position.coords?.accuracy || 0) });
-      },
-      (error) => {
-        const messages = {
-          1: "位置权限未授权，请在浏览器设置中允许后重试",
-          2: "暂时无法获取当前位置，请检查系统定位服务",
-          3: "获取当前位置超时，请重试",
-        };
-        reject(new Error(messages[error?.code] || "获取当前位置失败"));
-      },
-      { enableHighAccuracy: false, timeout: 12000, maximumAge: 10 * 60 * 1000 }
-    );
-  });
 }
 
 function syncDiscoveryTabs(tab) {
@@ -13367,17 +14679,12 @@ function syncDiscoveryTabs(tab) {
 function discoveryPanelCacheKey(tab) {
   const activeTab = normalizeDiscoveryTab(tab);
   const filters = discoveryFilterState(activeTab);
-  const location = S.nearbyLocation;
-  const locationKey =
-    activeTab === "nearby" && !filters.city && location?.latitude != null && location?.longitude != null
-      ? `${Number(location.latitude).toFixed(3)},${Number(location.longitude).toFixed(3)}`
-      : "";
-  return `nearby:${activeTab}:${[filters.gender, filters.property, filters.age, filters.city, locationKey]
+  return `nearby:${activeTab}:${[filters.gender, filters.property, filters.age, filters.city]
     .map((value) => encodeURIComponent(String(value || "")))
     .join(":")}`;
 }
 
-async function loadDiscoveryPanel(tab, { requestLocation = true, forceLocation = false, force = false } = {}) {
+async function loadDiscoveryPanel(tab, { force = false } = {}) {
   const activeTab = normalizeDiscoveryTab(tab);
   const previousCacheKey = discoveryPanelCacheKey(S.nearbyTab);
   const panel = $("discovery-panel");
@@ -13401,7 +14708,7 @@ async function loadDiscoveryPanel(tab, { requestLocation = true, forceLocation =
     : false;
   if (cached) {
     if (!panelDomRestored) panel.innerHTML = cached.html;
-    if (!force && !forceLocation && cached.fresh) {
+    if (!force && cached.fresh) {
       rememberPanelDomSnapshot(cacheKey, panel);
       rememberCurrentPageSnapshot(routeCacheKey("nearby"));
       if (S.nearbyController === controller) S.nearbyController = null;
@@ -13414,34 +14721,7 @@ async function loadDiscoveryPanel(tab, { requestLocation = true, forceLocation =
   if (cached) panel.classList.add("is-refreshing");
   else panel.classList.add("is-loading");
   try {
-    if (forceLocation) {
-      S.nearbyLocation = await requestNearbyLocation();
-      cacheKey = discoveryPanelCacheKey(activeTab);
-      cached = reusableCacheEntry(S.panelCache, cacheKey);
-      panelDom = reusablePanelDomEntry(cacheKey, cached);
-      panelDomRestored = panelDom
-        ? previousCacheKey === cacheKey
-          ? true
-          : restorePanelDomSnapshot(panel, panelDom)
-        : false;
-      if (cached && !panelDomRestored) panel.innerHTML = cached.html;
-    }
-    let data = await fetchDiscoveryPeople(activeTab, { signal: controller.signal });
-    if (activeTab === "nearby" && data?.location_required && requestLocation && !forceLocation) {
-      panel.innerHTML = `<div class="tab-panel-loading">资料中没有城市，正在申请获取当前位置…</div>`;
-      try {
-        S.nearbyLocation = await requestNearbyLocation();
-        data = await fetchDiscoveryPeople(activeTab, { signal: controller.signal });
-      } catch (error) {
-        if (seq !== S.nearbyLoadSeq || controller.signal.aborted) return;
-        const html = discoveryPanelHtml(data, activeTab, { locationError: error.message || String(error) });
-        panel.innerHTML = html;
-        rememberPanelSnapshot(cacheKey, html);
-        rememberPanelDomSnapshot(cacheKey, panel);
-        rememberCurrentPageSnapshot(routeCacheKey("nearby"));
-        return;
-      }
-    }
+    const data = await fetchDiscoveryPeople(activeTab, { signal: controller.signal });
     if (seq !== S.nearbyLoadSeq || controller.signal.aborted || S.route !== "nearby") return;
     const nextHtml = discoveryPanelHtml(data, activeTab);
     if (!panelDomRestored || cached?.html !== nextHtml) panel.innerHTML = nextHtml;
@@ -13800,8 +15080,19 @@ async function pageMoments(signal, { force = false } = {}) {
   return `<div class="moments-page">
     <section class="moments-toolbar">
       <div><h2>动态</h2><p id="moment-page-subtitle">${esc(momentsTabDescription(view.tab, view.data))}</p></div>
-      <details class="moment-compose"><summary class="btn primary">发布动态</summary><form data-form="moment-publish">
-        <textarea class="ui-scrollbar" name="text" rows="4" maxlength="2000" placeholder="分享此刻的想法" required></textarea>
+      <details class="moment-compose" ${S.momentMediaDraft.length ? "open" : ""}><summary class="btn primary">发布动态</summary><form data-form="moment-publish">
+        <textarea class="ui-scrollbar" name="text" rows="4" maxlength="2000" placeholder="分享此刻的想法，也可以只发布图片或视频"></textarea>
+        <div class="moment-compose-media"><input class="sr-only" id="moment-media-images" type="file" data-moment-media="image" accept=".jpg,.jpeg,.png,.gif,.webp,.avif,image/jpeg,image/png,image/gif,image/webp,image/avif" multiple /><input class="sr-only" id="moment-media-video" type="file" data-moment-media="video" accept=".mp4,.mov,.webm,video/mp4,video/quicktime,video/webm" /><div class="media-picker-actions"><label class="btn secondary small" for="moment-media-images">选择图片</label><label class="btn secondary small" for="moment-media-video">选择视频</label><button type="button" class="btn soft small" data-action="moment-media-clear" ${
+        S.momentMediaDraft.length ? 'data-locked="false"' : 'disabled data-locked="true"'
+        }>清除已选媒体</button></div><p class="media-upload-status" data-moment-media-status>${
+          S.momentMediaDraft.some((draft) => draft.kind === "video")
+            ? "已选择 1 个视频"
+            : S.momentMediaDraft.length
+              ? `已选择 ${S.momentMediaDraft.length} 张图片，最多 9 张`
+              : "可选择最多 9 张图片，或 1 个视频"
+        }</p><div class="moment-compose-preview-grid" data-moment-media-preview ${
+          S.momentMediaDraft.length ? "" : "hidden"
+        }>${momentMediaDraftHtml()}</div></div>
         <div class="moment-compose-options"><label>可见范围<select name="visibility_scope"><option>公开</option><option>仅好友可见</option><option>好友及粉丝可见</option><option>仅自己可见</option></select></label><label>话题<input name="topic" maxlength="40" placeholder="可选" /></label></div>
         <div class="moment-compose-switches"><label><input type="checkbox" name="comment_forbid" value="1" />关闭评论</label><label><input type="checkbox" name="hide_comment" value="1" />评论仅双方可见</label></div>
         <button type="submit" class="btn primary full">发布</button>
@@ -14278,6 +15569,26 @@ async function pageTasks(signal) {
     }</section><div id="task-result" class="result-panel"></div>`;
 }
 
+function normalizedProfileGender(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (["male", "男"].includes(normalized)) return "male";
+  if (["female", "女"].includes(normalized)) return "female";
+  if (["other", "其他"].includes(normalized)) return "other";
+  return "unspecified";
+}
+
+function profileGenderOptions(value) {
+  const current = normalizedProfileGender(value);
+  return [
+    ["unspecified", "保密"],
+    ["male", "男"],
+    ["female", "女"],
+    ["other", "其他"],
+  ]
+    .map(([key, label]) => `<option value="${key}" ${key === current ? "selected" : ""}>${label}</option>`)
+    .join("");
+}
+
 async function pageMe(signal) {
   const { data } = await api("/api/profile/me", { signal });
   if (data.user) applyUser(data.user);
@@ -14291,15 +15602,35 @@ async function pageMe(signal) {
     name
   )}</h2><p>UID ${esc(user.uid || user.id || "—")} · ${user.is_realname ? "已实名" : "未实名"} · 乐园币 ${esc(
     user.money ?? "0"
-  )}</p></div><button type="button" class="btn secondary small profile-edit-button" data-action="focus-nickname">编辑资料</button></div>
+  )}</p></div><button type="button" class="btn secondary small profile-edit-button" data-action="focus-profile-editor">编辑资料</button></div>
     <div class="profile-stats ui-scrollbar ui-scrollbar--compact">
       <button type="button" data-action="social-open-tab" data-tab="friends"><strong data-me-stat="friends">${esc(countAt("friends"))}</strong><span>好友</span></button>
       <button type="button" data-action="social-open-tab" data-tab="follows"><strong data-me-stat="follows">${esc(countAt("follows"))}</strong><span>关注</span></button>
       <button type="button" data-action="social-open-tab" data-tab="fans"><strong data-me-stat="fans">${esc(countAt("fans"))}</strong><span>粉丝</span></button>
       <button type="button" data-action="social-open-tab" data-tab="visitors" data-visitor-tab="seen_me"><strong data-me-stat="visitors">${esc(countAt("visitors"))}</strong><span>谁看过我</span></button>
     </div></section>
-    <section class="section"><div class="form-grid">
-      <form class="surface-card" data-form="profile-nick"><div class="section-head"><div><h2>修改昵称</h2><p>实名及修改次数限制由服务端决定</p></div></div><div class="field"><label for="nickname-new">新昵称</label><input id="nickname-new" name="name" maxlength="24" placeholder="输入新昵称" required /></div><button type="submit" class="btn primary full mt-sm">保存昵称</button></form>
+    <section class="section" id="profile-editor"><div class="form-grid">
+      <form class="surface-card profile-avatar-editor" data-form="profile-avatar"><div class="section-head"><div><h2>头像</h2><p>图片保存在 Web 私有媒体存储中，不会提交浏览器临时地址</p></div></div><div class="profile-avatar-preview" data-profile-avatar-preview ${profileAvatarPreviewHtml(user) ? "" : "hidden"}>${profileAvatarPreviewHtml(
+        user
+      )}</div><input class="sr-only" id="profile-avatar-file" type="file" data-profile-avatar accept=".jpg,.jpeg,.png,.gif,.webp,.avif,image/jpeg,image/png,image/gif,image/webp,image/avif" /><div class="media-picker-actions"><label class="btn secondary" for="profile-avatar-file">选择头像</label><button type="button" class="btn soft" data-action="profile-avatar-remove" ${
+        S.profileAvatarDraft ? 'data-locked="false"' : 'disabled data-locked="true"'
+      }>移除所选图片</button></div><p class="media-upload-status" data-profile-avatar-status>${esc(
+        profileAvatarDraftStatus()
+      )}</p><progress class="media-upload-track" data-profile-avatar-progress max="100" value="${Math.round(
+        Math.max(0, Math.min(1, Number(S.profileAvatarDraft?.progress || 0))) * 100
+      )}" ${S.profileAvatarDraft?.uploading ? "" : "hidden"}></progress><button type="submit" class="btn primary full mt-sm" data-profile-avatar-submit ${
+        S.profileAvatarDraft ? 'data-locked="false"' : 'disabled data-locked="true"'
+      }>上传并保存头像</button></form>
+      <form class="surface-card profile-details-editor" data-form="profile-details"><div class="section-head"><div><h2>基本资料</h2><p>资料以 Web 本地数据库为准，并异步兼容原有账号体系</p></div></div><div class="field"><label for="profile-nickname">昵称</label><input id="profile-nickname" name="nickname" value="${esc(
+        user.nickname || user.name || ""
+      )}" minlength="2" maxlength="32" autocomplete="nickname" required /></div><div class="field"><label for="profile-signature">个性签名</label><textarea id="profile-signature" name="signature" rows="3" maxlength="280" placeholder="可选">${esc(
+        user.signature || ""
+      )}</textarea></div><div class="field"><label for="profile-city">城市</label><input id="profile-city" name="city" value="${esc(
+        user.city || ""
+      )}" maxlength="64" autocomplete="address-level2" placeholder="可选" /></div><div class="field"><label for="profile-gender">性别</label><select id="profile-gender" name="gender">${profileGenderOptions(
+        user.gender || user.sex
+      )}</select></div><button type="submit" class="btn primary full mt-sm">保存基本资料</button></form>
+      ${S.localPasswordChangeEnabled ? `<form class="surface-card" data-form="local-password-change"><div class="section-head"><div><h2>修改登录密码</h2><p>修改后所有设备需要使用新密码重新登录</p></div></div><div class="field"><label for="password-current">当前密码</label><input id="password-current" name="current_password" type="password" autocomplete="current-password" maxlength="4096" required /></div><div class="field"><label for="password-new">新密码</label><input id="password-new" name="new_password" type="password" autocomplete="new-password" minlength="8" maxlength="128" required /></div><div class="field"><label for="password-confirm">确认新密码</label><input id="password-confirm" name="confirm_password" type="password" autocomplete="new-password" minlength="8" maxlength="128" required /></div><button type="submit" class="btn primary full mt-sm">更新密码</button></form>` : ""}
       <div class="surface-card"><div class="section-head"><div><h2>账户信息</h2><p>仅展示必要的非敏感字段</p></div></div>${keyValueView({
         uid: user.uid || user.id,
         nickname: name,
@@ -14311,6 +15642,640 @@ async function pageMe(signal) {
       })}</div>
     </div></section>
     <section class="section"><div class="surface-card profile-service-card"><div class="section-head"><div><h2>资料与礼仪</h2><p>查看账号认证、礼仪分和推荐码</p></div></div><div class="button-row profile-query-actions"><button type="button" class="btn secondary" data-action="face-status" aria-controls="me-result" aria-pressed="false">查看实名状态</button><button type="button" class="btn secondary" data-action="etiquette" aria-controls="me-result" aria-pressed="false">查看礼仪分</button><button type="button" class="btn secondary" data-action="referral-get" aria-controls="me-result" aria-pressed="false">查看推荐码</button></div><div id="me-result" class="result-panel profile-query-result-panel" aria-live="polite"></div><form class="inline-form profile-referral-form" data-form="referral-set"><div class="field"><label for="referral-value">设置推荐码</label><input id="referral-value" name="referral" placeholder="输入推荐码" required /></div><button type="submit" class="btn secondary">保存</button></form></div></section>`;
+}
+
+function agentConnectionStatusText(connection) {
+  if (!connection) return "尚未配置";
+  if (connection.last_test_status === "ok") return "连接测试通过";
+  if (connection.last_test_status === "failed") return "最近一次连接测试失败";
+  return "尚未测试连接";
+}
+
+function agentStyleProfileHtml(profile) {
+  if (!profile) {
+    return `<div class="notice"><strong>尚未形成语言风格</strong><div>启用运行器后，可从本人已归档的历史文字消息中提炼稳定表达习惯。模型生成的内容不会重新进入风格学习。</div></div>`;
+  }
+  const traits = profile.traits && typeof profile.traits === "object" ? profile.traits : {};
+  const traitLabels = {
+    tone: "语气",
+    sentence_pattern: "句式",
+    vocabulary: "用词",
+    punctuation: "标点",
+    expressions: "常用表达",
+    do: "建议保持",
+    avoid: "建议避免",
+  };
+  const rows = Object.entries(traitLabels)
+    .filter(([key]) => traits[key] !== undefined && traits[key] !== null && traits[key] !== "")
+    .map(([key, label]) => {
+      const value = Array.isArray(traits[key]) ? traits[key].join("；") : String(traits[key]);
+      return `<div class="kv-row"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`;
+    })
+    .join("");
+  return `<div class="notice"><strong>${esc(profile.summary || "已生成语言风格")}</strong><div>基于 ${esc(
+    profile.source_message_count || 0
+  )} 条本人历史消息，生成于 ${esc(formatDate(profile.generated_at))}</div></div>${
+    rows ? `<div class="kv-list">${rows}</div>` : ""
+  }`;
+}
+
+function aiAgentExecutionActionLabel(action) {
+  return AI_AGENT_EXECUTION_ACTIONS[action]?.label || "账号动作";
+}
+
+function requireAiAgentExecutionAction(action, { requireAutoSend = false } = {}) {
+  const normalized = String(action || "").trim();
+  const execution = S.aiAgentExecutionStatus;
+  if (!S.aiAgentExecutionAccessEnabled || !execution) throw new Error("账号执行功能当前不可用");
+  if (!execution.user_enabled) throw new Error("请先主动开启账号执行功能");
+  if (!S.aiAgentModelReady) throw new Error("请先完成模型连接和运行设置");
+  if (!execution.allowed_actions.includes(normalized) || !execution.selected_actions.includes(normalized)) {
+    throw new Error("该动作未加入你的执行白名单");
+  }
+  if (requireAutoSend && !execution.auto_send_enabled) {
+    throw new Error("请先开启生成后直接发送权限");
+  }
+  return execution;
+}
+
+function agentExecutionActionReview(action, target, content) {
+  const spec = AI_AGENT_EXECUTION_ACTIONS[action];
+  if (!spec) throw new Error("请选择有效的账号动作");
+  const normalizedTarget = String(target || "").trim();
+  const normalizedContent = String(content || "").trim();
+  if (spec.needsTarget && !normalizedTarget) throw new Error("请输入目标用户编号");
+  if (normalizedTarget.length > 128) throw new Error("目标用户编号过长");
+  if (spec.needsContent && !normalizedContent) throw new Error("请输入要执行的文字内容");
+  if (normalizedContent.length > 2000) throw new Error("执行内容不能超过 2000 个字符");
+  return {
+    target: spec.needsTarget ? normalizedTarget : "",
+    content: spec.needsContent ? normalizedContent : "",
+  };
+}
+
+function renderAiAgentExecutionConfirmation() {
+  const panel = $("agent-execution-confirmation");
+  const pending = S.aiAgentPendingExecution;
+  if (!panel) return;
+  if (
+    !pending ||
+    pending.sessionGeneration !== S.sessionGeneration ||
+    pending.executionGeneration !== S.aiAgentExecutionGeneration
+  ) {
+    panel.replaceChildren();
+    return;
+  }
+  const directReply = pending.kind === "reply_send";
+  const title = directReply ? "确认生成并立即发送" : `确认执行：${aiAgentExecutionActionLabel(pending.action)}`;
+  const contentReview = pending.content
+    ? `<div class="field"><label for="agent-execution-review-content">将要执行的文字内容</label><textarea id="agent-execution-review-content" rows="6" readonly>${esc(
+        pending.content
+      )}</textarea></div>`
+    : "";
+  const objectiveReview = pending.objective
+    ? `<div class="field"><label for="agent-execution-review-objective">生成目标</label><textarea id="agent-execution-review-objective" rows="4" readonly>${esc(
+        pending.objective
+      )}</textarea></div>`
+    : "";
+  panel.innerHTML = `<div class="notice"><strong>${esc(title)}</strong><div>${
+    directReply
+      ? "确认后服务端会生成新回复并立即发送，最终发送文本不会先以草稿形式返回。"
+      : "这是实际账号操作，不是草稿生成。服务端一次性确认凭证有效期为 5 分钟，请再次核对目标和内容。"
+  }</div></div>
+    ${pending.target ? `<div class="kv-list"><div class="kv-row"><span>目标用户编号</span><strong>${esc(pending.target)}</strong></div></div>` : ""}
+    ${contentReview}${objectiveReview}
+    <div class="button-row"><button type="button" class="btn primary" data-action="agent-confirm-execution">${esc(
+      directReply ? "确认生成并发送" : `确认${aiAgentExecutionActionLabel(pending.action)}`
+    )}</button><button type="button" class="btn secondary" data-action="agent-cancel-execution">取消本次执行</button></div>`;
+}
+
+async function stageAiAgentExecution({ kind, action, target = "", content = "", objective = "" }) {
+  const directReply = kind === "reply_send";
+  requireAiAgentExecutionAction(action, { requireAutoSend: directReply });
+  if (directReply && !S.aiAgentModelReady) throw new Error("请先完成模型连接和运行设置");
+  const reviewed = directReply
+    ? { target: String(target || "").trim(), content: "" }
+    : agentExecutionActionReview(action, target, content);
+  if (directReply && !reviewed.target) throw new Error("请输入目标用户编号");
+  if (reviewed.target.length > 128) throw new Error("目标用户编号过长");
+  const normalizedObjective = String(objective || "").trim();
+  if (directReply && !normalizedObjective) throw new Error("请填写本次回复目标");
+  if (normalizedObjective.length > 2000) throw new Error("回复目标不能超过 2000 个字符");
+  clearAiAgentPendingExecution();
+  const generation = S.sessionGeneration;
+  const executionGeneration = S.aiAgentExecutionGeneration;
+  const idempotencyKey = newAgentIdempotencyKey();
+  let confirmationToken = "";
+  let expiresAt = 0;
+  if (!directReply) {
+    const body = { action, idempotency_key: idempotencyKey };
+    if (reviewed.target) body.target_upstream_uid = reviewed.target;
+    if (reviewed.content) body.content = reviewed.content;
+    const prepared = await agentExecutionApi("/api/agent/actions/prepare", {
+      method: "POST",
+      body: JSON.stringify(body),
+      timeout: 30000,
+    });
+    if (
+      generation !== S.sessionGeneration ||
+      executionGeneration !== S.aiAgentExecutionGeneration
+    ) {
+      return;
+    }
+    requireAiAgentExecutionAction(action);
+    confirmationToken = String(prepared.confirmation_token || "").trim();
+    const hasExpiresIn = Object.prototype.hasOwnProperty.call(prepared, "expires_in");
+    const rawExpiresIn = Number(prepared.expires_in);
+    if (hasExpiresIn && (!Number.isFinite(rawExpiresIn) || rawExpiresIn <= 0)) {
+      throw new Error("服务端返回的一次性确认凭证已失效");
+    }
+    const expiresIn = hasExpiresIn ? Math.min(300, rawExpiresIn) : 300;
+    if (!confirmationToken || confirmationToken.length > 4096) {
+      throw new Error("服务端未返回有效的一次性确认凭证");
+    }
+    expiresAt = Date.now() + expiresIn * 1000;
+  }
+  S.aiAgentPendingExecution = Object.freeze({
+    sessionGeneration: generation,
+    executionGeneration,
+    kind: directReply ? "reply_send" : "action",
+    action,
+    target: reviewed.target,
+    content: reviewed.content,
+    objective: normalizedObjective,
+    idempotencyKey,
+    confirmationToken,
+    expiresAt,
+  });
+  renderAiAgentExecutionConfirmation();
+  $("agent-execution-confirmation")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+async function executeAiAgentPendingExecution() {
+  const pending = S.aiAgentPendingExecution;
+  if (
+    !pending ||
+    pending.sessionGeneration !== S.sessionGeneration ||
+    pending.executionGeneration !== S.aiAgentExecutionGeneration
+  ) {
+    clearAiAgentPendingExecution();
+    throw new Error("待确认内容已失效，请重新检查执行内容");
+  }
+  const directReply = pending.kind === "reply_send";
+  requireAiAgentExecutionAction(pending.action, { requireAutoSend: directReply });
+  if (directReply && !S.aiAgentModelReady) throw new Error("模型运行状态已变化，请重新检查");
+  if (!directReply) {
+    if (!pending.confirmationToken || Date.now() >= Number(pending.expiresAt || 0)) {
+      clearAiAgentPendingExecution();
+      throw new Error("一次性确认凭证已过期，请重新检查执行内容");
+    }
+  }
+  const confirmed = window.confirm(
+    directReply
+      ? `确认让模型生成新回复并立即发送给用户 ${pending.target}？最终文本不会先返回审核。`
+      : `确认实际执行“${aiAgentExecutionActionLabel(pending.action)}”？该操作会立即影响你的社交账号。`
+  );
+  if (!confirmed) return null;
+  const generation = S.sessionGeneration;
+  let data;
+  try {
+    if (directReply) {
+      data = await agentExecutionApi("/api/agent/replies/send", {
+        method: "POST",
+        body: JSON.stringify({
+          peer_upstream_uid: pending.target,
+          objective: pending.objective,
+          idempotency_key: pending.idempotencyKey,
+        }),
+        timeout: 120000,
+      });
+    } else {
+      const body = {
+        action: pending.action,
+        idempotency_key: pending.idempotencyKey,
+        confirmation_token: pending.confirmationToken,
+      };
+      if (pending.target) body.target_upstream_uid = pending.target;
+      if (pending.content) body.content = pending.content;
+      data = await agentExecutionApi("/api/agent/actions/execute", {
+        method: "POST",
+        body: JSON.stringify(body),
+        timeout: 30000,
+      });
+    }
+  } catch (error) {
+    if (!directReply && [400, 409, 410, 422].includes(Number(error?.status || 0))) {
+      clearAiAgentPendingExecution();
+    }
+    throw error;
+  }
+  if (S.aiAgentPendingExecution === pending) clearAiAgentPendingExecution();
+  if (pending.action === "publish_text_post") clearMomentCache();
+  if (["follow_user", "unfollow_user"].includes(pending.action)) {
+    clearRelationshipCache(["follows", "fans"]);
+  }
+  if (pending.action === "send_private_message") clearViewCacheKey("msg");
+  const successMessage = data.message || `${aiAgentExecutionActionLabel(pending.action)}已执行`;
+  toast(successMessage);
+  clearViewCacheKey("agent");
+  if (generation === S.sessionGeneration && S.route === "agent") {
+    const panel = $("agent-execution-confirmation");
+    const executedText = directReply ? String(data.draft || "").trim() : pending.content;
+    if (panel) {
+      panel.innerHTML = `<div class="notice"><strong>${esc(successMessage)}</strong><div>服务端已确认本次操作完成。再次执行需要重新检查并确认。</div></div>${
+        executedText
+          ? `<div class="field"><label for="agent-execution-result-content">本次已执行文字</label><textarea id="agent-execution-result-content" rows="6" readonly>${esc(
+              executedText
+            )}</textarea></div>`
+          : ""
+      }`;
+    }
+  }
+  return data;
+}
+
+function syncAgentExecutionActionForm(form) {
+  if (!form) return;
+  const action = String(form.elements.namedItem("action")?.value || "");
+  const spec = AI_AGENT_EXECUTION_ACTIONS[action] || null;
+  const targetField = form.querySelector("[data-agent-execution-target-field]");
+  const contentField = form.querySelector("[data-agent-execution-content-field]");
+  const targetInput = form.elements.namedItem("target_upstream_uid");
+  const contentInput = form.elements.namedItem("content");
+  if (targetField) targetField.hidden = !spec?.needsTarget;
+  if (contentField) contentField.hidden = !spec?.needsContent;
+  if (targetInput) {
+    targetInput.required = Boolean(spec?.needsTarget);
+    if (!spec?.needsTarget) targetInput.value = "";
+  }
+  if (contentInput) {
+    contentInput.required = Boolean(spec?.needsContent);
+    if (!spec?.needsContent) contentInput.value = "";
+  }
+}
+
+function syncAgentExecutionSettingsForm(form) {
+  if (!form) return;
+  const userEnabled = Boolean(form.elements.namedItem("user_enabled")?.checked);
+  const sendSelected = Boolean(
+    form.querySelector('input[name="selected_actions"][value="send_private_message"]:checked')
+  );
+  const autoSendInput = form.elements.namedItem("auto_send_enabled");
+  if (!autoSendInput) return;
+  autoSendInput.disabled = !userEnabled || !sendSelected;
+  if (autoSendInput.disabled) autoSendInput.checked = false;
+}
+
+function aiAgentAutonomyTimeValue(value) {
+  const minute = Number(value);
+  const normalized = Number.isInteger(minute) ? Math.min(1439, Math.max(0, minute)) : 0;
+  return `${String(Math.floor(normalized / 60)).padStart(2, "0")}:${String(normalized % 60).padStart(2, "0")}`;
+}
+
+function aiAgentAutonomyMinuteValue(value, label) {
+  const normalized = String(value || "").trim();
+  const match = /^(\d{2}):(\d{2})$/.exec(normalized);
+  if (!match) throw new Error(`请选择有效的${label}`);
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour > 23 || minute > 59) throw new Error(`请选择有效的${label}`);
+  return hour * 60 + minute;
+}
+
+function aiAgentAutonomyInteger(values, name, label, minimum, maximum) {
+  const value = Number(values[name]);
+  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${label}必须是 ${minimum} 到 ${maximum} 之间的整数`);
+  }
+  return value;
+}
+
+function aiAgentAutonomyTaskTypeLabel(task) {
+  const type = String(task?.task_type || task?.type || task?.action_type || "").trim();
+  return (
+    {
+      reply_to_message: "自动回复",
+      scheduled_post: "定时文字动态",
+      follow_target: "白名单关注",
+      unfollow_target: "白名单取消关注",
+      send_private_message: "自动回复",
+      publish_text_post: "定时文字动态",
+      follow_user: "白名单关注",
+      unfollow_user: "白名单取消关注",
+    }[type] || "无人值守任务"
+  );
+}
+
+function aiAgentAutonomyTaskStatusLabel(task) {
+  const status = String(task?.status || "").trim();
+  return (
+    {
+      queued: "排队中",
+      deferred: "等待运行",
+      leased: "已领取",
+      generating: "正在生成",
+      dispatching: "正在执行",
+      succeeded: "已完成",
+      failed: "执行失败",
+      cancelled: "已取消",
+      stale: "已失效",
+      manual_review: "等待人工检查",
+    }[status] || status || "状态未知"
+  );
+}
+
+function agentAutonomyRecentTasksHtml(tasks) {
+  if (!tasks.length) {
+    return `<div class="notice"><strong>暂无最近任务</strong><div>只有满足全部门禁并进入队列的任务才会显示在这里。</div></div>`;
+  }
+  return `<div class="stack">${tasks
+    .map((task) => {
+      const status = String(task.status || "").trim();
+      const outcomeUnknown = task.outcome_unknown === true || status === "manual_review";
+      const timestamp = task.finished_at || task.updated_at || task.scheduled_for || task.created_at;
+      const detail = [
+        timestamp ? formatSocialTime(timestamp) : "",
+        task.target_upstream_uid ? `目标 ${String(task.target_upstream_uid).slice(0, 128)}` : "",
+        task.stable_error_code ? `原因 ${String(task.stable_error_code).slice(0, 160)}` : "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      return `<div class="notice${outcomeUnknown || status === "failed" ? " warn" : ""}"><strong>${esc(
+        aiAgentAutonomyTaskTypeLabel(task)
+      )} · ${esc(aiAgentAutonomyTaskStatusLabel(task))}</strong>${
+        detail ? `<div>${esc(detail)}</div>` : ""
+      }${
+        outcomeUnknown
+          ? `<div>本次外部结果不能安全确认，系统不会自动重试，请先人工检查账号状态。</div>`
+          : ""
+      }</div>`;
+    })
+    .join("")}</div>`;
+}
+
+function syncAgentAutonomySettingsForm(form) {
+  if (!form) return;
+  const autonomy = S.aiAgentAutonomyStatus;
+  const configurable = autonomy?.user_authorized === true;
+  form.querySelectorAll("input, textarea, select, button").forEach((control) => {
+    control.disabled = !configurable;
+  });
+  if (!configurable) return;
+  const executionActions = new Set(S.aiAgentExecutionStatus?.selected_actions || []);
+  form.querySelectorAll('input[name="allowed_actions"]').forEach((input) => {
+    input.disabled = !executionActions.has(input.value);
+    if (input.disabled) input.checked = false;
+  });
+  const userEnabled = Boolean(form.elements.namedItem("user_enabled")?.checked);
+  const selectedActions = new Set(
+    [...form.querySelectorAll('input[name="allowed_actions"]:checked')].map((input) => input.value)
+  );
+  const featureRequirements = [
+    ["auto_reply_enabled", selectedActions.has("send_private_message")],
+    ["scheduled_post_enabled", selectedActions.has("publish_text_post")],
+    [
+      "managed_relationships_enabled",
+      selectedActions.has("follow_user") || selectedActions.has("unfollow_user"),
+    ],
+  ];
+  featureRequirements.forEach(([name, actionAllowed]) => {
+    const input = form.elements.namedItem(name);
+    if (!input) return;
+    input.disabled = !userEnabled || !actionAllowed;
+    if (input.disabled) input.checked = false;
+  });
+}
+
+function agentAutonomySectionHtml(autonomy) {
+  if (!autonomy?.visible) return "";
+  const executionActions = new Set(S.aiAgentExecutionStatus?.selected_actions || []);
+  const selectedActions = new Set(
+    autonomy.allowed_actions.filter((action) => executionActions.has(action))
+  );
+  const configurable = autonomy.user_authorized === true;
+  const controlDisabled = configurable ? "" : "disabled";
+  const actionOptions = Object.keys(AI_AGENT_EXECUTION_ACTIONS)
+    .map((action) => {
+      const executionAllowed = executionActions.has(action);
+      return `<label class="check-line"><input name="allowed_actions" type="checkbox" value="${esc(
+        action
+      )}" ${selectedActions.has(action) ? "checked" : ""} ${
+        configurable && executionAllowed ? "" : "disabled"
+      } /><span>${esc(aiAgentExecutionActionLabel(action))}${
+        executionAllowed ? "" : "（需先在上方授权）"
+      }</span></label>`;
+    })
+    .join("");
+  const activeTitle = autonomy.halted
+    ? "无人值守 Agent 已自动停机"
+    : autonomy.effective_enabled
+      ? "无人值守 Agent 正在运行"
+      : autonomy.user_enabled && !autonomy.background_enabled
+        ? "配置已保存，部署端后台调度未启用"
+      : autonomy.user_enabled
+        ? "配置已保存，但当前门禁未全部满足"
+        : "无人值守 Agent 保持关闭";
+  const statusDetail = `系统开关${autonomy.system_enabled ? "已开启" : "未开启"} · 管理授权${
+    autonomy.user_authorized ? "已授予" : "未授予"
+  } · 后台调度${autonomy.background_enabled ? "已启用" : "未启用"} · 运行条件${
+    autonomy.available ? "已满足" : "未满足"
+  }`;
+  const haltedReason = autonomy.halted_reason
+    ? `<div>停机原因：${esc(autonomy.halted_reason)}</div>`
+    : "";
+  return `<section class="section" id="agent-autonomy-section"><div class="section-head"><div><h2>无人值守运行</h2><p>该区域与手动二次确认执行相互独立，只有全部门禁同时满足时才会在后台运行</p></div></div>
+    <div class="notice${autonomy.halted || !autonomy.effective_enabled ? " warn" : ""}"><strong>${esc(
+      activeTitle
+    )}</strong><div>${esc(statusDetail)}</div>${haltedReason}</div>
+    <div class="notice mt-sm"><strong>自动化边界</strong><div>自动回复只处理当前仍待回复的入站文字消息；如果你已经回复或会话最新消息发生变化，任务会失效。关系动作只对精确用户编号白名单生效，不支持通配符。无人值守动作只以 Web 本地权威事务成功为准，兼容镜像异步处理且失败不会回滚本地结果。任何结果未知的操作都不会自动重试，而会等待人工检查。</div></div>
+    <div class="form-grid mt-md">
+      <form class="surface-card" data-form="agent-autonomy-settings" autocomplete="off"><div class="section-head"><div><h2>后台策略</h2><p>默认全部关闭，可按动作和预算逐项启用</p></div></div>
+        <label class="check-line"><input name="user_enabled" type="checkbox" ${
+          autonomy.user_enabled ? "checked" : ""
+        } ${controlDisabled} /><span>启用无人值守 Agent 总开关</span></label>
+        <div class="field"><label>无人值守动作白名单</label><div class="stack">${actionOptions}</div><p class="field-help">这里只能选择已在上方账号执行设置中授权的动作。</p></div>
+        <div class="stack">
+          <label class="check-line"><input name="auto_reply_enabled" type="checkbox" ${
+            autonomy.auto_reply_enabled ? "checked" : ""
+          } ${controlDisabled} /><span>自动回复待回复入站消息</span></label>
+          <label class="check-line"><input name="scheduled_post_enabled" type="checkbox" ${
+            autonomy.scheduled_post_enabled ? "checked" : ""
+          } ${controlDisabled} /><span>按间隔生成并发布公开文字动态</span></label>
+          <label class="check-line"><input name="managed_relationships_enabled" type="checkbox" ${
+            autonomy.managed_relationships_enabled ? "checked" : ""
+          } ${controlDisabled} /><span>管理白名单中的关注关系</span></label>
+        </div>
+        <div class="field"><label for="agent-autonomy-brief">运行目标与内容边界</label><textarea id="agent-autonomy-brief" name="operation_brief" rows="6" maxlength="4000" placeholder="说明允许回复或发布的主题、语气和禁止事项；不要填写密码、令牌或其他密钥" ${controlDisabled}>${esc(
+          autonomy.operation_brief
+        )}</textarea></div>
+        <div class="field"><label for="agent-autonomy-targets">关系动作目标白名单</label><textarea id="agent-autonomy-targets" name="managed_target_uids" rows="5" maxlength="13000" placeholder="每行一个精确用户编号" ${controlDisabled}>${esc(
+          autonomy.managed_target_uids.join("\n")
+        )}</textarea><p class="field-help">仅用于关注和取消关注；自动回复仍只针对真实待回复会话。</p></div>
+        <div class="form-grid">
+          <div class="field"><label for="agent-autonomy-timezone">时区</label><input id="agent-autonomy-timezone" name="timezone" maxlength="64" value="${esc(
+            autonomy.timezone
+          )}" ${controlDisabled} required /></div>
+          <div class="field"><label for="agent-autonomy-start">每日开始时间</label><input id="agent-autonomy-start" name="active_start_minute" type="time" value="${esc(
+            aiAgentAutonomyTimeValue(autonomy.active_start_minute)
+          )}" ${controlDisabled} required /></div>
+          <div class="field"><label for="agent-autonomy-end">每日结束时间</label><input id="agent-autonomy-end" name="active_end_minute" type="time" value="${esc(
+            aiAgentAutonomyTimeValue(autonomy.active_end_minute)
+          )}" ${controlDisabled} required /><p class="field-help">开始与结束相同表示全天。</p></div>
+          <div class="field"><label for="agent-autonomy-minimum-interval">动作最小间隔（秒）</label><input id="agent-autonomy-minimum-interval" name="minimum_action_interval_seconds" type="number" min="60" max="86400" step="1" value="${esc(
+            autonomy.minimum_action_interval_seconds
+          )}" ${controlDisabled} required /></div>
+          <div class="field"><label for="agent-autonomy-daily-total">每日总上限</label><input id="agent-autonomy-daily-total" name="daily_total_limit" type="number" min="1" max="200" step="1" value="${esc(
+            autonomy.daily_total_limit
+          )}" ${controlDisabled} required /></div>
+          <div class="field"><label for="agent-autonomy-daily-reply">每日自动回复上限</label><input id="agent-autonomy-daily-reply" name="daily_reply_limit" type="number" min="0" max="200" step="1" value="${esc(
+            autonomy.daily_reply_limit
+          )}" ${controlDisabled} required /></div>
+          <div class="field"><label for="agent-autonomy-daily-post">每日动态上限</label><input id="agent-autonomy-daily-post" name="daily_post_limit" type="number" min="0" max="20" step="1" value="${esc(
+            autonomy.daily_post_limit
+          )}" ${controlDisabled} required /></div>
+          <div class="field"><label for="agent-autonomy-daily-relationship">每日关系动作上限</label><input id="agent-autonomy-daily-relationship" name="daily_relationship_limit" type="number" min="0" max="100" step="1" value="${esc(
+            autonomy.daily_relationship_limit
+          )}" ${controlDisabled} required /></div>
+          <div class="field"><label for="agent-autonomy-post-interval">动态发布最小间隔（分钟）</label><input id="agent-autonomy-post-interval" name="post_interval_minutes" type="number" min="60" max="10080" step="1" value="${esc(
+            autonomy.post_interval_minutes
+          )}" ${controlDisabled} required /></div>
+          <div class="field"><label for="agent-autonomy-failure-limit">连续失败停机阈值</label><input id="agent-autonomy-failure-limit" name="consecutive_failure_limit" type="number" min="1" max="20" step="1" value="${esc(
+            autonomy.consecutive_failure_limit
+          )}" ${controlDisabled} required /></div>
+        </div>
+        <button type="submit" class="btn primary full mt-sm" ${controlDisabled}>保存无人值守策略</button>
+      </form>
+      <div class="surface-card"><div class="section-head"><div><h2>最近任务</h2><p>仅展示非敏感状态；结果未知的任务需要人工检查</p></div></div>${agentAutonomyRecentTasksHtml(
+        autonomy.recent_tasks
+      )}</div>
+    </div>
+  </section>`;
+}
+
+function agentExecutionSectionHtml(execution) {
+  if (!execution) return "";
+  const selected = new Set(execution.selected_actions);
+  const actionsHtml = execution.allowed_actions.length
+    ? execution.allowed_actions
+        .map(
+          (action) =>
+            `<label class="check-line"><input name="selected_actions" type="checkbox" value="${esc(action)}" ${
+              selected.has(action) ? "checked" : ""
+            } /><span>${esc(aiAgentExecutionActionLabel(action))}</span></label>`
+        )
+        .join("")
+    : `<div class="notice"><strong>管理员尚未开放具体动作</strong><div>账号执行保持关闭，模型仍只能生成草稿。</div></div>`;
+  const sendAllowed = execution.allowed_actions.includes("send_private_message");
+  const enabledActions = execution.selected_actions.filter((action) => execution.allowed_actions.includes(action));
+  const initialAction = enabledActions[0] || "";
+  const initialSpec = AI_AGENT_EXECUTION_ACTIONS[initialAction] || null;
+  const executionReady = execution.user_enabled === true && S.aiAgentModelReady;
+  const directSendReady =
+    executionReady &&
+    execution.auto_send_enabled === true &&
+    selected.has("send_private_message") &&
+    S.aiAgentModelReady;
+  const actionOptions = enabledActions.length
+    ? enabledActions
+        .map((action) => `<option value="${esc(action)}">${esc(aiAgentExecutionActionLabel(action))}</option>`)
+        .join("")
+    : '<option value="">请先保存动作白名单</option>';
+  return `<section class="section" id="agent-execution-section"><div class="section-head"><div><h2>账号执行</h2><p>此能力与草稿生成独立，只有管理员授权、用户主动开启和动作白名单同时满足时才能使用</p></div></div>
+    <div class="notice"><strong>本区域的每次实际执行都需要二次确认</strong><div>本区域开启后不会自动监听或接管账号，只处理你在本页发起、核对并再次确认的单次请求。无人值守运行必须在下方独立配置和开启。</div></div>
+    <div class="form-grid mt-md">
+      <form class="surface-card" data-form="agent-execution-settings"><div class="section-head"><div><h2>执行权限设置</h2><p>默认不选择任何动作，可随时关闭</p></div></div>
+        <label class="check-line"><input name="user_enabled" type="checkbox" ${execution.user_enabled ? "checked" : ""} /><span>主动开启账号执行</span></label>
+        <div class="field"><label>动作白名单</label><div class="stack">${actionsHtml}</div></div>
+        ${
+          sendAllowed
+            ? `<label class="check-line"><input name="auto_send_enabled" type="checkbox" ${
+                execution.auto_send_enabled ? "checked" : ""
+              } /><span>允许模型生成的私信直接发送</span></label><p class="field-help">手动直发仍需二次确认；后台自动回复还必须在无人值守区域独立开启。</p>`
+            : ""
+        }
+        <button type="submit" class="btn primary full mt-sm">保存执行权限</button>
+      </form>
+      ${
+        sendAllowed
+          ? `<form class="surface-card" data-form="agent-reply-send-review" autocomplete="off"><div class="section-head"><div><h2>生成后直接发送</h2><p>最终文本不会先作为草稿返回，请仅在明确接受该风险时使用</p></div></div>
+            <div class="field"><label for="agent-reply-send-peer">目标用户编号</label><input id="agent-reply-send-peer" name="peer_upstream_uid" maxlength="128" required /></div>
+            <div class="field"><label for="agent-reply-send-objective">本次回复目标</label><textarea id="agent-reply-send-objective" name="objective" rows="4" maxlength="2000" required></textarea></div>
+            <button type="submit" class="btn primary full" ${directSendReady ? "" : "disabled"}>检查并进入二次确认</button>
+          </form>`
+          : ""
+      }
+      <form class="surface-card" data-form="agent-action-review" autocomplete="off"><div class="section-head"><div><h2>执行白名单动作</h2><p>可发送已审核文字、发布文字动态或变更关注关系</p></div></div>
+        <div class="field"><label for="agent-execution-action">动作</label><select id="agent-execution-action" name="action" ${
+          executionReady && enabledActions.length ? "" : "disabled"
+        }>${actionOptions}</select></div>
+        <div class="field" data-agent-execution-target-field ${initialSpec?.needsTarget ? "" : "hidden"}><label for="agent-execution-target">目标用户编号</label><input id="agent-execution-target" name="target_upstream_uid" maxlength="128" ${
+          initialSpec?.needsTarget ? "required" : ""
+        } /></div>
+        <div class="field" data-agent-execution-content-field ${initialSpec?.needsContent ? "" : "hidden"}><label for="agent-execution-content">文字内容</label><textarea id="agent-execution-content" name="content" rows="5" maxlength="2000" ${
+          initialSpec?.needsContent ? "required" : ""
+        }></textarea></div>
+        <button type="submit" class="btn primary full" ${executionReady && enabledActions.length ? "" : "disabled"}>检查并进入二次确认</button>
+      </form>
+    </div>
+    <div id="agent-execution-confirmation" class="result-panel" aria-live="polite"></div>
+  </section>`;
+}
+
+async function pageAgent(signal) {
+  const data = await agentApi("/api/agent/status", { signal, timeout: 7000 });
+  setAiAgentAccess(true, data, { redirect: false });
+  const connection = data.connection || null;
+  const settings = data.settings || {};
+  const ready = settings.ready === true;
+  const execution = S.aiAgentExecutionStatus;
+  const autonomy = S.aiAgentAutonomyStatus;
+  return `<section class="hero-card"><div class="hero-copy"><p class="eyebrow">个人模型</p><h2>草稿、账号执行与无人值守分别受控</h2><p>默认只生成草稿。手动账号执行需要独立授权并逐次确认；无人值守还需要管理员单独授权、个人策略开关和后台安全门禁全部满足。会话内容只会发送到你配置且由系统白名单允许的模型服务。</p></div></section>
+    <section class="section"><div class="form-grid">
+      <form class="surface-card" data-form="agent-connection" autocomplete="off"><div class="section-head"><div><h2>模型连接</h2><p>${esc(
+        agentConnectionStatusText(connection)
+      )}；API Key 使用应用主密钥加密保存且永不回显</p></div></div>
+        <div class="field"><label for="agent-connection-label">连接名称</label><input id="agent-connection-label" name="label" maxlength="120" value="${esc(
+          connection?.label || "默认连接"
+        )}" required /></div>
+        <div class="field"><label for="agent-base-url">服务基础地址</label><input id="agent-base-url" name="base_url" type="url" inputmode="url" maxlength="512" value="${esc(
+          connection?.base_url || ""
+        )}" placeholder="https://provider.example.com/v1" required /></div>
+        <div class="field"><label for="agent-model">模型名称</label><input id="agent-model" name="model" maxlength="160" value="${esc(
+          connection?.model || ""
+        )}" placeholder="填写服务商支持的模型名称" required /></div>
+        <div class="field"><label for="agent-api-key">API Key</label><input id="agent-api-key" name="api_key" type="password" autocomplete="off" maxlength="8192" placeholder="${
+          connection?.key_configured ? "留空表示保留已保存的密钥" : "首次配置必须填写"
+        }" /></div>
+        <label class="check-line"><input name="enabled" type="checkbox" ${connection?.enabled !== false ? "checked" : ""} /><span>启用此模型连接</span></label>
+        <div class="button-row mt-sm"><button type="submit" class="btn primary">保存模型连接</button><button type="button" class="btn secondary" data-action="agent-test-connection" ${
+          connection?.key_configured ? "" : "disabled"
+        }>测试连接</button></div>
+      </form>
+      <form class="surface-card" data-form="agent-settings"><div class="section-head"><div><h2>运行设置</h2><p>管理员模型授权与个人开关必须同时开启；实际账号动作在独立区域授权</p></div></div>
+        <label class="check-line"><input name="user_enabled" type="checkbox" ${settings.user_enabled ? "checked" : ""} /><span>启用个人模型运行器</span></label>
+        <div class="field"><label for="agent-custom-instructions">个人写作要求</label><textarea id="agent-custom-instructions" name="custom_instructions" rows="5" maxlength="4000" placeholder="例如语气自然、避免过度热情；不要填写账号密码或其他密钥">${esc(
+          settings.custom_instructions || ""
+        )}</textarea></div>
+        <div class="field"><label for="agent-temperature">随机度</label><input id="agent-temperature" name="temperature" type="number" min="0" max="2" step="0.1" value="${esc(
+          settings.temperature ?? 0.7
+        )}" required /></div>
+        <div class="field"><label for="agent-context-limit">会话上下文条数</label><input id="agent-context-limit" name="context_message_limit" type="number" min="1" max="100" step="1" value="${esc(
+          settings.context_message_limit ?? 30
+        )}" required /></div>
+        <div class="field"><label for="agent-output-tokens">最大输出长度</label><input id="agent-output-tokens" name="max_output_tokens" type="number" min="64" max="4096" step="1" value="${esc(
+          settings.max_output_tokens ?? 512
+        )}" required /></div>
+        <button type="submit" class="btn primary full mt-sm">保存运行设置</button>
+      </form>
+    </div></section>
+    <section class="section"><div class="surface-card"><div class="section-head"><div><h2>个人语言风格</h2><p>仅分析本人发出的历史文字消息，不分析敏感身份属性</p></div><button type="button" class="btn secondary small" data-action="agent-analyze-style" ${
+      ready ? "" : "disabled"
+    }>重新分析</button></div>${agentStyleProfileHtml(data.style_profile)}</div></section>
+    <section class="section"><div class="surface-card"><div class="section-head"><div><h2>回复草稿</h2><p>读取指定联系人的已归档会话，生成后不会自动发送</p></div></div>
+      <form data-form="agent-draft"><div class="field"><label for="agent-peer-uid">对方用户编号</label><input id="agent-peer-uid" name="peer_upstream_uid" maxlength="128" placeholder="输入已有会话中的对方用户编号" required /></div><div class="field"><label for="agent-objective">本次回复意图</label><textarea id="agent-objective" name="objective" rows="3" maxlength="2000" placeholder="可选，例如礼貌回应并继续了解对方"></textarea></div><button type="submit" class="btn primary" ${
+        ready ? "" : "disabled"
+      }>生成审核草稿</button></form><div id="agent-result" class="result-panel" aria-live="polite"></div>
+    </div></section>${agentExecutionSectionHtml(execution)}${agentAutonomySectionHtml(autonomy)}`;
 }
 
 async function pageLab() {
@@ -14327,6 +16292,7 @@ const PAGE_RENDERERS = {
   social: pageSocial,
   wallet: pageWallet,
   tasks: pageTasks,
+  agent: pageAgent,
   lab: pageLab,
 };
 
@@ -15362,6 +17328,8 @@ function applyPeerReadEvent(event) {
 }
 
 function mergeRevokedMessage(previous, revoked) {
+  if (!shouldApplyCompatibilityRevocation(previous, revoked)) return previous;
+  const authority = preferredCanonicalMessageAuthority(previous, revoked);
   return {
     ...previous,
     ...revoked,
@@ -15375,6 +17343,13 @@ function mergeRevokedMessage(previous, revoked) {
     kind: previous.kind || revoked.kind,
     objectName: previous.objectName || revoked.objectName || "",
     timestamp: previous.timestamp || revoked.timestamp,
+    source: authority
+      ? String(authority.source || "web-local")
+      : String(revoked.source || previous.source || ""),
+    provider: authority
+      ? String(authority.provider || "web-local")
+      : String(revoked.provider || previous.provider || ""),
+    canonicalAuthority: Boolean(authority),
     rawMessage: revoked.rawMessage || previous.rawMessage || null,
     recalledText:
       previous.recalledText ||
@@ -15383,7 +17358,7 @@ function mergeRevokedMessage(previous, revoked) {
     text: "",
     media: {},
     flashId: "",
-    revoked: true,
+    revoked: mergedMessageRevoked(previous, revoked),
     preview: "[消息已撤回]",
   };
 }
@@ -15408,16 +17383,20 @@ function mergePendingMessageRevocations(peer, incoming) {
   pending.forEach((revoked) => {
     const incomingIndex = merged.findIndex((entry) => messagesReferToSameMessage(entry, revoked));
     if (incomingIndex >= 0) {
-      releaseMessageLocalMedia(merged[incomingIndex]);
-      merged[incomingIndex] = mergeRevokedMessage(merged[incomingIndex], revoked);
+      const previous = merged[incomingIndex];
+      if (!shouldApplyCompatibilityRevocation(previous, revoked)) return;
+      releaseMessageLocalMedia(previous);
+      merged[incomingIndex] = mergeRevokedMessage(previous, revoked);
       return;
     }
     const existingIndex = S.imMessages.findIndex(
       (entry) => String(entry.peer || "") === target && messagesReferToSameMessage(entry, revoked)
     );
     if (existingIndex >= 0) {
-      releaseMessageLocalMedia(S.imMessages[existingIndex]);
-      S.imMessages[existingIndex] = mergeRevokedMessage(S.imMessages[existingIndex], revoked);
+      const previous = S.imMessages[existingIndex];
+      if (!shouldApplyCompatibilityRevocation(previous, revoked)) return;
+      releaseMessageLocalMedia(previous);
+      S.imMessages[existingIndex] = mergeRevokedMessage(previous, revoked);
       return;
     }
     merged.push(revoked);
@@ -15455,6 +17434,7 @@ function applyMessageRevokedEvent(event, me = String(S.user?.uid || S.user?.id |
     );
     if (index >= 0) {
       const previous = S.imMessages[index];
+      if (!shouldApplyCompatibilityRevocation(previous, revoked)) return;
       releaseMessageLocalMedia(previous);
       archived = mergeRevokedMessage(previous, revoked);
       S.imMessages[index] = archived;
@@ -15857,6 +17837,14 @@ async function diagnoseTimConnectionFailure() {
 
 /** Fetch BFF UserSig and login TIM (idempotent when already connected). */
 async function ensureTimConnected({ force = false, background = false } = {}) {
+  if (webLocalDependencyMode()) {
+    S.imConnected = true;
+    S.imMode = "rest";
+    S.imLastError = "";
+    S.imNextReconnectAt = 0;
+    updateImConnectionStatus();
+    return true;
+  }
   const sessionGeneration = S.sessionGeneration;
   const policyGeneration = S.messagePolicyGeneration;
   const basePolicyIsCurrent = () =>
@@ -16139,13 +18127,17 @@ function updatePresence(active) {
   S.presenceTimer = setInterval(once, 45000);
 }
 
-async function logout() {
+async function logout({ notifyServer = true } = {}) {
   try {
     if (VOICE_MATCH_ENABLED) await cleanupVoiceMatch({ cancelQueue: true, disconnect: true });
     else await cleanupDisabledVoiceMatchQueue();
-    await api("/api/auth/logout", { method: "POST", body: "{}", timeout: 7000, authOptional: true });
+    if (notifyServer) {
+      await api("/api/auth/logout", { method: "POST", body: "{}", timeout: 7000, authOptional: true });
+    }
   } catch (error) {
-    toast(`服务端退出未确认：${error.message || error}`, "error", 3600);
+    if (notifyServer) {
+      toast(`服务端退出未确认：${error.message || error}`, "error", 3600);
+    }
   } finally {
     if (S.routeController) S.routeController.abort();
     S.routeController = null;
@@ -16155,6 +18147,7 @@ async function logout() {
     S.nearbyController = null;
     S.authenticated = false;
     S.sessionGeneration += 1;
+    setAiAgentAccess(false, null, { redirect: false });
     S.user = null;
     finishVoiceRecording(null, true);
     closeFlashViewer();
@@ -16173,6 +18166,7 @@ async function logout() {
     await cleanupIM();
     await clearSensitiveBrowserStorage();
     revokeAllChatObjectUrls();
+    clearComposeDrafts();
     S.routeSeq += 1;
     S.profileSeq += 1;
     S.route = "nearby";
@@ -16182,9 +18176,9 @@ async function logout() {
       online: { gender: "不限", property: "不限", age: "不限", city: "" },
       nearby: { gender: "不限", property: "不限", age: "不限", city: "" },
     };
-    S.nearbyLocation = null;
     S.nearbyLoadSeq += 1;
     S.nearbyCustomCityEnabled = false;
+    S.localPasswordChangeEnabled = false;
     S.momentsTab = "推荐";
     S.momentsSearch = "";
     S.momentsFeedSeq = 0;
@@ -16201,6 +18195,7 @@ async function logout() {
     S.imArchiveLoadedPeers.clear();
     S.imMessageOlderLoadingPeers.clear();
     S.imMessageHistoryExhaustedPeers.clear();
+    S.imMessageArchiveCursors.clear();
     S.imMessageRenderLimits.clear();
     resetMessageSearchState();
     S.imComposerPanel = "";
@@ -16293,16 +18288,56 @@ async function handleAction(action, button) {
   }
   if (action === "mine-tab") return switchMineTab(button.dataset.tab);
   if (action === "logout") return logout();
+  if (action === "agent-test-connection") {
+    const data = await agentApi("/api/agent/connection/test", {
+      method: "POST",
+      body: "{}",
+      timeout: 90000,
+    });
+    toast(data.message || "模型连接测试成功");
+    clearViewCacheKey("agent");
+    return switchMineTab("agent", { force: true });
+  }
+  if (action === "agent-analyze-style") {
+    await agentApi("/api/agent/style/analyze", {
+      method: "POST",
+      body: JSON.stringify({ idempotency_key: newAgentIdempotencyKey() }),
+      timeout: 120000,
+    });
+    toast("个人语言风格已更新");
+    clearViewCacheKey("agent");
+    return switchMineTab("agent", { force: true });
+  }
+  if (action === "agent-copy-draft") {
+    const draft = String($("agent-draft-output")?.value || "");
+    if (!draft) throw new Error("当前没有可复制的草稿");
+    await navigator.clipboard.writeText(draft);
+    toast("草稿已复制");
+    return;
+  }
+  if (action === "agent-review-draft-send") {
+    const draft = String($("agent-draft-output")?.value || "").trim();
+    const peer = String(button.dataset.peerUpstreamUid || "").trim();
+    if (!draft || !peer) throw new Error("当前没有可执行的私信草稿");
+    return stageAiAgentExecution({
+      kind: "action",
+      action: "send_private_message",
+      target: peer,
+      content: draft,
+    });
+  }
+  if (action === "agent-confirm-execution") return executeAiAgentPendingExecution();
+  if (action === "agent-cancel-execution") {
+    clearAiAgentPendingExecution();
+    toast("已取消本次账号执行", "info");
+    return;
+  }
   if (action === "match-tab") {
     const tab = normalizeMatchTab(button.dataset.tab);
     return switchMatchHubTab(tab);
   }
   if (action === "nearby-tab") return loadDiscoveryPanel(button.dataset.tab);
   if (action === "nearby-refresh") return loadDiscoveryPanel(S.nearbyTab, { force: true });
-  if (action === "nearby-request-location") {
-    S.nearbyLocation = null;
-    return loadDiscoveryPanel("nearby", { forceLocation: true });
-  }
   if (action === "moment-tab") {
     const tab = normalizeMomentsTab(button.dataset.tab);
     const hadSearch = Boolean(S.momentsSearch);
@@ -16312,6 +18347,16 @@ async function handleAction(action, button) {
   if (action === "moment-clear-search") {
     S.momentsSearch = "";
     return switchMomentsTab(S.momentsTab, { force: true });
+  }
+  if (action === "moment-media-remove") {
+    if (S.momentMediaUploading) throw new Error("媒体正在上传，暂时不能移除");
+    removeMomentMediaDraft(button.dataset.draftId);
+    return;
+  }
+  if (action === "moment-media-clear") {
+    if (S.momentMediaUploading) throw new Error("媒体正在上传，暂时不能清除");
+    clearMomentMediaDraft();
+    return;
   }
   if (action === "play-moment-video") {
     const video = button.closest?.("[data-playback-wrap]")?.querySelector?.('video[data-moment-video="true"]');
@@ -16599,7 +18644,23 @@ async function handleAction(action, button) {
     await sendChatSticker(button.dataset.index, button.dataset.value);
     return;
   }
+  if (action === "open-native-media") {
+    await openNativeMedia(
+      button.dataset.messageId,
+      button.dataset.attachmentId,
+      button.dataset.mediaKind || "file"
+    );
+    return;
+  }
   if (action === "open-chat-media") {
+    if (button.dataset.nativeAttachmentId) {
+      await openNativeMedia(
+        button.dataset.messageId,
+        button.dataset.nativeAttachmentId,
+        button.dataset.mediaKind || "image"
+      );
+      return;
+    }
     const image = button.querySelector("img[data-media-source]");
     if (image && (image.dataset.mediaFailed === "1" || image.hidden)) {
       reloadChatMediaImage(image, { manual: true });
@@ -16619,6 +18680,14 @@ async function handleAction(action, button) {
   if (action === "retry-chat-playback") {
     const media = button.closest("[data-playback-wrap]")?.querySelector("[data-media-playback]");
     if (!media) throw new Error("媒体重试控件不可用");
+    if (media.dataset.nativeAttachmentId) {
+      await openNativeMedia(
+        media.dataset.audioMessageId || media.dataset.messageId,
+        media.dataset.nativeAttachmentId,
+        media.matches("audio") ? "audio" : "video"
+      );
+      return;
+    }
     if (media.matches?.("audio[data-audio-message-id]")) {
       await recoverChatAudioPlayback(media, { resumePlayback: true, manual: true });
       return;
@@ -16923,11 +18992,16 @@ async function handleAction(action, button) {
     refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
     return;
   }
-  if (action === "focus-nickname") {
-    const input = $("nickname-new");
-    if (input) {
-      input.scrollIntoView({ behavior: "smooth", block: "center" });
-      input.focus();
+  if (action === "profile-avatar-remove") {
+    if (S.profileAvatarDraft?.uploading) throw new Error("头像正在上传，暂时不能移除");
+    clearProfileAvatarDraft();
+    return;
+  }
+  if (action === "focus-profile-editor") {
+    const editor = $("profile-editor");
+    if (editor) {
+      editor.scrollIntoView({ behavior: "smooth", block: "start" });
+      $("profile-nickname")?.focus({ preventScroll: true });
     }
     return;
   }
@@ -16995,6 +19069,293 @@ function formValues(form) {
 async function handleProductForm(form, submitter) {
   const kind = form.dataset.form;
   const values = formValues(form);
+  if (kind === "agent-connection") {
+    const apiKey = String(values.api_key || "");
+    clearAgentApiKeyInputs(form);
+    await agentApi("/api/agent/connection", {
+      method: "PUT",
+      body: JSON.stringify({
+        label: String(values.label || "默认连接").trim(),
+        base_url: String(values.base_url || "").trim(),
+        model: String(values.model || "").trim(),
+        api_key: apiKey || null,
+        enabled: Boolean(form.elements.namedItem("enabled")?.checked),
+      }),
+      timeout: 30000,
+    });
+    toast("模型连接已保存");
+    clearViewCacheKey("agent");
+    return switchMineTab("agent", { force: true });
+  }
+  if (kind === "agent-settings") {
+    await agentApi("/api/agent/settings", {
+      method: "PUT",
+      body: JSON.stringify({
+        user_enabled: Boolean(form.elements.namedItem("user_enabled")?.checked),
+        custom_instructions: String(values.custom_instructions || ""),
+        temperature: Number(values.temperature || 0.7),
+        max_output_tokens: Number(values.max_output_tokens || 512),
+        context_message_limit: Number(values.context_message_limit || 30),
+      }),
+      timeout: 30000,
+    });
+    toast("模型运行设置已保存");
+    clearViewCacheKey("agent");
+    return switchMineTab("agent", { force: true });
+  }
+  if (kind === "agent-execution-settings") {
+    const execution = S.aiAgentExecutionStatus;
+    if (!S.aiAgentExecutionAccessEnabled || !execution) throw new Error("账号执行功能当前不可用");
+    const allowed = new Set(execution.allowed_actions);
+    const selectedActions = [
+      ...form.querySelectorAll('input[name="selected_actions"]:checked'),
+    ]
+      .map((input) => String(input.value || "").trim())
+      .filter((action) => allowed.has(action));
+    const userEnabled = Boolean(form.elements.namedItem("user_enabled")?.checked);
+    const autoSendEnabled =
+      userEnabled && Boolean(form.elements.namedItem("auto_send_enabled")?.checked);
+    if (userEnabled && !selectedActions.length) throw new Error("请至少选择一个账号执行动作");
+    if (autoSendEnabled && !selectedActions.includes("send_private_message")) {
+      throw new Error("开启生成后直接发送前，请先选择发送私信动作");
+    }
+    clearAiAgentPendingExecution();
+    await agentExecutionApi("/api/agent/execution-settings", {
+      method: "PUT",
+      body: JSON.stringify({
+        user_enabled: userEnabled,
+        auto_send_enabled: autoSendEnabled,
+        selected_actions: selectedActions,
+      }),
+      timeout: 30000,
+    });
+    toast("账号执行权限已保存");
+    clearViewCacheKey("agent");
+    return switchMineTab("agent", { force: true });
+  }
+  if (kind === "agent-autonomy-settings") {
+    const autonomy = S.aiAgentAutonomyStatus;
+    if (!autonomy?.visible || autonomy.user_authorized !== true) {
+      throw new Error("无人值守 Agent 尚未获得管理员授权");
+    }
+    const executionActions = new Set(S.aiAgentExecutionStatus?.selected_actions || []);
+    const requestedActions = [
+      ...form.querySelectorAll('input[name="allowed_actions"]:checked'),
+    ].map((input) => String(input.value || "").trim());
+    const allowedActions = [...new Set(requestedActions)].filter(
+      (action) =>
+        executionActions.has(action) &&
+        Object.prototype.hasOwnProperty.call(AI_AGENT_EXECUTION_ACTIONS, action)
+    );
+    if (allowedActions.length !== new Set(requestedActions).size) {
+      throw new Error("账号执行授权已变化，请刷新页面后重新选择无人值守动作");
+    }
+
+    const userEnabled = Boolean(form.elements.namedItem("user_enabled")?.checked);
+    const autoReplyEnabled =
+      userEnabled && Boolean(form.elements.namedItem("auto_reply_enabled")?.checked);
+    const scheduledPostEnabled =
+      userEnabled && Boolean(form.elements.namedItem("scheduled_post_enabled")?.checked);
+    const managedRelationshipsEnabled =
+      userEnabled && Boolean(form.elements.namedItem("managed_relationships_enabled")?.checked);
+    if (
+      userEnabled &&
+      !autoReplyEnabled &&
+      !scheduledPostEnabled &&
+      !managedRelationshipsEnabled
+    ) {
+      throw new Error("开启无人值守总开关时，请至少启用一种自动化能力");
+    }
+    if (autoReplyEnabled && !allowedActions.includes("send_private_message")) {
+      throw new Error("开启自动回复前，请先选择发送私信动作");
+    }
+    if (scheduledPostEnabled && !allowedActions.includes("publish_text_post")) {
+      throw new Error("开启定时动态前，请先选择发布文字动态动作");
+    }
+    if (
+      managedRelationshipsEnabled &&
+      !allowedActions.some((action) => action === "follow_user" || action === "unfollow_user")
+    ) {
+      throw new Error("开启关系管理前，请先选择关注或取消关注动作");
+    }
+
+    const managedTargetUids = [
+      ...new Set(
+        String(values.managed_target_uids || "")
+          .split(/\r?\n/)
+          .map((uid) => uid.trim())
+          .filter(Boolean)
+      ),
+    ];
+    if (managedTargetUids.length > 100) throw new Error("关系动作目标最多填写 100 个用户编号");
+    if (
+      managedTargetUids.some(
+        (uid) =>
+          uid.length > 128 ||
+          [...uid].some((character) => character.codePointAt(0) < 33) ||
+          /[*?\[\]]/.test(uid)
+      )
+    ) {
+      throw new Error("关系动作目标必须是每行一个、不含空格或通配符的精确用户编号");
+    }
+    if (managedRelationshipsEnabled && !managedTargetUids.length) {
+      throw new Error("开启关系管理前，请至少填写一个精确用户编号");
+    }
+
+    const operationBrief = String(values.operation_brief || "").trim();
+    if (operationBrief.length > 4000) throw new Error("运行目标与内容边界不能超过 4000 个字符");
+    if (scheduledPostEnabled && !operationBrief) {
+      throw new Error("开启定时动态前，请填写运行目标与内容边界");
+    }
+    const timezone = String(values.timezone || "").trim();
+    if (!timezone || timezone.length > 64) throw new Error("时区不能为空且不能超过 64 个字符");
+    const activeStartMinute = aiAgentAutonomyMinuteValue(
+      values.active_start_minute,
+      "每日开始时间"
+    );
+    const activeEndMinute = aiAgentAutonomyMinuteValue(values.active_end_minute, "每日结束时间");
+    const minimumActionIntervalSeconds = aiAgentAutonomyInteger(
+      values,
+      "minimum_action_interval_seconds",
+      "动作最小间隔",
+      60,
+      86400
+    );
+    const dailyTotalLimit = aiAgentAutonomyInteger(
+      values,
+      "daily_total_limit",
+      "每日总上限",
+      1,
+      200
+    );
+    const dailyReplyLimit = aiAgentAutonomyInteger(
+      values,
+      "daily_reply_limit",
+      "每日自动回复上限",
+      0,
+      200
+    );
+    const dailyPostLimit = aiAgentAutonomyInteger(
+      values,
+      "daily_post_limit",
+      "每日动态上限",
+      0,
+      20
+    );
+    const dailyRelationshipLimit = aiAgentAutonomyInteger(
+      values,
+      "daily_relationship_limit",
+      "每日关系动作上限",
+      0,
+      100
+    );
+    if (
+      dailyReplyLimit > dailyTotalLimit ||
+      dailyPostLimit > dailyTotalLimit ||
+      dailyRelationshipLimit > dailyTotalLimit
+    ) {
+      throw new Error("各类每日动作上限不能超过每日总上限");
+    }
+    if (autoReplyEnabled && dailyReplyLimit < 1) {
+      throw new Error("开启自动回复时，每日自动回复上限至少为 1");
+    }
+    if (scheduledPostEnabled && dailyPostLimit < 1) {
+      throw new Error("开启定时动态时，每日动态上限至少为 1");
+    }
+    if (managedRelationshipsEnabled && dailyRelationshipLimit < 1) {
+      throw new Error("开启关系管理时，每日关系动作上限至少为 1");
+    }
+    const postIntervalMinutes = aiAgentAutonomyInteger(
+      values,
+      "post_interval_minutes",
+      "动态发布最小间隔",
+      60,
+      10080
+    );
+    const consecutiveFailureLimit = aiAgentAutonomyInteger(
+      values,
+      "consecutive_failure_limit",
+      "连续失败停机阈值",
+      1,
+      20
+    );
+
+    await agentAutonomyApi("/api/agent/autonomy-settings", {
+      method: "PUT",
+      body: JSON.stringify({
+        user_enabled: userEnabled,
+        auto_reply_enabled: autoReplyEnabled,
+        scheduled_post_enabled: scheduledPostEnabled,
+        managed_relationships_enabled: managedRelationshipsEnabled,
+        allowed_actions: allowedActions,
+        operation_brief: operationBrief,
+        managed_target_uids: managedTargetUids,
+        timezone,
+        active_start_minute: activeStartMinute,
+        active_end_minute: activeEndMinute,
+        minimum_action_interval_seconds: minimumActionIntervalSeconds,
+        daily_total_limit: dailyTotalLimit,
+        daily_reply_limit: dailyReplyLimit,
+        daily_post_limit: dailyPostLimit,
+        daily_relationship_limit: dailyRelationshipLimit,
+        post_interval_minutes: postIntervalMinutes,
+        consecutive_failure_limit: consecutiveFailureLimit,
+      }),
+      timeout: 30000,
+    });
+    toast("无人值守策略已保存");
+    clearViewCacheKey("agent");
+    return switchMineTab("agent", { force: true });
+  }
+  if (kind === "agent-reply-send-review") {
+    return stageAiAgentExecution({
+      kind: "reply_send",
+      action: "send_private_message",
+      target: String(values.peer_upstream_uid || "").trim(),
+      objective: String(values.objective || "").trim(),
+    });
+  }
+  if (kind === "agent-action-review") {
+    return stageAiAgentExecution({
+      kind: "action",
+      action: String(values.action || "").trim(),
+      target: String(values.target_upstream_uid || "").trim(),
+      content: String(values.content || "").trim(),
+    });
+  }
+  if (kind === "agent-draft") {
+    const peer = String(values.peer_upstream_uid || "").trim();
+    if (!peer) throw new Error("请输入对方用户编号");
+    const data = await agentApi("/api/agent/drafts", {
+      method: "POST",
+      body: JSON.stringify({
+        peer_upstream_uid: peer,
+        objective: String(values.objective || "").trim(),
+        idempotency_key: newAgentIdempotencyKey(),
+      }),
+      timeout: 120000,
+    });
+    const draft = String(data.draft || "").trim();
+    if (!draft) throw new Error("模型没有返回可用草稿");
+    const draftCanExecute =
+      S.aiAgentExecutionAccessEnabled &&
+      S.aiAgentModelReady &&
+      S.aiAgentExecutionStatus?.user_enabled === true &&
+      S.aiAgentExecutionStatus.selected_actions.includes("send_private_message");
+    setPanel(
+      "agent-result",
+      `<div class="notice"><strong>草稿已生成，尚未发送</strong><div>请检查事实、语气和隐私信息后再手动使用。</div></div><div class="field"><label for="agent-draft-output">审核草稿</label><textarea id="agent-draft-output" rows="7" readonly>${esc(
+        draft
+      )}</textarea></div><div class="button-row"><button type="button" class="btn secondary" data-action="agent-copy-draft">复制草稿</button>${
+        draftCanExecute
+          ? `<button type="button" class="btn primary" data-action="agent-review-draft-send" data-peer-upstream-uid="${esc(
+              peer
+            )}">检查并进入发送确认</button>`
+          : ""
+      }</div>`
+    );
+    return;
+  }
   if (kind === "message-search") {
     S.messageSearchQuery = String(values.query || "");
     S.messageSearchDate = String(values.date || S.messageSearchDate || "");
@@ -17007,23 +19368,42 @@ async function handleProductForm(form, submitter) {
   }
   if (kind === "moment-publish") {
     const text = String(values.text || "").trim();
-    if (!text) throw new Error("请输入动态内容");
-    const { data } = await api("/api/moments/publish", {
-      method: "POST",
-      body: JSON.stringify({
-        text,
-        visibility_scope: values.visibility_scope || "公开",
-        topic: String(values.topic || "").trim(),
-        plate: "动态",
-        comment_forbid: values.comment_forbid === "1",
-        hide_comment: values.hide_comment === "1",
-      }),
-    });
-    if (toastEnv(data, "动态已发布")) {
+    if (!text && !S.momentMediaDraft.length) throw new Error("请输入动态内容，或选择图片、视频");
+    const imageCount = S.momentMediaDraft.filter((draft) => draft.kind === "image").length;
+    const videoCount = S.momentMediaDraft.filter((draft) => draft.kind === "video").length;
+    if (imageCount > 9) throw new Error("动态图片最多选择 9 张");
+    if (videoCount > 1 || (imageCount && videoCount)) throw new Error("图片和视频不能同时发布");
+    setMomentComposeLocked(form, true);
+    try {
+      const mediaAssetIds = await ensureMomentMediaAssets();
+      S.momentPublishRequestId ||= newComposeRequestId("moment-publish");
+      const { data, ok } = await api("/api/moments/publish", {
+        method: "POST",
+        body: JSON.stringify({
+          text,
+          media_asset_ids: mediaAssetIds,
+          visibility_scope: values.visibility_scope || "公开",
+          topic: String(values.topic || "").trim(),
+          plate: "动态",
+          comment_forbid: values.comment_forbid === "1",
+          hide_comment: values.hide_comment === "1",
+          client_request_id: S.momentPublishRequestId,
+        }),
+        timeout: 20000,
+      });
+      if (!ok || data?.ok === false) {
+        toastEnv(data, "动态发布失败");
+        return;
+      }
+      toastEnv(data, "动态已发布");
       form.reset();
+      form.closest("details")?.removeAttribute("open");
+      clearMomentMediaDraft();
       clearMomentCache();
       S.momentsSearch = "";
       await switchMomentsTab("我的", { force: true });
+    } finally {
+      setMomentComposeLocked(form, false);
     }
     return;
   }
@@ -17069,7 +19449,6 @@ async function handleProductForm(form, submitter) {
     if (city && (!S.nearbyCustomCityEnabled || tab !== "nearby")) throw new Error("自定义城市筛选需要管理员授权");
     if (city.length > 40) throw new Error("城市名称不能超过 40 个字符");
     S.nearbyFilters[tab] = { gender, property, age, city };
-    if (city) S.nearbyLocation = null;
     return loadDiscoveryPanel(tab);
   }
   if (kind === "match-filter") {
@@ -17146,16 +19525,136 @@ async function handleProductForm(form, submitter) {
     setPanel("wallet-result", operationView(data, "提现请求结果"));
     return;
   }
-  if (kind === "profile-nick") {
-    const name = String(values.name || "").trim();
-    if (!name) throw new Error("请输入新昵称");
-    const { data } = await api("/api/profile/nick", { method: "POST", body: JSON.stringify({ name }) });
-    if (data.user) applyUser(data.user);
-    if (toastEnv(data, "昵称已更新")) go("me", { force: true });
-    else {
-      setActiveProfileQuery("");
-      setPanel("me-result", operationView(data, "昵称修改结果"));
+  if (kind === "profile-avatar") {
+    const draft = S.profileAvatarDraft;
+    if (!draft?.file) throw new Error("请先选择头像图片");
+    draft.uploading = true;
+    draft.error = "";
+    renderProfileAvatarDraft();
+    try {
+      if (!draft.assetId) {
+        const asset = await createNativeMediaAsset("image", draft.file, (progress) => {
+          draft.progress = progress;
+          renderProfileAvatarDraft({ refreshPreview: false });
+        });
+        draft.assetId = String(asset.asset_id || "");
+        draft.progress = 1;
+      }
+      if (!draft.assetId) throw new Error("头像上传完成但未返回可用资产编号");
+      draft.operationId ||= newComposeRequestId("profile-avatar");
+      const { data, ok } = await api("/api/profile/reset", {
+        method: "POST",
+        body: JSON.stringify({
+          type: "头像设置",
+          avatar_asset_id: draft.assetId,
+          operation_id: draft.operationId,
+        }),
+        timeout: 20000,
+      });
+      if (!ok || data?.ok === false) {
+        const info = errorInfo(data, "头像保存失败");
+        throw new Error([info.title, info.detail].filter(Boolean).join(" · "));
+      }
+      if (data.user) applyUser({ ...(S.user || {}), ...data.user });
+      toastEnv(data, "头像已更新");
+      clearProfileAvatarDraft();
+      clearMomentCache();
+      go("me", { force: true });
+    } catch (error) {
+      draft.error = String(error?.message || error || "头像保存失败");
+      throw error;
+    } finally {
+      if (S.profileAvatarDraft === draft) {
+        draft.uploading = false;
+        renderProfileAvatarDraft();
+      }
     }
+    return;
+  }
+  if (kind === "profile-details") {
+    const current = S.user || {};
+    const requested = [
+      {
+        field: "nickname",
+        type: "昵称设置",
+        value: String(values.nickname || "").trim(),
+        current: String(current.nickname || current.name || "").trim(),
+      },
+      {
+        field: "signature",
+        type: "个性签名设置",
+        value: String(values.signature || "").trim(),
+        current: String(current.signature || "").trim(),
+      },
+      {
+        field: "city",
+        type: "城市设置",
+        value: String(values.city || "").trim(),
+        current: String(current.city || "").trim(),
+      },
+      {
+        field: "gender",
+        type: "性别设置",
+        value: normalizedProfileGender(values.gender),
+        current: normalizedProfileGender(current.gender || current.sex),
+      },
+    ].filter((item) => item.value !== item.current);
+    if (!String(values.nickname || "").trim()) throw new Error("请输入昵称");
+    if (!requested.length) {
+      toast("资料没有变化", "info");
+      return;
+    }
+    let saved = 0;
+    try {
+      for (const item of requested) {
+        const { data, ok } = await api("/api/profile/reset", {
+          method: "POST",
+          body: JSON.stringify({
+            type: item.type,
+            value: item.value,
+            operation_id: newComposeRequestId(`profile-${item.field}`),
+          }),
+        });
+        if (!ok || data?.ok === false) {
+          const info = errorInfo(data, `${item.type}失败`);
+          throw new Error([info.title, info.detail].filter(Boolean).join(" · "));
+        }
+        if (data.user) applyUser({ ...(S.user || {}), ...data.user });
+        saved += 1;
+      }
+    } catch (error) {
+      clearMomentCache();
+      if (saved) throw new Error(`已保存 ${saved} 项资料；其余项目未保存：${error?.message || error}`);
+      throw error;
+    }
+    clearMomentCache();
+    toast("基本资料已保存");
+    go("me", { force: true });
+    return;
+  }
+  if (kind === "local-password-change") {
+    const currentPassword = String(values.current_password || "");
+    const newPassword = String(values.new_password || "");
+    const confirmPassword = String(values.confirm_password || "");
+    if (!currentPassword) throw new Error("请输入当前密码");
+    if (newPassword.length < 8 || newPassword.length > 128) {
+      throw new Error("新密码长度必须为 8 至 128 个字符");
+    }
+    if (newPassword !== confirmPassword) throw new Error("两次输入的新密码不一致");
+    const { data, ok } = await api("/api/auth/password", {
+      method: "POST",
+      body: JSON.stringify({
+        current_password: currentPassword,
+        new_password: newPassword,
+      }),
+      authOptional: true,
+    });
+    if (!ok || data?.ok === false) {
+      toastEnv(data, "密码修改失败");
+      return;
+    }
+    toast("密码已更新，请重新登录");
+    await logout({ notifyServer: false });
     return;
   }
   if (kind === "referral-set") {
@@ -17215,6 +19714,7 @@ async function handleProductForm(form, submitter) {
 
 function applyFeatureEnvelope(data) {
   const features = data && data.features;
+  applyDependencyMode(data);
   applyCapabilities(data?.capabilities);
   S.serverHeartbeat = Boolean(data?.auto_heartbeat);
   S.inviteLoginAvailable = Boolean(data?.capabilities?.invite_login);
@@ -17301,7 +19801,7 @@ $("send-sms").addEventListener("click", (event) => {
   });
 });
 
-function completeBrowserLogin(data) {
+async function completeBrowserLogin(data) {
   resetTurnstileChallenge({ hide: true });
   S.sessionGeneration += 1;
   S.authenticated = true;
@@ -17319,6 +19819,7 @@ function completeBrowserLogin(data) {
   S.imArchiveLoadedPeers.clear();
   S.imMessageOlderLoadingPeers.clear();
   S.imMessageHistoryExhaustedPeers.clear();
+  S.imMessageArchiveCursors.clear();
   resetMessageSearchState();
   S.imAudioSourceRefreshes.clear();
   S.imVoiceTranscriptLoading.clear();
@@ -17334,10 +19835,12 @@ function completeBrowserLogin(data) {
   S.presenceWarningShown = false;
   S.meStats = null;
   S.meStatsAt = 0;
+  applyDependencyMode(data);
   applyCapabilities(data.capabilities);
   applyUser(data.user);
   if (!VOICE_MATCH_ENABLED) void cleanupDisabledVoiceMatchQueue();
   showLogin(false, true);
+  await refreshAiAgentAccess({ redirect: false });
   buildNav();
   S.authenticatedServicesPending = true;
   const desired = hashRoute();
@@ -17393,7 +19896,7 @@ async function submitLoginCredentials() {
     setLoginStage("invite");
     return;
   }
-  completeBrowserLogin(result.data);
+  await completeBrowserLogin(result.data);
 }
 
 async function submitLoginInvite() {
@@ -17422,7 +19925,7 @@ async function submitLoginInvite() {
     }
     return;
   }
-  completeBrowserLogin(result.data);
+  await completeBrowserLogin(result.data);
 }
 
 async function cancelPendingLogin() {
@@ -17474,6 +19977,17 @@ function scheduleFriendFilter(input) {
 }
 
 document.addEventListener("input", (event) => {
+  const momentComposeField = event.target.closest && event.target.closest('form[data-form="moment-publish"] input, form[data-form="moment-publish"] textarea, form[data-form="moment-publish"] select');
+  if (momentComposeField && !S.momentMediaUploading) {
+    S.momentPublishRequestId = "";
+  }
+  const agentExecutionForm =
+    event.target.closest &&
+    event.target.closest('form[data-form="agent-action-review"], form[data-form="agent-reply-send-review"]');
+  if (agentExecutionForm) {
+    clearAiAgentPendingExecution();
+    return;
+  }
   const composerInput = event.target.closest && event.target.closest("#im-text");
   if (composerInput) {
     setChatComposerDraft(composerInput.value);
@@ -17552,6 +20066,50 @@ document.addEventListener("focusout", (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  const profileAvatarInput = event.target.closest && event.target.closest("input[data-profile-avatar]");
+  if (profileAvatarInput) {
+    try {
+      const file = profileAvatarInput.files?.[0];
+      if (file) selectProfileAvatarFile(file);
+    } catch (error) {
+      toast(error?.message || "头像图片不可用", "error", 4200);
+    } finally {
+      profileAvatarInput.value = "";
+    }
+    return;
+  }
+  const momentMediaInput = event.target.closest && event.target.closest("input[data-moment-media]");
+  if (momentMediaInput) {
+    try {
+      selectMomentMediaFiles(String(momentMediaInput.dataset.momentMedia || "image"), momentMediaInput.files);
+    } catch (error) {
+      toast(error?.message || "动态媒体不可用", "error", 4200);
+    } finally {
+      momentMediaInput.value = "";
+    }
+    return;
+  }
+  const agentAutonomySetting =
+    event.target.closest &&
+    event.target.closest('form[data-form="agent-autonomy-settings"] input[type="checkbox"]');
+  if (agentAutonomySetting) {
+    syncAgentAutonomySettingsForm(agentAutonomySetting.form);
+    return;
+  }
+  const agentExecutionSetting =
+    event.target.closest && event.target.closest('form[data-form="agent-execution-settings"] input');
+  if (agentExecutionSetting) {
+    syncAgentExecutionSettingsForm(agentExecutionSetting.form);
+    clearAiAgentPendingExecution();
+    return;
+  }
+  const agentExecutionAction =
+    event.target.closest && event.target.closest('form[data-form="agent-action-review"] select[name="action"]');
+  if (agentExecutionAction) {
+    syncAgentExecutionActionForm(agentExecutionAction.form);
+    clearAiAgentPendingExecution();
+    return;
+  }
   const messageSearchDate = event.target.closest && event.target.closest("#message-search-date");
   if (messageSearchDate) {
     S.messageSearchDate = String(messageSearchDate.value || "");
@@ -17955,6 +20513,9 @@ document.addEventListener("visibilitychange", () => {
   if (!S.authenticated) return;
   updatePresence(!document.hidden);
   if (!document.hidden) {
+    void refreshAiAgentAccess({ redirect: true }).catch((error) => {
+      if (error?.name !== "AbortError") console.info("[agent-access]", error?.message || error);
+    });
     startMessageSyncTimer();
     void runMessageSyncCycle({ force: true });
     scanVisibleMomentCards(root(), { force: true });
@@ -17983,9 +20544,18 @@ window.addEventListener("pageshow", (event) => {
     S.imNextReconnectAt = 0;
   }
   void startMessageServices();
+  void refreshAiAgentAccess({ redirect: true })
+    .then(() => {
+      if (S.route === "agent" && S.aiAgentAccessEnabled) return switchMineTab("agent", { force: true });
+      return null;
+    })
+    .catch(() => {});
 });
 
 window.addEventListener("pagehide", (event) => {
+  clearAgentApiKeyInputs(document);
+  clearAiAgentPendingExecution();
+  setAiAgentExecutionStatus(null);
   finishVoiceRecording(null, true);
   closeFlashViewer();
   flushPendingFlashAcknowledgements();
@@ -17996,6 +20566,7 @@ window.addEventListener("pagehide", (event) => {
   if (!event.persisted) {
     closeMessageSyncChannel();
     revokeAllChatObjectUrls();
+    clearComposeDrafts();
     S.imMediaRetryState.clear();
     S.imAudioSourceRefreshes.clear();
     S.imVoiceTranscriptLoading.clear();
@@ -18160,7 +20731,7 @@ function classifyBootSessionAttempt(result, error, transientFailures = 0) {
   };
 }
 
-function completeRestoredSession(data) {
+async function completeRestoredSession(data) {
   cancelBootSessionRecovery();
   S.sessionGeneration += 1;
   S.authenticated = true;
@@ -18169,6 +20740,7 @@ function completeRestoredSession(data) {
   applyUser(data.user);
   if (!VOICE_MATCH_ENABLED) void cleanupDisabledVoiceMatchQueue();
   showLogin(false);
+  await refreshAiAgentAccess({ redirect: false });
   S.authenticatedServicesPending = true;
   const desired = hashRoute();
   go(isRouteAllowed(desired) ? desired : "nearby", { replace: !isRouteAllowed(desired), force: true });
@@ -18214,7 +20786,7 @@ async function recoverSessionAfterBoot(token, initialRecovery) {
     const next = classifyBootSessionAttempt(result, error, transientFailures);
     if (next.resolved) {
       if (result?.status === 200 && result.data?.ok && result.data?.user?.logged_in) {
-        completeRestoredSession(result.data);
+        await completeRestoredSession(result.data);
       } else {
         setSessionRecoveryMessage("");
       }
@@ -18236,7 +20808,7 @@ $("session-recovery-retry")?.addEventListener("click", () => {
   buildNav();
   const { status, data, recovery } = await restoreSessionAtBoot();
   if (status === 200 && data.ok && data.user?.logged_in) {
-    completeRestoredSession(data);
+    await completeRestoredSession(data);
     return;
   }
   scheduleDeferredFeatureLoad();

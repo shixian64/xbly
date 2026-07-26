@@ -889,6 +889,7 @@ class TimRestHistoryEnvelopeTests(unittest.TestCase):
         self.assertTrue(all(item["unread_authoritative"] for item in payload["items"]))
         self.assertTrue(all(item["unread_observed_at"] for item in payload["items"]))
         self.assertEqual(payload["items"][0]["source"], "tim_rest")
+        self.assertTrue(payload["snapshot_complete"])
 
         bff_server._attach_cached_conversation_summaries(
             payload["items"],
@@ -2577,6 +2578,8 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         blocked_peers=(),
         blocked_by_peers=(),
         authorizer=None,
+        local_sender=None,
+        authentication_source="provider",
     ):
         calls = []
         result = SimpleNamespace(
@@ -2606,6 +2609,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
             blocked_by_message_peers=set(blocked_by_peers),
             blocked_message_peers_snapshot_at=time.monotonic(),
             blocked_by_message_peers_snapshot_at=time.monotonic(),
+            authentication_source=authentication_source,
         )
 
         class Harness:
@@ -2615,12 +2619,18 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                 self.response = None
                 if authorizer is not None:
                     self._request_message_peer_authorizer = authorizer
+                if local_sender is not None:
+                    self._request_local_text_sender = local_sender
 
             def _check_api_origin(self):
                 return True
 
             def body(self):
-                return {"peer": peer, "text": "你好"}
+                return {
+                    "peer": peer,
+                    "text": "你好",
+                    "client_message_id": "web-client-message-1",
+                }
 
             def sid(self):
                 return "sid"
@@ -2636,10 +2646,19 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         bff_server.Handler.do_POST(harness)
         return calls, harness.response
 
-    def _run_mark_read(self, *, authorized=True, peers=None, receipt_ok=True):
+    def _run_mark_read(
+        self,
+        *,
+        authorized=True,
+        peers=None,
+        conversation_ok=True,
+        receipt_ok=True,
+        local_marker=None,
+        authentication_source="provider",
+    ):
         conversation_calls = []
         receipt_calls = []
-        conversation_result = SimpleNamespace(ok=True)
+        conversation_result = SimpleNamespace(ok=conversation_ok)
         receipt_result = SimpleNamespace(
             ok=receipt_ok,
             error_code=0 if receipt_ok else 90001,
@@ -2668,6 +2687,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
             blocked_by_message_peers=set(),
             blocked_message_peers_snapshot_at=time.monotonic(),
             blocked_by_message_peers_snapshot_at=time.monotonic(),
+            authentication_source=authentication_source,
         )
 
         class Harness:
@@ -2676,6 +2696,8 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
             def __init__(self):
                 self.response = None
                 self._request_match_pool_online_list_enabled = False
+                if local_marker is not None:
+                    self._request_local_read_marker = local_marker
 
             def _check_api_origin(self):
                 return True
@@ -2719,6 +2741,89 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         self.assertEqual(response[0], 403)
         self.assertEqual(response[1]["code"], "PRIVATE_MESSAGE_PERMISSION_REQUIRED")
 
+    def test_web_local_send_commits_before_and_without_tim(self) -> None:
+        local_calls = []
+
+        def send_local(peer, text, client_message_id, quote):
+            local_calls.append((peer, text, client_message_id, quote))
+            return {
+                "handled": True,
+                "status": 200,
+                "payload": {
+                    "ok": True,
+                    "canonical_message_id": "canonical-local-1",
+                    "message_id": "canonical-local-1",
+                    "client_message_id": client_message_id,
+                    "tim_mirror_status": "pending",
+                    "compatibility_sync": "pending",
+                },
+            }
+
+        tim_calls, response = self._run_rest_send(
+            friend_peers={"9"},
+            local_sender=send_local,
+        )
+
+        self.assertEqual(tim_calls, [])
+        self.assertEqual(
+            local_calls,
+            [("9", "你好", "web-client-message-1", {})],
+        )
+        self.assertEqual(response[0], 200)
+        self.assertTrue(response[1]["ok"])
+        self.assertEqual(response[1]["canonical_message_id"], "canonical-local-1")
+        self.assertEqual(response[1]["tim_mirror_status"], "pending")
+
+    def test_unmigrated_peer_falls_back_to_legacy_tim_send(self) -> None:
+        local_calls = []
+
+        def send_local(peer, text, client_message_id, quote):
+            local_calls.append((peer, text, client_message_id, quote))
+            return {"handled": False, "reason": "peer_not_migrated"}
+
+        tim_calls, response = self._run_rest_send(
+            friend_peers={"9"},
+            local_sender=send_local,
+        )
+
+        self.assertEqual(len(local_calls), 1)
+        self.assertEqual(tim_calls, [("42", "9", "你好")])
+        self.assertEqual(response[0], 200)
+        self.assertTrue(response[1]["ok"])
+
+    def test_local_password_mode_rejects_unmigrated_peer_without_tim(self) -> None:
+        local_calls = []
+
+        def send_local(peer, text, client_message_id, quote):
+            local_calls.append((peer, text, client_message_id, quote))
+            return {"handled": False, "reason": "peer_not_migrated"}
+
+        tim_calls, response = self._run_rest_send(
+            friend_peers={"9"},
+            local_sender=send_local,
+            authentication_source="local",
+        )
+
+        self.assertEqual(len(local_calls), 1)
+        self.assertEqual(tim_calls, [])
+        self.assertEqual(response[0], 409)
+        self.assertEqual(response[1]["code"], "PEER_NOT_MIGRATED")
+        self.assertFalse(response[1]["retryable"])
+
+    def test_local_password_mode_never_falls_through_on_invalid_local_result(self) -> None:
+        tim_calls, response = self._run_rest_send(
+            friend_peers={"9"},
+            local_sender=lambda *_args: None,
+            authentication_source="local",
+        )
+
+        self.assertEqual(tim_calls, [])
+        self.assertEqual(response[0], 503)
+        self.assertEqual(
+            response[1]["code"],
+            "LOCAL_MESSAGE_SERVICE_UNAVAILABLE",
+        )
+
     def test_rest_mode_read_report_uses_authenticated_account(self) -> None:
         calls, receipt_calls, response = self._run_mark_read()
 
@@ -2750,6 +2855,52 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         self.assertEqual(response[0], 502)
         self.assertEqual(response[1]["conversation_read_peers"], ["9"])
         self.assertEqual(response[1]["receipt_failed_peers"], ["9"])
+
+    def test_local_read_remains_successful_when_tim_read_sync_is_unavailable(self) -> None:
+        local_calls = []
+        calls, receipt_calls, response = self._run_mark_read(
+            conversation_ok=False,
+            receipt_ok=False,
+            local_marker=lambda peer: local_calls.append(peer) or 4,
+        )
+
+        self.assertEqual(local_calls, ["9"])
+        self.assertEqual(calls, [("42", "9")])
+        self.assertEqual(receipt_calls[0][:2], ("42", "9"))
+        self.assertEqual(response[0], 200)
+        self.assertEqual(response[1]["read_peers"], ["9"])
+        self.assertEqual(response[1]["local_read_peers"], ["9"])
+        self.assertEqual(response[1]["local_read_counts"], {"9": 4})
+
+    def test_local_password_mode_does_not_wait_for_tim_read_sync(self) -> None:
+        local_calls = []
+        calls, receipt_calls, response = self._run_mark_read(
+            conversation_ok=False,
+            receipt_ok=False,
+            local_marker=lambda peer: local_calls.append(peer) or 3,
+            authentication_source="local",
+        )
+
+        self.assertEqual(local_calls, ["9"])
+        self.assertEqual(calls, [])
+        self.assertEqual(receipt_calls, [])
+        self.assertEqual(response[0], 200)
+        self.assertEqual(response[1]["read_peers"], ["9"])
+        self.assertEqual(response[1]["compatibility_sync_skipped_peers"], ["9"])
+
+    def test_local_password_mode_rejects_nonlocal_read_without_tim(self) -> None:
+        local_calls = []
+        calls, receipt_calls, response = self._run_mark_read(
+            local_marker=lambda peer: local_calls.append(peer) or None,
+            authentication_source="local",
+        )
+
+        self.assertEqual(local_calls, ["9"])
+        self.assertEqual(calls, [])
+        self.assertEqual(receipt_calls, [])
+        self.assertEqual(response[0], 409)
+        self.assertEqual(response[1]["code"], "PEER_NOT_MIGRATED")
+        self.assertEqual(response[1]["failed_peers"], ["9"])
 
     def test_system_customer_service_read_report_needs_no_private_message_grant(self) -> None:
         calls, receipt_calls, response = self._run_mark_read(
@@ -2863,6 +3014,134 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         )
         self.assertEqual(web_user.blocked_by_message_peers, {"9"})
 
+    def test_restored_session_uses_trusted_durable_blocks_without_upstream_fetch(self) -> None:
+        upstream_calls = []
+        authorizer_calls = []
+        failed = ApiResult(
+            False,
+            503,
+            "upstream unavailable",
+            message="upstream unavailable",
+        )
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(
+                session=SimpleNamespace(uid="42"),
+                social=SimpleNamespace(
+                    my_blacklist=lambda: upstream_calls.append("blacklist") or failed,
+                    blacklist_me=lambda: upstream_calls.append("blacklist-me") or failed,
+                ),
+            ),
+            blocked_message_peers=set(),
+            blocked_by_message_peers=set(),
+            blocked_message_peers_snapshot_at=0.0,
+            blocked_by_message_peers_snapshot_at=0.0,
+            message_blocks_retry_at=0.0,
+        )
+        harness = SimpleNamespace(
+            _request_message_block_snapshot_loader=lambda: {
+                "blacklist": [],
+                "blacklisted_by": ["9"],
+            },
+            _request_message_peer_authorizer=lambda peer: authorizer_calls.append(peer)
+            or True,
+        )
+
+        self.assertFalse(bff_server.Handler.can_message_peer(harness, web_user, "9"))
+        self.assertTrue(bff_server.Handler.can_message_peer(harness, web_user, "10"))
+        self.assertEqual(upstream_calls, [])
+        self.assertEqual(authorizer_calls, ["10"])
+        self.assertEqual(web_user.blocked_message_peers, set())
+        self.assertEqual(web_user.blocked_by_message_peers, {"9"})
+        self.assertGreater(web_user.blocked_message_peers_snapshot_at, 0.0)
+        self.assertEqual(
+            web_user.blocked_message_peers_snapshot_at,
+            web_user.blocked_by_message_peers_snapshot_at,
+        )
+
+    def test_canonical_authorizer_overrides_stale_complete_unblock_snapshot(self) -> None:
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(session=SimpleNamespace(uid="42")),
+            authentication_source="local",
+            blocked_message_peers={"9"},
+            blocked_by_message_peers=set(),
+            blocked_message_peers_snapshot_at=1.0,
+            blocked_by_message_peers_snapshot_at=1.0,
+            message_blocks_retry_at=0.0,
+        )
+        calls = []
+        harness = SimpleNamespace(
+            _request_message_peer_authorizer=lambda peer: calls.append(peer) or True,
+            _request_message_peer_authorizer_canonical=True,
+        )
+
+        self.assertTrue(bff_server.Handler.can_message_peer(harness, web_user, "9"))
+        self.assertEqual(calls, ["9"])
+
+    def test_canonical_authorizer_cannot_override_unpersisted_block_snapshot(self) -> None:
+        failed = ApiResult(
+            False,
+            503,
+            "upstream unavailable",
+            message="upstream unavailable",
+        )
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(
+                session=SimpleNamespace(uid="42"),
+                social=SimpleNamespace(
+                    my_blacklist=lambda: failed,
+                    blacklist_me=lambda: failed,
+                ),
+            ),
+            blocked_message_peers={"9"},
+            blocked_by_message_peers=set(),
+            blocked_message_peers_snapshot_at=0.0,
+            blocked_by_message_peers_snapshot_at=1.0,
+            message_blocks_retry_at=0.0,
+        )
+        calls = []
+        harness = SimpleNamespace(
+            _request_message_block_snapshot_loader=lambda: None,
+            _request_message_peer_authorizer=lambda peer: calls.append(peer) or True,
+            _request_message_peer_authorizer_canonical=True,
+        )
+
+        self.assertFalse(bff_server.Handler.can_message_peer(harness, web_user, "9"))
+        self.assertEqual(calls, [])
+
+    def test_incomplete_durable_block_snapshot_still_fails_closed(self) -> None:
+        upstream_calls = []
+        failed = ApiResult(
+            False,
+            503,
+            "upstream unavailable",
+            message="upstream unavailable",
+        )
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(
+                session=SimpleNamespace(uid="42"),
+                social=SimpleNamespace(
+                    my_blacklist=lambda: upstream_calls.append("blacklist") or failed,
+                    blacklist_me=lambda: upstream_calls.append("blacklist-me") or failed,
+                ),
+            ),
+            blocked_message_peers=set(),
+            blocked_by_message_peers=set(),
+            blocked_message_peers_snapshot_at=0.0,
+            blocked_by_message_peers_snapshot_at=0.0,
+            message_blocks_retry_at=0.0,
+        )
+        harness = SimpleNamespace(
+            _request_message_block_snapshot_loader=lambda: {"blacklist": []},
+            _request_message_peer_authorizer=lambda _peer: self.fail(
+                "authorizer must not run without both trusted block directions"
+            ),
+        )
+
+        self.assertFalse(bff_server.Handler.can_message_peer(harness, web_user, "9"))
+        self.assertEqual(upstream_calls, ["blacklist", "blacklist-me"])
+        self.assertEqual(web_user.blocked_message_peers_snapshot_at, 0.0)
+        self.assertEqual(web_user.blocked_by_message_peers_snapshot_at, 0.0)
+
     def test_blacklist_fetch_and_persistence_run_inside_direction_guard(self) -> None:
         events = []
         empty = ApiResult(False, 200, "false", data=False)
@@ -2959,6 +3238,32 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
             web_user.message_blocks_retry_at,
             135.0 + bff_server.MESSAGE_BLOCK_SNAPSHOT_RETRY_SEC,
         )
+
+    def test_local_password_mode_never_refreshes_block_snapshots_upstream(self) -> None:
+        upstream_calls = []
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(
+                session=SimpleNamespace(uid="42"),
+                social=SimpleNamespace(
+                    my_blacklist=lambda: upstream_calls.append("blacklist"),
+                    blacklist_me=lambda: upstream_calls.append("blacklist-me"),
+                ),
+            ),
+            authentication_source="local",
+            blocked_message_peers={"9"},
+            blocked_by_message_peers={"10"},
+            blocked_message_peers_snapshot_at=1.0,
+            blocked_by_message_peers_snapshot_at=1.0,
+            message_blocks_retry_at=0.0,
+        )
+
+        self.assertTrue(
+            bff_server.Handler.ensure_message_blocks_loaded(
+                SimpleNamespace(),
+                web_user,
+            )
+        )
+        self.assertEqual(upstream_calls, [])
 
     def test_blacklist_read_failure_preserves_previous_snapshot(self) -> None:
         results = [
@@ -3435,6 +3740,122 @@ class ImRevokeBffContractTests(unittest.TestCase):
         self.assertEqual(harness.response[0], 200)
         self.assertTrue(harness.response[1]["ok"])
 
+    def test_canonical_revoke_commits_locally_without_calling_tim(self) -> None:
+        canonical_id = "00000000-0000-0000-0000-000000000123"
+        tim_calls = []
+        local_calls = []
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(session=SimpleNamespace(uid="42")),
+            authentication_source="local",
+            native=SimpleNamespace(
+                tim_rest=SimpleNamespace(
+                    revoke_c2c=lambda *args: tim_calls.append(args)
+                )
+            ),
+        )
+
+        class Harness:
+            path = "/api/im/rest/revoke"
+
+            def __init__(self):
+                self.response = None
+                self._request_local_text_revoker = self.revoke_local
+
+            def revoke_local(self, peer, message_id):
+                local_calls.append((peer, message_id))
+                return {
+                    "handled": True,
+                    "status": 200,
+                    "payload": {
+                        "ok": True,
+                        "source": "web-local",
+                        "provider": "web-local",
+                        "canonical_message_id": message_id,
+                        "revoked": True,
+                        "revoked_at": "2026-07-25T12:00:00+00:00",
+                        "recalled_text": "重新编辑正文",
+                        "created": True,
+                        "tim_mirror_status": "cancelled",
+                        "compatibility_sync": "cancelled",
+                    },
+                }
+
+            def _check_api_origin(self):
+                return True
+
+            def body(self):
+                return {"to": "9", "canonical_message_id": canonical_id}
+
+            def sid(self):
+                return "sid"
+
+            def user(self, _sid):
+                return web_user
+
+            def ok(self, obj, status=200, **_kwargs):
+                self.response = (status, obj)
+                return self.response
+
+        harness = Harness()
+        bff_server.Handler.do_POST(harness)
+
+        self.assertEqual(local_calls, [("9", canonical_id)])
+        self.assertEqual(tim_calls, [])
+        self.assertEqual(harness.response[0], 200)
+        self.assertEqual(harness.response[1]["source"], "web-local")
+        self.assertTrue(harness.response[1]["revoked"])
+        self.assertEqual(harness.response[1]["recalled_text"], "重新编辑正文")
+
+    def test_local_only_legacy_revoke_never_contacts_tim(self) -> None:
+        tim_calls = []
+        web_user = SimpleNamespace(
+            app=SimpleNamespace(session=SimpleNamespace(uid="42")),
+            authentication_source="local",
+            native=SimpleNamespace(
+                tim_rest=SimpleNamespace(
+                    revoke_c2c=lambda *args: tim_calls.append(args)
+                )
+            ),
+        )
+
+        class Harness:
+            path = "/api/im/rest/revoke"
+            _request_local_text_revoker = staticmethod(
+                lambda *_args: {
+                    "handled": False,
+                    "reason": "local_message_not_found",
+                }
+            )
+
+            def __init__(self):
+                self.response = None
+
+            def _check_api_origin(self):
+                return True
+
+            def body(self):
+                return {"to": "9", "msg_key": "legacy-tim-key"}
+
+            def sid(self):
+                return "sid"
+
+            def user(self, _sid):
+                return web_user
+
+            def ok(self, obj, status=200, **_kwargs):
+                self.response = (status, obj)
+                return self.response
+
+        harness = Harness()
+        bff_server.Handler.do_POST(harness)
+
+        self.assertEqual(tim_calls, [])
+        self.assertEqual(harness.response[0], 409)
+        self.assertEqual(
+            harness.response[1]["code"],
+            "LEGACY_MESSAGE_REVOKE_UNAVAILABLE",
+        )
+
 
 class SocialFrontendContractTests(unittest.TestCase):
     def _app_fragment(self, app_js: str, start: str, end: str) -> str:
@@ -3718,7 +4139,7 @@ class SocialFrontendContractTests(unittest.TestCase):
             "async function pageNearby", 1
         )[0]
         fresh_cache_branch = load_discovery.split(
-            "if (!force && !forceLocation && cached.fresh)", 1
+            "if (!force && cached.fresh)", 1
         )[1].split("  } else {", 1)[0]
 
         snapshot = 'rememberCurrentPageSnapshot(routeCacheKey("nearby"));'
@@ -3878,7 +4299,10 @@ class SocialFrontendContractTests(unittest.TestCase):
         self.assertIn("async function loadDiscoveryPanel", nearby)
         self.assertIn("const nextHtml = discoveryPanelHtml", nearby)
         self.assertIn("panel.innerHTML = nextHtml", nearby)
-        self.assertIn("navigator.geolocation.getCurrentPosition", nearby)
+        self.assertNotIn("navigator.geolocation", nearby)
+        self.assertIn('params.set("city", filters.city)', nearby)
+        self.assertNotIn('params.set("latitude"', nearby)
+        self.assertNotIn('params.set("longitude"', nearby)
         self.assertNotIn('class="welcome-strip"', nearby_page)
         self.assertNotIn('class="quick-entry-grid"', nearby_page)
         self.assertNotIn('data-action="match-users"', matching)
@@ -4737,6 +5161,7 @@ if (merged.profile_resolved !== false) throw new Error("partial merged profile m
         self.assertIn("return Promise.allSettled(tasks);", start_services)
         self.assertNotIn(".then(() => runMessageSyncCycle", start_services)
         self.assertIn("refreshConversationSummary({ force })", summary_sync)
+        self.assertIn("loadArchivedConversationSummary({ force: true })", summary_sync)
         self.assertIn("ensureTimConnected({ background: true })", background_sync)
         self.assertIn("return Promise.allSettled(tasks);", background_sync)
         self.assertNotIn('S.route === "msg" && !S.imConnected', background_sync)
@@ -4749,7 +5174,7 @@ if (merged.profile_resolved !== false) throw new Error("partial merged profile m
             app_js,
         )
         self.assertIn("imArchiveLoadedPeers: new Set()", app_js)
-        self.assertIn("const shouldLoadArchive = !S.imArchiveLoadedPeers.has(target)", app_js)
+        self.assertIn("const shouldLoadArchive = force || !S.imArchiveLoadedPeers.has(target)", app_js)
         self.assertIn("if (shouldLoadArchive)", app_js)
         self.assertIn("S.imArchiveLoadedPeers.add(target)", app_js)
         self.assertIn("function chatLogIsNearBottom", app_js)
@@ -4785,6 +5210,220 @@ if (merged.profile_resolved !== false) throw new Error("partial merged profile m
             'if (typeof chat.getConversationList !== "function") return;', 1
         )[1].split("void refreshVisiblePeerPresence", 1)[0]
         self.assertIn("recalculateUnreadTotal();", tim_conversation_sync)
+
+    def test_web_local_dependency_mode_prioritizes_archive_and_keeps_local_unread(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        connect = app_js.split("async function ensureTimConnected", 1)[1].split(
+            "async function cleanupIM", 1
+        )[0]
+        load_messages = app_js.split("async function loadConversationMessages", 1)[1].split(
+            "function oldestPeerMessageTimestamp", 1
+        )[0]
+        send_text = app_js.split("async function sendTextMessage", 1)[1].split(
+            "function progressRatio", 1
+        )[0]
+        normalize = app_js.split("function normalizeConversationSummary", 1)[1].split(
+            "function filterDismissedConversations", 1
+        )[0]
+        dependency_mode = app_js.split("function applyDependencyMode", 1)[1].split(
+            "function applyUser", 1
+        )[0]
+        capabilities = app_js.split("function applyCapabilities", 1)[1].split(
+            "function setLoginMode", 1
+        )[0]
+        composer_panel = app_js.split("function chatComposerPanelHtml()", 1)[1].split(
+            "function chatComposerQuoteHtml", 1
+        )[0]
+        composer = app_js.split("function chatComposerHtml()", 1)[1].split(
+            "function chatPaneHtml", 1
+        )[0]
+
+        self.assertIn('dependencyMode: "provider"', app_js)
+        self.assertIn("function webLocalDependencyMode", app_js)
+        self.assertIn('S.dependencyMode = local ? "web-local/degraded"', app_js)
+        self.assertIn("if (webLocalDependencyMode())", connect)
+        self.assertLess(
+            connect.index("if (webLocalDependencyMode())"),
+            connect.index("ensureTimSdkLoaded()"),
+        )
+        self.assertIn("const localOnly = archiveOnly || webLocalDependencyMode();", load_messages)
+        self.assertIn("if (!localOnly)", load_messages)
+        self.assertIn("archiveOnly: true", send_text)
+        self.assertIn('provider === "web-local"', normalize)
+        self.assertIn("conversation.unread_authoritative === true", normalize)
+        self.assertIn("S.directImCredentialsEnabled = false;", dependency_mode)
+        self.assertIn("!webLocalDependencyMode()", capabilities)
+        self.assertIn('if (webLocalDependencyMode()) return "";', composer_panel)
+        self.assertIn("const richMessageActionsAvailable = S.messagePolicyReady;", composer)
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        script = (
+            "function conversationPreview(item) { return item.last_message || ''; }\n"
+            "function conversationPreviewTimestamp(item) { return Number(item.preview_timestamp || 0); }\n"
+            "function conversationPreviewAuthoritative(item) { return item.preview_authoritative === true; }\n"
+            "function normalizeConversationSummary"
+            + normalize
+            + "\n"
+            + "const local = normalizeConversationSummary({source:'archive',provider:'web-local',"
+            + "unread_count:5,unread_authoritative:true,last_message:'新消息'}, {authority:'archive'});\n"
+            + "if (local.unread_count !== 5 || local.unread_authoritative !== true) throw new Error('local unread lost');\n"
+            + "const legacy = normalizeConversationSummary({source:'archive',provider:'tim',"
+            + "unread_count:5,unread_authoritative:true,last_message:'旧消息'}, {authority:'archive'});\n"
+            + "if (legacy.unread_count !== 0 || legacy.unread_authoritative !== false) throw new Error('legacy archive became authoritative');\n"
+        )
+        result = subprocess.run(
+            [node, "-e", script],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_web_local_archive_polling_avoids_legacy_history_and_closes_read_loop(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        load_messages = app_js.split("async function loadConversationMessages", 1)[1].split(
+            "function oldestPeerMessageTimestamp", 1
+        )[0]
+        load_older = app_js.split("async function loadOlderConversationMessages", 1)[1].split(
+            "function recalculateUnreadTotal", 1
+        )[0]
+
+        self.assertIn("const receivedMessageChanged =", load_messages)
+        self.assertIn("receivedMessageChanged &&", load_messages)
+        self.assertIn('S.route === "msg" &&', load_messages)
+        self.assertIn("!document.hidden", load_messages)
+        self.assertIn("markConversationRead(target);", load_messages)
+        self.assertIn("const localOnly = webLocalDependencyMode();", load_older)
+        self.assertIn("if (!localOnly)", load_older)
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        script = (
+            r"""
+const calls = [];
+let readCount = 0;
+let refreshedCount = 0;
+let toastCount = 0;
+const document = { hidden: false };
+const S = {
+  user: { uid: "42" },
+  route: "msg",
+  activePeer: "9",
+  imMode: "rest",
+  chat: null,
+  imMessages: [],
+  imMessageLoadingPeers: new Set(),
+  imMessageLoadedPeers: new Set(),
+  imArchiveLoadedPeers: new Set(),
+  imMessageOlderLoadingPeers: new Set(),
+  imMessageHistoryExhaustedPeers: new Set(),
+};
+function webLocalDependencyMode() { return true; }
+async function api(path) {
+  calls.push(path);
+  if (!path.startsWith("/api/archive/messages?")) {
+    throw new Error(`legacy history called: ${path}`);
+  }
+  return {
+    ok: true,
+    data: {
+      ok: true,
+      items: path.includes("&before=")
+        ? []
+        : [{ id: "incoming-1", flow: "in", source: "archive", text: "新消息" }],
+      has_more: false,
+    },
+  };
+}
+function itemsOf(data) { return Array.isArray(data?.items) ? data.items : []; }
+function timMessageEntry(item, peer) {
+  return { ...item, peer, type: item.flow === "out" ? "mine" : "" };
+}
+function mergePendingMessageRevocations(_peer, entries) { return entries; }
+function mergePeerMessages(_peer, entries) {
+  if (!entries.length) return false;
+  S.imMessages.push(...entries);
+  return true;
+}
+function refreshChatLog() {}
+function archiveMessageBestEffort() {}
+function archiveRemoteUrl() { return ""; }
+function messageIdentityKey(entry) { return String(entry.id || ""); }
+function markConversationRead(peer) {
+  if (peer !== "9") throw new Error("wrong read peer");
+  readCount += 1;
+}
+function refreshMessageConversationRegion() { refreshedCount += 1; }
+function scheduleSdkMessageReadReceipts() {}
+function revealOlderRenderedMessages() { return false; }
+function oldestPeerMessageTimestamp() { return 2000; }
+function chatHistoryStatusHtml() { return ""; }
+function expandChatMessageRenderLimit() {}
+function renderChatLog() {}
+function requestAnimationFrame(callback) { callback(); }
+function toast() { toastCount += 1; }
+"""
+            + "async function loadConversationMessages"
+            + load_messages
+            + "\nasync function loadOlderConversationMessages"
+            + load_older
+            + r"""
+(async () => {
+  await loadConversationMessages("9", { force: true });
+  if (calls.length !== 1 || !calls[0].startsWith("/api/archive/messages?")) {
+    throw new Error(`unexpected active-poll calls: ${JSON.stringify(calls)}`);
+  }
+  if (readCount !== 1 || refreshedCount !== 1) {
+    throw new Error(`local read loop not closed: read=${readCount} refresh=${refreshedCount}`);
+  }
+  document.hidden = true;
+  await loadConversationMessages("9", { force: true });
+  if (readCount !== 1 || refreshedCount !== 1) {
+    throw new Error("hidden local conversation was incorrectly marked read");
+  }
+  document.hidden = false;
+
+  calls.length = 0;
+  S.imMessages = [{ id: "current", peer: "9", timestamp: 2000 }];
+  S.imMessageLoadedPeers.add("9");
+  const log = {
+    scrollHeight: 100,
+    scrollTop: 20,
+    isConnected: true,
+    querySelector() { return null; },
+    insertAdjacentHTML() {},
+  };
+  const loaded = await loadOlderConversationMessages("9", log);
+  if (loaded !== false) throw new Error("empty local history unexpectedly added messages");
+  if (calls.length !== 1 || !calls[0].startsWith("/api/archive/messages?")) {
+    throw new Error(`unexpected older-history calls: ${JSON.stringify(calls)}`);
+  }
+  if (!S.imMessageHistoryExhaustedPeers.has("9")) {
+    throw new Error("local archive exhaustion was not remembered");
+  }
+  if (toastCount !== 0) throw new Error("local archive exhaustion showed an upstream error");
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exitCode = 1;
+});
+"""
+        )
+        result = subprocess.run(
+            [node, "-e", script],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_mobile_chat_keeps_following_the_bottom_while_layout_settles(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -5017,8 +5656,18 @@ function assert(condition, message) {
         self.assertIn("appendLocalMessage(pending)", send_text)
         self.assertLess(
             send_text.index("appendLocalMessage(pending)"),
-            send_text.index("await S.chat.sendMessage(message)"),
+            send_text.index('await api("/api/im/rest/send"'),
         )
+        self.assertIn("client_message_id: pendingID", send_text)
+        self.assertIn("quote: messageQuote", send_text)
+        self.assertNotIn("S.chat.sendMessage", send_text)
+        self.assertNotIn("S.chat.createTextMessage", send_text)
+        self.assertIn("canonicalMessageID(response)", send_text)
+        self.assertIn("response.message_id", send_text)
+        self.assertIn("response.msg_uid", send_text)
+        self.assertIn("responseMessage.id", send_text)
+        self.assertIn("response.compatibility_sync", send_text)
+        self.assertIn("response.tim_mirror_status", send_text)
         self.assertIn("updateLocalMessage(pendingID, replacement)", send_text)
         self.assertIn('delivery: "failed"', send_text)
         self.assertIn("consumeSubmittedChatDraft", send_form)
@@ -5467,18 +6116,45 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
         self.assertIn('repeat(4, minmax(0, 1fr))', app_css)
         self.assertNotIn('class="chat-sticker-group-head"', sticker_panel)
 
-    def test_tim_rich_media_recording_flash_and_upload_plugin_are_wired(self) -> None:
+    def test_web_native_rich_media_recording_and_flash_are_wired(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        asset_upload = self._app_fragment(
+            app_js,
+            "async function createNativeMediaAsset",
+            "async function sendTimMediaFile",
+        )
+        media_send = self._app_fragment(
+            app_js,
+            "async function sendTimMediaFile",
+            "function defineFileMetadata",
+        )
+        flash_send = self._app_fragment(
+            app_js,
+            "async function sendFlashPhoto",
+            "async function handleChatUploadInput",
+        )
+        flash_view = self._app_fragment(
+            app_js,
+            "async function openFlashViewer",
+            "async function pageNearby",
+        )
 
-        for sdk_call in (
-            "chat.createImageMessage(options)",
-            "chat.createAudioMessage(options)",
-            "chat.createFaceMessage({",
-        ):
-            self.assertIn(sdk_call, app_js)
+        self.assertIn('api("/api/im/media/uploads"', asset_upload)
+        self.assertIn("uploadNativeMediaObject(intent, file", asset_upload)
+        self.assertIn('`/api/im/media/uploads/${encodeURIComponent', asset_upload)
+        self.assertIn('api("/api/im/media/messages"', media_send)
+        self.assertIn('source: "web-local"', media_send)
+        self.assertIn('provider: "web-local"', media_send)
+        self.assertIn("canonicalAuthority: true", media_send)
+        self.assertNotIn("ensureTimMediaReady()", media_send)
+        self.assertNotIn("chat.createImageMessage", media_send)
+        self.assertNotIn("chat.createAudioMessage", media_send)
         self.assertIn("new MediaRecorder(", app_js)
-        self.assertIn('api("/api/im/flash/send"', app_js)
+        self.assertIn('api("/api/im/media/messages"', flash_send)
+        self.assertIn("flash: true", flash_send)
+        self.assertIn('source: "web-local"', flash_send)
+        self.assertIn('`/api/im/media/attachments/${encodeURIComponent(id)}/claim`', flash_view)
         self.assertIn('api("/api/im/flash/get"', app_js)
         self.assertIn('api("/api/im/flash/ack"', app_js)
         self.assertIn("archiveRevealedFlashPhoto(id, url)", app_js)
@@ -5490,13 +6166,9 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
         self.assertIn("normalizeStoredFlashAcknowledgements(stored, now)", app_js)
         self.assertNotIn("localStorage.clear()", app_js)
         self.assertIn("keepalive: true", app_js)
-        self.assertIn('url: String(data.url || data.photo_url || "")', app_js)
+        self.assertIn("const rawUrl = firstMessageValue", flash_view)
+        self.assertIn("const url = mediaUrl(rawUrl)", flash_view)
         self.assertNotIn("hold.controller?.abort()", app_js)
-        self.assertIn("ensureTimUploadPluginLoaded()", app_js)
-        self.assertIn(
-            'registerPlugin({ "tim-upload-plugin": window.TIMUploadPlugin })',
-            app_js,
-        )
 
     def test_ios_tuiemoji_tokens_use_the_matching_apk_small_expression(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -5680,7 +6352,7 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
         self.assertIn("retryMessageId: entry.id, peer: entry.peer", app_js)
         self.assertIn("height: auto", app_css.split(".chat-image-button img {", 1)[1].split("}", 1)[0])
 
-    def test_media_picker_and_runtime_whitelists_match_tim_2276(self) -> None:
+    def test_media_picker_and_runtime_whitelists_match_web_native_media_service(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
         composer = self._app_fragment(app_js, "function chatComposerHtml()", "function chatPaneHtml()")
@@ -5690,9 +6362,9 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
 
         video_input = composer.split('id="im-file-video"', 1)[1].split("/>", 1)[0]
         video_accept = video_input.split('accept="', 1)[1].split('"', 1)[0]
-        self.assertEqual(video_accept, ".mp4,.mov,video/mp4,video/quicktime,video/mov")
-        self.assertIn('const TIM_VIDEO_MIME_TYPES = new Set(["video/mp4", "video/quicktime", "video/mov"]);', constants)
-        self.assertIn("const TIM_VIDEO_FILE_EXTENSION_RE = /\\.(?:mp4|mov)$/i;", constants)
+        self.assertEqual(video_accept, ".mp4,.mov,.webm,video/mp4,video/quicktime,video/webm")
+        self.assertIn('const TIM_VIDEO_MIME_TYPES = new Set(["video/mp4", "video/quicktime", "video/webm"]);', constants)
+        self.assertIn("const TIM_VIDEO_FILE_EXTENSION_RE = /\\.(?:mp4|mov|webm)$/i;", constants)
         self.assertIn("TIM_VIDEO_FILE_EXTENSION_RE.test(name)", validator)
         self.assertIn("TIM_VIDEO_MIME_TYPES.has(mime)", validator)
         self.assertIn('mov: "video/quicktime"', constants)
@@ -5701,34 +6373,47 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
 
         image_input = composer.split('id="im-file-image"', 1)[1].split("/>", 1)[0]
         flash_input = composer.split('id="im-file-flash"', 1)[1].split("/>", 1)[0]
-        self.assertIn(".bmp", image_input)
-        self.assertIn("image/bmp", image_input)
-        self.assertNotIn(".bmp", flash_input)
-        self.assertNotIn("image/bmp", flash_input)
-        tim_image_types = constants.split("const TIM_IMAGE_MIME_TYPES", 1)[1].split(";", 1)[0]
+        self.assertIn(".avif", image_input)
+        self.assertIn("image/avif", image_input)
+        self.assertIn(".avif", flash_input)
+        self.assertIn("image/avif", flash_input)
+        self.assertNotIn(".bmp", image_input)
+        self.assertNotIn("image/bmp", image_input)
+        image_types = constants.split("const TIM_IMAGE_MIME_TYPES", 1)[1].split(";", 1)[0]
         flash_image_types = constants.split("const FLASH_IMAGE_MIME_TYPES", 1)[1].split(";", 1)[0]
-        self.assertIn('"image/bmp"', tim_image_types)
+        self.assertIn('"image/avif"', image_types)
+        self.assertIn('"image/avif"', flash_image_types)
+        self.assertNotIn('"image/bmp"', image_types)
         self.assertNotIn('"image/bmp"', flash_image_types)
         self.assertIn("isFlash ? FLASH_IMAGE_FILE_EXTENSION_RE : TIM_IMAGE_FILE_EXTENSION_RE", validator)
         self.assertIn("isFlash ? FLASH_IMAGE_MIME_TYPES : TIM_IMAGE_MIME_TYPES", validator)
 
-    def test_sdk_remote_media_fields_replace_and_revoke_local_blob_urls(self) -> None:
+    def test_native_media_uses_private_access_and_releases_local_blob_urls(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
         image_media = self._app_fragment(app_js, "function normalizeImageMedia", "function normalizeEntryMedia")
         entry_media = self._app_fragment(app_js, "function normalizeEntryMedia", "function messageFlashID")
         object_urls = self._app_fragment(app_js, "function trackChatObjectUrl", "async function ensureTimMediaReady")
         sender = self._app_fragment(app_js, "async function sendTimMediaFile", "function defineFileMetadata")
-        logout = self._app_fragment(app_js, "async function logout()", "async function loadMomentComments")
+        private_access = self._app_fragment(
+            app_js,
+            "async function requestNativeMediaAccess",
+            "function closeChatMediaViewer",
+        )
+        logout = self._app_fragment(app_js, "async function logout(", "async function loadMomentComments")
 
         self.assertIn('"imageUrl"', image_media)
         self.assertIn('"remoteAudioUrl"', entry_media)
         self.assertIn('"remoteVideoUrl"', entry_media)
         self.assertIn("URL.revokeObjectURL(url)", object_urls)
         self.assertIn("collectBlobObjectUrls", object_urls)
-        self.assertIn("revokeSdkTemporaryObjectUrls", sender)
-        self.assertIn("replaceUploadedLocalMediaUrl", sender)
+        self.assertIn('api("/api/im/media/messages"', sender)
+        self.assertIn("url: localMedia.url", sender)
+        self.assertIn("native: true", sender)
+        self.assertIn("if (!mediaReferencesUrl(replacement.media, localMedia.url))", sender)
         self.assertIn("revokeChatObjectUrl(localMedia.url)", sender)
+        self.assertIn('`/api/im/media/attachments/${encodeURIComponent(id)}/access`', private_access)
+        self.assertIn("url: grant.url", private_access)
         self.assertIn("revokeAllChatObjectUrls()", logout)
 
     def test_flash_countdown_starts_only_after_image_load(self) -> None:
@@ -5778,7 +6463,7 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
         self.assertIn("video.onerror = () =>", metadata)
         self.assertIn("finish(resolve", metadata)
         self.assertIn("timer = setTimeout(", metadata)
-        self.assertIn("仍将尝试通过实时消息通道发送", metadata)
+        self.assertIn("仍将上传并由服务端校验格式", metadata)
         self.assertIn("metadataWarning", metadata)
         self.assertIn("clearTimeout(timer)", metadata)
         self.assertIn("video.onloadedmetadata = null", metadata)
@@ -5835,18 +6520,29 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
         self.assertIn("min-height: 44px", app_css)
         self.assertIn("font-size: 16px", app_css)
 
-    def test_voice_recording_explains_secure_context_and_rest_text_fallback(self) -> None:
+    def test_voice_recording_explains_secure_context_and_uses_native_media_fallback(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
 
         availability = self._app_fragment(app_js, "function voiceRecordingAvailability", "function syncVisualViewport")
         recording = self._app_fragment(app_js, "async function startVoiceRecording", "function moveVoiceRecording")
+        connection_status = self._app_fragment(
+            app_js,
+            "function imConnectionStatusText",
+            "function updateImConnectionStatus",
+        )
+        native_sender = self._app_fragment(
+            app_js,
+            "async function sendTimMediaFile",
+            "function defineFileMetadata",
+        )
         self.assertIn("window.isSecureContext", availability)
         self.assertIn("录音需要安全网页环境或本机访问", availability)
         self.assertIn("voiceRecordingAvailability()", recording)
-        self.assertIn("定时同步模式（约 8 秒，仅支持文本发送）", app_js)
-        self.assertIn("尝试启用文本备用通道", app_js)
-        self.assertIn("当前仅可发送文本", app_js)
+        self.assertIn('sendTimMediaFile("audio", file', recording)
+        self.assertIn("Web 本地文字和媒体可用", connection_status)
+        self.assertNotIn("仅支持文本发送", connection_status)
+        self.assertIn('api("/api/im/media/messages"', native_sender)
 
     def test_voice_messages_use_compact_bubbles_and_web_voice_to_text(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -6073,6 +6769,288 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
         self.assertIn("isMineRoute(S.route) && isMineRoute(target)", app_js)
         self.assertIn(".mine-tab-panel.is-loading", app_css)
         self.assertIn("scrollbar-gutter: stable", app_css)
+
+    def test_byok_runner_navigation_requires_current_server_authorization(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        access = self._app_fragment(
+            app_js,
+            "function setAiAgentAccess",
+            "function agentErrorMessage",
+        )
+        refresh = self._app_fragment(
+            app_js,
+            "async function refreshAiAgentAccess",
+            "async function agentApi",
+        )
+        login = self._app_fragment(
+            app_js,
+            "async function completeBrowserLogin",
+            "function clearPendingCredentialInputs",
+        )
+        restored = self._app_fragment(
+            app_js,
+            "async function completeRestoredSession",
+            "async function restoreSessionAtBoot",
+        )
+        visibility = self._app_fragment(
+            app_js,
+            'document.addEventListener("visibilitychange"',
+            'window.addEventListener("blur"',
+        )
+
+        self.assertIn("aiAgentAccessEnabled: false", app_js)
+        self.assertIn("aiAgentAccessRefreshSeq: 0", app_js)
+        self.assertIn('api("/api/agent/status"', refresh)
+        self.assertIn("const generation = S.sessionGeneration", refresh)
+        self.assertIn("const requestSeq = ++S.aiAgentAccessRefreshSeq", refresh)
+        self.assertIn("generation === S.sessionGeneration", refresh)
+        self.assertIn("requestSeq === S.aiAgentAccessRefreshSeq", refresh)
+        self.assertIn("if (!responseIsCurrent()) return null", refresh)
+        self.assertIn("[401, 403, 404].includes(result.status)", refresh)
+        self.assertIn('go("me", { replace: true, force: true })', access)
+        self.assertIn(
+            "return S.aiAgentAccessEnabled ? [...MINE_NAV, AI_AGENT_NAV] : MINE_NAV",
+            app_js,
+        )
+        self.assertIn("await refreshAiAgentAccess({ redirect: false })", login)
+        self.assertIn("await refreshAiAgentAccess({ redirect: false })", restored)
+        self.assertIn("refreshAiAgentAccess({ redirect: true })", visibility)
+
+    def test_byok_api_key_and_view_state_are_cleared_at_session_boundaries(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        api = self._app_fragment(app_js, "async function api(path", "function archiveHash")
+        access = self._app_fragment(
+            app_js,
+            "function clearAgentApiKeyInputs",
+            "function agentErrorMessage",
+        )
+        switch_mine = self._app_fragment(
+            app_js,
+            "async function switchMineTab",
+            "function routeCacheKey",
+        )
+        activate_route = self._app_fragment(
+            app_js,
+            "async function activateRoute",
+            "function loadingState",
+        )
+        logout = self._app_fragment(
+            app_js,
+            "async function logout(",
+            "async function loadMomentComments",
+        )
+        forms = self._app_fragment(
+            app_js,
+            "async function handleProductForm",
+            "function applyFeatureEnvelope",
+        )
+        connection_form = forms.split('if (kind === "agent-connection")', 1)[1].split(
+            'if (kind === "agent-settings")', 1
+        )[0]
+        pagehide = self._app_fragment(
+            app_js,
+            'window.addEventListener("pagehide"',
+            "syncVisualViewport();",
+        )
+
+        self.assertIn('input[name="api_key"]', access)
+        self.assertIn("clearAgentApiKeyInputs(document)", access)
+        self.assertIn("setAiAgentAccess(false, null, { redirect: false })", api)
+        self.assertIn("setAiAgentAccess(false, null, { redirect: false })", logout)
+        self.assertIn('S.route === "agent" && target !== "agent"', switch_mine)
+        self.assertIn("clearAgentApiKeyInputs(panel)", switch_mine)
+        self.assertIn('S.route === "agent" && target !== "agent"', activate_route)
+        self.assertIn("clearAgentApiKeyInputs(root())", activate_route)
+        self.assertIn("clearAgentApiKeyInputs(form)", connection_form)
+        self.assertIn("clearAgentApiKeyInputs(document)", pagehide)
+        self.assertLess(
+            connection_form.index("clearAgentApiKeyInputs(form)"),
+            connection_form.index('await agentApi("/api/agent/connection"'),
+        )
+        self.assertIn('normalized === "agent" || normalized === "mine:agent"', app_js)
+        self.assertIn('if (S.route === "agent" || isSensitiveRouteCacheKey(key))', app_js)
+        self.assertIn('if (target !== "msg" && target !== "agent")', activate_route)
+
+    def test_byok_account_execution_is_separately_gated_and_twice_confirmed(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        execution_state = self._app_fragment(
+            app_js,
+            "function normalizedAiAgentExecutionStatus",
+            "function setAiAgentAccess",
+        )
+        execution_api = self._app_fragment(
+            app_js,
+            "async function agentExecutionApi",
+            "function newAgentIdempotencyKey",
+        )
+        review = self._app_fragment(
+            app_js,
+            "function renderAiAgentExecutionConfirmation",
+            "async function stageAiAgentExecution",
+        )
+        prepare = self._app_fragment(
+            app_js,
+            "async function stageAiAgentExecution",
+            "async function executeAiAgentPendingExecution",
+        )
+        execute = self._app_fragment(
+            app_js,
+            "async function executeAiAgentPendingExecution",
+            "function syncAgentExecutionActionForm",
+        )
+        section = self._app_fragment(
+            app_js,
+            "function agentExecutionSectionHtml",
+            "async function pageAgent",
+        )
+        forms = self._app_fragment(
+            app_js,
+            "async function handleProductForm",
+            "function applyFeatureEnvelope",
+        )
+        switch_mine = self._app_fragment(
+            app_js,
+            "async function switchMineTab",
+            "function routeCacheKey",
+        )
+        pagehide = self._app_fragment(
+            app_js,
+            'window.addEventListener("pagehide"',
+            "syncVisualViewport();",
+        )
+
+        for action in (
+            "send_private_message",
+            "publish_text_post",
+            "follow_user",
+            "unfollow_user",
+        ):
+            self.assertIn(action, app_js)
+        self.assertIn("source.available !== true", execution_state)
+        self.assertIn("source.admin_granted !== true", execution_state)
+        self.assertIn("source.system_enabled !== true", execution_state)
+        self.assertIn("AI_AGENT_EXECUTION_ACTIONS", execution_state)
+        self.assertIn("allowedSet.has(action)", execution_state)
+        self.assertIn("if (!execution) return \"\"", section)
+        self.assertIn("默认不选择任何动作", section)
+        self.assertIn("开启后不会自动监听或接管账号", section)
+        self.assertIn("selected.has(action) ? \"checked\" : \"\"", section)
+        self.assertIn('agentExecutionApi("/api/agent/execution-settings"', forms)
+        self.assertIn("user_enabled: userEnabled", forms)
+        self.assertIn("auto_send_enabled: autoSendEnabled", forms)
+        self.assertIn("selected_actions: selectedActions", forms)
+        self.assertIn('agentExecutionApi("/api/agent/actions/prepare"', prepare)
+        self.assertIn("prepared.confirmation_token", prepare)
+        self.assertIn("executionGeneration !== S.aiAgentExecutionGeneration", prepare)
+        self.assertLess(
+            prepare.index('agentExecutionApi("/api/agent/actions/prepare"'),
+            prepare.index("S.aiAgentPendingExecution = Object.freeze"),
+        )
+        self.assertNotIn("confirmationToken", review)
+        self.assertIn("window.confirm(", execute)
+        self.assertIn('agentExecutionApi("/api/agent/replies/send"', execute)
+        self.assertIn('agentExecutionApi("/api/agent/actions/execute"', execute)
+        self.assertIn("confirmation_token: pending.confirmationToken", execute)
+        self.assertIn('String(data.draft || "").trim()', execute)
+        self.assertLess(
+            execute.index("window.confirm("),
+            execute.index('agentExecutionApi("/api/agent/replies/send"'),
+        )
+        self.assertLess(
+            execute.index("window.confirm("),
+            execute.index('agentExecutionApi("/api/agent/actions/execute"'),
+        )
+        self.assertIn("requireAutoSend: directReply", execute)
+        self.assertIn("pending.executionGeneration !== S.aiAgentExecutionGeneration", execute)
+        self.assertIn("clearAiAgentPendingExecution()", switch_mine)
+        self.assertIn("setAiAgentExecutionStatus(null)", pagehide)
+        self.assertIn("setAiAgentExecutionStatus(null)", execution_api)
+        self.assertEqual(app_js.count('"/api/agent/actions/execute"'), 1)
+        self.assertEqual(app_js.count('"/api/agent/replies/send"'), 1)
+
+    def test_profile_avatar_uses_owner_bound_native_asset_and_full_local_profile_editor(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
+        page_me = self._app_fragment(app_js, "async function pageMe", "function agentConnectionStatusText")
+        forms = self._app_fragment(app_js, "async function handleProductForm", "function applyFeatureEnvelope")
+        avatar_form = forms.split('if (kind === "profile-avatar")', 1)[1].split(
+            'if (kind === "profile-details")', 1
+        )[0]
+        details_form = forms.split('if (kind === "profile-details")', 1)[1].split(
+            'if (kind === "local-password-change")', 1
+        )[0]
+
+        self.assertIn('data-form="profile-avatar"', page_me)
+        self.assertIn('input class="sr-only" id="profile-avatar-file"', page_me)
+        self.assertIn('data-form="profile-details"', page_me)
+        for field in ("nickname", "signature", "city", "gender"):
+            self.assertIn(f'name="{field}"', page_me)
+        self.assertIn('normalizeChatPickerFile("image", rawFile)', app_js)
+        self.assertIn('validateChatFile("image", file)', app_js)
+        self.assertIn('createNativeMediaAsset("image", draft.file', avatar_form)
+        self.assertIn('avatar_asset_id: draft.assetId', avatar_form)
+        self.assertNotIn("previewUrl", avatar_form.split('body: JSON.stringify({', 1)[1].split("}),", 1)[0])
+        self.assertNotIn("avatar:", avatar_form)
+        self.assertIn('api("/api/profile/reset"', details_form)
+        self.assertIn("clearProfileAvatarDraft()", avatar_form)
+        self.assertIn("clearMomentCache()", avatar_form)
+        self.assertIn(".profile-avatar-preview", app_css)
+        self.assertIn(".media-upload-track", app_css)
+
+    def test_moment_composer_uploads_native_assets_without_client_media_urls(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
+        page = self._app_fragment(app_js, "async function pageMoments", "function syncMomentsTabUI")
+        forms = self._app_fragment(app_js, "async function handleProductForm", "function applyFeatureEnvelope")
+        publish = forms.split('if (kind === "moment-publish")', 1)[1].split(
+            'if (kind === "moment-comment")', 1
+        )[0]
+
+        self.assertIn('data-moment-media="image"', page)
+        self.assertIn('data-moment-media="video"', page)
+        image_input = page.split('data-moment-media="image"', 1)[1].split("/>", 1)[0]
+        video_input = page.split('data-moment-media="video"', 1)[1].split("/>", 1)[0]
+        self.assertIn("multiple", image_input)
+        self.assertNotIn("multiple", video_input)
+        self.assertNotIn('placeholder="分享此刻的想法，也可以只发布图片或视频" required', page)
+        self.assertIn("S.momentMediaDraft.length + files.length > 9", app_js)
+        self.assertIn("图片和视频不能同时发布", app_js)
+        self.assertIn("createNativeMediaAsset(draft.kind, draft.file", app_js)
+        self.assertIn("media_asset_ids: mediaAssetIds", publish)
+        request_body = publish.split('body: JSON.stringify({', 1)[1].split("}),", 1)[0]
+        self.assertNotIn("pictures:", request_body)
+        self.assertNotIn("video:", request_body)
+        self.assertNotIn("cover:", request_body)
+        self.assertIn("draft.assetId", app_js)
+        self.assertIn("clearMomentMediaDraft()", publish)
+        self.assertIn(".moment-compose-preview-grid", app_css)
+        self.assertIn('form[data-form="moment-publish"]', app_js)
+        self.assertIn("S.momentMediaUploading", app_js)
+        self.assertIn('form.dataset.composeLocked === "true"', app_js)
+
+    def test_native_profile_and_moment_media_paths_remain_same_origin_and_current(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        media_url = self._app_fragment(app_js, "const LOCAL_PRIVATE_MEDIA_PATH_RE", "function validAvatarValue")
+        moment_media = self._app_fragment(app_js, "function momentMediaHtml", "function momentOwnershipMenu")
+        moment_card = self._app_fragment(app_js, "function renderMomentCard", "function momentCard")
+
+        self.assertIn("(?:native\\/)?", media_url)
+        self.assertIn("if (LOCAL_PRIVATE_MEDIA_PATH_RE.test(raw)) return raw", media_url)
+        self.assertLess(
+            media_url.index("if (LOCAL_PRIVATE_MEDIA_PATH_RE.test(raw)) return raw"),
+            media_url.index("const canonical = raw.replace"),
+        )
+        self.assertIn('const video = pictures.length ? "" : mediaUrl(post.video)', moment_media)
+        self.assertIn("pictureHtml || videoHtml", moment_media)
+        self.assertNotIn("这条动态没有文字内容", moment_card)
+        self.assertIn('String(post.content || "").trim()', moment_card)
+        self.assertIn("clearComposeDrafts()", app_js)
 
     def test_static_asset_cache_versions_match_content_hashes(self) -> None:
         root = Path(__file__).resolve().parents[1]

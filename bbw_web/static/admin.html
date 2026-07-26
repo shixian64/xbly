@@ -320,11 +320,44 @@
             <div>
               <p class="admin-section-kicker">治理与安全</p>
               <h2 id="admin-security-title">安全与访问</h2>
-              <p>统一管理身份验证器、敏感访问状态和管理员密码，降低高风险操作暴露面。</p>
+              <p>统一管理模型运行器、账号动作、无人值守运营、身份验证器、敏感访问状态和管理员密码，降低高风险操作暴露面。</p>
             </div>
           </header>
           <div id="admin-security-summary" class="admin-security-summary" aria-live="polite"></div>
           <div class="admin-panel-grid">
+            <section class="admin-panel" aria-labelledby="admin-byok-model-runner-title">
+              <div class="admin-panel-title">
+                <div>
+                  <p class="admin-panel-kicker">模型能力</p>
+                  <h3 id="admin-byok-model-runner-title">BYOK 模型运行器</h3>
+                </div>
+                <p>全局关闭时所有用户均不可见、不可使用；全局开启后仍需在用户详情中逐一授权。</p>
+              </div>
+              <div id="admin-byok-model-runner-control" aria-live="polite"></div>
+            </section>
+
+            <section class="admin-panel" aria-labelledby="admin-byok-account-actions-title">
+              <div class="admin-panel-title">
+                <div>
+                  <p class="admin-panel-kicker">高风险能力</p>
+                  <h3 id="admin-byok-account-actions-title">模型账号动作执行</h3>
+                </div>
+                <p>独立控制模型是否可以请求执行社交账号动作；必须同时开启模型运行器并完成逐用户授权。</p>
+              </div>
+              <div id="admin-byok-account-actions-control" aria-live="polite"></div>
+            </section>
+
+            <section class="admin-panel" aria-labelledby="admin-byok-autonomous-agent-title">
+              <div class="admin-panel-title">
+                <div>
+                  <p class="admin-panel-kicker">持续外部操作</p>
+                  <h3 id="admin-byok-autonomous-agent-title">无人值守运营 Agent</h3>
+                </div>
+                <p>独立控制持续自动化运营能力；必须同时开启模型运行器和账号动作执行，并完成第三层逐用户授权。</p>
+              </div>
+              <div id="admin-byok-autonomous-agent-control" aria-live="polite"></div>
+            </section>
+
             <section class="admin-panel" aria-labelledby="admin-totp-title">
               <div class="admin-panel-title">
                 <div>
@@ -467,6 +500,57 @@
     </div>
   </dialog>
 
+  <dialog id="admin-byok-model-runner-global-dialog" class="admin-dialog" aria-labelledby="admin-byok-model-runner-global-title">
+    <form id="admin-byok-model-runner-global-form" class="admin-dialog-card" method="post" action="/admin" novalidate>
+      <header>
+        <h2 id="admin-byok-model-runner-global-title">修改 BYOK 模型运行器全局开关</h2>
+        <p id="admin-byok-model-runner-global-description"></p>
+      </header>
+      <div class="admin-field">
+        <label for="admin-byok-model-runner-global-reason">操作理由</label>
+        <textarea id="admin-byok-model-runner-global-reason" name="reason" rows="3" minlength="3" maxlength="500" required></textarea>
+      </div>
+      <div class="admin-dialog-actions">
+        <button id="admin-byok-model-runner-global-submit" class="admin-button admin-button-primary" type="submit">确认修改全局开关</button>
+        <button id="admin-byok-model-runner-global-cancel" class="admin-button admin-button-secondary" type="button">取消</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="admin-byok-account-actions-global-dialog" class="admin-dialog" aria-labelledby="admin-byok-account-actions-global-title">
+    <form id="admin-byok-account-actions-global-form" class="admin-dialog-card" method="post" action="/admin" novalidate>
+      <header>
+        <h2 id="admin-byok-account-actions-global-title">修改模型账号动作执行全局开关</h2>
+        <p id="admin-byok-account-actions-global-description"></p>
+      </header>
+      <div class="admin-field">
+        <label for="admin-byok-account-actions-global-reason">操作理由</label>
+        <textarea id="admin-byok-account-actions-global-reason" name="reason" rows="3" minlength="3" maxlength="500" required></textarea>
+      </div>
+      <div class="admin-dialog-actions">
+        <button id="admin-byok-account-actions-global-submit" class="admin-button admin-button-primary" type="submit">确认修改全局开关</button>
+        <button id="admin-byok-account-actions-global-cancel" class="admin-button admin-button-secondary" type="button">取消</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="admin-byok-autonomous-agent-global-dialog" class="admin-dialog" aria-labelledby="admin-byok-autonomous-agent-global-title">
+    <form id="admin-byok-autonomous-agent-global-form" class="admin-dialog-card" method="post" action="/admin" novalidate>
+      <header>
+        <h2 id="admin-byok-autonomous-agent-global-title">修改无人值守运营 Agent 全局开关</h2>
+        <p id="admin-byok-autonomous-agent-global-description"></p>
+      </header>
+      <div class="admin-field">
+        <label for="admin-byok-autonomous-agent-global-reason">操作理由</label>
+        <textarea id="admin-byok-autonomous-agent-global-reason" name="reason" rows="3" minlength="3" maxlength="500" required></textarea>
+      </div>
+      <div class="admin-dialog-actions">
+        <button id="admin-byok-autonomous-agent-global-submit" class="admin-button admin-button-primary" type="submit">确认修改全局开关</button>
+        <button id="admin-byok-autonomous-agent-global-cancel" class="admin-button admin-button-secondary" type="button">取消</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="admin-user-status-dialog" class="admin-dialog" aria-labelledby="admin-user-status-title">
     <form id="admin-user-status-form" class="admin-dialog-card" method="post" action="/admin" novalidate>
       <header>
@@ -518,6 +602,57 @@
     </form>
   </dialog>
 
-  <script src="/static/admin.js?v=20260724-admin-clarity-v7"></script>
+  <dialog id="admin-user-byok-model-runner-dialog" class="admin-dialog" aria-labelledby="admin-user-byok-model-runner-title">
+    <form id="admin-user-byok-model-runner-form" class="admin-dialog-card" method="post" action="/admin" novalidate>
+      <header>
+        <h2 id="admin-user-byok-model-runner-title">修改 BYOK 模型运行器授权</h2>
+        <p id="admin-user-byok-model-runner-description"></p>
+      </header>
+      <div class="admin-field">
+        <label for="admin-user-byok-model-runner-reason">操作理由</label>
+        <textarea id="admin-user-byok-model-runner-reason" name="reason" rows="3" minlength="3" maxlength="500" required></textarea>
+      </div>
+      <div class="admin-dialog-actions">
+        <button id="admin-user-byok-model-runner-submit" class="admin-button admin-button-primary" type="submit">确认修改授权</button>
+        <button id="admin-user-byok-model-runner-cancel" class="admin-button admin-button-secondary" type="button">取消</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="admin-user-byok-account-actions-dialog" class="admin-dialog" aria-labelledby="admin-user-byok-account-actions-title">
+    <form id="admin-user-byok-account-actions-form" class="admin-dialog-card" method="post" action="/admin" novalidate>
+      <header>
+        <h2 id="admin-user-byok-account-actions-title">修改模型账号动作执行授权</h2>
+        <p id="admin-user-byok-account-actions-description"></p>
+      </header>
+      <div class="admin-field">
+        <label for="admin-user-byok-account-actions-reason">操作理由</label>
+        <textarea id="admin-user-byok-account-actions-reason" name="reason" rows="3" minlength="3" maxlength="500" required></textarea>
+      </div>
+      <div class="admin-dialog-actions">
+        <button id="admin-user-byok-account-actions-submit" class="admin-button admin-button-primary" type="submit">确认修改授权</button>
+        <button id="admin-user-byok-account-actions-cancel" class="admin-button admin-button-secondary" type="button">取消</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="admin-user-byok-autonomous-agent-dialog" class="admin-dialog" aria-labelledby="admin-user-byok-autonomous-agent-title">
+    <form id="admin-user-byok-autonomous-agent-form" class="admin-dialog-card" method="post" action="/admin" novalidate>
+      <header>
+        <h2 id="admin-user-byok-autonomous-agent-title">修改无人值守运营 Agent 授权</h2>
+        <p id="admin-user-byok-autonomous-agent-description"></p>
+      </header>
+      <div class="admin-field">
+        <label for="admin-user-byok-autonomous-agent-reason">操作理由</label>
+        <textarea id="admin-user-byok-autonomous-agent-reason" name="reason" rows="3" minlength="3" maxlength="500" required></textarea>
+      </div>
+      <div class="admin-dialog-actions">
+        <button id="admin-user-byok-autonomous-agent-submit" class="admin-button admin-button-primary" type="submit">确认修改授权</button>
+        <button id="admin-user-byok-autonomous-agent-cancel" class="admin-button admin-button-secondary" type="button">取消</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/static/admin.js?v=20260725-byok-autonomous-agent-v1"></script>
 </body>
 </html>

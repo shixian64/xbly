@@ -182,6 +182,32 @@ def extract_message_quote(cloud_custom_data: Any) -> dict[str, str]:
     return normalize_message_quote(cloud_custom_data)
 
 
+def extract_local_message_identity(cloud_custom_data: Any) -> dict[str, str]:
+    """Read bounded Web-local identifiers carried through a TIM mirror."""
+
+    payload = _json_object(cloud_custom_data)
+    namespace = payload.get(QUOTE_NAMESPACE)
+    if not isinstance(namespace, Mapping):
+        return {}
+    message_id = _bounded(
+        namespace.get("message_id")
+        or namespace.get("canonical_message_id")
+        or namespace.get("id"),
+        128,
+    )
+    client_message_id = _bounded(
+        namespace.get("client_message_id")
+        or namespace.get("client_message_key"),
+        160,
+    )
+    if not message_id and not client_message_id:
+        return {}
+    return {
+        "canonical_message_id": message_id,
+        "client_message_id": client_message_id,
+    }
+
+
 def encode_message_quote(quote: Any) -> str:
     normalized = normalize_message_quote(quote)
     if not normalized:

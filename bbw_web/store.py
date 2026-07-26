@@ -15,16 +15,27 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from bbw_protocol.app import BeibeiwuApp
-from bbw_protocol.adapters import NativeBundle
-from bbw_protocol.device import build_device_profile
-from bbw_protocol.heartbeat import Heartbeat
-from bbw_protocol.session import Session
+from bbw_web.providers import (
+    ProviderApplication,
+    ProviderAuthenticationRejected,
+    ProviderHeartbeat,
+    ProviderNativeBundle,
+    ProviderRuntime,
+    ProviderUnavailable,
+    RuntimeProvider,
+)
 
 # bbw_web owns multi-user paths; protocol core stays single-session oriented
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SESSIONS_DIR = REPO_ROOT / "sessions"
 WEB_META_DIR = Path(__file__).resolve().parent / "data"
+
+
+def _default_runtime_provider() -> RuntimeProvider:
+    """Resolve the legacy provider only when a store actually needs it."""
+    from bbw_web.providers import LegacyBanghuaProvider
+
+    return LegacyBanghuaProvider()
 
 
 class _RequestGateLease:
@@ -96,11 +107,11 @@ class WebUser:
     """One authenticated (or pending) browser session."""
 
     web_sid: str
-    app: BeibeiwuApp
-    native: NativeBundle
+    app: ProviderApplication
+    native: ProviderNativeBundle
     created_at: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
-    heartbeat: Optional[Heartbeat] = None
+    heartbeat: Optional[ProviderHeartbeat] = None
     label: str = ""  # optional display label
     persist_sessions: bool = False
     match_pool_online_list_enabled: bool = False
@@ -144,9 +155,14 @@ class WebUser:
     def start_heartbeat(self, interval_sec: float = 55.0) -> Dict[str, Any]:
         if self.heartbeat and self.heartbeat.running:
             return self.heartbeat.status()
-        self.heartbeat = Heartbeat(self.app, interval_sec=interval_sec)
+        self.heartbeat = self.app.create_heartbeat(interval_sec=interval_sec)
         self.heartbeat.start()
         return self.heartbeat.status()
+
+    def heartbeat_once(self) -> Dict[str, Any]:
+        if self.heartbeat is None:
+            self.heartbeat = self.app.create_heartbeat()
+        return self.heartbeat.once()
 
     def stop_heartbeat(self) -> None:
         if self.heartbeat:
@@ -222,10 +238,13 @@ class WebUser:
 
     def capabilities(self) -> Dict[str, bool]:
         enabled = bool(self.match_pool_online_list_enabled)
+        local_session = str(
+            getattr(self, "authentication_source", "") or ""
+        ) == "local"
         return {
             "match_pool_online_list": True,
             "proactive_private_message": enabled,
-            "direct_im_credentials": enabled,
+            "direct_im_credentials": enabled and not local_session,
             "nearby_custom_city": bool(self.nearby_custom_city_enabled),
         }
 
@@ -239,18 +258,28 @@ class SessionStore:
         ttl_sec: float = 86400.0 * 7,
         auto_heartbeat: bool = True,
         heartbeat_interval: float = 55.0,
+        upstream_auth_timeout_sec: float = 5.0,
         persist_sessions: bool = False,
         allow_weak_onekey: bool = False,
         pending_expire_callback: Optional[Callable[[WebUser], None]] = None,
+        runtime_provider: Optional[RuntimeProvider] = None,
     ):
         self._lock = threading.RLock()
         self.users: Dict[str, WebUser] = {}
         self.ttl_sec = ttl_sec
         self.auto_heartbeat = auto_heartbeat
         self.heartbeat_interval = heartbeat_interval
+        self.upstream_auth_timeout_sec = max(
+            1.0, float(upstream_auth_timeout_sec)
+        )
         self.persist_sessions = bool(persist_sessions)
         self.allow_weak_onekey = bool(allow_weak_onekey)
         self.pending_expire_callback = pending_expire_callback
+        self.runtime_provider = (
+            runtime_provider
+            if runtime_provider is not None
+            else _default_runtime_provider()
+        )
         if self.persist_sessions:
             SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
             WEB_META_DIR.mkdir(parents=True, exist_ok=True)
@@ -258,23 +287,57 @@ class SessionStore:
     def _new_sid(self) -> str:
         return secrets.token_urlsafe(24)
 
+    def _register_runtime(
+        self,
+        runtime: ProviderRuntime,
+        *,
+        label: str = "",
+    ) -> WebUser:
+        sid = self._new_sid()
+        user = WebUser(
+            web_sid=sid,
+            app=runtime.app,
+            native=runtime.native,
+            label=label or "",
+            persist_sessions=self.persist_sessions,
+        )
+        self.users[sid] = user
+        return user
+
     def create(self, label: str = "") -> WebUser:
         with self._lock:
             self.purge_expired()
             sid = self._new_sid()
-            sess = Session()
+            runtime = self.runtime_provider.create_runtime()
             # provisional device; re-seeded on login with phone
-            sess.apply_device(build_device_profile(seed=sid[:12]))
-            app = BeibeiwuApp(sess)
+            try:
+                runtime.app.set_device(seed=sid[:12])
+            except Exception:
+                try:
+                    runtime.app.client.close()
+                except Exception:
+                    pass
+                raise
             user = WebUser(
                 web_sid=sid,
-                app=app,
-                native=NativeBundle(app),
+                app=runtime.app,
+                native=runtime.native,
                 label=label or "",
                 persist_sessions=self.persist_sessions,
             )
             self.users[sid] = user
             return user
+
+    def send_sms(self, phone: str) -> Any:
+        """Send one SMS through an isolated provider runtime."""
+        runtime = self.runtime_provider.create_runtime()
+        try:
+            return runtime.app.auth.send_sms(phone)
+        finally:
+            try:
+                runtime.app.client.close()
+            except Exception:
+                pass
 
     def rotate_sid(self, user: WebUser) -> WebUser:
         """Rotate the browser credential after authentication.
@@ -402,14 +465,63 @@ class SessionStore:
         elif label:
             user.label = label
         with user.lock:
-            # stable device profile per phone
-            user.app.session.apply_device(build_device_profile(seed=phone))
-            r = user.app.auth.login_password(phone, password)
-            if not r.ok or not user.app.session.logged_in:
+            try:
+                # stable device profile per phone
+                user.app.set_device(seed=phone)
+                client = getattr(user.app, "client", None)
+                previous_timeout = getattr(client, "timeout", None)
+                timeout_changed = False
+                if previous_timeout is not None:
+                    try:
+                        client.timeout = min(
+                            float(previous_timeout),
+                            self.upstream_auth_timeout_sec,
+                        )
+                        timeout_changed = True
+                    except (TypeError, ValueError, OverflowError, AttributeError):
+                        timeout_changed = False
+                try:
+                    r = user.app.auth.login_password(phone, password)
+                finally:
+                    if timeout_changed:
+                        client.timeout = previous_timeout
+                authenticated = bool(r.ok) and bool(user.app.session.logged_in)
+            except Exception:
+                # An arbitrary adapter exception is not evidence that the
+                # upstream is unavailable.  Preserve its type for the BFF's
+                # conservative generic-failure path and clean up a provisional
+                # runtime before returning control to the caller.
+                try:
+                    user.app.session.password = ""
+                except Exception:
+                    pass
                 if created:
                     self.drop(user.web_sid)
-                raise RuntimeError(
-                    r.message or r.code or r.raw[:200] or "login failed"
+                raise
+            if not authenticated:
+                user.app.session.password = ""
+                if created:
+                    self.drop(user.web_sid)
+                try:
+                    upstream_status = int(getattr(r, "status", 0) or 0)
+                except (TypeError, ValueError, OverflowError):
+                    upstream_status = 0
+                upstream_code = str(getattr(r, "code", "") or "")
+                message = str(
+                    getattr(r, "message", "")
+                    or upstream_code
+                    or str(getattr(r, "raw", "") or "")[:200]
+                    or "login failed"
+                )
+                error_type = (
+                    ProviderUnavailable
+                    if upstream_status < 0 or 500 <= upstream_status < 600
+                    else ProviderAuthenticationRejected
+                )
+                raise error_type(
+                    message,
+                    upstream_status=upstream_status,
+                    upstream_code=upstream_code,
                 )
             # The protocol helper keeps the submitted password for CLI refresh.  The
             # Web process never needs to retain it after the request completes.
@@ -439,7 +551,7 @@ class SessionStore:
         elif label:
             user.label = label
         with user.lock:
-            user.app.session.apply_device(build_device_profile(seed=phone))
+            user.app.set_device(seed=phone)
             r = user.app.auth.login_onekey(phone)
             if not r.ok or not user.app.session.logged_in:
                 if created:
@@ -466,14 +578,31 @@ class SessionStore:
         if not path.exists():
             return None
         with self._lock:
-            sess = Session.load(str(path))
+            runtime = self.runtime_provider.load_runtime(path)
+            sess = runtime.app.session
             if not sess.logged_in:
+                try:
+                    runtime.app.client.close()
+                except Exception:
+                    pass
                 return None
             user = self.get(web_sid) if web_sid else None
             if not user:
-                user = self.create(label=sess.nickname or uid)
-            user.app = BeibeiwuApp(sess)
-            user.native = NativeBundle(user.app)
+                self.purge_expired()
+                user = self._register_runtime(
+                    runtime,
+                    label=str(getattr(sess, "nickname", "") or uid),
+                )
+            else:
+                user.stop_heartbeat()
+                previous_app = user.app
+                user.app = runtime.app
+                user.native = runtime.native
+                if previous_app is not runtime.app:
+                    try:
+                        previous_app.client.close()
+                    except Exception:
+                        pass
             user.persist_sessions = True
             if self.auto_heartbeat:
                 user.start_heartbeat(self.heartbeat_interval)

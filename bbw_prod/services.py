@@ -18,12 +18,14 @@ from .models import (
     AdminSession,
     AdminUser,
     AuditLog,
+    ChatMessage,
     ExternalAccount,
     InviteCode,
     MediaObject,
     Message,
     RawUpstreamResponse,
     User,
+    UserCredential,
     WebSession,
     utcnow,
 )
@@ -36,6 +38,7 @@ from .repositories import (
     MediaObjectRepository,
     RawUpstreamResponseRepository,
     UserRepository,
+    UserCredentialRepository,
     WebSessionRepository,
 )
 from .security import (
@@ -43,6 +46,7 @@ from .security import (
     PasswordHasher,
     SessionTokenManager,
     TOTPManager,
+    UserPasswordHasher,
     keyed_identifier_hash,
     normalize_username,
 )
@@ -72,6 +76,16 @@ class AuthenticationFailed(ServiceError):
     code = "authentication_failed"
 
 
+class LocalAuthenticationUnavailable(ServiceError):
+    """账号存在，但尚未通过一次上游密码登录建立本地验证材料。"""
+
+    code = "local_authentication_unavailable"
+
+
+class PasswordPolicyError(ServiceError):
+    code = "password_policy_error"
+
+
 class PermissionDenied(ServiceError):
     code = "permission_denied"
 
@@ -82,6 +96,53 @@ class InviteInvalid(ServiceError):
 
 class QuotaExceeded(ServiceError):
     code = "quota_exceeded"
+
+
+WEB_LOCAL_PROFILE_FIELDS_KEY = "_web_local_fields"
+WEB_LOCAL_PROFILE_UPDATED_AT_KEY = "_web_local_updated_at"
+WEB_LOCAL_PROFILE_FIELDS = frozenset(
+    {"nickname", "avatar", "signature", "city", "gender", "privacy"}
+)
+
+
+def merge_provider_profile_preserving_local(
+    current: Mapping[str, Any] | None,
+    incoming: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge a provider snapshot without overwriting Web-local authority.
+
+    Provider login remains useful for refreshing fields that Web has never
+    claimed.  Once a field is changed locally, the marker written alongside
+    the profile makes that field authoritative even when a later Banghua
+    response is stale.
+    """
+
+    current_values = dict(current or {})
+    merged = dict(incoming or {})
+    raw_local_fields = current_values.get(WEB_LOCAL_PROFILE_FIELDS_KEY)
+    local_fields = {
+        str(field)
+        for field in raw_local_fields
+        if str(field) in WEB_LOCAL_PROFILE_FIELDS
+    } if isinstance(raw_local_fields, (list, tuple, set, frozenset)) else set()
+    for field in local_fields:
+        if field in current_values:
+            merged[field] = current_values[field]
+        else:
+            merged.pop(field, None)
+    if local_fields:
+        merged[WEB_LOCAL_PROFILE_FIELDS_KEY] = sorted(local_fields)
+        if WEB_LOCAL_PROFILE_UPDATED_AT_KEY in current_values:
+            merged[WEB_LOCAL_PROFILE_UPDATED_AT_KEY] = current_values[
+                WEB_LOCAL_PROFILE_UPDATED_AT_KEY
+            ]
+    for key, value in current_values.items():
+        if (
+            str(key).startswith("_web_")
+            and key != WEB_LOCAL_PROFILE_FIELDS_KEY
+        ):
+            merged[key] = value
+    return merged
 
 
 def _aware(value: datetime) -> datetime:
@@ -119,6 +180,7 @@ class UserSessionState:
     last_seen_at: datetime
     idle_expires_at: datetime
     absolute_expires_at: datetime
+    auth_source: str = "provider"
 
 
 class UserSessionService:
@@ -153,6 +215,7 @@ class UserSessionService:
             last_seen_at=_aware(row.last_seen_at),
             idle_expires_at=_aware(row.idle_expires_at),
             absolute_expires_at=_aware(row.absolute_expires_at),
+            auth_source=str(getattr(row, "auth_source", "provider") or "provider"),
         )
 
     @staticmethod
@@ -165,6 +228,7 @@ class UserSessionService:
             "last_seen_at": state.last_seen_at.isoformat(),
             "idle_expires_at": state.idle_expires_at.isoformat(),
             "absolute_expires_at": state.absolute_expires_at.isoformat(),
+            "auth_source": state.auth_source,
         }
 
     @staticmethod
@@ -178,6 +242,7 @@ class UserSessionService:
                 last_seen_at=datetime.fromisoformat(str(payload["last_seen_at"])),
                 idle_expires_at=datetime.fromisoformat(str(payload["idle_expires_at"])),
                 absolute_expires_at=datetime.fromisoformat(str(payload["absolute_expires_at"])),
+                auth_source=str(payload.get("auth_source") or "provider"),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -196,8 +261,12 @@ class UserSessionService:
         client_ip: str | None,
         user_agent: str | None,
         raw_sid: str | None = None,
+        auth_source: str = "provider",
         now: datetime | None = None,
     ) -> IssuedSession:
+        normalized_auth_source = str(auth_source or "provider").strip().lower()
+        if normalized_auth_source not in {"provider", "web-local"}:
+            raise ValueError("invalid web session authentication source")
         current = now or utcnow()
         absolute = current + timedelta(seconds=self.settings.user_absolute_ttl_seconds)
         idle = min(current + timedelta(seconds=self.settings.user_idle_ttl_seconds), absolute)
@@ -206,6 +275,7 @@ class UserSessionService:
             user_id=user_id,
             external_account_id=external_account_id,
             sid_hash=SessionTokenManager.hash_sid(raw_sid),
+            auth_source=normalized_auth_source,
             ip_hash=(
                 keyed_identifier_hash(client_ip, self.identifier_key, purpose="ip")
                 if client_ip
@@ -228,6 +298,7 @@ class UserSessionService:
         external_account_id: uuid.UUID,
         client_ip: str | None,
         user_agent: str | None,
+        auth_source: str = "provider",
         now: datetime | None = None,
     ) -> IssuedSession:
         """持久化 legacy/BFF 已经写入 Cookie 的 SID，库中仍只保存摘要。"""
@@ -238,6 +309,7 @@ class UserSessionService:
             external_account_id=external_account_id,
             client_ip=client_ip,
             user_agent=user_agent,
+            auth_source=auth_source,
             now=now,
         )
 
@@ -452,6 +524,7 @@ class LoginPrecheck:
     existing_external_account_id: uuid.UUID | None
     invite_code_id: uuid.UUID | None
     requires_invite: bool
+    local_password_available: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -459,6 +532,213 @@ class LoginCompletion:
     user: User
     external_account: ExternalAccount
     created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LocalAuthentication:
+    user: User
+    external_account: ExternalAccount
+    credential: UserCredential
+    password_rehashed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialEnrollment:
+    credential: UserCredential
+    created: bool
+    password_changed: bool
+    password_rehashed: bool
+
+
+class UserCredentialService:
+    """独立 Web 用户凭据的登记与认证边界。"""
+
+    UPSTREAM_PASSWORD_SOURCE = "upstream_password_login"
+    BACKFILL_SOURCE = "encrypted_password_backfill"
+    LOCAL_PASSWORD_CHANGE_SOURCE = "web_local_password_change"
+    NEW_PASSWORD_MIN_LENGTH = 8
+    NEW_PASSWORD_MAX_LENGTH = 128
+    CURRENT_PASSWORD_MAX_LENGTH = 4096
+
+    def __init__(self, db: Session, phone_hmac_key: bytes | None = None):
+        self.db = db
+        self.phone_hmac_key = phone_hmac_key
+        self.accounts = ExternalAccountRepository(db)
+        self.users = UserRepository(db)
+        self.credentials = UserCredentialRepository(db)
+        self.passwords = UserPasswordHasher()
+
+    def available_for_user(self, user_id: uuid.UUID) -> bool:
+        credential = self.credentials.get_for_user(user_id)
+        return credential is not None and credential.disabled_at is None
+
+    def enroll_verified_password(
+        self,
+        *,
+        user_id: uuid.UUID,
+        password: str,
+        enrollment_source: str = UPSTREAM_PASSWORD_SOURCE,
+        verified_at: datetime | None = None,
+    ) -> CredentialEnrollment:
+        """登记已由可信来源确认的密码，不接受未经认证的任意密码。"""
+
+        source = str(enrollment_source or "").strip()
+        if not source or len(source) > 48:
+            raise ValueError("invalid credential enrollment source")
+        confirmed_at = _aware(verified_at) if verified_at is not None else utcnow()
+        user = self.users.get(user_id, for_update=True)
+        if user is None:
+            raise NotFoundError("user account was not found")
+
+        credential = self.credentials.get_for_user(user_id, for_update=True)
+        if credential is None:
+            credential = UserCredential(
+                id=uuid.uuid4(),
+                user_id=user_id,
+                password_hash=self.passwords.hash(password),
+                credential_version=1,
+                enrollment_source=source,
+                verified_at=confirmed_at,
+                password_changed_at=confirmed_at,
+            )
+            self.credentials.add(credential)
+            return CredentialEnrollment(credential, True, True, False)
+
+        password_matches = self.passwords.verify(credential.password_hash, password)
+        if not password_matches:
+            credential.password_hash = self.passwords.hash(password)
+            credential.credential_version = max(1, credential.credential_version) + 1
+            credential.enrollment_source = source
+            credential.password_changed_at = confirmed_at
+            credential.verified_at = confirmed_at
+            self.db.flush()
+            return CredentialEnrollment(credential, False, True, False)
+
+        rehashed = self.passwords.needs_rehash(credential.password_hash)
+        if rehashed:
+            credential.password_hash = self.passwords.hash(password)
+        if confirmed_at > _aware(credential.verified_at):
+            credential.verified_at = confirmed_at
+        self.db.flush()
+        return CredentialEnrollment(credential, False, False, rehashed)
+
+    def authenticate_password(
+        self,
+        *,
+        phone: str,
+        password: str,
+        provider: str = "beibeiwu",
+    ) -> LocalAuthentication:
+        """仅访问本地数据库；登录编排层负责限制何时允许降级调用。"""
+
+        if self.phone_hmac_key is None:
+            raise RuntimeError("phone HMAC key is required for local authentication")
+        normalized = normalize_phone(phone)
+        digest = phone_lookup_hmac(normalized, self.phone_hmac_key)
+        account = self.accounts.get_by_phone_hmac(
+            digest,
+            provider=provider,
+            for_update=True,
+        )
+        if account is None:
+            self.passwords.verify_or_dummy(None, password)
+            raise AuthenticationFailed("invalid login credentials")
+
+        user = self.users.get(account.user_id, for_update=True)
+        if user is None:
+            self.passwords.verify_or_dummy(None, password)
+            raise AuthenticationFailed("invalid login credentials")
+        if user.status != "active":
+            self.passwords.verify_or_dummy(None, password)
+            raise PermissionDenied("user account is not active")
+
+        credential = self.credentials.get_for_user(user.id, for_update=True)
+        if credential is None:
+            self.passwords.verify_or_dummy(None, password)
+            raise LocalAuthenticationUnavailable(
+                "local password authentication has not been established"
+            )
+        if credential.disabled_at is not None:
+            self.passwords.verify_or_dummy(None, password)
+            raise PermissionDenied("local password authentication is disabled")
+        if not self.passwords.verify_or_dummy(credential.password_hash, password):
+            raise AuthenticationFailed("invalid login credentials")
+
+        rehashed = self.passwords.needs_rehash(credential.password_hash)
+        now = utcnow()
+        if rehashed:
+            credential.password_hash = self.passwords.hash(password)
+        credential.last_authenticated_at = now
+        user.last_login_at = now
+        self.db.flush()
+        return LocalAuthentication(user, account, credential, rehashed)
+
+    @classmethod
+    def validate_new_local_password(cls, password: str) -> None:
+        """Validate only passwords newly chosen by Web users.
+
+        Imported APK passwords deliberately keep their historical semantics;
+        applying this policy while authenticating or backfilling them would
+        lock out existing accounts.  New Web-local passwords, however, can use
+        a bounded policy without changing any legacy verifier.
+        """
+
+        if not isinstance(password, str):
+            raise PasswordPolicyError("新密码格式无效")
+        if not cls.NEW_PASSWORD_MIN_LENGTH <= len(password) <= cls.NEW_PASSWORD_MAX_LENGTH:
+            raise PasswordPolicyError(
+                f"新密码长度必须为 {cls.NEW_PASSWORD_MIN_LENGTH} 至 "
+                f"{cls.NEW_PASSWORD_MAX_LENGTH} 个字符"
+            )
+        if password.isspace():
+            raise PasswordPolicyError("新密码不能只包含空白字符")
+        if "\x00" in password:
+            raise PasswordPolicyError("新密码包含无效字符")
+
+    def change_local_password(
+        self,
+        *,
+        user_id: uuid.UUID,
+        current_password: str,
+        new_password: str,
+    ) -> UserCredential:
+        """Change one migrated credential after verifying the current password.
+
+        This operation is intentionally local-canonical.  It does not mutate
+        ``ExternalAccount.password_encrypted`` because that field represents
+        APK/Banghua compatibility material and must not pretend an upstream
+        password change succeeded.
+        """
+
+        if not isinstance(current_password, str) or not current_password:
+            raise AuthenticationFailed("当前密码验证失败")
+        if len(current_password) > self.CURRENT_PASSWORD_MAX_LENGTH:
+            raise AuthenticationFailed("当前密码验证失败")
+        self.validate_new_local_password(new_password)
+        if current_password == new_password:
+            raise PasswordPolicyError("新密码不能与当前密码相同")
+
+        user = self.users.get(user_id, for_update=True)
+        credential = self.credentials.get_for_user(user_id, for_update=True)
+        if user is None or user.status != "active":
+            self.passwords.verify_or_dummy(None, current_password)
+            raise PermissionDenied("账号当前不可用")
+        if credential is None or credential.disabled_at is not None:
+            self.passwords.verify_or_dummy(None, current_password)
+            raise LocalAuthenticationUnavailable("当前账号尚未建立可用的本地密码")
+        if not self.passwords.verify_or_dummy(
+            credential.password_hash, current_password
+        ):
+            raise AuthenticationFailed("当前密码验证失败")
+
+        changed_at = utcnow()
+        credential.password_hash = self.passwords.hash(new_password)
+        credential.credential_version = max(1, credential.credential_version) + 1
+        credential.enrollment_source = self.LOCAL_PASSWORD_CHANGE_SOURCE
+        credential.password_changed_at = changed_at
+        credential.last_authenticated_at = changed_at
+        self.db.flush()
+        return credential
 
 
 class LoginAccountService:
@@ -478,6 +758,7 @@ class LoginAccountService:
         self.accounts = ExternalAccountRepository(db)
         self.users = UserRepository(db)
         self.invites = InviteService(db, settings)
+        self.user_credentials = UserCredentialService(db, phone_hmac_key)
 
     def precheck_credentials(
         self, *, phone: str, provider: str = "beibeiwu"
@@ -497,6 +778,7 @@ class LoginAccountService:
                 existing.id,
                 None,
                 False,
+                self.user_credentials.available_for_user(user.id),
             )
         return LoginPrecheck(
             digest,
@@ -505,6 +787,7 @@ class LoginAccountService:
             None,
             None,
             bool(self.settings.invite_required),
+            False,
         )
 
     def precheck(
@@ -523,6 +806,7 @@ class LoginAccountService:
             context.existing_external_account_id,
             invite.id,
             True,
+            context.local_password_available,
         )
 
     @staticmethod
@@ -536,9 +820,11 @@ class LoginAccountService:
         normalized_phone: str,
         login_account: str,
         password: str,
+        password_verified: bool,
         token: str | None,
         token_expires_at: datetime | None,
-    ) -> None:
+    ) -> datetime:
+        authenticated_at = utcnow()
         account.phone_encrypted = self.cipher.encrypt_text(
             normalized_phone,
             purpose="external-account.phone",
@@ -549,9 +835,9 @@ class LoginAccountService:
             purpose="external-account.login",
             context=self._credential_context(account.id, "login"),
         )
-        # SMS login does not supply the upstream password.  Do not erase a
-        # previously captured password merely because this login used SMS.
-        if password:
+        # 只有明确成功的上游密码认证才能更新可逆上游密码。SMS 请求即使夹带
+        # password 字段也不能污染它；正常 SMS 登录仍保留原值。
+        if password and password_verified:
             account.password_encrypted = self.cipher.encrypt_text(
                 password,
                 purpose="external-account.password",
@@ -567,7 +853,27 @@ class LoginAccountService:
             else None
         )
         account.token_expires_at = token_expires_at
-        account.last_authenticated_at = utcnow()
+        account.last_authenticated_at = authenticated_at
+        return authenticated_at
+
+    def authenticate_local_password(
+        self,
+        *,
+        phone: str,
+        password: str,
+        provider: str = "beibeiwu",
+    ) -> LocalAuthentication:
+        """认证一个已机会式迁移的账号，不与上游网络交互。
+
+        登录编排层只能在确认上游不可用时调用。上游明确返回密码错误、封禁或
+        其他业务拒绝时不得降级到本方法，否则旧密码可能绕过上游状态。
+        """
+
+        return self.user_credentials.authenticate_password(
+            phone=phone,
+            password=password,
+            provider=provider,
+        )
 
     def complete_login(
         self,
@@ -579,6 +885,7 @@ class LoginAccountService:
         password: str,
         token: str | None,
         token_expires_at: datetime | None = None,
+        password_verified: bool = False,
         provider: str = "beibeiwu",
         display_name: str | None = None,
         profile: Mapping[str, Any] | None = None,
@@ -600,19 +907,27 @@ class LoginAccountService:
             by_phone.upstream_uid = upstream_uid
             by_phone.phone_hmac = digest
             by_phone.device_data = dict(device_data or by_phone.device_data or {})
-            self._set_credentials(
+            authenticated_at = self._set_credentials(
                 by_phone,
                 normalized_phone=normalized,
                 login_account=login_account,
                 password=password,
+                password_verified=password_verified,
                 token=token,
                 token_expires_at=token_expires_at,
             )
-            user.last_login_at = utcnow()
-            if display_name:
+            user.last_login_at = authenticated_at
+            current_profile = dict(user.profile or {})
+            local_profile_fields = set(
+                current_profile.get(WEB_LOCAL_PROFILE_FIELDS_KEY) or ()
+            )
+            if display_name and "nickname" not in local_profile_fields:
                 user.display_name = display_name[:160]
             if profile is not None:
-                user.profile = dict(profile)
+                user.profile = merge_provider_profile_preserving_local(
+                    current_profile,
+                    profile,
+                )
             invite = None
             if require_invite and self.settings.invite_required:
                 if not invite_code:
@@ -622,6 +937,12 @@ class LoginAccountService:
                 invite = self.invites.validate(invite_code, for_update=True)
             if invite is not None:
                 self.invites.consume_locked(invite)
+            if password and password_verified:
+                self.user_credentials.enroll_verified_password(
+                    user_id=user.id,
+                    password=password,
+                    verified_at=authenticated_at,
+                )
             self.db.flush()
             return LoginCompletion(user, by_phone, False)
 
@@ -656,24 +977,161 @@ class LoginAccountService:
             password_encrypted=None,
             device_data=dict(device_data or {}),
         )
-        self._set_credentials(
+        authenticated_at = self._set_credentials(
             account,
             normalized_phone=normalized,
             login_account=login_account,
             password=password,
+            password_verified=password_verified,
             token=token,
             token_expires_at=token_expires_at,
         )
+        user.last_login_at = authenticated_at
         # There is intentionally no ORM relationship between these security
         # boundary models.  Flush the parent explicitly so PostgreSQL never
         # sees the external account before its referenced user row.
         self.db.add(user)
         self.db.flush()
         self.db.add(account)
+        if password and password_verified:
+            self.user_credentials.enroll_verified_password(
+                user_id=user.id,
+                password=password,
+                verified_at=authenticated_at,
+            )
         if invite is not None:
             self.invites.consume_locked(invite)
         self.db.flush()
         return LoginCompletion(user, account, True)
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialBackfillReport:
+    dry_run: bool
+    scanned: int
+    eligible: int
+    created: int
+    skipped_existing: int
+    failed: int
+
+
+class CredentialBackfillService:
+    """从现有上游密文机会式建立独立凭据；绝不删除或改写原密文。"""
+
+    MAX_APPLY_LIMIT = 50
+
+    def __init__(self, db: Session, cipher: CredentialCipher | None = None):
+        self.db = db
+        self.cipher = cipher
+        self.credentials = UserCredentialRepository(db)
+        self.user_credentials = UserCredentialService(db)
+
+    @staticmethod
+    def _password_context(account_id: uuid.UUID) -> str:
+        return f"external-account:{account_id}:password"
+
+    def run(
+        self,
+        *,
+        apply: bool = False,
+        provider: str = "beibeiwu",
+        limit: int | None = None,
+        approved_account_ids: set[uuid.UUID] | frozenset[uuid.UUID] | None = None,
+    ) -> CredentialBackfillReport:
+        if limit is not None and limit < 1:
+            raise ValueError("backfill limit must be positive")
+        approved_ids = {
+            value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+            for value in (approved_account_ids or ())
+        }
+        if apply and not approved_ids:
+            raise ValueError(
+                "applying credential backfill requires a non-empty approved account allowlist"
+            )
+        if apply and limit is None:
+            raise ValueError("applying credential backfill requires an explicit limit")
+        if apply and limit > self.MAX_APPLY_LIMIT:
+            raise ValueError(
+                f"credential backfill apply limit must not exceed {self.MAX_APPLY_LIMIT}"
+            )
+        if apply and limit != 1:
+            raise ValueError(
+                "credential backfill service applies one account per transaction"
+            )
+        if apply and self.cipher is None:
+            raise RuntimeError("credential cipher is required when applying backfill")
+        stmt = (
+            select(ExternalAccount)
+            .join(User, User.id == ExternalAccount.user_id)
+            .where(
+                ExternalAccount.provider == provider,
+                User.status == "active",
+                ExternalAccount.password_encrypted.is_not(None),
+                ~select(UserCredential.id)
+                .where(UserCredential.user_id == ExternalAccount.user_id)
+                .exists(),
+            )
+            .order_by(ExternalAccount.created_at, ExternalAccount.id)
+        )
+        if approved_account_ids is not None:
+            stmt = stmt.where(ExternalAccount.id.in_(approved_ids))
+        if limit is not None:
+            stmt = stmt.limit(limit)
+
+        scanned = eligible = created = skipped_existing = failed = 0
+        for account in self.db.scalars(stmt):
+            scanned += 1
+            if self.credentials.get_for_user(account.user_id) is not None:
+                skipped_existing += 1
+                continue
+
+            if not apply:
+                # 默认演练只盘点候选；不触碰解密密钥，不把历史明文带入内存，
+                # 也不消耗 Argon2 资源。
+                eligible += 1
+                continue
+
+            password = ""
+            try:
+                encrypted = account.password_encrypted
+                if encrypted is None:
+                    continue
+                cipher = self.cipher
+                assert cipher is not None
+                password = cipher.decrypt_text(
+                    encrypted,
+                    purpose="external-account.password",
+                    context=self._password_context(account.id),
+                )
+                with self.db.begin_nested():
+                    if self.credentials.get_for_user(
+                        account.user_id,
+                        for_update=True,
+                    ) is not None:
+                        skipped_existing += 1
+                        continue
+                    enrollment = self.user_credentials.enroll_verified_password(
+                        user_id=account.user_id,
+                        password=password,
+                        enrollment_source=UserCredentialService.BACKFILL_SOURCE,
+                        verified_at=utcnow(),
+                    )
+                eligible += 1
+                created += int(enrollment.created)
+            except Exception:
+                # 不传播可能包含敏感上下文的异常消息，也不输出账号或明文。
+                failed += 1
+            finally:
+                password = ""
+
+        return CredentialBackfillReport(
+            dry_run=not apply,
+            scanned=scanned,
+            eligible=eligible,
+            created=created,
+            skipped_existing=skipped_existing,
+            failed=failed,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1617,4 +2075,32 @@ class RetentionService:
         if not ids:
             return 0
         result = self.db.execute(delete(Message).where(Message.id.in_(ids)))
+        return int(result.rowcount or 0)
+
+    def purge_expired_canonical_messages(
+        self,
+        *,
+        at: datetime | None = None,
+        limit: int = 1000,
+    ) -> int:
+        """Delete expired Web-local authority rows in bounded batches.
+
+        ``message_receipts`` and ``message_deliveries`` reference the canonical
+        row with ``ON DELETE CASCADE``.  Once the longest participant retention
+        window has elapsed, keeping those compatibility/outbox records would
+        both violate retention and leave an unbounded TIM retry backlog.
+        """
+
+        now = at or utcnow()
+        ids = list(
+            self.db.scalars(
+                select(ChatMessage.id)
+                .where(ChatMessage.retention_expires_at <= now)
+                .order_by(ChatMessage.retention_expires_at, ChatMessage.id)
+                .limit(min(max(1, int(limit)), 5000))
+            )
+        )
+        if not ids:
+            return 0
+        result = self.db.execute(delete(ChatMessage).where(ChatMessage.id.in_(ids)))
         return int(result.rowcount or 0)

@@ -38,7 +38,13 @@ def _env_bool(name: str, default: bool) -> bool:
     raise ConfigurationError(f"{name} must be a boolean")
 
 
-def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+def _env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int = 0,
+    maximum: int | None = None,
+) -> int:
     value = os.getenv(name)
     if value is None:
         return default
@@ -48,12 +54,22 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
         raise ConfigurationError(f"{name} must be an integer") from exc
     if parsed < minimum:
         raise ConfigurationError(f"{name} must be >= {minimum}")
+    if maximum is not None and parsed > maximum:
+        raise ConfigurationError(f"{name} must be <= {maximum}")
     return parsed
 
 
 def _env_csv(name: str, default: str = "") -> tuple[str, ...]:
     value = os.getenv(name, default)
     return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
+def _env_choice(name: str, default: str, *, choices: tuple[str, ...]) -> str:
+    value = str(os.getenv(name, default) or "").strip().lower()
+    if value not in choices:
+        allowed = ", ".join(choices)
+        raise ConfigurationError(f"{name} must be one of: {allowed}")
+    return value
 
 
 def _read_secret_source(value: str | None, file_path: str | None, *, name: str) -> bytes:
@@ -199,6 +215,10 @@ class Settings:
     turnstile_site_key: str | None
     turnstile_secret_key_file: str | None
     invite_required: bool
+    upstream_auth_mode: str
+    compatibility_mode: str
+    upstream_auth_timeout_seconds: int
+    local_password_auth_concurrency: int
     active_sync_seconds: int
     inactive_sync_seconds: int
     media_strip_metadata: bool
@@ -209,6 +229,13 @@ class Settings:
     media_max_attachment_bytes: int
     media_allowed_hosts: tuple[str, ...]
     r2_presign_ttl_seconds: int
+    ai_byok_allowed_hosts: tuple[str, ...]
+    ai_byok_connect_timeout_seconds: int
+    ai_byok_read_timeout_seconds: int
+    ai_byok_max_response_bytes: int
+    ai_agent_background_enabled: bool
+    ai_agent_dispatch_batch_size: int
+    ai_agent_failure_backoff_seconds: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -279,23 +306,44 @@ class Settings:
             turnstile_site_key=os.getenv("BBW_TURNSTILE_SITE_KEY"),
             turnstile_secret_key_file=os.getenv("BBW_TURNSTILE_SECRET_KEY_FILE"),
             invite_required=_env_bool("BBW_INVITE_REQUIRED", True),
+            upstream_auth_mode=_env_choice(
+                "BBW_UPSTREAM_AUTH_MODE",
+                "provider-first",
+                choices=("provider-first", "local-only"),
+            ),
+            compatibility_mode=_env_choice(
+                "BBW_COMPATIBILITY_MODE",
+                "enabled",
+                choices=("enabled", "paused", "retired"),
+            ),
+            upstream_auth_timeout_seconds=_env_int(
+                "BBW_UPSTREAM_AUTH_TIMEOUT_SECONDS",
+                5,
+                minimum=1,
+            ),
+            local_password_auth_concurrency=_env_int(
+                "BBW_LOCAL_PASSWORD_AUTH_CONCURRENCY",
+                2,
+                minimum=1,
+                maximum=8,
+            ),
             active_sync_seconds=_env_int("BBW_ACTIVE_SYNC_SECONDS", 300, minimum=60),
             inactive_sync_seconds=_env_int("BBW_INACTIVE_SYNC_SECONDS", 3600, minimum=300),
             media_strip_metadata=_env_bool("BBW_MEDIA_STRIP_METADATA", True),
             media_max_image_bytes=_env_int(
-                "BBW_MEDIA_MAX_IMAGE_BYTES", 10 * MEBIBYTE, minimum=1
+                "BBW_MEDIA_MAX_IMAGE_BYTES", 20 * MEBIBYTE, minimum=1
             ),
             media_max_audio_bytes=_env_int(
-                "BBW_MEDIA_MAX_AUDIO_BYTES", 10 * MEBIBYTE, minimum=1
+                "BBW_MEDIA_MAX_AUDIO_BYTES", 20 * MEBIBYTE, minimum=1
             ),
             media_max_video_bytes=_env_int(
-                "BBW_MEDIA_MAX_VIDEO_BYTES", 50 * MEBIBYTE, minimum=1
+                "BBW_MEDIA_MAX_VIDEO_BYTES", 100 * MEBIBYTE, minimum=1
             ),
             moment_video_max_source_bytes=_env_int(
                 "BBW_MOMENT_VIDEO_MAX_SOURCE_BYTES", 150 * MEBIBYTE, minimum=1
             ),
             media_max_attachment_bytes=_env_int(
-                "BBW_MEDIA_MAX_ATTACHMENT_BYTES", 20 * MEBIBYTE, minimum=1
+                "BBW_MEDIA_MAX_ATTACHMENT_BYTES", 40 * MEBIBYTE, minimum=1
             ),
             media_allowed_hosts=_env_csv(
                 "BBW_MEDIA_ALLOWED_HOSTS",
@@ -303,6 +351,34 @@ class Settings:
             ),
             r2_presign_ttl_seconds=_env_int(
                 "BBW_R2_PRESIGN_TTL_SECONDS", 300, minimum=30
+            ),
+            ai_byok_allowed_hosts=_env_csv("BBW_AI_BYOK_ALLOWED_HOSTS"),
+            ai_byok_connect_timeout_seconds=_env_int(
+                "BBW_AI_BYOK_CONNECT_TIMEOUT_SECONDS", 10, minimum=1, maximum=30
+            ),
+            ai_byok_read_timeout_seconds=_env_int(
+                "BBW_AI_BYOK_READ_TIMEOUT_SECONDS", 60, minimum=5, maximum=180
+            ),
+            ai_byok_max_response_bytes=_env_int(
+                "BBW_AI_BYOK_MAX_RESPONSE_BYTES",
+                MEBIBYTE,
+                minimum=64 * 1024,
+                maximum=4 * MEBIBYTE,
+            ),
+            ai_agent_background_enabled=_env_bool(
+                "BBW_AI_AGENT_BACKGROUND_ENABLED", False
+            ),
+            ai_agent_dispatch_batch_size=_env_int(
+                "BBW_AI_AGENT_DISPATCH_BATCH_SIZE",
+                10,
+                minimum=1,
+                maximum=50,
+            ),
+            ai_agent_failure_backoff_seconds=_env_int(
+                "BBW_AI_AGENT_FAILURE_BACKOFF_SECONDS",
+                300,
+                minimum=60,
+                maximum=3600,
             ),
         )
 

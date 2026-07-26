@@ -12,6 +12,9 @@ const ADMIN_ENDPOINTS = Object.freeze({
   password: `${ADMIN_API_ROOT}/password`,
   credentialUnlock: `${ADMIN_API_ROOT}/credentials/unlock`,
   credentialLock: `${ADMIN_API_ROOT}/credentials/lock`,
+  byokModelRunner: `${ADMIN_API_ROOT}/byok-model-runner`,
+  byokAccountActions: `${ADMIN_API_ROOT}/byok-account-actions`,
+  byokAutonomousAgent: `${ADMIN_API_ROOT}/byok-autonomous-agent`,
   invites: `${ADMIN_API_ROOT}/invites`,
   inviteDisable: (inviteId) => `${ADMIN_API_ROOT}/invites/${encodeURIComponent(inviteId)}/disable`,
   users: `${ADMIN_API_ROOT}/users`,
@@ -21,6 +24,12 @@ const ADMIN_ENDPOINTS = Object.freeze({
     `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/match-pool-online-list`,
   userNearbyCustomCity: (userId) =>
     `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/nearby-custom-city`,
+  userByokModelRunner: (userId) =>
+    `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/byok-model-runner`,
+  userByokAccountActions: (userId) =>
+    `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/byok-account-actions`,
+  userByokAutonomousAgent: (userId) =>
+    `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/byok-autonomous-agent`,
   userCredentials: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/credentials`,
   userConversations: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/conversations`,
   userMessages: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/messages`,
@@ -79,6 +88,9 @@ const ADMIN_STATE = {
   visibilityRefreshPending: false,
   needsRefresh: false,
   overviewSnapshot: null,
+  byokModelRunnerControl: null,
+  byokAccountActionsControl: null,
+  byokAutonomousAgentControl: null,
   sidebarCollapsed: false,
   sidebarOpen: false,
   invitePage: 1,
@@ -106,6 +118,12 @@ const ADMIN_STATE = {
   pendingUserStatus: null,
   pendingMatchPoolOnlineList: null,
   pendingNearbyCustomCity: null,
+  pendingByokModelRunnerGlobal: null,
+  pendingUserByokModelRunner: null,
+  pendingByokAccountActionsGlobal: null,
+  pendingUserByokAccountActions: null,
+  pendingByokAutonomousAgentGlobal: null,
+  pendingUserByokAutonomousAgent: null,
   credentialDisplayTimer: null,
   oneTimeInvite: "",
   totpEnrollment: null,
@@ -131,6 +149,9 @@ const ADMIN_FIELD_LABELS = Object.freeze({
   chat_retention_days: "聊天保存天数",
   match_pool_online_list_enabled: "非匹配主动私信权限",
   nearby_custom_city_enabled: "自定义城市筛选权限",
+  byok_model_runner_enabled: "BYOK 模型运行器权限",
+  byok_account_actions_enabled: "模型账号动作执行权限",
+  byok_autonomous_agent_enabled: "无人值守运营 Agent 权限",
   invite_code_id: "邀请码记录编号",
   profile: "用户资料",
   device: "设备资料",
@@ -192,6 +213,10 @@ const HIDDEN_DATA_FIELD_PARTS = Object.freeze([
   "credential_key",
   "master_key",
   "private_key",
+  "api_key",
+  "apikey",
+  "x_api_key",
+  "client_secret",
   "authorization",
   "cookie",
   "user_sig",
@@ -781,6 +806,48 @@ function closeNearbyCustomCityDialog() {
   if (dialog.open) dialog.close();
 }
 
+function closeByokModelRunnerGlobalDialog() {
+  ADMIN_STATE.pendingByokModelRunnerGlobal = null;
+  clearInputValues($("admin-byok-model-runner-global-form"));
+  const dialog = $("admin-byok-model-runner-global-dialog");
+  if (dialog.open) dialog.close();
+}
+
+function closeUserByokModelRunnerDialog() {
+  ADMIN_STATE.pendingUserByokModelRunner = null;
+  clearInputValues($("admin-user-byok-model-runner-form"));
+  const dialog = $("admin-user-byok-model-runner-dialog");
+  if (dialog.open) dialog.close();
+}
+
+function closeByokAccountActionsGlobalDialog() {
+  ADMIN_STATE.pendingByokAccountActionsGlobal = null;
+  clearInputValues($("admin-byok-account-actions-global-form"));
+  const dialog = $("admin-byok-account-actions-global-dialog");
+  if (dialog.open) dialog.close();
+}
+
+function closeUserByokAccountActionsDialog() {
+  ADMIN_STATE.pendingUserByokAccountActions = null;
+  clearInputValues($("admin-user-byok-account-actions-form"));
+  const dialog = $("admin-user-byok-account-actions-dialog");
+  if (dialog.open) dialog.close();
+}
+
+function closeByokAutonomousAgentGlobalDialog() {
+  ADMIN_STATE.pendingByokAutonomousAgentGlobal = null;
+  clearInputValues($("admin-byok-autonomous-agent-global-form"));
+  const dialog = $("admin-byok-autonomous-agent-global-dialog");
+  if (dialog.open) dialog.close();
+}
+
+function closeUserByokAutonomousAgentDialog() {
+  ADMIN_STATE.pendingUserByokAutonomousAgent = null;
+  clearInputValues($("admin-user-byok-autonomous-agent-form"));
+  const dialog = $("admin-user-byok-autonomous-agent-dialog");
+  if (dialog.open) dialog.close();
+}
+
 function clearUnlockState() {
   clearInterval(ADMIN_STATE.unlockTimer);
   ADMIN_STATE.unlockTimer = null;
@@ -817,8 +884,14 @@ function clearDataViewDom() {
     "admin-audit-table",
     "admin-audit-pagination",
     "admin-security-summary",
+    "admin-byok-model-runner-control",
+    "admin-byok-account-actions-control",
+    "admin-byok-autonomous-agent-control",
   ].forEach((id) => $(id)?.replaceChildren());
   ADMIN_STATE.overviewSnapshot = null;
+  ADMIN_STATE.byokModelRunnerControl = null;
+  ADMIN_STATE.byokAccountActionsControl = null;
+  ADMIN_STATE.byokAutonomousAgentControl = null;
   ADMIN_STATE.selectedUserId = "";
   ADMIN_STATE.selectedUser = null;
   ADMIN_STATE.selectedConversation = null;
@@ -835,6 +908,12 @@ function clearSensitiveDom({ clearData = true } = {}) {
   closeUserStatusDialog();
   closeMatchPoolOnlineListDialog();
   closeNearbyCustomCityDialog();
+  closeByokModelRunnerGlobalDialog();
+  closeUserByokModelRunnerDialog();
+  closeByokAccountActionsGlobalDialog();
+  closeUserByokAccountActionsDialog();
+  closeByokAutonomousAgentGlobalDialog();
+  closeUserByokAutonomousAgentDialog();
   clearUnlockState();
   ADMIN_STATE.pendingCredentialUserId = "";
   closeUnlockDialog();
@@ -1156,6 +1235,23 @@ async function loadOverview() {
     const activeInvites = Number(knownMetric(invites, ["active"], 0)) || 0;
     const totalInvites = Number(knownMetric(invites, ["total"], 0)) || 0;
     const storageData = overview.storage || {};
+    const dependencies = Array.isArray(overview.dependencies) ? overview.dependencies : [];
+    const unavailableDependencies = dependencies.filter((item) => item?.status === "unavailable");
+    const degradedDependencies = dependencies.filter((item) => item?.status === "degraded");
+    const dependencyTone = unavailableDependencies.length
+      ? "danger"
+      : degradedDependencies.length
+        ? "warning"
+        : dependencies.length
+          ? "success"
+          : "warning";
+    const dependencySummary = unavailableDependencies.length
+      ? `${formatNumber(unavailableDependencies.length)} 项不可用`
+      : degradedDependencies.length
+        ? `${formatNumber(degradedDependencies.length)} 项降级`
+        : dependencies.length
+          ? "已观测依赖均可用"
+          : "尚未获得外部依赖状态";
     const used = Number(knownMetric(storageData, ["used_bytes", "media_used_bytes"], 0)) || 0;
     const quota = Number(knownMetric(storageData, ["quota_bytes", "media_quota_bytes"], 0)) || 0;
     const storagePercent = quota > 0 ? Math.min(999, (used / quota) * 100) : 0;
@@ -1178,6 +1274,12 @@ async function loadOverview() {
         ADMIN_STATE.me?.totp_enabled ? "身份验证器已启用，可按需解锁敏感数据" : "未绑定身份验证器，敏感数据保持锁定",
         ADMIN_STATE.me?.totp_enabled ? "保护已启用" : "需要配置",
         ADMIN_STATE.me?.totp_enabled ? "success" : "warning"
+      ),
+      healthCard(
+        "外部依赖",
+        dependencySummary,
+        dependencies.length ? `${formatNumber(dependencies.length)} 项已观测` : "等待请求样本",
+        dependencyTone
       )
     );
     metrics.replaceChildren(
@@ -1216,6 +1318,17 @@ async function loadOverview() {
       dataMetric("可用邀请码", formatNumber(activeInvites)),
       dataMetric("统计时间", overview.generated_at ? formatDate(overview.generated_at) : "未提供")
     );
+    const dependencyStatusLabels = {
+      available: "可用",
+      degraded: "降级",
+      unavailable: "不可用",
+    };
+    for (const dependency of dependencies.slice(0, 12)) {
+      const provider = String(dependency?.provider || "外部服务");
+      const domain = String(dependency?.domain || "能力");
+      const status = dependencyStatusLabels[dependency?.status] || "未知";
+      healthGrid.append(dataMetric(`${provider} / ${domain}`, status));
+    }
     health.appendChild(healthGrid);
     jobs.replaceChildren();
     const dataGrid = element("div", "admin-data-metric-grid");
@@ -1338,6 +1451,9 @@ function userPermissionCell(user) {
   const permissions = [];
   if (user?.match_pool_online_list_enabled) permissions.push("非匹配主动私信");
   if (user?.nearby_custom_city_enabled) permissions.push("自定义城市筛选");
+  if (user?.byok_model_runner_enabled) permissions.push("BYOK 模型运行器");
+  if (user?.byok_account_actions_enabled) permissions.push("模型账号动作执行");
+  if (user?.byok_autonomous_agent_enabled) permissions.push("无人值守运营 Agent");
   if (!permissions.length) return primaryCell("无额外授权", "使用默认功能范围");
   return primaryCell(permissions.join("、"), "已授权额外功能");
 }
@@ -1650,6 +1766,141 @@ function renderUserProfile() {
   cityToggle.append(cityInput, cityTrack, cityLabel);
   cityPanel.append(cityCopy, cityToggle);
   permissionsSection.appendChild(cityPanel);
+
+  const byokModelRunnerEnabled = Boolean(user.byok_model_runner_enabled);
+  const byokModelRunnerPanel = element("section", "admin-feature-panel");
+  const byokModelRunnerCopy = element("div", "admin-feature-panel-copy");
+  byokModelRunnerCopy.appendChild(element("h4", "", "BYOK 模型运行器"));
+  byokModelRunnerCopy.appendChild(
+    element(
+      "p",
+      "",
+      "授权后，该用户才能查看并使用个人模型运行器，配置自己的兼容模型接口和密钥，并进行语言风格分析与回复草稿生成。撤销授权会关闭用户运行开关、撤销账号动作执行与无人值守运营授权，并取消相关未开始任务。"
+    )
+  );
+  const byokModelRunnerToggle = element("label", "admin-feature-switch");
+  const byokModelRunnerInput = document.createElement("input");
+  byokModelRunnerInput.type = "checkbox";
+  byokModelRunnerInput.checked = byokModelRunnerEnabled;
+  byokModelRunnerInput.disabled = !ADMIN_STATE.selectedUserId;
+  byokModelRunnerInput.setAttribute("role", "switch");
+  byokModelRunnerInput.setAttribute("aria-label", "允许该用户使用 BYOK 模型运行器");
+  const byokModelRunnerTrack = element("span", "admin-feature-switch-track");
+  byokModelRunnerTrack.setAttribute("aria-hidden", "true");
+  const byokModelRunnerLabel = element(
+    "span",
+    "admin-feature-switch-label",
+    byokModelRunnerEnabled ? "已授权" : "未授权"
+  );
+  byokModelRunnerInput.addEventListener("change", () => {
+    const targetEnabled = byokModelRunnerInput.checked;
+    byokModelRunnerInput.checked = !targetEnabled;
+    openUserByokModelRunnerDialog(targetEnabled);
+  });
+  byokModelRunnerToggle.append(
+    byokModelRunnerInput,
+    byokModelRunnerTrack,
+    byokModelRunnerLabel
+  );
+  byokModelRunnerPanel.append(byokModelRunnerCopy, byokModelRunnerToggle);
+  permissionsSection.appendChild(byokModelRunnerPanel);
+
+  const byokAccountActionsEnabled = Boolean(user.byok_account_actions_enabled);
+  const accountActive = user.status !== "disabled" && !user.disabled_at;
+  const byokAccountActionsPanel = element("section", "admin-feature-panel");
+  const byokAccountActionsCopy = element("div", "admin-feature-panel-copy");
+  byokAccountActionsCopy.appendChild(element("h4", "", "模型账号动作执行"));
+  byokAccountActionsCopy.appendChild(
+    element(
+      "p",
+      "",
+      "这是独立的高风险授权。授权后，该用户仍需满足模型运行器全局开关、动作执行全局开关和个人执行设置，才能请求发送私信、发布文字动态、关注或取关。撤销授权会关闭个人执行设置、撤销无人值守运营授权并取消相关未开始任务。"
+    )
+  );
+  const byokAccountActionsToggle = element("label", "admin-feature-switch");
+  const byokAccountActionsInput = document.createElement("input");
+  byokAccountActionsInput.type = "checkbox";
+  byokAccountActionsInput.checked = byokAccountActionsEnabled;
+  byokAccountActionsInput.disabled =
+    !ADMIN_STATE.selectedUserId ||
+    ((!byokModelRunnerEnabled || !accountActive) && !byokAccountActionsEnabled);
+  byokAccountActionsInput.setAttribute("role", "switch");
+  byokAccountActionsInput.setAttribute("aria-label", "允许该用户执行模型请求的社交账号动作");
+  const byokAccountActionsTrack = element("span", "admin-feature-switch-track");
+  byokAccountActionsTrack.setAttribute("aria-hidden", "true");
+  const byokAccountActionsLabel = element(
+    "span",
+    "admin-feature-switch-label",
+    byokAccountActionsEnabled
+      ? "已授权"
+      : !accountActive
+        ? "用户已停用"
+      : byokModelRunnerEnabled
+        ? "未授权"
+        : "等待模型运行器授权"
+  );
+  byokAccountActionsInput.addEventListener("change", () => {
+    const targetEnabled = byokAccountActionsInput.checked;
+    byokAccountActionsInput.checked = !targetEnabled;
+    openUserByokAccountActionsDialog(targetEnabled);
+  });
+  byokAccountActionsToggle.append(
+    byokAccountActionsInput,
+    byokAccountActionsTrack,
+    byokAccountActionsLabel
+  );
+  byokAccountActionsPanel.append(byokAccountActionsCopy, byokAccountActionsToggle);
+  permissionsSection.appendChild(byokAccountActionsPanel);
+
+  const byokAutonomousAgentEnabled = Boolean(user.byok_autonomous_agent_enabled);
+  const byokAutonomousAgentPanel = element("section", "admin-feature-panel");
+  const byokAutonomousAgentCopy = element("div", "admin-feature-panel-copy");
+  byokAutonomousAgentCopy.appendChild(element("h4", "", "无人值守运营 Agent"));
+  byokAutonomousAgentCopy.appendChild(
+    element(
+      "p",
+      "",
+      "这是独立的最高风险授权。授权后，该用户仍需满足模型运行器、账号动作执行、自治 Agent 三项全局开关，并主动配置个人自治策略，系统才可处理自动回复、定时文字动态或受限关系动作。撤销授权会关闭个人自治设置并取消尚未开始的任务。"
+    )
+  );
+  const byokAutonomousAgentToggle = element("label", "admin-feature-switch");
+  const byokAutonomousAgentInput = document.createElement("input");
+  byokAutonomousAgentInput.type = "checkbox";
+  byokAutonomousAgentInput.checked = byokAutonomousAgentEnabled;
+  byokAutonomousAgentInput.disabled =
+    !ADMIN_STATE.selectedUserId ||
+    ((!byokModelRunnerEnabled || !byokAccountActionsEnabled || !accountActive) &&
+      !byokAutonomousAgentEnabled);
+  byokAutonomousAgentInput.setAttribute("role", "switch");
+  byokAutonomousAgentInput.setAttribute("aria-label", "允许该用户使用无人值守运营 Agent");
+  const byokAutonomousAgentTrack = element("span", "admin-feature-switch-track");
+  byokAutonomousAgentTrack.setAttribute("aria-hidden", "true");
+  const byokAutonomousAgentLabel = element(
+    "span",
+    "admin-feature-switch-label",
+    byokAutonomousAgentEnabled
+      ? "已授权"
+      : !accountActive
+        ? "用户已停用"
+        : byokModelRunnerEnabled && byokAccountActionsEnabled
+          ? "未授权"
+          : "等待前置授权"
+  );
+  byokAutonomousAgentInput.addEventListener("change", () => {
+    const targetEnabled = byokAutonomousAgentInput.checked;
+    byokAutonomousAgentInput.checked = !targetEnabled;
+    openUserByokAutonomousAgentDialog(targetEnabled);
+  });
+  byokAutonomousAgentToggle.append(
+    byokAutonomousAgentInput,
+    byokAutonomousAgentTrack,
+    byokAutonomousAgentLabel
+  );
+  byokAutonomousAgentPanel.append(
+    byokAutonomousAgentCopy,
+    byokAutonomousAgentToggle
+  );
+  permissionsSection.appendChild(byokAutonomousAgentPanel);
   container.appendChild(permissionsSection);
   const currentStatus = user.status || (user.disabled_at ? "disabled" : "active");
   const targetStatus = currentStatus === "disabled" ? "active" : "disabled";
@@ -1659,7 +1910,7 @@ function renderUserProfile() {
       "p",
       "",
       targetStatus === "disabled"
-        ? "停用后会立即撤销该用户的本站会话并暂停后台同步。"
+        ? "停用后会立即撤销该用户的本站会话并暂停后台同步，同时关闭个人模型、账号执行与无人值守设置，并取消相关未开始任务。"
         : "重新启用后，用户可以再次登录，后台同步也会恢复。"
     )
   );
@@ -1736,6 +1987,144 @@ function openNearbyCustomCityDialog(enabled) {
   const dialog = $("admin-nearby-custom-city-dialog");
   if (!dialog.open) dialog.showModal();
   setTimeout(() => $("admin-nearby-custom-city-reason").focus(), 0);
+}
+
+function openByokModelRunnerGlobalDialog(enabled) {
+  ADMIN_STATE.pendingByokModelRunnerGlobal = { enabled: Boolean(enabled) };
+  clearInputValues($("admin-byok-model-runner-global-form"));
+  $("admin-byok-model-runner-global-title").textContent = enabled
+    ? "开启 BYOK 模型运行器"
+    : "关闭 BYOK 模型运行器";
+  $("admin-byok-model-runner-global-description").textContent = enabled
+    ? "开启后，已获得逐用户授权的用户才能查看并使用个人模型运行器。正式环境还必须具备模型服务域名白名单。"
+    : "关闭后，所有用户会立即失去模型运行器访问能力，账号动作执行和无人值守运营 Agent 全局开关也会关闭，个人自治设置及相关未开始任务会被停止；逐用户模型运行器授权和已保存的加密连接配置不会删除。";
+  $("admin-byok-model-runner-global-submit").textContent = enabled
+    ? "确认开启全局功能"
+    : "确认关闭全局功能";
+  const dialog = $("admin-byok-model-runner-global-dialog");
+  if (!dialog.open) dialog.showModal();
+  setTimeout(() => $("admin-byok-model-runner-global-reason").focus(), 0);
+}
+
+function openUserByokModelRunnerDialog(enabled) {
+  if (!ADMIN_STATE.selectedUserId) return;
+  ADMIN_STATE.pendingUserByokModelRunner = {
+    userId: ADMIN_STATE.selectedUserId,
+    enabled: Boolean(enabled),
+  };
+  clearInputValues($("admin-user-byok-model-runner-form"));
+  $("admin-user-byok-model-runner-title").textContent = enabled
+    ? "授权 BYOK 模型运行器"
+    : "撤销 BYOK 模型运行器授权";
+  $("admin-user-byok-model-runner-description").textContent = enabled
+    ? "授权后，该用户在全局功能开启时可以查看模型运行器，配置自己的模型接口与密钥，并使用风格分析和回复草稿功能。"
+    : "撤销后，用户入口会隐藏，用户自己的运行开关会关闭，账号动作执行授权会被撤销，模型运行任务和尚未执行的排队动作会取消；已保存的加密连接配置不会在管理端展示。";
+  $("admin-user-byok-model-runner-submit").textContent = enabled
+    ? "确认授权"
+    : "确认撤销授权";
+  const dialog = $("admin-user-byok-model-runner-dialog");
+  if (!dialog.open) dialog.showModal();
+  setTimeout(() => $("admin-user-byok-model-runner-reason").focus(), 0);
+}
+
+function openByokAccountActionsGlobalDialog(enabled) {
+  ADMIN_STATE.pendingByokAccountActionsGlobal = { enabled: Boolean(enabled) };
+  clearInputValues($("admin-byok-account-actions-global-form"));
+  $("admin-byok-account-actions-global-title").textContent = enabled
+    ? "开启模型账号动作执行"
+    : "关闭模型账号动作执行";
+  $("admin-byok-account-actions-global-description").textContent = enabled
+    ? "开启后，只有同时获得模型运行器授权和账号动作执行授权的用户，才可以在个人执行设置开启后请求执行受支持的社交账号动作。"
+    : "关闭后，新的账号动作执行请求会被服务端拒绝，无人值守运营 Agent 全局开关和个人自治设置会关闭，相关未开始任务会取消；逐用户账号动作授权记录仍会保留。";
+  $("admin-byok-account-actions-global-submit").textContent = enabled
+    ? "确认开启动作执行"
+    : "确认关闭动作执行";
+  const dialog = $("admin-byok-account-actions-global-dialog");
+  if (!dialog.open) dialog.showModal();
+  setTimeout(() => $("admin-byok-account-actions-global-reason").focus(), 0);
+}
+
+function openUserByokAccountActionsDialog(enabled) {
+  if (!ADMIN_STATE.selectedUserId) return;
+  if (
+    enabled &&
+    (ADMIN_STATE.selectedUser?.status === "disabled" || ADMIN_STATE.selectedUser?.disabled_at)
+  ) {
+    toast("已停用用户不能获得模型账号动作执行授权", "error", 4200);
+    return;
+  }
+  if (enabled && !ADMIN_STATE.selectedUser?.byok_model_runner_enabled) {
+    toast("请先授权该用户使用 BYOK 模型运行器", "error", 4200);
+    return;
+  }
+  ADMIN_STATE.pendingUserByokAccountActions = {
+    userId: ADMIN_STATE.selectedUserId,
+    enabled: Boolean(enabled),
+  };
+  clearInputValues($("admin-user-byok-account-actions-form"));
+  $("admin-user-byok-account-actions-title").textContent = enabled
+    ? "授权模型账号动作执行"
+    : "撤销模型账号动作执行授权";
+  $("admin-user-byok-account-actions-description").textContent = enabled
+    ? "授权后，该用户在两个全局开关和个人执行设置均开启时，可以请求发送私信、发布文字动态、关注或取关。实际动作仍必须通过服务端动作白名单和执行前门禁。"
+    : "撤销后，服务端会立即拒绝该用户新的账号动作执行请求，关闭个人执行设置并取消尚未执行的排队请求。";
+  $("admin-user-byok-account-actions-submit").textContent = enabled
+    ? "确认授权动作执行"
+    : "确认撤销动作执行授权";
+  const dialog = $("admin-user-byok-account-actions-dialog");
+  if (!dialog.open) dialog.showModal();
+  setTimeout(() => $("admin-user-byok-account-actions-reason").focus(), 0);
+}
+
+function openByokAutonomousAgentGlobalDialog(enabled) {
+  ADMIN_STATE.pendingByokAutonomousAgentGlobal = { enabled: Boolean(enabled) };
+  clearInputValues($("admin-byok-autonomous-agent-global-form"));
+  $("admin-byok-autonomous-agent-global-title").textContent = enabled
+    ? "开启无人值守运营 Agent"
+    : "关闭无人值守运营 Agent";
+  $("admin-byok-autonomous-agent-global-description").textContent = enabled
+    ? "开启后，只有同时获得模型运行器、账号动作执行和无人值守运营三项逐用户授权的用户，才可以在个人自治设置开启后运行受限自动化任务。"
+    : "关闭后，新的无人值守任务会被拒绝，所有个人自治设置会关闭，尚未进入外部派发阶段的任务会取消；逐用户自治授权记录仍会保留。";
+  $("admin-byok-autonomous-agent-global-submit").textContent = enabled
+    ? "确认开启无人值守能力"
+    : "确认关闭无人值守能力";
+  const dialog = $("admin-byok-autonomous-agent-global-dialog");
+  if (!dialog.open) dialog.showModal();
+  setTimeout(() => $("admin-byok-autonomous-agent-global-reason").focus(), 0);
+}
+
+function openUserByokAutonomousAgentDialog(enabled) {
+  if (!ADMIN_STATE.selectedUserId) return;
+  const user = ADMIN_STATE.selectedUser || {};
+  if (enabled && (user.status === "disabled" || user.disabled_at)) {
+    toast("已停用用户不能获得无人值守运营 Agent 授权", "error", 4200);
+    return;
+  }
+  if (enabled && !user.byok_model_runner_enabled) {
+    toast("请先授权该用户使用 BYOK 模型运行器", "error", 4200);
+    return;
+  }
+  if (enabled && !user.byok_account_actions_enabled) {
+    toast("请先授权该用户使用模型账号动作执行", "error", 4200);
+    return;
+  }
+  ADMIN_STATE.pendingUserByokAutonomousAgent = {
+    userId: ADMIN_STATE.selectedUserId,
+    enabled: Boolean(enabled),
+  };
+  clearInputValues($("admin-user-byok-autonomous-agent-form"));
+  $("admin-user-byok-autonomous-agent-title").textContent = enabled
+    ? "授权无人值守运营 Agent"
+    : "撤销无人值守运营 Agent 授权";
+  $("admin-user-byok-autonomous-agent-description").textContent = enabled
+    ? "授权后，该用户仍需在三项全局功能开启时主动配置个人自治策略、目标范围、频率与限额，系统才会运行无人值守任务。"
+    : "撤销后，服务端会立即拒绝该用户新的无人值守任务，关闭个人自治设置并取消尚未进入外部派发阶段的任务。";
+  $("admin-user-byok-autonomous-agent-submit").textContent = enabled
+    ? "确认授权无人值守能力"
+    : "确认撤销无人值守授权";
+  const dialog = $("admin-user-byok-autonomous-agent-dialog");
+  if (!dialog.open) dialog.showModal();
+  setTimeout(() => $("admin-user-byok-autonomous-agent-reason").focus(), 0);
 }
 
 async function selectUserTab(tab) {
@@ -2421,6 +2810,23 @@ function auditActionLabel(value) {
     "user.status_changed": "修改用户状态",
     "user.match_pool_online_list_changed": "修改主动私信授权",
     "user.nearby_custom_city_changed": "修改自定义城市授权",
+    "user.byok_model_runner_changed": "修改用户 BYOK 模型运行器授权",
+    "ai.model_runner_control_view": "查看 BYOK 模型运行器全局状态",
+    "ai.model_runner_global_changed": "修改 BYOK 模型运行器全局开关",
+    "ai.account_actions_control_view": "查看模型账号动作执行全局状态",
+    "ai.account_actions_global_changed": "修改模型账号动作执行全局开关",
+    "user.byok_account_actions_changed": "修改用户模型账号动作执行授权",
+    "ai.autonomous_agent_control_view": "查看无人值守运营 Agent 全局状态",
+    "ai.autonomous_agent_global_changed": "修改无人值守运营 Agent 全局开关",
+    "user.byok_autonomous_agent_changed": "修改用户无人值守运营 Agent 授权",
+    "ai.model_connection_saved": "保存个人模型连接",
+    "ai.agent_settings_saved": "保存个人模型运行器设置",
+    "ai.model_connection_tested": "测试个人模型连接",
+    "ai.style_profile_analyzed": "分析个人语言风格",
+    "ai.reply_draft_generated": "生成回复草稿",
+    "ai.execution_settings_changed": "修改模型账号动作执行设置",
+    "ai.account_action_executed": "执行模型请求的账号动作",
+    "ai.reply_generated_and_sent": "生成并发送模型回复",
     "conversation.list": "查看用户会话",
     "message.list": "查看归档消息",
     "media.list": "查看媒体列表",
@@ -2566,9 +2972,348 @@ function renderSecuritySummary() {
   );
 }
 
+function renderByokModelRunnerControl() {
+  const target = $("admin-byok-model-runner-control");
+  if (!target) return;
+  target.replaceChildren();
+  const feature = ADMIN_STATE.byokModelRunnerControl;
+  if (!feature || typeof feature !== "object") {
+    renderLoading(target, "正在读取模型运行器状态");
+    return;
+  }
+
+  const enabled = feature.enabled === true;
+  const allowlistBlocked = Boolean(
+    !enabled &&
+      feature.production_allowlist_required === true &&
+      feature.allowed_hosts_configured !== true
+  );
+  const featurePanel = element("section", "admin-feature-panel");
+  const featureCopy = element("div", "admin-feature-panel-copy");
+  featureCopy.appendChild(element("h4", "", "全局访问状态"));
+  featureCopy.appendChild(
+    element(
+      "p",
+      "",
+      enabled
+        ? "全局功能已开启。只有在用户详情中获得单独授权的用户才能查看并使用模型运行器。"
+        : allowlistBlocked
+          ? "全局功能已关闭。正式环境尚未配置模型服务域名白名单，完成服务端配置后才能开启。"
+          : "全局功能已关闭。逐用户授权会保留，但用户不能查看或使用模型运行器。"
+    )
+  );
+  const featureToggle = element("label", "admin-feature-switch");
+  const featureInput = document.createElement("input");
+  featureInput.type = "checkbox";
+  featureInput.checked = enabled;
+  featureInput.disabled = allowlistBlocked;
+  featureInput.setAttribute("role", "switch");
+  featureInput.setAttribute("aria-label", "控制 BYOK 模型运行器全局开关");
+  if (allowlistBlocked) {
+    featureInput.setAttribute("aria-describedby", "admin-byok-model-runner-allowlist-note");
+  }
+  const featureTrack = element("span", "admin-feature-switch-track");
+  featureTrack.setAttribute("aria-hidden", "true");
+  const featureLabel = element(
+    "span",
+    "admin-feature-switch-label",
+    allowlistBlocked ? "等待白名单" : enabled ? "已开启" : "已关闭"
+  );
+  featureInput.addEventListener("change", () => {
+    const targetEnabled = featureInput.checked;
+    featureInput.checked = !targetEnabled;
+    openByokModelRunnerGlobalDialog(targetEnabled);
+  });
+  featureToggle.append(featureInput, featureTrack, featureLabel);
+  featurePanel.append(featureCopy, featureToggle);
+  target.appendChild(featurePanel);
+
+  if (allowlistBlocked) {
+    const note = element(
+      "p",
+      "admin-field-note",
+      "请先通过服务端配置正式环境允许访问的模型服务域名。管理端不会接收或显示域名白名单明文。"
+    );
+    note.id = "admin-byok-model-runner-allowlist-note";
+    target.appendChild(note);
+  }
+
+  const metrics = element("div", "admin-data-metric-grid");
+  metrics.append(
+    dataMetric("逐用户授权", formatNumber(Number(feature.authorized_users) || 0)),
+    dataMetric("用户已启用", formatNumber(Number(feature.user_enabled_runners) || 0)),
+    dataMetric("已配置连接", formatNumber(Number(feature.configured_connections) || 0)),
+    dataMetric(
+      "域名白名单",
+      feature.allowed_hosts_configured
+        ? `${formatNumber(Number(feature.allowed_host_count) || 0)} 个域名`
+        : "未配置"
+    ),
+    dataMetric("最近修改", feature.updated_at ? formatDate(feature.updated_at) : "尚未修改")
+  );
+  target.appendChild(metrics);
+}
+
+async function loadByokModelRunnerControl({ showLoading = true } = {}) {
+  const target = $("admin-byok-model-runner-control");
+  const generation = ADMIN_STATE.viewGeneration;
+  if (showLoading && target) renderLoading(target, "正在读取模型运行器状态");
+  try {
+    const data = await adminApi(ADMIN_ENDPOINTS.byokModelRunner);
+    if (
+      generation !== ADMIN_STATE.viewGeneration ||
+      ADMIN_STATE.pageHidden ||
+      ADMIN_STATE.currentView !== "security"
+    ) {
+      return;
+    }
+    ADMIN_STATE.byokModelRunnerControl =
+      data.feature || data.data?.feature || data.data || data;
+    renderByokModelRunnerControl();
+  } catch (error) {
+    if (
+      generation === ADMIN_STATE.viewGeneration &&
+      ADMIN_STATE.currentView === "security" &&
+      target
+    ) {
+      ADMIN_STATE.byokModelRunnerControl = null;
+      renderError(target, error);
+    }
+  }
+}
+
+function renderByokAccountActionsControl() {
+  const target = $("admin-byok-account-actions-control");
+  if (!target) return;
+  target.replaceChildren();
+  const feature = ADMIN_STATE.byokAccountActionsControl;
+  if (!feature || typeof feature !== "object") {
+    renderLoading(target, "正在读取账号动作执行状态");
+    return;
+  }
+
+  const enabled = feature.enabled === true;
+  const backgroundEnabled = feature.background_enabled === true;
+  const modelRunnerEnabled = feature.model_runner_enabled === true;
+  const prerequisiteBlocked = !enabled && !modelRunnerEnabled;
+  const featurePanel = element("section", "admin-feature-panel");
+  const featureCopy = element("div", "admin-feature-panel-copy");
+  featureCopy.appendChild(element("h4", "", "全局执行状态"));
+  featureCopy.appendChild(
+    element(
+      "p",
+      "",
+      enabled
+        ? "全局账号动作执行已开启。用户仍需获得两项逐用户授权，并在个人页面开启执行设置；服务端会在每次动作前重新检查全部门禁。"
+        : prerequisiteBlocked
+          ? "全局账号动作执行已关闭。请先开启 BYOK 模型运行器全局功能，才能开启动作执行。"
+          : "全局账号动作执行已关闭。新的执行请求会被拒绝，逐用户执行授权记录会保留。"
+    )
+  );
+  const featureToggle = element("label", "admin-feature-switch");
+  const featureInput = document.createElement("input");
+  featureInput.type = "checkbox";
+  featureInput.checked = enabled;
+  featureInput.disabled = prerequisiteBlocked;
+  featureInput.setAttribute("role", "switch");
+  featureInput.setAttribute("aria-label", "控制模型账号动作执行全局开关");
+  if (prerequisiteBlocked) {
+    featureInput.setAttribute("aria-describedby", "admin-byok-account-actions-prerequisite-note");
+  }
+  const featureTrack = element("span", "admin-feature-switch-track");
+  featureTrack.setAttribute("aria-hidden", "true");
+  const featureLabel = element(
+    "span",
+    "admin-feature-switch-label",
+    prerequisiteBlocked ? "等待模型运行器" : enabled ? "已开启" : "已关闭"
+  );
+  featureInput.addEventListener("change", () => {
+    const targetEnabled = featureInput.checked;
+    featureInput.checked = !targetEnabled;
+    openByokAccountActionsGlobalDialog(targetEnabled);
+  });
+  featureToggle.append(featureInput, featureTrack, featureLabel);
+  featurePanel.append(featureCopy, featureToggle);
+  target.appendChild(featurePanel);
+
+  if (prerequisiteBlocked) {
+    const note = element(
+      "p",
+      "admin-field-note",
+      "账号动作执行是模型运行器的附加高风险能力，不能在模型运行器全局关闭时单独开启。"
+    );
+    note.id = "admin-byok-account-actions-prerequisite-note";
+    target.appendChild(note);
+  }
+
+  const metrics = element("div", "admin-data-metric-grid");
+  metrics.append(
+    dataMetric("逐用户执行授权", formatNumber(Number(feature.authorized_users) || 0)),
+    dataMetric("用户已启用执行", formatNumber(Number(feature.user_enabled_executors) || 0)),
+    dataMetric("依赖的模型运行器", modelRunnerEnabled ? "已开启" : "已关闭"),
+    dataMetric("最近修改", feature.updated_at ? formatDate(feature.updated_at) : "尚未修改")
+  );
+  target.appendChild(metrics);
+}
+
+async function loadByokAccountActionsControl({ showLoading = true } = {}) {
+  const target = $("admin-byok-account-actions-control");
+  const generation = ADMIN_STATE.viewGeneration;
+  if (showLoading && target) renderLoading(target, "正在读取账号动作执行状态");
+  try {
+    const data = await adminApi(ADMIN_ENDPOINTS.byokAccountActions);
+    if (
+      generation !== ADMIN_STATE.viewGeneration ||
+      ADMIN_STATE.pageHidden ||
+      ADMIN_STATE.currentView !== "security"
+    ) {
+      return;
+    }
+    ADMIN_STATE.byokAccountActionsControl =
+      data.feature || data.data?.feature || data.data || data;
+    renderByokAccountActionsControl();
+  } catch (error) {
+    if (
+      generation === ADMIN_STATE.viewGeneration &&
+      !ADMIN_STATE.pageHidden &&
+      ADMIN_STATE.currentView === "security" &&
+      target
+    ) {
+      ADMIN_STATE.byokAccountActionsControl = null;
+      renderError(target, error);
+    }
+  }
+}
+
+function renderByokAutonomousAgentControl() {
+  const target = $("admin-byok-autonomous-agent-control");
+  if (!target) return;
+  target.replaceChildren();
+  const feature = ADMIN_STATE.byokAutonomousAgentControl;
+  if (!feature || typeof feature !== "object") {
+    renderLoading(target, "正在读取无人值守运营 Agent 状态");
+    return;
+  }
+
+  const enabled = feature.enabled === true;
+  const modelRunnerEnabled = feature.model_runner_enabled === true;
+  const accountActionsEnabled = feature.account_actions_enabled === true;
+  const prerequisiteBlocked =
+    !enabled && (!modelRunnerEnabled || !accountActionsEnabled);
+  const featurePanel = element("section", "admin-feature-panel");
+  const featureCopy = element("div", "admin-feature-panel-copy");
+  featureCopy.appendChild(element("h4", "", "全局自治状态"));
+  featureCopy.appendChild(
+    element(
+      "p",
+      "",
+      enabled
+        ? backgroundEnabled
+          ? "全局无人值守能力已开启，部署端后台调度也已启用。用户仍需获得三项逐用户授权并主动配置个人自治策略；任务在每次模型生成和派发前都会重新检查门禁。"
+          : "全局无人值守能力已开启，但部署端后台调度尚未启用。用户可以保存策略，系统不会扫描或执行新的无人值守任务。"
+        : prerequisiteBlocked
+          ? "全局无人值守能力已关闭。请先开启 BYOK 模型运行器和模型账号动作执行，才能开启本功能。"
+          : "全局无人值守能力已关闭。新的自治任务会被拒绝，逐用户授权记录会保留。"
+    )
+  );
+  const featureToggle = element("label", "admin-feature-switch");
+  const featureInput = document.createElement("input");
+  featureInput.type = "checkbox";
+  featureInput.checked = enabled;
+  featureInput.disabled = prerequisiteBlocked;
+  featureInput.setAttribute("role", "switch");
+  featureInput.setAttribute("aria-label", "控制无人值守运营 Agent 全局开关");
+  if (prerequisiteBlocked) {
+    featureInput.setAttribute(
+      "aria-describedby",
+      "admin-byok-autonomous-agent-prerequisite-note"
+    );
+  }
+  const featureTrack = element("span", "admin-feature-switch-track");
+  featureTrack.setAttribute("aria-hidden", "true");
+  const featureLabel = element(
+    "span",
+    "admin-feature-switch-label",
+    prerequisiteBlocked ? "等待前置能力" : enabled ? "已开启" : "已关闭"
+  );
+  featureInput.addEventListener("change", () => {
+    const targetEnabled = featureInput.checked;
+    featureInput.checked = !targetEnabled;
+    openByokAutonomousAgentGlobalDialog(targetEnabled);
+  });
+  featureToggle.append(featureInput, featureTrack, featureLabel);
+  featurePanel.append(featureCopy, featureToggle);
+  target.appendChild(featurePanel);
+
+  if (prerequisiteBlocked) {
+    const note = element(
+      "p",
+      "admin-field-note",
+      "无人值守运营 Agent 会产生持续外部副作用，必须建立在模型运行器和固定账号动作两层门禁之上。"
+    );
+    note.id = "admin-byok-autonomous-agent-prerequisite-note";
+    target.appendChild(note);
+  }
+
+  if (enabled && !backgroundEnabled) {
+    target.appendChild(
+      element(
+        "p",
+        "admin-field-note",
+        "需要在部署配置中显式开启 AI_AGENT_BACKGROUND_ENABLED，并重新加载 Scheduler 与 Agent Worker，后台任务才会实际运行。"
+      )
+    );
+  }
+
+  const metrics = element("div", "admin-data-metric-grid");
+  metrics.append(
+    dataMetric("逐用户自治授权", formatNumber(Number(feature.authorized_users) || 0)),
+    dataMetric("用户已启用自治", formatNumber(Number(feature.user_enabled_agents) || 0)),
+    dataMetric("模型运行器", modelRunnerEnabled ? "已开启" : "已关闭"),
+    dataMetric("账号动作执行", accountActionsEnabled ? "已开启" : "已关闭"),
+    dataMetric("部署端后台调度", backgroundEnabled ? "已启用" : "未启用"),
+    dataMetric("最近修改", feature.updated_at ? formatDate(feature.updated_at) : "尚未修改")
+  );
+  target.appendChild(metrics);
+}
+
+async function loadByokAutonomousAgentControl({ showLoading = true } = {}) {
+  const target = $("admin-byok-autonomous-agent-control");
+  const generation = ADMIN_STATE.viewGeneration;
+  if (showLoading && target) renderLoading(target, "正在读取无人值守运营 Agent 状态");
+  try {
+    const data = await adminApi(ADMIN_ENDPOINTS.byokAutonomousAgent);
+    if (
+      generation !== ADMIN_STATE.viewGeneration ||
+      ADMIN_STATE.pageHidden ||
+      ADMIN_STATE.currentView !== "security"
+    ) {
+      return;
+    }
+    ADMIN_STATE.byokAutonomousAgentControl =
+      data.feature || data.data?.feature || data.data || data;
+    renderByokAutonomousAgentControl();
+  } catch (error) {
+    if (
+      generation === ADMIN_STATE.viewGeneration &&
+      !ADMIN_STATE.pageHidden &&
+      ADMIN_STATE.currentView === "security" &&
+      target
+    ) {
+      ADMIN_STATE.byokAutonomousAgentControl = null;
+      renderError(target, error);
+    }
+  }
+}
+
 async function loadSecurity() {
   renderSecurityStatus();
   renderSecuritySummary();
+  await Promise.all([
+    loadByokModelRunnerControl(),
+    loadByokAccountActionsControl(),
+    loadByokAutonomousAgentControl(),
+  ]);
   markPageUpdated();
 }
 
@@ -3046,6 +3791,285 @@ $("admin-nearby-custom-city-cancel").addEventListener("click", closeNearbyCustom
 $("admin-nearby-custom-city-dialog").addEventListener("cancel", (event) => {
   event.preventDefault();
   closeNearbyCustomCityDialog();
+});
+
+$("admin-byok-model-runner-global-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const button = $("admin-byok-model-runner-global-submit");
+  void withPending(button, async () => {
+    const pending = ADMIN_STATE.pendingByokModelRunnerGlobal;
+    const reason = $("admin-byok-model-runner-global-reason").value.trim();
+    if (!pending || typeof pending.enabled !== "boolean") {
+      throw new AdminApiError("BYOK 模型运行器全局开关操作已经失效，请重新打开确认窗口");
+    }
+    if (reason.length < 3) throw new AdminApiError("请填写至少三个字符的操作理由");
+    const data = await adminApi(ADMIN_ENDPOINTS.byokModelRunner, {
+      method: "POST",
+      body: JSON.stringify({ enabled: pending.enabled, reason }),
+    });
+    const updatedFeature = data.feature || data.data?.feature || data.data || {};
+    const cancelledRuns = Number(data.cancelled_runs || data.data?.cancelled_runs || 0);
+    closeByokModelRunnerGlobalDialog();
+    ADMIN_STATE.byokModelRunnerControl = {
+      ...(ADMIN_STATE.byokModelRunnerControl || {}),
+      ...updatedFeature,
+    };
+    renderByokModelRunnerControl();
+    toast(
+      pending.enabled
+        ? "BYOK 模型运行器全局功能已开启"
+        : cancelledRuns > 0
+          ? `BYOK 模型运行器全局功能已关闭，已取消 ${formatNumber(cancelledRuns)} 个运行任务`
+          : "BYOK 模型运行器全局功能已关闭",
+      "success",
+      4600
+    );
+    await Promise.all([
+      loadByokModelRunnerControl({ showLoading: false }),
+      loadByokAccountActionsControl({ showLoading: false }),
+      loadByokAutonomousAgentControl({ showLoading: false }),
+    ]);
+  });
+});
+
+$("admin-byok-model-runner-global-cancel").addEventListener(
+  "click",
+  closeByokModelRunnerGlobalDialog
+);
+$("admin-byok-model-runner-global-dialog").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeByokModelRunnerGlobalDialog();
+});
+
+$("admin-byok-account-actions-global-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const button = $("admin-byok-account-actions-global-submit");
+  void withPending(button, async () => {
+    const pending = ADMIN_STATE.pendingByokAccountActionsGlobal;
+    const reason = $("admin-byok-account-actions-global-reason").value.trim();
+    if (!pending || typeof pending.enabled !== "boolean") {
+      throw new AdminApiError("模型账号动作执行全局开关操作已经失效，请重新打开确认窗口");
+    }
+    if (reason.length < 3) throw new AdminApiError("请填写至少三个字符的操作理由");
+    const data = await adminApi(ADMIN_ENDPOINTS.byokAccountActions, {
+      method: "POST",
+      body: JSON.stringify({ enabled: pending.enabled, reason }),
+    });
+    const updatedFeature = data.feature || data.data?.feature || data.data || {};
+    const cancelledQueuedExecutions = Number(
+      data.cancelled_queued_executions || data.data?.cancelled_queued_executions || 0
+    );
+    closeByokAccountActionsGlobalDialog();
+    ADMIN_STATE.byokAccountActionsControl = {
+      ...(ADMIN_STATE.byokAccountActionsControl || {}),
+      ...updatedFeature,
+    };
+    renderByokAccountActionsControl();
+    toast(
+      pending.enabled
+        ? "模型账号动作执行全局功能已开启"
+        : cancelledQueuedExecutions > 0
+          ? `模型账号动作执行全局功能已关闭，已取消 ${formatNumber(cancelledQueuedExecutions)} 个排队请求`
+          : "模型账号动作执行全局功能已关闭",
+      "success",
+      4600
+    );
+    await Promise.all([
+      loadByokAccountActionsControl({ showLoading: false }),
+      loadByokAutonomousAgentControl({ showLoading: false }),
+    ]);
+  });
+});
+
+$("admin-byok-account-actions-global-cancel").addEventListener(
+  "click",
+  closeByokAccountActionsGlobalDialog
+);
+$("admin-byok-account-actions-global-dialog").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeByokAccountActionsGlobalDialog();
+});
+
+$("admin-byok-autonomous-agent-global-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const button = $("admin-byok-autonomous-agent-global-submit");
+  void withPending(button, async () => {
+    const pending = ADMIN_STATE.pendingByokAutonomousAgentGlobal;
+    const reason = $("admin-byok-autonomous-agent-global-reason").value.trim();
+    if (!pending || typeof pending.enabled !== "boolean") {
+      throw new AdminApiError("无人值守运营 Agent 全局开关操作已经失效，请重新打开确认窗口");
+    }
+    if (reason.length < 3) throw new AdminApiError("请填写至少三个字符的操作理由");
+    const data = await adminApi(ADMIN_ENDPOINTS.byokAutonomousAgent, {
+      method: "POST",
+      body: JSON.stringify({ enabled: pending.enabled, reason }),
+    });
+    const updatedFeature = data.feature || data.data?.feature || data.data || {};
+    const cancelledTasks = Number(
+      data.cancelled_autonomy_tasks || data.data?.cancelled_autonomy_tasks || 0
+    );
+    closeByokAutonomousAgentGlobalDialog();
+    ADMIN_STATE.byokAutonomousAgentControl = {
+      ...(ADMIN_STATE.byokAutonomousAgentControl || {}),
+      ...updatedFeature,
+    };
+    renderByokAutonomousAgentControl();
+    toast(
+      pending.enabled
+        ? "无人值守运营 Agent 全局功能已开启"
+        : cancelledTasks > 0
+          ? `无人值守运营 Agent 全局功能已关闭，已取消 ${formatNumber(cancelledTasks)} 个未开始任务`
+          : "无人值守运营 Agent 全局功能已关闭",
+      "success",
+      4600
+    );
+    await loadByokAutonomousAgentControl({ showLoading: false });
+  });
+});
+
+$("admin-byok-autonomous-agent-global-cancel").addEventListener(
+  "click",
+  closeByokAutonomousAgentGlobalDialog
+);
+$("admin-byok-autonomous-agent-global-dialog").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeByokAutonomousAgentGlobalDialog();
+});
+
+$("admin-user-byok-model-runner-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const button = $("admin-user-byok-model-runner-submit");
+  void withPending(button, async () => {
+    const pending = ADMIN_STATE.pendingUserByokModelRunner;
+    const requestState = captureUserDetailRequest("profile");
+    const reason = $("admin-user-byok-model-runner-reason").value.trim();
+    if (!pending?.userId || typeof pending.enabled !== "boolean") {
+      throw new AdminApiError("BYOK 模型运行器授权操作已经失效，请重新打开用户详情");
+    }
+    if (reason.length < 3) throw new AdminApiError("请填写至少三个字符的操作理由");
+    const data = await adminApi(ADMIN_ENDPOINTS.userByokModelRunner(pending.userId), {
+      method: "POST",
+      body: JSON.stringify({ enabled: pending.enabled, reason }),
+    });
+    const updated = data.user || data.data?.user || data.data || {};
+    const cancelledRuns = Number(data.cancelled_runs || data.data?.cancelled_runs || 0);
+    closeUserByokModelRunnerDialog();
+    if (isCurrentUserDetailRequest(requestState) && requestState.userId === pending.userId) {
+      ADMIN_STATE.selectedUser = { ...(ADMIN_STATE.selectedUser || {}), ...updated };
+      renderUserProfile();
+    }
+    ADMIN_STATE.needsRefresh = true;
+    toast(
+      pending.enabled
+        ? "已授权用户使用 BYOK 模型运行器"
+        : cancelledRuns > 0
+          ? `已撤销 BYOK 模型运行器授权，并取消 ${formatNumber(cancelledRuns)} 个运行任务`
+          : "已撤销用户的 BYOK 模型运行器授权",
+      "success",
+      4600
+    );
+  });
+});
+
+$("admin-user-byok-model-runner-cancel").addEventListener(
+  "click",
+  closeUserByokModelRunnerDialog
+);
+$("admin-user-byok-model-runner-dialog").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeUserByokModelRunnerDialog();
+});
+
+$("admin-user-byok-account-actions-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const button = $("admin-user-byok-account-actions-submit");
+  void withPending(button, async () => {
+    const pending = ADMIN_STATE.pendingUserByokAccountActions;
+    const requestState = captureUserDetailRequest("profile");
+    const reason = $("admin-user-byok-account-actions-reason").value.trim();
+    if (!pending?.userId || typeof pending.enabled !== "boolean") {
+      throw new AdminApiError("模型账号动作执行授权操作已经失效，请重新打开用户详情");
+    }
+    if (reason.length < 3) throw new AdminApiError("请填写至少三个字符的操作理由");
+    const data = await adminApi(ADMIN_ENDPOINTS.userByokAccountActions(pending.userId), {
+      method: "POST",
+      body: JSON.stringify({ enabled: pending.enabled, reason }),
+    });
+    const updated = data.user || data.data?.user || data.data || {};
+    const cancelledQueuedExecutions = Number(
+      data.cancelled_queued_executions || data.data?.cancelled_queued_executions || 0
+    );
+    closeUserByokAccountActionsDialog();
+    if (isCurrentUserDetailRequest(requestState) && requestState.userId === pending.userId) {
+      ADMIN_STATE.selectedUser = { ...(ADMIN_STATE.selectedUser || {}), ...updated };
+      renderUserProfile();
+    }
+    ADMIN_STATE.needsRefresh = true;
+    toast(
+      pending.enabled
+        ? "已授权用户执行模型请求的社交账号动作"
+        : cancelledQueuedExecutions > 0
+          ? `已撤销模型账号动作执行授权，并取消 ${formatNumber(cancelledQueuedExecutions)} 个排队请求`
+          : "已撤销用户的模型账号动作执行授权",
+      "success",
+      4600
+    );
+  });
+});
+
+$("admin-user-byok-account-actions-cancel").addEventListener(
+  "click",
+  closeUserByokAccountActionsDialog
+);
+$("admin-user-byok-account-actions-dialog").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeUserByokAccountActionsDialog();
+});
+
+$("admin-user-byok-autonomous-agent-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const button = $("admin-user-byok-autonomous-agent-submit");
+  void withPending(button, async () => {
+    const pending = ADMIN_STATE.pendingUserByokAutonomousAgent;
+    const requestState = captureUserDetailRequest("profile");
+    const reason = $("admin-user-byok-autonomous-agent-reason").value.trim();
+    if (!pending?.userId || typeof pending.enabled !== "boolean") {
+      throw new AdminApiError("无人值守运营 Agent 授权操作已经失效，请重新打开用户详情");
+    }
+    if (reason.length < 3) throw new AdminApiError("请填写至少三个字符的操作理由");
+    const data = await adminApi(ADMIN_ENDPOINTS.userByokAutonomousAgent(pending.userId), {
+      method: "POST",
+      body: JSON.stringify({ enabled: pending.enabled, reason }),
+    });
+    const updated = data.user || data.data?.user || data.data || {};
+    const cancelledTasks = Number(
+      data.cancelled_autonomy_tasks || data.data?.cancelled_autonomy_tasks || 0
+    );
+    closeUserByokAutonomousAgentDialog();
+    if (isCurrentUserDetailRequest(requestState) && requestState.userId === pending.userId) {
+      ADMIN_STATE.selectedUser = { ...(ADMIN_STATE.selectedUser || {}), ...updated };
+      renderUserProfile();
+    }
+    ADMIN_STATE.needsRefresh = true;
+    toast(
+      pending.enabled
+        ? "已授权用户使用无人值守运营 Agent"
+        : cancelledTasks > 0
+          ? `已撤销无人值守运营 Agent 授权，并取消 ${formatNumber(cancelledTasks)} 个未开始任务`
+          : "已撤销用户的无人值守运营 Agent 授权",
+      "success",
+      4600
+    );
+  });
+});
+
+$("admin-user-byok-autonomous-agent-cancel").addEventListener(
+  "click",
+  closeUserByokAutonomousAgentDialog
+);
+$("admin-user-byok-autonomous-agent-dialog").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeUserByokAutonomousAgentDialog();
 });
 
 $("admin-audit-filter-form").addEventListener("submit", (event) => {

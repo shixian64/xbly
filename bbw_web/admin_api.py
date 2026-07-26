@@ -11,6 +11,7 @@ by :mod:`bbw_prod.services`.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import ipaddress
 import json
 import math
@@ -29,9 +30,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 from sqlalchemy import func, or_, select, text as sql_text
 
+from bbw_agent import repositories as agent_repositories
 from bbw_prod.db import session_scope
+from bbw_prod import models as prod_models
 from bbw_prod.models import (
     ActivityEvent,
+    AiAgentExecutionSetting,
+    AiAgentSetting,
+    AiModelConnection,
+    AiModelRunnerSystemSetting,
     AdminSession,
     AdminUser,
     AuditLog,
@@ -46,6 +53,13 @@ from bbw_prod.models import (
     User,
     WebSession,
     utcnow,
+)
+from bbw_agent.repositories import (
+    AgentActionExecutionRepository,
+    AgentExecutionSettingRepository,
+    AgentRunRepository,
+    AgentSettingRepository,
+    ModelRunnerSystemSettingRepository,
 )
 from bbw_prod.repositories import (
     AdminUserRepository,
@@ -238,6 +252,66 @@ class UserNearbyCustomCityBody(_StrictBody):
         return value.strip()
 
 
+class UserByokModelRunnerBody(_StrictBody):
+    enabled: StrictBool
+    reason: str = Field(min_length=3, max_length=500)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def strip_reason(cls, value: str) -> str:
+        return value.strip()
+
+
+class SystemByokModelRunnerBody(_StrictBody):
+    enabled: StrictBool
+    reason: str = Field(min_length=3, max_length=500)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def strip_reason(cls, value: str) -> str:
+        return value.strip()
+
+
+class UserByokAccountActionsBody(_StrictBody):
+    enabled: StrictBool
+    reason: str = Field(min_length=3, max_length=500)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def strip_reason(cls, value: str) -> str:
+        return value.strip()
+
+
+class SystemByokAccountActionsBody(_StrictBody):
+    enabled: StrictBool
+    reason: str = Field(min_length=3, max_length=500)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def strip_reason(cls, value: str) -> str:
+        return value.strip()
+
+
+class UserByokAutonomousAgentBody(_StrictBody):
+    enabled: StrictBool
+    reason: str = Field(min_length=3, max_length=500)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def strip_reason(cls, value: str) -> str:
+        return value.strip()
+
+
+class SystemByokAutonomousAgentBody(_StrictBody):
+    enabled: StrictBool
+    reason: str = Field(min_length=3, max_length=500)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def strip_reason(cls, value: str) -> str:
+        return value.strip()
+
+
 class PasswordChangeBody(_StrictBody):
     current_password: str = Field(min_length=1, max_length=1024)
     new_password: str = Field(min_length=12, max_length=1024)
@@ -260,6 +334,225 @@ def _is_production(settings: Any) -> bool:
         "prod",
         "production",
     }
+
+
+def _first_available_attribute(source: Any, names: tuple[str, ...]) -> Any | None:
+    for name in names:
+        value = getattr(source, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _autonomy_setting_model() -> Any | None:
+    return _first_available_attribute(
+        prod_models,
+        ("AiAgentAutonomySetting", "AiAutonomousAgentSetting"),
+    )
+
+
+def _autonomy_setting_repository(db: Any) -> Any:
+    repository_type = _first_available_attribute(
+        agent_repositories,
+        ("AgentAutonomySettingRepository", "AutonomousAgentSettingRepository"),
+    )
+    if repository_type is None:
+        raise RuntimeError("autonomous agent setting repository is unavailable")
+    return repository_type(db)
+
+
+def _autonomy_task_repository(db: Any) -> Any:
+    repository_type = _first_available_attribute(
+        agent_repositories,
+        ("AgentAutonomyTaskRepository", "AutonomousTaskRepository"),
+    )
+    if repository_type is None:
+        raise RuntimeError("autonomous agent task repository is unavailable")
+    return repository_type(db)
+
+
+def _repository_method(repository: Any, names: tuple[str, ...]) -> Any | None:
+    return _first_available_attribute(repository, names)
+
+
+def _invoke_repository_method(
+    repository: Any,
+    names: tuple[str, ...],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    method = _repository_method(repository, names)
+    if method is None:
+        raise RuntimeError(
+            f"repository method is unavailable: {', '.join(names)}"
+        )
+    parameters = inspect.signature(method).parameters.values()
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    accepted_names = {parameter.name for parameter in parameters}
+    call_kwargs = (
+        kwargs
+        if accepts_kwargs
+        else {name: value for name, value in kwargs.items() if name in accepted_names}
+    )
+    return method(*args, **call_kwargs)
+
+
+def _disable_autonomy_for_owner(
+    db: Any,
+    owner_user_id: uuid.UUID,
+    *,
+    reason: str,
+) -> bool:
+    return bool(
+        _invoke_repository_method(
+            _autonomy_setting_repository(db),
+            ("disable_for_owner",),
+            owner_user_id,
+            reason=reason,
+            halt_reason=reason,
+        )
+    )
+
+
+def _disable_all_autonomy_settings(db: Any, *, reason: str) -> int:
+    repository = _autonomy_setting_repository(db)
+    bulk_method = _repository_method(
+        repository,
+        ("disable_all", "disable_all_enabled"),
+    )
+    if bulk_method is not None:
+        return int(
+            _invoke_repository_method(
+                repository,
+                ("disable_all", "disable_all_enabled"),
+                reason=reason,
+                halt_reason=reason,
+            )
+            or 0
+        )
+    model = _autonomy_setting_model()
+    if model is None or getattr(model, "owner_user_id", None) is None:
+        raise RuntimeError("autonomous agent setting model is unavailable")
+    owner_ids = list(db.scalars(select(model.owner_user_id)))
+    return sum(
+        1
+        for owner_user_id in owner_ids
+        if _disable_autonomy_for_owner(db, owner_user_id, reason=reason)
+    )
+
+
+def _cancel_autonomy_tasks_for_owner(
+    db: Any,
+    owner_user_id: uuid.UUID,
+    *,
+    stable_error_code: str,
+) -> int:
+    return int(
+        _invoke_repository_method(
+            _autonomy_task_repository(db),
+            ("cancel_queued_for_owner", "cancel_not_started_for_owner"),
+            owner_user_id,
+            stable_error_code=stable_error_code,
+            reason=stable_error_code,
+        )
+        or 0
+    )
+
+
+def _cancel_all_autonomy_tasks(db: Any, *, stable_error_code: str) -> int:
+    return int(
+        _invoke_repository_method(
+            _autonomy_task_repository(db),
+            ("cancel_all_queued", "cancel_all_not_started"),
+            stable_error_code=stable_error_code,
+            reason=stable_error_code,
+        )
+        or 0
+    )
+
+
+def _set_autonomy_system_enabled(row: Any, enabled: bool) -> None:
+    if getattr(type(row), "autonomous_agent_enabled", None) is None:
+        raise RuntimeError("autonomous agent system setting is unavailable")
+    setattr(row, "autonomous_agent_enabled", bool(enabled))
+
+
+def _set_user_autonomy_grant(user: User, enabled: bool) -> None:
+    if getattr(type(user), "byok_autonomous_agent_enabled", None) is None:
+        raise RuntimeError("autonomous agent user grant is unavailable")
+    setattr(user, "byok_autonomous_agent_enabled", bool(enabled))
+
+
+def _revoke_user_autonomy(
+    db: Any,
+    user: User,
+    *,
+    stable_error_code: str,
+) -> tuple[bool, bool, int]:
+    grant_revoked = bool(
+        getattr(user, "byok_autonomous_agent_enabled", False)
+    )
+    if grant_revoked:
+        _set_user_autonomy_grant(user, False)
+    setting_disabled = _disable_autonomy_for_owner(
+        db,
+        user.id,
+        reason=stable_error_code,
+    )
+    cancelled_tasks = _cancel_autonomy_tasks_for_owner(
+        db,
+        user.id,
+        stable_error_code=stable_error_code,
+    )
+    return grant_revoked, setting_disabled, cancelled_tasks
+
+
+def _disable_system_autonomy(
+    db: Any,
+    row: Any,
+    *,
+    stable_error_code: str,
+) -> tuple[bool, int, int]:
+    old_enabled = bool(getattr(row, "autonomous_agent_enabled", False))
+    if old_enabled:
+        _set_autonomy_system_enabled(row, False)
+    disabled_settings = _disable_all_autonomy_settings(
+        db,
+        reason=stable_error_code,
+    )
+    cancelled_tasks = _cancel_all_autonomy_tasks(
+        db,
+        stable_error_code=stable_error_code,
+    )
+    return old_enabled, disabled_settings, cancelled_tasks
+
+
+def _count_autonomy_authorized_users(db: Any) -> int:
+    field = getattr(User, "byok_autonomous_agent_enabled", None)
+    if field is None:
+        return 0
+    return int(
+        db.scalar(
+            select(func.count()).select_from(User).where(field.is_(True))
+        )
+        or 0
+    )
+
+
+def _count_user_enabled_autonomy_settings(db: Any) -> int:
+    model = _autonomy_setting_model()
+    field = getattr(model, "user_enabled", None) if model is not None else None
+    if model is None or field is None:
+        return 0
+    return int(
+        db.scalar(
+            select(func.count()).select_from(model).where(field.is_(True))
+        )
+        or 0
+    )
 
 
 def _validate_strong_password(password: str, *, username: str = "") -> None:
@@ -779,6 +1072,11 @@ def _user_public(user: User, account: ExternalAccount | None) -> dict[str, Any]:
             user.match_pool_online_list_enabled
         ),
         "nearby_custom_city_enabled": bool(user.nearby_custom_city_enabled),
+        "byok_model_runner_enabled": bool(user.byok_model_runner_enabled),
+        "byok_account_actions_enabled": bool(user.byok_account_actions_enabled),
+        "byok_autonomous_agent_enabled": bool(
+            getattr(user, "byok_autonomous_agent_enabled", False)
+        ),
         "last_login_at": _iso(user.last_login_at),
         "last_authenticated_at": _iso(account.last_authenticated_at) if account else None,
         "last_sync_at": _iso(account.last_sync_at) if account else None,
@@ -1694,6 +1992,486 @@ def disable_invite(
     return {"ok": True, "invite": item}
 
 
+@router.get("/byok-model-runner")
+def get_byok_model_runner_control(
+    request: Request,
+    context: AdminContext = Depends(_admin_context),
+) -> dict[str, Any]:
+    with session_scope() as db:
+        row = ModelRunnerSystemSettingRepository(db).get()
+        allowed_hosts = tuple(
+            getattr(_settings(request), "ai_byok_allowed_hosts", ()) or ()
+        )
+        feature = {
+            "enabled": bool(row is not None and row.enabled),
+            "account_actions_enabled": bool(
+                row is not None and row.account_actions_enabled
+            ),
+            "autonomous_agent_enabled": bool(
+                row is not None
+                and getattr(row, "autonomous_agent_enabled", False)
+            ),
+            "allowed_hosts_configured": bool(allowed_hosts),
+            "allowed_host_count": len(allowed_hosts),
+            "production_allowlist_required": _is_production(_settings(request)),
+            "authorized_users": int(
+                db.scalar(
+                    select(func.count())
+                    .select_from(User)
+                    .where(User.byok_model_runner_enabled.is_(True))
+                )
+                or 0
+            ),
+            "user_enabled_runners": int(
+                db.scalar(
+                    select(func.count())
+                    .select_from(AiAgentSetting)
+                    .where(AiAgentSetting.user_enabled.is_(True))
+                )
+                or 0
+            ),
+            "configured_connections": int(
+                db.scalar(select(func.count()).select_from(AiModelConnection)) or 0
+            ),
+            "updated_at": _iso(row.updated_at) if row is not None else None,
+            "updated_by_admin_id": (
+                str(row.updated_by_admin_id)
+                if row is not None and row.updated_by_admin_id
+                else None
+            ),
+        }
+        _record_read(
+            _audit_service(db, request),
+            context,
+            action="ai.model_runner_control_view",
+            resource_type="system_feature",
+            resource_id="byok_model_runner",
+        )
+    return {"ok": True, "feature": feature}
+
+
+@router.post("/byok-model-runner")
+def set_byok_model_runner_control(
+    body: SystemByokModelRunnerBody,
+    request: Request,
+    context: AdminContext = Depends(_admin_context),
+) -> dict[str, Any]:
+    allowed_hosts = tuple(
+        getattr(_settings(request), "ai_byok_allowed_hosts", ()) or ()
+    )
+    if body.enabled and _is_production(_settings(request)) and not allowed_hosts:
+        raise HTTPException(
+            status_code=409,
+            detail="正式环境必须先配置用户模型服务域名白名单",
+        )
+    with session_scope() as db:
+        row = ModelRunnerSystemSettingRepository(db).get_or_create(for_update=True)
+        old_enabled = bool(row.enabled)
+        old_account_actions_enabled = bool(row.account_actions_enabled)
+        old_autonomous_agent_enabled = bool(
+            getattr(row, "autonomous_agent_enabled", False)
+        )
+        new_enabled = bool(body.enabled)
+        changed = old_enabled != new_enabled
+        row.enabled = new_enabled
+        account_actions_disabled = bool(not new_enabled and row.account_actions_enabled)
+        if not new_enabled:
+            row.account_actions_enabled = False
+            cancelled_queued_executions = (
+                AgentActionExecutionRepository(db).cancel_all_active(
+                    stable_error_code="model_runner_disabled"
+                )
+            )
+            (
+                autonomous_agent_disabled,
+                disabled_autonomy_settings,
+                cancelled_autonomy_tasks,
+            ) = _disable_system_autonomy(
+                db,
+                row,
+                stable_error_code="model_runner_disabled",
+            )
+        else:
+            cancelled_queued_executions = 0
+            autonomous_agent_disabled = False
+            disabled_autonomy_settings = 0
+            cancelled_autonomy_tasks = 0
+        row.updated_by_admin_id = context.admin_user_id
+        cancelled_runs = (
+            AgentRunRepository(db).cancel_all_active() if not new_enabled else 0
+        )
+        audit = _audit_service(db, request)
+        audit.record(
+            actor_type="admin",
+            action="ai.model_runner_global_changed",
+            admin_user_id=context.admin_user_id,
+            resource_type="system_feature",
+            resource_id="byok_model_runner",
+            reason=body.reason,
+            client_ip=context.client_ip,
+            details={
+                "old_enabled": old_enabled,
+                "new_enabled": new_enabled,
+                "changed": changed,
+                "cancelled_runs": cancelled_runs,
+                "allowed_host_count": len(allowed_hosts),
+                "old_account_actions_enabled": old_account_actions_enabled,
+                "new_account_actions_enabled": bool(row.account_actions_enabled),
+                "account_actions_disabled": account_actions_disabled,
+                "cancelled_queued_executions": cancelled_queued_executions,
+                "old_autonomous_agent_enabled": old_autonomous_agent_enabled,
+                "new_autonomous_agent_enabled": bool(
+                    getattr(row, "autonomous_agent_enabled", False)
+                ),
+                "autonomous_agent_disabled": autonomous_agent_disabled,
+                "disabled_autonomy_settings": disabled_autonomy_settings,
+                "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+            },
+        )
+        if account_actions_disabled:
+            audit.record(
+                actor_type="admin",
+                action="ai.account_actions_global_changed",
+                admin_user_id=context.admin_user_id,
+                resource_type="system_feature",
+                resource_id="byok_account_actions",
+                reason=body.reason,
+                client_ip=context.client_ip,
+                details={
+                    "old_enabled": True,
+                    "new_enabled": False,
+                    "changed": True,
+                    "cascade_source": "model_runner_disabled",
+                    "cancelled_queued_executions": cancelled_queued_executions,
+                },
+            )
+        if (
+            autonomous_agent_disabled
+            or disabled_autonomy_settings
+            or cancelled_autonomy_tasks
+        ):
+            audit.record(
+                actor_type="admin",
+                action="ai.autonomous_agent_global_changed",
+                admin_user_id=context.admin_user_id,
+                resource_type="system_feature",
+                resource_id="byok_autonomous_agent",
+                reason=body.reason,
+                client_ip=context.client_ip,
+                details={
+                    "old_enabled": old_autonomous_agent_enabled,
+                    "new_enabled": False,
+                    "changed": autonomous_agent_disabled,
+                    "cascade_source": "model_runner_disabled",
+                    "disabled_autonomy_settings": disabled_autonomy_settings,
+                    "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+                },
+            )
+        db.flush()
+        feature = {
+            "enabled": bool(row.enabled),
+            "account_actions_enabled": bool(row.account_actions_enabled),
+            "autonomous_agent_enabled": bool(
+                getattr(row, "autonomous_agent_enabled", False)
+            ),
+            "allowed_hosts_configured": bool(allowed_hosts),
+            "allowed_host_count": len(allowed_hosts),
+            "production_allowlist_required": _is_production(_settings(request)),
+            "updated_at": _iso(row.updated_at),
+            "updated_by_admin_id": str(context.admin_user_id),
+        }
+    return {
+        "ok": True,
+        "feature": feature,
+        "changed": changed,
+        "cancelled_runs": cancelled_runs,
+        "account_actions_disabled": account_actions_disabled,
+        "cancelled_queued_executions": cancelled_queued_executions,
+        "autonomous_agent_disabled": autonomous_agent_disabled,
+        "disabled_autonomy_settings": disabled_autonomy_settings,
+        "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+    }
+
+
+@router.get("/byok-account-actions")
+def get_byok_account_actions_control(
+    request: Request,
+    context: AdminContext = Depends(_admin_context),
+) -> dict[str, Any]:
+    with session_scope() as db:
+        row = ModelRunnerSystemSettingRepository(db).get()
+        feature = {
+            "enabled": bool(row is not None and row.account_actions_enabled),
+            "model_runner_enabled": bool(row is not None and row.enabled),
+            "autonomous_agent_enabled": bool(
+                row is not None
+                and getattr(row, "autonomous_agent_enabled", False)
+            ),
+            "authorized_users": int(
+                db.scalar(
+                    select(func.count())
+                    .select_from(User)
+                    .where(User.byok_account_actions_enabled.is_(True))
+                )
+                or 0
+            ),
+            "user_enabled_executors": int(
+                db.scalar(
+                    select(func.count())
+                    .select_from(AiAgentExecutionSetting)
+                    .where(AiAgentExecutionSetting.user_enabled.is_(True))
+                )
+                or 0
+            ),
+            "updated_at": _iso(row.updated_at) if row is not None else None,
+            "updated_by_admin_id": (
+                str(row.updated_by_admin_id)
+                if row is not None and row.updated_by_admin_id
+                else None
+            ),
+        }
+        _record_read(
+            _audit_service(db, request),
+            context,
+            action="ai.account_actions_control_view",
+            resource_type="system_feature",
+            resource_id="byok_account_actions",
+        )
+    return {"ok": True, "feature": feature}
+
+
+@router.post("/byok-account-actions")
+def set_byok_account_actions_control(
+    body: SystemByokAccountActionsBody,
+    request: Request,
+    context: AdminContext = Depends(_admin_context),
+) -> dict[str, Any]:
+    allowed_hosts = tuple(
+        getattr(_settings(request), "ai_byok_allowed_hosts", ()) or ()
+    )
+    with session_scope() as db:
+        row = ModelRunnerSystemSettingRepository(db).get_or_create(for_update=True)
+        if body.enabled and not row.enabled:
+            raise HTTPException(
+                status_code=409,
+                detail="请先开启 BYOK 模型运行器全局功能",
+            )
+        if body.enabled and _is_production(_settings(request)) and not allowed_hosts:
+            raise HTTPException(
+                status_code=409,
+                detail="正式环境必须先配置用户模型服务域名白名单",
+            )
+        old_enabled = bool(row.account_actions_enabled)
+        new_enabled = bool(body.enabled)
+        changed = old_enabled != new_enabled
+        row.account_actions_enabled = new_enabled
+        row.updated_by_admin_id = context.admin_user_id
+        cancelled_queued_executions = (
+            AgentActionExecutionRepository(db).cancel_all_active(
+                stable_error_code="system_execution_disabled"
+            )
+            if not new_enabled
+            else 0
+        )
+        if not new_enabled:
+            (
+                autonomous_agent_disabled,
+                disabled_autonomy_settings,
+                cancelled_autonomy_tasks,
+            ) = _disable_system_autonomy(
+                db,
+                row,
+                stable_error_code="account_actions_disabled",
+            )
+        else:
+            autonomous_agent_disabled = False
+            disabled_autonomy_settings = 0
+            cancelled_autonomy_tasks = 0
+        audit = _audit_service(db, request)
+        audit.record(
+            actor_type="admin",
+            action="ai.account_actions_global_changed",
+            admin_user_id=context.admin_user_id,
+            resource_type="system_feature",
+            resource_id="byok_account_actions",
+            reason=body.reason,
+            client_ip=context.client_ip,
+            details={
+                "old_enabled": old_enabled,
+                "new_enabled": new_enabled,
+                "changed": changed,
+                "model_runner_enabled": bool(row.enabled),
+                "cancelled_queued_executions": cancelled_queued_executions,
+                "autonomous_agent_disabled": autonomous_agent_disabled,
+                "disabled_autonomy_settings": disabled_autonomy_settings,
+                "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+            },
+        )
+        if (
+            autonomous_agent_disabled
+            or disabled_autonomy_settings
+            or cancelled_autonomy_tasks
+        ):
+            audit.record(
+                actor_type="admin",
+                action="ai.autonomous_agent_global_changed",
+                admin_user_id=context.admin_user_id,
+                resource_type="system_feature",
+                resource_id="byok_autonomous_agent",
+                reason=body.reason,
+                client_ip=context.client_ip,
+                details={
+                    "old_enabled": autonomous_agent_disabled,
+                    "new_enabled": False,
+                    "changed": autonomous_agent_disabled,
+                    "cascade_source": "account_actions_disabled",
+                    "disabled_autonomy_settings": disabled_autonomy_settings,
+                    "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+                },
+            )
+        db.flush()
+        feature = {
+            "enabled": bool(row.account_actions_enabled),
+            "model_runner_enabled": bool(row.enabled),
+            "autonomous_agent_enabled": bool(
+                getattr(row, "autonomous_agent_enabled", False)
+            ),
+            "updated_at": _iso(row.updated_at),
+            "updated_by_admin_id": str(context.admin_user_id),
+        }
+    return {
+        "ok": True,
+        "feature": feature,
+        "changed": changed,
+        "cancelled_queued_executions": cancelled_queued_executions,
+        "autonomous_agent_disabled": autonomous_agent_disabled,
+        "disabled_autonomy_settings": disabled_autonomy_settings,
+        "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+    }
+
+
+@router.get("/byok-autonomous-agent")
+def get_byok_autonomous_agent_control(
+    request: Request,
+    context: AdminContext = Depends(_admin_context),
+) -> dict[str, Any]:
+    with session_scope() as db:
+        row = ModelRunnerSystemSettingRepository(db).get()
+        feature = {
+            "enabled": bool(
+                row is not None
+                and getattr(row, "autonomous_agent_enabled", False)
+            ),
+            "background_enabled": bool(
+                getattr(_settings(request), "ai_agent_background_enabled", False)
+            ),
+            "model_runner_enabled": bool(row is not None and row.enabled),
+            "account_actions_enabled": bool(
+                row is not None and row.account_actions_enabled
+            ),
+            "authorized_users": _count_autonomy_authorized_users(db),
+            "user_enabled_agents": _count_user_enabled_autonomy_settings(db),
+            "updated_at": _iso(row.updated_at) if row is not None else None,
+            "updated_by_admin_id": (
+                str(row.updated_by_admin_id)
+                if row is not None and row.updated_by_admin_id
+                else None
+            ),
+        }
+        _record_read(
+            _audit_service(db, request),
+            context,
+            action="ai.autonomous_agent_control_view",
+            resource_type="system_feature",
+            resource_id="byok_autonomous_agent",
+        )
+    return {"ok": True, "feature": feature}
+
+
+@router.post("/byok-autonomous-agent")
+def set_byok_autonomous_agent_control(
+    body: SystemByokAutonomousAgentBody,
+    request: Request,
+    context: AdminContext = Depends(_admin_context),
+) -> dict[str, Any]:
+    allowed_hosts = tuple(
+        getattr(_settings(request), "ai_byok_allowed_hosts", ()) or ()
+    )
+    with session_scope() as db:
+        row = ModelRunnerSystemSettingRepository(db).get_or_create(for_update=True)
+        if body.enabled and not row.enabled:
+            raise HTTPException(
+                status_code=409,
+                detail="请先开启 BYOK 模型运行器全局功能",
+            )
+        if body.enabled and not row.account_actions_enabled:
+            raise HTTPException(
+                status_code=409,
+                detail="请先开启模型账号动作执行全局功能",
+            )
+        if body.enabled and _is_production(_settings(request)) and not allowed_hosts:
+            raise HTTPException(
+                status_code=409,
+                detail="正式环境必须先配置用户模型服务域名白名单",
+            )
+        old_enabled = bool(getattr(row, "autonomous_agent_enabled", False))
+        new_enabled = bool(body.enabled)
+        changed = old_enabled != new_enabled
+        if new_enabled:
+            _set_autonomy_system_enabled(row, True)
+            disabled_autonomy_settings = 0
+            cancelled_autonomy_tasks = 0
+        else:
+            (
+                _old_enabled,
+                disabled_autonomy_settings,
+                cancelled_autonomy_tasks,
+            ) = _disable_system_autonomy(
+                db,
+                row,
+                stable_error_code="autonomous_agent_disabled",
+            )
+        row.updated_by_admin_id = context.admin_user_id
+        _audit_service(db, request).record(
+            actor_type="admin",
+            action="ai.autonomous_agent_global_changed",
+            admin_user_id=context.admin_user_id,
+            resource_type="system_feature",
+            resource_id="byok_autonomous_agent",
+            reason=body.reason,
+            client_ip=context.client_ip,
+            details={
+                "old_enabled": old_enabled,
+                "new_enabled": new_enabled,
+                "changed": changed,
+                "model_runner_enabled": bool(row.enabled),
+                "account_actions_enabled": bool(row.account_actions_enabled),
+                "disabled_autonomy_settings": disabled_autonomy_settings,
+                "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+            },
+        )
+        db.flush()
+        feature = {
+            "enabled": bool(
+                getattr(row, "autonomous_agent_enabled", False)
+            ),
+            "background_enabled": bool(
+                getattr(_settings(request), "ai_agent_background_enabled", False)
+            ),
+            "model_runner_enabled": bool(row.enabled),
+            "account_actions_enabled": bool(row.account_actions_enabled),
+            "updated_at": _iso(row.updated_at),
+            "updated_by_admin_id": str(context.admin_user_id),
+        }
+    return {
+        "ok": True,
+        "feature": feature,
+        "changed": changed,
+        "disabled_autonomy_settings": disabled_autonomy_settings,
+        "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+    }
+
+
 @router.get("/users")
 def list_users(
     request: Request,
@@ -1853,6 +2631,13 @@ def set_user_status(
             if account is not None:
                 account.sync_enabled = body.status == "active"
             revoked = 0
+            cancelled_ai_runs = 0
+            execution_grant_revoked = False
+            execution_setting_disabled = False
+            cancelled_queued_executions = 0
+            autonomy_grant_revoked = False
+            autonomy_setting_disabled = False
+            cancelled_autonomy_tasks = 0
             if body.status == "disabled":
                 revoked = UserSessionService(
                     db,
@@ -1860,6 +2645,36 @@ def set_user_status(
                     _settings(request),
                     _persistence(request).session_hmac_key,
                 ).revoke_all_for_user(user_id, reason="administrator_disabled_user")
+                agent_settings = AgentSettingRepository(db).get(
+                    user_id, for_update=True
+                )
+                if agent_settings is not None:
+                    agent_settings.user_enabled = False
+                    agent_settings.version = int(agent_settings.version) + 1
+                cancelled_ai_runs = AgentRunRepository(db).cancel_active_for_owner(
+                    user_id
+                )
+                if user.byok_account_actions_enabled:
+                    user.byok_account_actions_enabled = False
+                    execution_grant_revoked = True
+                execution_setting_disabled = bool(
+                    AgentExecutionSettingRepository(db).disable_for_owner(user_id)
+                )
+                cancelled_queued_executions = (
+                    AgentActionExecutionRepository(db).cancel_active_for_owner(
+                        user_id,
+                        stable_error_code="account_disabled",
+                    )
+                )
+                (
+                    autonomy_grant_revoked,
+                    autonomy_setting_disabled,
+                    cancelled_autonomy_tasks,
+                ) = _revoke_user_autonomy(
+                    db,
+                    user,
+                    stable_error_code="account_disabled",
+                )
             audit = _audit_service(db, request)
             audit.record(
                 actor_type="admin",
@@ -1874,14 +2689,74 @@ def set_user_status(
                     "old_status": old_status,
                     "new_status": body.status,
                     "revoked_sessions": revoked,
+                    "cancelled_ai_runs": cancelled_ai_runs,
+                    "execution_grant_revoked": execution_grant_revoked,
+                    "execution_setting_disabled": execution_setting_disabled,
+                    "cancelled_queued_executions": cancelled_queued_executions,
+                    "autonomy_grant_revoked": autonomy_grant_revoked,
+                    "autonomy_setting_disabled": autonomy_setting_disabled,
+                    "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
                 },
             )
+            if execution_grant_revoked:
+                audit.record(
+                    actor_type="admin",
+                    action="user.byok_account_actions_changed",
+                    admin_user_id=context.admin_user_id,
+                    target_user_id=user_id,
+                    resource_type="user_feature",
+                    resource_id="byok_account_actions",
+                    reason=body.reason,
+                    client_ip=context.client_ip,
+                    details={
+                        "old_enabled": True,
+                        "new_enabled": False,
+                        "changed": True,
+                        "cascade_source": "user_disabled",
+                        "execution_setting_disabled": execution_setting_disabled,
+                        "cancelled_queued_executions": cancelled_queued_executions,
+                    },
+                )
+            if (
+                autonomy_grant_revoked
+                or autonomy_setting_disabled
+                or cancelled_autonomy_tasks
+            ):
+                audit.record(
+                    actor_type="admin",
+                    action="user.byok_autonomous_agent_changed",
+                    admin_user_id=context.admin_user_id,
+                    target_user_id=user_id,
+                    resource_type="user_feature",
+                    resource_id="byok_autonomous_agent",
+                    reason=body.reason,
+                    client_ip=context.client_ip,
+                    details={
+                        "old_enabled": autonomy_grant_revoked,
+                        "new_enabled": False,
+                        "changed": autonomy_grant_revoked,
+                        "cascade_source": "user_disabled",
+                        "autonomy_setting_disabled": autonomy_setting_disabled,
+                        "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+                    },
+                )
             item = _user_public(user, account)
     except Exception as exc:
         if isinstance(exc, ServiceError):
             _raise_service_error(exc)
         raise
-    return {"ok": True, "user": item, "revoked_sessions": revoked}
+    return {
+        "ok": True,
+        "user": item,
+        "revoked_sessions": revoked,
+        "cancelled_ai_runs": cancelled_ai_runs,
+        "execution_grant_revoked": execution_grant_revoked,
+        "execution_setting_disabled": execution_setting_disabled,
+        "cancelled_queued_executions": cancelled_queued_executions,
+        "autonomy_grant_revoked": autonomy_grant_revoked,
+        "autonomy_setting_disabled": autonomy_setting_disabled,
+        "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+    }
 
 
 @router.post("/users/{user_id}/match-pool-online-list")
@@ -1899,7 +2774,8 @@ def set_user_match_pool_online_list(
             new_enabled = bool(body.enabled)
             changed = old_enabled != new_enabled
             user.match_pool_online_list_enabled = new_enabled
-            _audit_service(db, request).record(
+            audit = _audit_service(db, request)
+            audit.record(
                 actor_type="admin",
                 action="user.match_pool_online_list_changed",
                 admin_user_id=context.admin_user_id,
@@ -1939,7 +2815,8 @@ def set_user_nearby_custom_city(
             new_enabled = bool(body.enabled)
             changed = old_enabled != new_enabled
             user.nearby_custom_city_enabled = new_enabled
-            _audit_service(db, request).record(
+            audit = _audit_service(db, request)
+            audit.record(
                 actor_type="admin",
                 action="user.nearby_custom_city_changed",
                 admin_user_id=context.admin_user_id,
@@ -1961,6 +2838,353 @@ def set_user_nearby_custom_city(
             _raise_service_error(exc)
         raise
     return {"ok": True, "user": item, "changed": changed}
+
+
+@router.post("/users/{user_id}/byok-model-runner")
+def set_user_byok_model_runner(
+    user_id: uuid.UUID,
+    body: UserByokModelRunnerBody,
+    request: Request,
+    context: AdminContext = Depends(_admin_context),
+) -> dict[str, Any]:
+    try:
+        with session_scope() as db:
+            account = ExternalAccountRepository(db).get_for_user(user_id)
+            user = _require_user(db, user_id, for_update=True)
+            old_enabled = bool(user.byok_model_runner_enabled)
+            new_enabled = bool(body.enabled)
+            changed = old_enabled != new_enabled
+            user.byok_model_runner_enabled = new_enabled
+            cancelled_runs = 0
+            user_runner_disabled = False
+            account_actions_grant_revoked = False
+            execution_setting_disabled = False
+            cancelled_queued_executions = 0
+            autonomy_grant_revoked = False
+            autonomy_setting_disabled = False
+            cancelled_autonomy_tasks = 0
+            if not new_enabled:
+                agent_settings = AgentSettingRepository(db).get(
+                    user_id, for_update=True
+                )
+                if agent_settings is not None and agent_settings.user_enabled:
+                    agent_settings.user_enabled = False
+                    agent_settings.version = int(agent_settings.version) + 1
+                    user_runner_disabled = True
+                cancelled_runs = AgentRunRepository(db).cancel_active_for_owner(
+                    user_id
+                )
+                if user.byok_account_actions_enabled:
+                    user.byok_account_actions_enabled = False
+                    account_actions_grant_revoked = True
+                execution_setting_disabled = bool(
+                    AgentExecutionSettingRepository(db).disable_for_owner(user_id)
+                )
+                cancelled_queued_executions = (
+                    AgentActionExecutionRepository(db).cancel_active_for_owner(
+                        user_id,
+                        stable_error_code="model_runner_access_revoked",
+                    )
+                )
+                (
+                    autonomy_grant_revoked,
+                    autonomy_setting_disabled,
+                    cancelled_autonomy_tasks,
+                ) = _revoke_user_autonomy(
+                    db,
+                    user,
+                    stable_error_code="model_runner_access_revoked",
+                )
+            audit = _audit_service(db, request)
+            audit.record(
+                actor_type="admin",
+                action="user.byok_model_runner_changed",
+                admin_user_id=context.admin_user_id,
+                target_user_id=user_id,
+                resource_type="user_feature",
+                resource_id="byok_model_runner",
+                reason=body.reason,
+                client_ip=context.client_ip,
+                details={
+                    "old_enabled": old_enabled,
+                    "new_enabled": new_enabled,
+                    "changed": changed,
+                    "scope": ["model_configuration", "style_analysis", "reply_draft"],
+                    "user_runner_disabled": user_runner_disabled,
+                    "cancelled_runs": cancelled_runs,
+                    "account_actions_grant_revoked": account_actions_grant_revoked,
+                    "execution_setting_disabled": execution_setting_disabled,
+                    "cancelled_queued_executions": cancelled_queued_executions,
+                    "autonomy_grant_revoked": autonomy_grant_revoked,
+                    "autonomy_setting_disabled": autonomy_setting_disabled,
+                    "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+                },
+            )
+            if account_actions_grant_revoked:
+                audit.record(
+                    actor_type="admin",
+                    action="user.byok_account_actions_changed",
+                    admin_user_id=context.admin_user_id,
+                    target_user_id=user_id,
+                    resource_type="user_feature",
+                    resource_id="byok_account_actions",
+                    reason=body.reason,
+                    client_ip=context.client_ip,
+                    details={
+                        "old_enabled": True,
+                        "new_enabled": False,
+                        "changed": True,
+                        "cascade_source": "model_runner_access_revoked",
+                        "execution_setting_disabled": execution_setting_disabled,
+                        "cancelled_queued_executions": cancelled_queued_executions,
+                    },
+                )
+            if (
+                autonomy_grant_revoked
+                or autonomy_setting_disabled
+                or cancelled_autonomy_tasks
+            ):
+                audit.record(
+                    actor_type="admin",
+                    action="user.byok_autonomous_agent_changed",
+                    admin_user_id=context.admin_user_id,
+                    target_user_id=user_id,
+                    resource_type="user_feature",
+                    resource_id="byok_autonomous_agent",
+                    reason=body.reason,
+                    client_ip=context.client_ip,
+                    details={
+                        "old_enabled": autonomy_grant_revoked,
+                        "new_enabled": False,
+                        "changed": autonomy_grant_revoked,
+                        "cascade_source": "model_runner_access_revoked",
+                        "autonomy_setting_disabled": autonomy_setting_disabled,
+                        "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+                    },
+                )
+            item = _user_public(user, account)
+    except Exception as exc:
+        if isinstance(exc, ServiceError):
+            _raise_service_error(exc)
+        raise
+    return {
+        "ok": True,
+        "user": item,
+        "changed": changed,
+        "cancelled_runs": cancelled_runs,
+        "account_actions_grant_revoked": account_actions_grant_revoked,
+        "execution_setting_disabled": execution_setting_disabled,
+        "cancelled_queued_executions": cancelled_queued_executions,
+        "autonomy_grant_revoked": autonomy_grant_revoked,
+        "autonomy_setting_disabled": autonomy_setting_disabled,
+        "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+    }
+
+
+@router.post("/users/{user_id}/byok-account-actions")
+def set_user_byok_account_actions(
+    user_id: uuid.UUID,
+    body: UserByokAccountActionsBody,
+    request: Request,
+    context: AdminContext = Depends(_admin_context),
+) -> dict[str, Any]:
+    try:
+        with session_scope() as db:
+            account = ExternalAccountRepository(db).get_for_user(user_id)
+            user = _require_user(db, user_id, for_update=True)
+            new_enabled = bool(body.enabled)
+            if new_enabled and not user.byok_model_runner_enabled:
+                raise HTTPException(
+                    status_code=409,
+                    detail="请先授权该用户使用 BYOK 模型运行器",
+                )
+            if new_enabled and (
+                user.status != "active" or user.disabled_at is not None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="已停用用户不能获得模型账号动作执行授权",
+                )
+            old_enabled = bool(user.byok_account_actions_enabled)
+            changed = old_enabled != new_enabled
+            user.byok_account_actions_enabled = new_enabled
+            execution_setting_disabled = False
+            cancelled_queued_executions = 0
+            autonomy_grant_revoked = False
+            autonomy_setting_disabled = False
+            cancelled_autonomy_tasks = 0
+            if not new_enabled:
+                execution_setting_disabled = bool(
+                    AgentExecutionSettingRepository(db).disable_for_owner(user_id)
+                )
+                cancelled_queued_executions = (
+                    AgentActionExecutionRepository(db).cancel_active_for_owner(
+                        user_id,
+                        stable_error_code="execution_access_revoked",
+                    )
+                )
+                (
+                    autonomy_grant_revoked,
+                    autonomy_setting_disabled,
+                    cancelled_autonomy_tasks,
+                ) = _revoke_user_autonomy(
+                    db,
+                    user,
+                    stable_error_code="execution_access_revoked",
+                )
+            audit = _audit_service(db, request)
+            audit.record(
+                actor_type="admin",
+                action="user.byok_account_actions_changed",
+                admin_user_id=context.admin_user_id,
+                target_user_id=user_id,
+                resource_type="user_feature",
+                resource_id="byok_account_actions",
+                reason=body.reason,
+                client_ip=context.client_ip,
+                details={
+                    "old_enabled": old_enabled,
+                    "new_enabled": new_enabled,
+                    "changed": changed,
+                    "model_runner_granted": bool(user.byok_model_runner_enabled),
+                    "execution_setting_disabled": execution_setting_disabled,
+                    "cancelled_queued_executions": cancelled_queued_executions,
+                    "autonomy_grant_revoked": autonomy_grant_revoked,
+                    "autonomy_setting_disabled": autonomy_setting_disabled,
+                    "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+                    "scope": [
+                        "send_private_message",
+                        "publish_text_post",
+                        "follow_user",
+                        "unfollow_user",
+                    ],
+                },
+            )
+            if (
+                autonomy_grant_revoked
+                or autonomy_setting_disabled
+                or cancelled_autonomy_tasks
+            ):
+                audit.record(
+                    actor_type="admin",
+                    action="user.byok_autonomous_agent_changed",
+                    admin_user_id=context.admin_user_id,
+                    target_user_id=user_id,
+                    resource_type="user_feature",
+                    resource_id="byok_autonomous_agent",
+                    reason=body.reason,
+                    client_ip=context.client_ip,
+                    details={
+                        "old_enabled": autonomy_grant_revoked,
+                        "new_enabled": False,
+                        "changed": autonomy_grant_revoked,
+                        "cascade_source": "execution_access_revoked",
+                        "autonomy_setting_disabled": autonomy_setting_disabled,
+                        "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+                    },
+                )
+            item = _user_public(user, account)
+    except Exception as exc:
+        if isinstance(exc, ServiceError):
+            _raise_service_error(exc)
+        raise
+    return {
+        "ok": True,
+        "user": item,
+        "changed": changed,
+        "execution_setting_disabled": execution_setting_disabled,
+        "cancelled_queued_executions": cancelled_queued_executions,
+        "autonomy_grant_revoked": autonomy_grant_revoked,
+        "autonomy_setting_disabled": autonomy_setting_disabled,
+        "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+    }
+
+
+@router.post("/users/{user_id}/byok-autonomous-agent")
+def set_user_byok_autonomous_agent(
+    user_id: uuid.UUID,
+    body: UserByokAutonomousAgentBody,
+    request: Request,
+    context: AdminContext = Depends(_admin_context),
+) -> dict[str, Any]:
+    try:
+        with session_scope() as db:
+            account = ExternalAccountRepository(db).get_for_user(user_id)
+            user = _require_user(db, user_id, for_update=True)
+            new_enabled = bool(body.enabled)
+            if new_enabled and not user.byok_model_runner_enabled:
+                raise HTTPException(
+                    status_code=409,
+                    detail="请先授权该用户使用 BYOK 模型运行器",
+                )
+            if new_enabled and not user.byok_account_actions_enabled:
+                raise HTTPException(
+                    status_code=409,
+                    detail="请先授权该用户使用模型账号动作执行",
+                )
+            if new_enabled and (
+                user.status != "active" or user.disabled_at is not None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="已停用用户不能获得无人值守运营 Agent 授权",
+                )
+            old_enabled = bool(
+                getattr(user, "byok_autonomous_agent_enabled", False)
+            )
+            changed = old_enabled != new_enabled
+            _set_user_autonomy_grant(user, new_enabled)
+            autonomy_setting_disabled = False
+            cancelled_autonomy_tasks = 0
+            if not new_enabled:
+                autonomy_setting_disabled = _disable_autonomy_for_owner(
+                    db,
+                    user_id,
+                    reason="autonomous_access_revoked",
+                )
+                cancelled_autonomy_tasks = _cancel_autonomy_tasks_for_owner(
+                    db,
+                    user_id,
+                    stable_error_code="autonomous_access_revoked",
+                )
+            _audit_service(db, request).record(
+                actor_type="admin",
+                action="user.byok_autonomous_agent_changed",
+                admin_user_id=context.admin_user_id,
+                target_user_id=user_id,
+                resource_type="user_feature",
+                resource_id="byok_autonomous_agent",
+                reason=body.reason,
+                client_ip=context.client_ip,
+                details={
+                    "old_enabled": old_enabled,
+                    "new_enabled": new_enabled,
+                    "changed": changed,
+                    "model_runner_granted": bool(user.byok_model_runner_enabled),
+                    "account_actions_granted": bool(
+                        user.byok_account_actions_enabled
+                    ),
+                    "autonomy_setting_disabled": autonomy_setting_disabled,
+                    "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+                    "scope": [
+                        "auto_reply",
+                        "scheduled_posts",
+                        "relationship_actions",
+                    ],
+                },
+            )
+            item = _user_public(user, account)
+    except Exception as exc:
+        if isinstance(exc, ServiceError):
+            _raise_service_error(exc)
+        raise
+    return {
+        "ok": True,
+        "user": item,
+        "changed": changed,
+        "autonomy_setting_disabled": autonomy_setting_disabled,
+        "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+    }
 
 
 @router.post("/users/{user_id}/credentials")
@@ -2522,6 +3746,9 @@ def admin_overview(
                     else int(_settings(request).system_media_quota_bytes)
                 ),
             },
+            "dependencies": (
+                request.app.state.persistence.dependency_status.public_snapshot()
+            ),
             "generated_at": _iso(now),
         }
         _record_read(

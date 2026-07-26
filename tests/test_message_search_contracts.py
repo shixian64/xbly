@@ -154,6 +154,35 @@ class MessageSearchBackendTests(unittest.TestCase):
         self.assertNotIn("message_search_media_name", sql)
         self.assertNotIn("message_search_quote_text", sql)
 
+    def test_peer_search_can_cover_all_provider_conversations(self) -> None:
+        first_conversation = uuid.uuid4()
+        second_conversation = uuid.uuid4()
+
+        class FakeDb:
+            def __init__(self) -> None:
+                self.statement: object | None = None
+
+            def scalars(self, statement: object) -> list[object]:
+                self.statement = statement
+                return []
+
+        db = FakeDb()
+        MessageRepository(db).search_for_owner(
+            uuid.uuid4(),
+            conversation_ids=[first_conversation, second_conversation],
+            query="迁移",
+            limit=20,
+        )
+
+        self.assertIsNotNone(db.statement)
+        compiled = db.statement.compile(dialect=postgresql.dialect())
+        sql = str(compiled)
+        self.assertIn("messages.conversation_id IN", sql)
+        self.assertEqual(
+            compiled.params["conversation_id_1"],
+            [first_conversation, second_conversation],
+        )
+
     def test_message_search_trigram_indexes_have_a_concurrent_migration(self) -> None:
         migration = (
             ROOT

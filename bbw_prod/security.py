@@ -13,7 +13,7 @@ import unicodedata
 from dataclasses import dataclass
 from urllib.parse import quote
 
-from argon2 import PasswordHasher as Argon2PasswordHasher
+from argon2 import PasswordHasher as Argon2PasswordHasher, extract_parameters
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from argon2.low_level import Type
 
@@ -72,6 +72,102 @@ class PasswordHasher:
         return False
 
     def needs_rehash(self, encoded_hash: str) -> bool:
+        try:
+            return self._hasher.check_needs_rehash(encoded_hash)
+        except (InvalidHashError, VerificationError):
+            return True
+
+
+_USER_PASSWORD_HASH_MAX_ENCODED_LENGTH = 512
+_USER_PASSWORD_TIME_COST_RANGE = range(1, 11)
+_USER_PASSWORD_MEMORY_COST_RANGE = range(8 * 1024, 256 * 1024 + 1)
+_USER_PASSWORD_PARALLELISM_RANGE = range(1, 9)
+_USER_PASSWORD_SALT_LENGTH_RANGE = range(8, 65)
+_USER_PASSWORD_HASH_LENGTH_RANGE = range(16, 65)
+
+
+def is_safe_user_password_hash(encoded_hash: object) -> bool:
+    """判断用户密码摘要能否在受控资源范围内安全验证。
+
+    Argon2 会采用摘要自身携带的参数进行验证，因此不能把数据库中的参数
+    不加限制地交给底层实现。此函数只做纯解析与边界检查，不执行哈希运算。
+    """
+
+    if (
+        not isinstance(encoded_hash, str)
+        or not encoded_hash
+        or len(encoded_hash) > _USER_PASSWORD_HASH_MAX_ENCODED_LENGTH
+        or not encoded_hash.isascii()
+    ):
+        return False
+    try:
+        parameters = extract_parameters(encoded_hash)
+    except (InvalidHashError, TypeError, ValueError):
+        return False
+    return bool(
+        parameters.type is Type.ID
+        and parameters.version == 19
+        and parameters.time_cost in _USER_PASSWORD_TIME_COST_RANGE
+        and parameters.memory_cost in _USER_PASSWORD_MEMORY_COST_RANGE
+        and parameters.parallelism in _USER_PASSWORD_PARALLELISM_RANGE
+        and parameters.salt_len in _USER_PASSWORD_SALT_LENGTH_RANGE
+        and parameters.hash_len in _USER_PASSWORD_HASH_LENGTH_RANGE
+    )
+
+
+_USER_PASSWORD_DUMMY_HASH = (
+    "$argon2id$v=19$m=65536,t=3,p=2$hgSFYbeBDzhtzVj32n3c+w$"
+    "CF/Zm+UUweR/dpAqTcnhqiaeZrOI2lyMu7IlZwSWNv4"
+)
+if not is_safe_user_password_hash(_USER_PASSWORD_DUMMY_HASH):  # pragma: no cover
+    raise RuntimeError("unsafe built-in user password dummy hash")
+
+
+class UserPasswordHasher:
+    """已由上游确认的用户密码所使用的本地 Argon2id 验证器。
+
+    这里不能套用管理员密码的最小长度规则：迁移期间必须兼容上游已经接受的
+    历史密码。密码原文仍然不做规范化，避免改变 APK 账号的认证语义。
+    """
+
+    def __init__(self) -> None:
+        self._hasher = Argon2PasswordHasher(
+            time_cost=3,
+            memory_cost=64 * 1024,
+            parallelism=2,
+            hash_len=32,
+            salt_len=16,
+            type=Type.ID,
+        )
+
+    @staticmethod
+    def validate_verified_password(password: str) -> None:
+        if not password:
+            raise ValueError("user password must not be empty")
+
+    def hash(self, password: str) -> str:
+        self.validate_verified_password(password)
+        return self._hasher.hash(password)
+
+    def verify(self, encoded_hash: str, password: str) -> bool:
+        if not is_safe_user_password_hash(encoded_hash):
+            return False
+        try:
+            return self._hasher.verify(encoded_hash, password)
+        except (VerifyMismatchError, VerificationError, InvalidHashError):
+            return False
+
+    def verify_or_dummy(self, encoded_hash: str | None, password: str) -> bool:
+        """未知账号和未迁移账号也执行一次 Argon2，降低枚举侧信道。"""
+
+        if encoded_hash and is_safe_user_password_hash(encoded_hash):
+            return self.verify(encoded_hash, password)
+        self.verify(_USER_PASSWORD_DUMMY_HASH, password)
+        return False
+
+    def needs_rehash(self, encoded_hash: str) -> bool:
+        if not is_safe_user_password_hash(encoded_hash):
+            return True
         try:
             return self._hasher.check_needs_rehash(encoded_hash)
         except (InvalidHashError, VerificationError):

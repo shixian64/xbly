@@ -286,7 +286,7 @@ class FrontendMessageQuoteContracts(unittest.TestCase):
             "messageAbstract",
             "messageRootID",
             "data-quote-message-sequence",
-            "options.cloudCustomData = cloudCustomData",
+            "client_message_id: pendingID",
             "quote: messageQuote",
             "restoreChatMessageQuote(uid)",
             "function toggleChatMessageActions(row)",

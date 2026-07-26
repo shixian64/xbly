@@ -14,6 +14,10 @@ from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
+from .compatibility import (
+    COMPATIBILITY_CANCELLED_REASON,
+    new_compatibility_outbox_status,
+)
 from .models import (
     ActivityEvent,
     AdminSession,
@@ -30,6 +34,7 @@ from .models import (
     SyncCursor,
     SystemStorageQuota,
     User,
+    UserCredential,
     WebSession,
     utcnow,
 )
@@ -73,6 +78,21 @@ class UserRepository(Repository[User]):
         if status:
             stmt = stmt.where(User.status == status)
         return list(self.db.scalars(stmt))
+
+
+class UserCredentialRepository(Repository[UserCredential]):
+    model = UserCredential
+
+    def get_for_user(
+        self,
+        user_id: uuid.UUID,
+        *,
+        for_update: bool = False,
+    ) -> UserCredential | None:
+        stmt = select(UserCredential).where(UserCredential.user_id == user_id)
+        if for_update:
+            stmt = stmt.with_for_update()
+        return self.db.scalar(stmt)
 
 
 class ExternalAccountRepository(Repository[ExternalAccount]):
@@ -612,6 +632,7 @@ class MessageRepository(Repository[Message]):
         owner_user_id: uuid.UUID,
         *,
         conversation_id: uuid.UUID | None = None,
+        conversation_ids: list[uuid.UUID] | tuple[uuid.UUID, ...] | None = None,
         query: str = "",
         kind: str = "all",
         occurred_from: datetime | None = None,
@@ -625,8 +646,15 @@ class MessageRepository(Repository[Message]):
                 ("true", "1")
             ),
         ]
+        if conversation_id is not None and conversation_ids is not None:
+            raise ValueError("conversation_id and conversation_ids are mutually exclusive")
         if conversation_id is not None:
             conditions.append(Message.conversation_id == conversation_id)
+        elif conversation_ids is not None:
+            selected_conversation_ids = list(dict.fromkeys(conversation_ids))
+            if not selected_conversation_ids:
+                return [], {}, False
+            conditions.append(Message.conversation_id.in_(selected_conversation_ids))
 
         normalized_query = str(query or "").strip()
         if normalized_query:
@@ -851,6 +879,20 @@ class OperationOutboxRepository(Repository[OperationOutbox]):
     model = OperationOutbox
 
     def enqueue(self, **values: Any) -> tuple[OperationOutbox, bool]:
+        operation_type = str(values.get("operation_type") or "")
+        if str(values.get("status") or "pending") == "pending" and (
+            new_compatibility_outbox_status(operation_type) == "cancelled"
+        ):
+            # Keep a durable audit/idempotency record after permanent legacy
+            # retirement without creating work that can never be dispatched.
+            values = {
+                **values,
+                "status": "cancelled",
+                "completed_at": values.get("completed_at") or utcnow(),
+                "last_error": COMPATIBILITY_CANCELLED_REASON,
+                "locked_by": None,
+                "locked_until": None,
+            }
         stmt = (
             insert(OperationOutbox)
             .values(**values)

@@ -4,6 +4,8 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 import importlib.util
 from pathlib import Path
+import shutil
+import subprocess
 from types import SimpleNamespace
 import unittest
 import uuid
@@ -475,6 +477,137 @@ class TimMessageDeduplicationTests(unittest.TestCase):
 
 
 class FrontendMessageDeduplicationContracts(unittest.TestCase):
+    def test_frontend_prefers_web_canonical_ids_and_tim_mirror_namespace(self) -> None:
+        source = (ROOT / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8-sig")
+        canonical = source.split("function canonicalMessageID", 1)[1].split(
+            "function numericMessageValue", 1
+        )[0]
+        identity = source.split("function messageIdentityKey(entry)", 1)[1].split(
+            "function messagesReferToSameMessage", 1
+        )[0]
+        same_message = source.split("function messagesReferToSameMessage", 1)[1].split(
+            "function compareMessageOrder", 1
+        )[0]
+        entry = source.split("function timMessageEntry", 1)[1].split(
+            "function chatMessageReadState", 1
+        )[0]
+
+        self.assertIn("parsedCloud?.bbw_message", canonical)
+        self.assertIn('["message_id", "messageId"]', canonical)
+        self.assertIn("const canonicalID = canonicalMessageID(entry);", identity)
+        self.assertIn("return `canonical|${canonicalID}`;", identity)
+        self.assertIn(
+            "if (leftCanonicalID && rightCanonicalID) return leftCanonicalID === rightCanonicalID;",
+            same_message,
+        )
+        self.assertIn("canonicalMessageId: canonicalID", entry)
+        self.assertIn("clientMessageId:", entry)
+        self.assertIn("compatibility_sync:", entry)
+        self.assertIn("tim_mirror_status:", entry)
+        self.assertIn("keys.add(`canonical|${canonicalID}`)", source)
+        self.assertIn("keys.add(`client-message|${clientMessageID}`)", source)
+
+    def test_web_local_canonical_revoke_state_wins_over_tim_compatibility(self) -> None:
+        source = (ROOT / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8-sig")
+        authority = source.split("function isWebLocalCanonicalMessage", 1)[1].split(
+            "function numericMessageValue", 1
+        )[0]
+        entry = source.split("function timMessageEntry", 1)[1].split(
+            "function chatMessageReadState", 1
+        )[0]
+        merge = source.split("function mergePeerMessages(peer, incoming)", 1)[1].split(
+            "async function loadConversationMessages", 1
+        )[0]
+        pending_revoke = source.split("function mergePendingMessageRevocations", 1)[1].split(
+            "function deferReplayedMessageRevocation", 1
+        )[0]
+        realtime_revoke = source.split("function applyMessageRevokedEvent", 1)[1].split(
+            "function attachTimHandlers", 1
+        )[0]
+
+        self.assertIn("provider,", entry)
+        self.assertIn("canonicalAuthority,", entry)
+        self.assertIn("preferredCanonicalMessageAuthority(previous, entry)", merge)
+        self.assertIn("const authorityOwnsRevocationState = Boolean(", merge)
+        self.assertIn("revoked: mergedMessageRevoked(previous, entry)", merge)
+        self.assertIn("text: authorityOwnsRevocationState", merge)
+        self.assertIn("media: authorityOwnsRevocationState", merge)
+        self.assertIn("canonicalAuthority: Boolean(authority)", merge)
+        self.assertGreaterEqual(
+            pending_revoke.count("shouldApplyCompatibilityRevocation(previous, revoked)"),
+            2,
+        )
+        self.assertIn(
+            "if (!shouldApplyCompatibilityRevocation(previous, revoked)) return;",
+            realtime_revoke,
+        )
+        self.assertLess(
+            realtime_revoke.index("shouldApplyCompatibilityRevocation(previous, revoked)"),
+            realtime_revoke.index("releaseMessageLocalMedia(previous)"),
+        )
+        self.assertLess(
+            realtime_revoke.index("shouldApplyCompatibilityRevocation(previous, revoked)"),
+            realtime_revoke.index("archiveMessageBestEffort(archived)"),
+        )
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        script = (
+            "function canonicalMessageID(entry) { return String(entry?.canonicalMessageId || entry?.canonical_message_id || ''); }\n"
+            + "function isWebLocalCanonicalMessage"
+            + authority
+            + "\n"
+            + r"""
+const canonicalActive = {
+  canonicalMessageId: "canonical-1",
+  provider: "web-local",
+  source: "archive",
+  revoked: false,
+};
+const canonicalRevoked = { ...canonicalActive, revoked: true };
+const localAckActive = {
+  canonicalMessageId: "canonical-1",
+  source: "web-local",
+  revoked: false,
+};
+const timRevoked = {
+  canonicalMessageId: "canonical-1",
+  provider: "tim",
+  source: "tim",
+  revoked: true,
+};
+const timActive = { ...timRevoked, revoked: false };
+if (mergedMessageRevoked(canonicalActive, timRevoked) !== false) {
+  throw new Error("TIM revoked state overrode active canonical state");
+}
+if (mergedMessageRevoked(timRevoked, canonicalActive) !== false) {
+  throw new Error("canonical state depended on merge order");
+}
+if (mergedMessageRevoked(canonicalRevoked, timActive) !== true) {
+  throw new Error("canonical revoked state was lost");
+}
+if (mergedMessageRevoked(localAckActive, timRevoked) !== false) {
+  throw new Error("local canonical acknowledgement was not authoritative");
+}
+if (shouldApplyCompatibilityRevocation(canonicalActive, timRevoked) !== false) {
+  throw new Error("TIM revoke event was allowed to overwrite canonical state");
+}
+if (shouldApplyCompatibilityRevocation(timActive, timRevoked) !== true) {
+  throw new Error("ordinary TIM revoke event was incorrectly ignored");
+}
+"""
+        )
+        result = subprocess.run(
+            [node, "-e", script],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_frontend_upserts_realtime_and_loaded_messages_by_tim_random(self) -> None:
         source = (ROOT / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8-sig")
 

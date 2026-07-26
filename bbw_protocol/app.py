@@ -92,13 +92,22 @@ class BeibeiwuApp:
         self.session.apply_device(prof)
         return self.session.device_dict()
 
+    def create_heartbeat(
+        self, interval_sec: float = 55.0, jitter_sec: float = 8.0
+    ):
+        """Create an UpdateOnline0 heartbeat without starting background work."""
+        from .heartbeat import Heartbeat
+
+        return Heartbeat(self, interval_sec=interval_sec, jitter_sec=jitter_sec)
+
     def start_heartbeat(
         self, interval_sec: float = 55.0, jitter_sec: float = 8.0
     ):
         """Start background UpdateOnline0. Caller must keep the returned object."""
-        from .heartbeat import Heartbeat
-
-        hb = Heartbeat(self, interval_sec=interval_sec, jitter_sec=jitter_sec)
+        hb = self.create_heartbeat(
+            interval_sec=interval_sec,
+            jitter_sec=jitter_sec,
+        )
         hb.start()
         return hb
 

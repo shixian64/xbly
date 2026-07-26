@@ -6,6 +6,7 @@ Docs: https://cloud.tencent.com/document/product/269/2282
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import ssl
@@ -660,6 +661,7 @@ class TimRestClient:
         cloud_custom_data: Any = None,
         sync_other_machine: int = 1,
         offline_push_info: Optional[Dict[str, Any]] = None,
+        idempotency_key: str | None = None,
     ) -> RestResult:
         """Send documented TIM ``MsgBody`` elements that need no local upload."""
         if not str(from_account or "").strip() or not str(to_account or "").strip():
@@ -681,13 +683,26 @@ class TimRestClient:
                 return self._invalid(element_error)
             body_elements.append({"MsgType": msg_type, "MsgContent": dict(content)})
 
+        deduplication_key = str(idempotency_key or "").strip()
+        if deduplication_key:
+            digest = hashlib.sha256(deduplication_key.encode("utf-8")).digest()
+            message_sequence = int.from_bytes(digest[:4], "big") or 1
+            message_random = int.from_bytes(digest[4:8], "big") or 1
+        else:
+            message_sequence = None
+            message_random = random.randint(0, 0xFFFFFFFF)
         body: Dict[str, Any] = {
             "SyncOtherMachine": int(sync_other_machine),
             "From_Account": str(from_account),
             "To_Account": str(to_account),
-            "MsgRandom": random.randint(0, 0xFFFFFFFF),
+            "MsgRandom": message_random,
             "MsgBody": body_elements,
         }
+        if message_sequence is not None:
+            # TIM deduplicates C2C sends carrying the same MsgSeq.  Keeping both
+            # values stable closes the worker crash window between an upstream
+            # success and the local outbox acknowledgement.
+            body["MsgSeq"] = message_sequence
         cloud_data = self._cloud_data(cloud_custom_data)
         if cloud_data:
             body["CloudCustomData"] = cloud_data
@@ -703,6 +718,7 @@ class TimRestClient:
         *,
         cloud_custom_data: Any = None,
         sync_other_machine: int = 1,
+        idempotency_key: str | None = None,
     ) -> RestResult:
         """Send a C2C text message as from_account (admin API, appears from that user)."""
         text = str(text or "").strip()
@@ -721,6 +737,7 @@ class TimRestClient:
             ],
             cloud_custom_data=cloud_custom_data,
             sync_other_machine=sync_other_machine,
+            idempotency_key=idempotency_key,
         )
 
     def send_face(

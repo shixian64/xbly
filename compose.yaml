@@ -47,20 +47,31 @@ x-app-environment: &app-environment
   BBW_R2_SECRET_KEY_FILE: /run/secrets/r2_secret_access_key
   BBW_R2_BUCKET: ${R2_BUCKET:?set R2_BUCKET}
   BBW_R2_REGION: auto
-  BBW_RQ_QUEUES: critical,default,media,sync,transcode-v2,transcode
+  BBW_RQ_QUEUES: critical,agent-control,agent,default,media,sync,transcode-v2,transcode
   BBW_TURNSTILE_SITE_KEY: ${TURNSTILE_SITE_KEY:-}
   BBW_TURNSTILE_SECRET_KEY_FILE: /run/secrets/turnstile_secret_key
   BBW_INVITE_REQUIRED: "true"
+  BBW_UPSTREAM_AUTH_MODE: "${BBW_UPSTREAM_AUTH_MODE:-provider-first}"
+  BBW_COMPATIBILITY_MODE: "${BBW_COMPATIBILITY_MODE:-enabled}"
+  BBW_UPSTREAM_AUTH_TIMEOUT_SECONDS: "${BBW_UPSTREAM_AUTH_TIMEOUT_SECONDS:-5}"
+  BBW_LOCAL_PASSWORD_AUTH_CONCURRENCY: "${BBW_LOCAL_PASSWORD_AUTH_CONCURRENCY:-2}"
   BBW_ACTIVE_SYNC_SECONDS: "300"
   BBW_INACTIVE_SYNC_SECONDS: "3600"
   BBW_MEDIA_STRIP_METADATA: "true"
-  BBW_MEDIA_MAX_IMAGE_BYTES: "10485760"
-  BBW_MEDIA_MAX_AUDIO_BYTES: "10485760"
-  BBW_MEDIA_MAX_VIDEO_BYTES: "52428800"
+  BBW_MEDIA_MAX_IMAGE_BYTES: "20971520"
+  BBW_MEDIA_MAX_AUDIO_BYTES: "20971520"
+  BBW_MEDIA_MAX_VIDEO_BYTES: "104857600"
   BBW_MOMENT_VIDEO_MAX_SOURCE_BYTES: "157286400"
-  BBW_MEDIA_MAX_ATTACHMENT_BYTES: "20971520"
+  BBW_MEDIA_MAX_ATTACHMENT_BYTES: "41943040"
   BBW_MEDIA_ALLOWED_HOSTS: "${MEDIA_ALLOWED_HOSTS:-oss.banghua.xin,*.myqcloud.com,*.qcloud.com}"
   BBW_R2_PRESIGN_TTL_SECONDS: "300"
+  BBW_AI_BYOK_ALLOWED_HOSTS: "${AI_BYOK_ALLOWED_HOSTS:-}"
+  BBW_AI_BYOK_CONNECT_TIMEOUT_SECONDS: "${AI_BYOK_CONNECT_TIMEOUT_SECONDS:-10}"
+  BBW_AI_BYOK_READ_TIMEOUT_SECONDS: "${AI_BYOK_READ_TIMEOUT_SECONDS:-60}"
+  BBW_AI_BYOK_MAX_RESPONSE_BYTES: "${AI_BYOK_MAX_RESPONSE_BYTES:-1048576}"
+  BBW_AI_AGENT_BACKGROUND_ENABLED: "${AI_AGENT_BACKGROUND_ENABLED:-false}"
+  BBW_AI_AGENT_DISPATCH_BATCH_SIZE: "${AI_AGENT_DISPATCH_BATCH_SIZE:-10}"
+  BBW_AI_AGENT_FAILURE_BACKOFF_SECONDS: "${AI_AGENT_FAILURE_BACKOFF_SECONDS:-300}"
   BBW_MOMENT_VIDEO_CACHE_RETENTION_DAYS: "30"
   BBW_MOMENT_VIDEO_CACHE_MAX_BYTES: "2147483648"
   BBW_MOMENT_VIDEO_CACHE_MAX_OBJECTS: "2000"
@@ -408,6 +419,41 @@ services:
     stop_grace_period: 60s
     logging: *default-logging
 
+  agent-worker:
+    image: ${APP_IMAGE:-bbw-app:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    <<: *app-security
+    environment:
+      <<: *app-environment
+      BBW_RQ_QUEUES: agent-control,agent
+      BBW_PHONE_HMAC_KEY_FILE: ""
+      BBW_SESSION_HMAC_KEY_FILE: ""
+      BBW_ROOMKIT_BUSINESS_TOKEN_FILE: ""
+      BBW_TURNSTILE_SITE_KEY: ""
+      BBW_TURNSTILE_SECRET_KEY_FILE: ""
+    secrets: *worker-secrets
+    command: ["python", "-m", "bbw_web.worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - database
+      - queue
+      - egress
+    mem_limit: 768m
+    mem_reservation: 320m
+    cpus: 1.25
+    # The RQ timeout for one model generation plus its guarded action is 300s.
+    stop_grace_period: 6m
+    logging: *default-logging
+
   transcode-worker:
     image: ${APP_IMAGE:-bbw-app:local}
     build:
@@ -471,6 +517,7 @@ services:
       TZ: ${TZ:-Asia/Shanghai}
       BBW_REDIS_URL: redis://redis:6379/0
       BBW_REDIS_PREFIX: ${BBW_REDIS_PREFIX:-bbw}
+      BBW_AI_AGENT_BACKGROUND_ENABLED: "${AI_AGENT_BACKGROUND_ENABLED:-false}"
       BBW_SKIP_DATABASE_CONFIG: "true"
     command: ["python", "-m", "bbw_web.scheduler"]
     depends_on:

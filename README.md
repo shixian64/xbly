@@ -22,11 +22,14 @@
 | v154 action catalog（历史分析保留） | ✅ 非商业 action 可调用 | `app.call*` · `call_url` · multipart；商业 action 统一停用 |
 | 匹配 / 任务 / 资料 / 社交 / 房间 | ✅ HTTP | 各 `modules/*` |
 | IM 凭证（腾讯 UserSig / 融云） | ✅ 凭证 | `app.native.im` |
-| IM 实时收发 | ⚠️ 需官方 SDK | `bbw_web` + TIM |
+| 已迁移 Web 账号间私聊（文本与富媒体） | ✅ PostgreSQL + 私有 R2 本地权威 | `bbw_web.messaging`、`bbw_web.media_native`；TIM 仅异步兼容镜像 |
+| Web-local 资料、关系与动态 | ✅ PostgreSQL + 私有 R2 本地权威 | 完整资料含 owner-bound 头像；动态支持文字、最多 9 图或单视频；私有头像/媒体动态不承诺旧 APK 可见 |
+| 与未迁移账号或 APK 互通 | ⚠️ 仍需 TIM / Banghua | 本地成功不依赖兼容镜像；外部服务死亡后该互通停止 |
 | 刷脸实名 | ⚠️ 仅 HTTP 编排 | `app.native.face` · 活体靠阿里云 |
 | 服务端会员权益 | ✅ 只读保留 | 登录和资料响应中的 `vip` / `svip` 状态 |
 | 产品化 Web App（PC/手机） | ✅ 主流程 | 本地：`python -m bbw_web`；生产：`compose.yaml` + `bbw_web.api` |
 | 多用户持久化与管理端 | ✅ | PostgreSQL、Redis、私有 R2；管理入口 `/admin` |
+| 内置 BYOK 模型运行器 | 已实现，后台默认关闭 | 用户自带 OpenAI-compatible API Key；语言风格、草稿、固定账号动作与受控无人值守 Agent |
 
 ---
 
@@ -46,6 +49,7 @@ xbly/
 │   ├── api.py             # FastAPI 生产入口
 │   ├── admin_api.py       # 单超级管理员、TOTP、审计和数据管理 API
 │   └── static/
+├── bbw_agent/             # 内置 BYOK 模型运行器、风格/草稿、固定动作与受控无人值守 Agent
 ├── bbw_prod/              # PostgreSQL 模型、加密、Session 和业务服务
 ├── migrations/            # Alembic 数据库迁移
 ├── compose.yaml           # App/PostgreSQL/Redis/RQ/Caddy 单机部署
@@ -56,6 +60,34 @@ xbly/
 ```
 
 **隔离约定：** `bbw_protocol` 只做协议；`bbw_web` 负责 Cookie / 多租户 / 页面。核不依赖 Web。
+
+## 内置 BYOK 模型运行器
+
+当前实现是 Web 应用内部、同源登录用户可用的 BYOK 模块，不是对外提供的 MCP
+Server。管理员必须先开启模型运行器全局开关并逐用户授权，用户才能看到入口、配置
+自己的 OpenAI-compatible 模型地址、模型名称和 API Key；用户还要主动开启个人运行
+开关，才能分析本人历史文字的语言风格或生成回复草稿。
+
+实际操作社交账号需要另一套独立授权：管理员开启“模型账号动作执行”全局开关并
+逐用户授权，用户再开启个人执行开关、选择动作白名单，并对每次操作进行确认。当前
+只支持发送私信、发布文字动态、关注和取消关注四类固定动作。
+
+无人值守运行使用第三套独立门禁：管理员还必须开启无人值守全局开关并逐用户授权，
+用户再开启个人自治策略；模型连接、个人模型运行器、账号执行开关、固定动作白名单、
+自动发送许可、目标白名单、活动时段、频率和每日预算也必须全部有效。部署端的
+`AI_AGENT_BACKGROUND_ENABLED` 默认是 `false`；显式开启后，专用 `agent-control` 和
+`agent` Worker 才会处理当前仍未回复的入站文字消息、按间隔发布公开文字动态，以及
+对白名单目标执行受控关注或取消关注。无人值守动作只以 Web 本地权威事务为成功边界；
+TIM 或旧社交系统兼容镜像通过 outbox 异步处理，镜像失败不会回滚本地结果。
+
+“生成并发送”仍是用户在页面主动发起并确认的一次请求，与后台自动回复是两条独立
+链路。无人值守任务使用数据库幂等键、租约、策略版本和派发前最终门禁；外部结果未知
+时会停机并等待人工检查，不会盲目重试。
+
+模型没有任意 HTTP/API 调用能力，也不会获得 Web Cookie、上游 Token、账号密码或
+其他账号凭据，也不能使用浏览器自动化或自由选择站内接口。详细的三层门禁、手动确认、
+后台 Worker、数据流、安全边界和停机说明见
+[docs/18_BYOK_MODEL_RUNNER.md](docs/18_BYOK_MODEL_RUNNER.md)。
 
 生产部署、Secret、Cloudflare R2、资源预算和验收步骤见
 [docs/14_PRODUCTION_DEPLOYMENT.md](docs/14_PRODUCTION_DEPLOYMENT.md)。不要把本地
@@ -369,20 +401,20 @@ cat docker/secrets/admin_initial_password
 Browser SPA（社交娱乐风 · PC 侧栏 / 手机五项底栏）
         │ HttpOnly + SameSite=Strict Cookie
         ▼
-   bbw_web BFF（全功能语义 API + 多用户）
+   bbw_web BFF（领域 API + PostgreSQL 读模型 + 多用户）
         │
-        ▼
-   BeibeiwuApp ── adapters ──► TIM / 刷脸 / RoomKit SDK（可选）
-        │
-        ▼
-   banghua HTTP（与 APK 相同 do= / 签名 / token）
+        ├── Web-native canonical ──► 账号、资料、社交、动态、发现、私聊
+        ├── 私有 R2 ──► 私聊媒体、头像、动态图片/视频与闪照
+        ├── RuntimeProvider ──► local-only / 剩余 Legacy Banghua 兼容领域
+        └── Compatibility Outbox ──► Banghua / TIM 尽力镜像
 ```
 
 - **Web 目标**：按 APK 的“身边 / 消息 / 匹配 / 动态 / 我的”组织主流程；匹配页顶部通过“匹配 / 语音匹配 / 漂流瓶”标签切换下方功能区，语音匹配使用融云 Web CallLib 与官方客户端互通，关系中心、资产与权益、任务与奖励归入我的。
 - **产品与研究隔离**：默认关闭协议台、任意 action、会话列表和弱一键登录；仅 `--enable-lab` 显式开启。
 - **会话安全**：SID 只存在 HttpOnly Cookie；CORS 默认关闭。本地入口默认使用内存会话，生产 FastAPI 入口使用 PostgreSQL 与 Redis 持久 Session。
 - **会员边界**：项目不提供购买、充值、会员开通、试用或余额兑换入口；服务端下发的 `vip` / `svip` 状态继续持久化并展示。
-- **原生边界**：IM 长连接 / 刷脸活体仍依赖厂商 SDK 或官方 App。
+- **原生边界**：Web-Web 私聊文本和富媒体已不依赖 TIM 投递；与 APK 互通、跨 APK 在线/输入状态、语音通话、刷脸活体等仍依赖对应厂商能力。
+- **迁移边界**：已迁移账号可在 Banghua 不可用时使用本地密码登录；两个已迁移 Web 账号的文本、图片、语音、视频、文件、闪照、撤回、已读和历史以 PostgreSQL/R2 为权威，TIM 仅异步镜像。昵称、签名、城市、性别、私有头像、关系，以及文字/最多 9 图/单视频动态、城市发现和文本匹配也有本地权威。默认 Legacy Provider、注册/短信/找回及其他 APK 领域仍未退役；房间和群聊本轮明确暂缓，能力矩阵、迁移命令与退役门槛见 [17](docs/17_WEB_PROVIDER_MIGRATION.md)。
 
 ---
 

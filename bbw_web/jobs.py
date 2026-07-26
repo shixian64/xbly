@@ -11,30 +11,41 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import socket
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from botocore.exceptions import ClientError
 from redis import Redis
 from rq import Queue
-from sqlalchemy import and_, delete, or_, select
+from rq.exceptions import InvalidJobOperation
+from sqlalchemy import and_, delete, exists, func, or_, select
+from sqlalchemy.orm import aliased
 
+from bbw_prod.compatibility import (
+    CompatibilityMode,
+    compatibility_dispatch_enabled,
+    compatibility_mode,
+)
 from bbw_prod.config import Settings, get_settings
 from bbw_prod.crypto import CredentialCipher
 from bbw_prod.db import session_scope
 from bbw_prod.models import (
     ActivityEvent,
+    AiAgentAutonomyTask,
     Conversation,
     ExternalAccount,
     MediaObject,
     Message,
+    MessageDelivery,
     OperationOutbox,
     Relationship,
     SyncCursor,
@@ -59,12 +70,24 @@ from bbw_prod.services import (
     QuotaExceeded,
     RetentionService,
 )
-from bbw_protocol.adapters.tim_rest import TimRestClient
 from bbw_web.media_archive import MediaArchiveError, PreparedMedia, download_and_prepare
 from bbw_web.match_history import MATCH_HISTORY_PROVIDER, MATCH_HISTORY_RETENTION_DAYS
-from bbw_web.message_quote import extract_message_quote, normalize_message_quote
+from bbw_web.message_quote import (
+    encode_message_quote,
+    extract_local_message_identity,
+    extract_message_quote,
+    normalize_message_quote,
+)
+from bbw_web.messaging.contracts import TIM_MIRROR_CHANNEL
+from bbw_web.messaging.repository import SqlAlchemyCanonicalMessageStore
 from bbw_web.normalize import normalize_conversations, normalize_messages
 from bbw_web.r2 import R2Storage
+from bbw_web.transports import (
+    MessageHistoryTransport,
+    MessageMirrorTransport,
+    MessageRecallLookupTransport,
+    MessageSendTransport,
+)
 
 
 CHAT_PROVIDER = "tim"
@@ -93,6 +116,14 @@ MEDIA_CONFIGURATION_ERROR_MARKERS = (
     "/run/secrets/r2_",
     "/run/secrets/r2-",
 )
+TIM_MIRROR_LOCK_SECONDS = 120
+TIM_MIRROR_JOB_TIMEOUT_SECONDS = 60
+TIM_MIRROR_BACKOFF_MAX_SECONDS = 3600
+TIM_MEDIA_READ_TTL_SECONDS = 900
+TIM_RECALL_LOOKUP_MAX_PAGES = 3
+WEB_NATIVE_MEDIA_CLEANUP_BATCH = 200
+WEB_NATIVE_UPLOAD_CLEANUP_GRACE_SECONDS = 60 * 60
+WEB_NATIVE_MEDIA_UNSENT_GRACE_SECONDS = 24 * 60 * 60
 LOGGER = logging.getLogger(__name__)
 DEFAULT_MEDIA_HOSTS = (
     "oss.banghua.xin",
@@ -113,6 +144,22 @@ MAX_METADATA_STRING = 20_000
 MAX_METADATA_ITEMS = 100
 _TIM_SDK_MESSAGE_ID = re.compile(r"^\d{12,}-(\d{9,13})-(\d{1,20})$")
 _TIM_HISTORY_MESSAGE_ID = re.compile(r"^\d{1,20}_(\d{1,20})_(\d{9,13})$")
+
+
+def _default_message_history_transport() -> MessageHistoryTransport:
+    """Resolve the legacy TIM adapter only when a sync job needs it."""
+
+    from bbw_web.transports import create_legacy_tim_rest_transport
+
+    return create_legacy_tim_rest_transport()
+
+
+def _default_message_send_transport() -> MessageMirrorTransport:
+    """Resolve the legacy TIM adapter only when a mirror job executes."""
+
+    from bbw_web.transports import create_legacy_tim_rest_transport
+
+    return create_legacy_tim_rest_transport()
 
 
 def _safe_url(value: Any) -> str:
@@ -664,7 +711,14 @@ def _merge_message_metadata(current: Any, update: Mapping[str, Any]) -> dict[str
     merged["message_key"] = max(
         (previous_key, incoming_key), key=_message_key_quality
     ) or ""
-    for key in ("message_sequence", "client_message_key", "read_at", "object_name"):
+    for key in (
+        "canonical_message_id",
+        "client_message_id",
+        "message_sequence",
+        "client_message_key",
+        "read_at",
+        "object_name",
+    ):
         merged[key] = incoming.get(key) or previous.get(key) or ""
 
     merged["revoked"] = bool(previous.get("revoked") or incoming.get("revoked"))
@@ -764,6 +818,7 @@ def _ingest_message(
     report: Mapping[str, Any],
     conversation: Conversation | None = None,
     occurred_at: datetime | None = None,
+    enqueue_media_archive: bool = True,
 ) -> tuple[Message, bool, uuid.UUID | None]:
     peer_uid = _bounded(report.get("peer_uid"), 128)
     if not peer_uid:
@@ -807,6 +862,8 @@ def _ingest_message(
         "message_sequence": message_sequence,
         "message_random": message_random,
         "client_message_key": _bounded(report.get("client_message_key"), 512),
+        "canonical_message_id": _bounded(report.get("canonical_message_id"), 128),
+        "client_message_id": _bounded(report.get("client_message_id"), 160),
         "idempotency_key": _bounded(report.get("idempotency_key"), 256),
         "observed_at": _bounded(report.get("observed_at"), 80),
         "revoked": _as_bool(report.get("revoked")),
@@ -891,7 +948,7 @@ def _ingest_message(
 
     outbox_id: uuid.UUID | None = None
     media_spec = _media_spec_from_report(report, message_type)
-    if media_spec:
+    if media_spec and enqueue_media_archive:
         digest = hashlib.sha256(
             f"{row.id}\n{media_spec['source_url']}".encode("utf-8", errors="replace")
         ).hexdigest()
@@ -926,11 +983,831 @@ def _ingest_message(
 
 def _duplicate_queue_error(exc: Exception) -> bool:
     message = str(exc).lower()
-    return "already exists" in message or "job exists" in message
+    return (
+        isinstance(exc, InvalidJobOperation)
+        or "already exists" in message
+        or "already been enqueued" in message
+        or "job exists" in message
+    )
 
 
 def _worker_identity() -> str:
     return f"{socket.gethostname()}:{os.getpid()}"
+
+
+@dataclass(frozen=True, slots=True)
+class _ClaimedTimMirror:
+    delivery_id: uuid.UUID
+    payload: dict[str, Any]
+    attempt: int
+    max_attempts: int
+
+
+def _tim_mirror_due(row: MessageDelivery, *, now: datetime) -> bool:
+    status = str(row.status or "")
+    locked_until = _as_utc(row.locked_until) if row.locked_until else None
+    if status in {"pending", "retry"}:
+        return _as_utc(row.available_at) <= now and (
+            locked_until is None or locked_until <= now
+        )
+    if status == "processing":
+        return locked_until is None or locked_until <= now
+    return False
+
+
+def _claim_tim_message_delivery(delivery_id: uuid.UUID) -> _ClaimedTimMirror | None:
+    """Claim one TIM outbox row; concurrent workers skip the locked row."""
+
+    now = utcnow()
+    with session_scope() as db:
+        row = db.scalar(
+            select(MessageDelivery)
+            .where(
+                MessageDelivery.id == delivery_id,
+                MessageDelivery.channel == TIM_MIRROR_CHANNEL,
+                MessageDelivery.required.is_(False),
+            )
+            .with_for_update(skip_locked=True)
+        )
+        if row is None or not _tim_mirror_due(row, now=now):
+            return None
+        if row.attempt_count >= row.max_attempts:
+            row.status = "failed"
+            row.locked_by = None
+            row.locked_until = None
+            row.last_error = row.last_error or "TIM mirror retry budget exhausted"
+            return None
+        row.status = "processing"
+        row.attempt_count += 1
+        row.locked_by = _worker_identity()
+        row.locked_until = now + timedelta(seconds=TIM_MIRROR_LOCK_SECONDS)
+        row.last_error = None
+        db.flush()
+        return _ClaimedTimMirror(
+            delivery_id=row.id,
+            payload=dict(row.payload or {}),
+            attempt=int(row.attempt_count),
+            max_attempts=int(row.max_attempts),
+        )
+
+
+def _tim_mirror_cloud_custom_data(payload: Mapping[str, Any]) -> str:
+    canonical_message_id = _bounded(payload.get("canonical_message_id"), 128)
+    client_message_id = _bounded(payload.get("client_message_id"), 160)
+    if not canonical_message_id or not client_message_id:
+        raise ValueError("TIM mirror payload has no canonical message identity")
+    quote = normalize_message_quote(payload.get("quote"))
+    cloud: dict[str, Any] = {}
+    encoded_quote = encode_message_quote(quote)
+    if encoded_quote:
+        decoded = json.loads(encoded_quote)
+        if isinstance(decoded, Mapping):
+            cloud.update(decoded)
+    local_identity: dict[str, Any] = {
+        "canonical_message_id": canonical_message_id,
+        "client_message_id": client_message_id,
+        "message_id": canonical_message_id,
+        "quote": quote,
+        "version": 1,
+    }
+    for key, limit in (
+        ("attachment_id", 128),
+        ("asset_id", 128),
+        ("message_type", 32),
+        ("operation", 16),
+    ):
+        value = _bounded(payload.get(key), limit)
+        if value:
+            local_identity[key] = value
+    cloud["bbw_message"] = local_identity
+    return json.dumps(cloud, ensure_ascii=False, separators=(",", ":"))
+
+
+def _tim_mirror_send_values(
+    payload: Mapping[str, Any],
+) -> tuple[str, str, str, str]:
+    from_uid = _bounded(payload.get("from"), 128)
+    to_uid = _bounded(payload.get("to"), 128)
+    text = str(payload.get("text") or "")
+    if (
+        not from_uid
+        or not to_uid
+        or from_uid == to_uid
+        or not text.strip()
+        or len(text) > 2000
+    ):
+        raise ValueError("TIM mirror payload is not sendable")
+    return from_uid, to_uid, text, _tim_mirror_cloud_custom_data(payload)
+
+
+def _tim_mirror_parties(payload: Mapping[str, Any]) -> tuple[str, str]:
+    from_uid = _bounded(payload.get("from"), 128)
+    to_uid = _bounded(payload.get("to"), 128)
+    if not from_uid or not to_uid or from_uid == to_uid:
+        raise ValueError("TIM mirror payload has invalid participants")
+    return from_uid, to_uid
+
+
+def _tim_media_report(payload: Mapping[str, Any]) -> dict[str, Any]:
+    report = payload.get("media_report")
+    if not isinstance(report, Mapping):
+        raise ValueError("TIM media mirror payload has no media report")
+    result = dict(report)
+    attachment_id = _bounded(
+        payload.get("attachment_id") or result.get("attachment_id"), 128
+    )
+    asset_id = _bounded(payload.get("asset_id") or result.get("asset_id"), 128)
+    if not attachment_id or not asset_id:
+        raise ValueError("TIM media mirror payload has no attachment identity")
+    result["attachment_id"] = attachment_id
+    result["asset_id"] = asset_id
+    return result
+
+
+def _tim_media_asset_and_url(
+    payload: Mapping[str, Any],
+) -> tuple[Any, str]:
+    """Resolve one private local asset and issue a bounded compatibility URL."""
+
+    from bbw_web.media_native import (
+        ATTACHMENT_STATUS_SENT,
+        SqlAlchemyMediaNativeRepository,
+    )
+    from bbw_web.media_native.r2_adapter import R2PrivateMediaAdapter
+
+    report = _tim_media_report(payload)
+    attachment_id = _uuid(report["attachment_id"], field="attachment_id")
+    asset_id = _uuid(report["asset_id"], field="asset_id")
+    with session_scope() as db:
+        repository = SqlAlchemyMediaNativeRepository(db)
+        attachment = repository.get_media_attachment(attachment_id)
+        asset = repository.get_media_asset(asset_id)
+        if (
+            attachment is None
+            or attachment.status != ATTACHMENT_STATUS_SENT
+            or attachment.message_id
+            != _uuid(payload.get("canonical_message_id"), field="canonical_message_id")
+            or attachment.payload.asset_id != asset_id
+            or asset is None
+            or asset.owner_user_id != attachment.sender_user_id
+        ):
+            raise ValueError("TIM media mirror asset is unavailable or revoked")
+
+    settings = get_settings()
+    adapter = R2PrivateMediaAdapter(
+        settings,
+        deployment=str(getattr(settings, "environment", "development")),
+    )
+    read = adapter.issue_private_read(
+        asset,
+        expires_at=utcnow() + timedelta(seconds=TIM_MEDIA_READ_TTL_SECONDS),
+    )
+    url = str(read.url or "").strip()
+    if not url.startswith("https://"):
+        raise ValueError("TIM media compatibility URL is unavailable")
+    return asset, url
+
+
+def _tim_media_element(
+    payload: Mapping[str, Any],
+    *,
+    asset: Any,
+    url: str,
+) -> dict[str, Any]:
+    report = _tim_media_report(payload)
+    kind = _bounded(payload.get("message_type"), 32).lower()
+    if kind not in {"image", "audio", "video", "file"}:
+        raise ValueError("TIM media mirror kind is unsupported")
+    media_uuid = _bounded(report.get("asset_id"), 128)
+    size = max(0, int(report.get("size") or getattr(asset, "size_bytes", 0) or 0))
+    filename = _bounded(
+        report.get("name") or getattr(asset, "filename", "") or "文件",
+        255,
+    )
+    if kind == "image":
+        content_type = _bounded(
+            report.get("mime") or getattr(asset, "content_type", ""), 160
+        ).lower()
+        image_format = {
+            "image/gif": 2,
+            "image/png": 3,
+            "image/bmp": 4,
+        }.get(content_type, 1)
+        return {
+            "MsgType": "TIMImageElem",
+            "MsgContent": {
+                "UUID": media_uuid,
+                "ImageFormat": image_format,
+                "ImageInfoArray": [
+                    {
+                        "Type": 0,
+                        "Size": size,
+                        "Width": max(0, int(report.get("width") or 0)),
+                        "Height": max(0, int(report.get("height") or 0)),
+                        "URL": url,
+                    }
+                ],
+            },
+        }
+    if kind == "audio":
+        duration = max(1, int(math.ceil(float(report.get("duration") or 0))))
+        return {
+            "MsgType": "TIMSoundElem",
+            "MsgContent": {
+                "Url": url,
+                "UUID": media_uuid,
+                "Size": size,
+                "Second": duration,
+                "Download_Flag": 2,
+            },
+        }
+    # TIM REST cannot upload a local video thumbnail.  Mirror video as a file
+    # so APK users still receive an attachment without inventing a public image.
+    return {
+        "MsgType": "TIMFileElem",
+        "MsgContent": {
+            "Url": url,
+            "UUID": media_uuid,
+            "FileSize": size,
+            "FileName": filename,
+            "Download_Flag": 2,
+        },
+    }
+
+
+def _tim_mirror_delivery_is_processing(delivery_id: uuid.UUID) -> bool:
+    with session_scope() as db:
+        status = db.scalar(
+            select(MessageDelivery.status).where(
+                MessageDelivery.id == delivery_id,
+                MessageDelivery.channel == TIM_MIRROR_CHANNEL,
+            )
+        )
+    return str(status or "") == "processing"
+
+
+def _tim_media_send_result(
+    delivery_id: uuid.UUID,
+    payload: Mapping[str, Any],
+    sender: MessageMirrorTransport,
+) -> Any:
+    from_uid, to_uid = _tim_mirror_parties(payload)
+    message_type = _bounded(payload.get("message_type"), 32).lower()
+    if not _tim_mirror_delivery_is_processing(delivery_id):
+        raise RuntimeError("TIM media send was cancelled before upstream dispatch")
+    if message_type == "flash":
+        return sender.send_text(
+            from_uid,
+            to_uid,
+            "收到一张闪照，请在 Web 端查看",
+            cloud_custom_data=_tim_mirror_cloud_custom_data(payload),
+            sync_other_machine=1,
+            idempotency_key=_bounded(payload.get("canonical_message_id"), 128),
+        )
+    asset, url = _tim_media_asset_and_url(payload)
+    # Resolving a private URL can overlap a local revoke transaction.  Recheck
+    # immediately before the external call so a cancelled delivery is not sent.
+    if not _tim_mirror_delivery_is_processing(delivery_id):
+        raise RuntimeError("TIM media send was cancelled before upstream dispatch")
+    element = _tim_media_element(payload, asset=asset, url=url)
+    return sender.send_elements(
+        from_uid,
+        to_uid,
+        [element],
+        cloud_custom_data=_tim_mirror_cloud_custom_data(payload),
+        sync_other_machine=1,
+        idempotency_key=_bounded(payload.get("canonical_message_id"), 128),
+    )
+
+
+def _tim_send_delivery_target_key(payload: Mapping[str, Any]) -> str:
+    _from_uid, to_uid = _tim_mirror_parties(payload)
+    message_type = _bounded(payload.get("message_type"), 32).lower()
+    return to_uid if message_type == "text" else f"media-send:{to_uid}"
+
+
+def _tim_send_upstream_key(payload: Mapping[str, Any]) -> tuple[str, str]:
+    canonical_message_id = _uuid(
+        payload.get("canonical_message_id"), field="canonical_message_id"
+    )
+    target_key = _tim_send_delivery_target_key(payload)
+    with session_scope() as db:
+        row = db.scalar(
+            select(MessageDelivery).where(
+                MessageDelivery.message_id == canonical_message_id,
+                MessageDelivery.channel == TIM_MIRROR_CHANNEL,
+                MessageDelivery.target_key == target_key,
+            )
+        )
+        if row is None:
+            return "missing", ""
+        return str(row.status or ""), _bounded(
+            dict(row.payload or {}).get("upstream_message_id"), 256
+        )
+
+
+def _tim_media_send_upstream_key(payload: Mapping[str, Any]) -> tuple[str, str]:
+    """Backward-compatible name for text/media revoke compensation lookup."""
+
+    return _tim_send_upstream_key(payload)
+
+
+def _tim_mirror_dedup_identity(payload: Mapping[str, Any]) -> tuple[int, int]:
+    canonical_message_id = _bounded(payload.get("canonical_message_id"), 128)
+    if not canonical_message_id:
+        raise ValueError("TIM mirror payload has no canonical message identity")
+    digest = hashlib.sha256(canonical_message_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big") or 1, int.from_bytes(
+        digest[4:8], "big"
+    ) or 1
+
+
+def _tim_recall_history_key(
+    payload: Mapping[str, Any],
+    transport: MessageRecallLookupTransport,
+) -> str:
+    """Recover a missing MsgKey from bounded roaming history.
+
+    TIM send retries reuse deterministic MsgSeq/MsgRandom values derived from
+    the canonical message ID.  Matching both that pair and CloudCustomData
+    keeps compensation idempotent even when the original send response omitted
+    MsgKey or the local worker was cancelled before acknowledging it.
+    """
+
+    from_uid, to_uid = _tim_mirror_parties(payload)
+    canonical_message_id = _bounded(payload.get("canonical_message_id"), 128)
+    expected_sequence, expected_random = _tim_mirror_dedup_identity(payload)
+    last_msg_key = ""
+    max_time = int(utcnow().timestamp()) + 60
+    seen_cursors: set[tuple[str, int]] = set()
+    for _page in range(TIM_RECALL_LOOKUP_MAX_PAGES):
+        result = transport.roaming_messages(
+            from_uid,
+            to_uid,
+            min_time=0,
+            max_time=max_time,
+            max_count=100,
+            last_msg_key=last_msg_key,
+        )
+        if not bool(getattr(result, "ok", False)):
+            code = int(getattr(result, "error_code", 0) or 0)
+            info = _bounded(getattr(result, "error_info", ""), 500)
+            raise RuntimeError(
+                f"TIM recall history lookup failed ({code}): {info or 'unknown error'}"
+            )
+        data = getattr(result, "data", None)
+        data = data if isinstance(data, Mapping) else {}
+        rows = data.get("MsgList")
+        rows = rows if isinstance(rows, list) else []
+        for raw in rows:
+            if not isinstance(raw, Mapping):
+                continue
+            cloud_custom_data = (
+                raw.get("CloudCustomData")
+                or raw.get("cloudCustomData")
+                or raw.get("cloud_custom_data")
+                or ""
+            )
+            local_identity = extract_local_message_identity(cloud_custom_data)
+            identity_matches = (
+                _bounded(local_identity.get("canonical_message_id"), 128)
+                == canonical_message_id
+            )
+            sequence_matches = (
+                _as_int(raw.get("MsgSeq"), 0, maximum=0xFFFFFFFF)
+                == expected_sequence
+                and _as_int(raw.get("MsgRandom"), 0, maximum=0xFFFFFFFF)
+                == expected_random
+            )
+            if not identity_matches and not sequence_matches:
+                continue
+            for key in ("MsgKey", "MsgUID", "msg_key", "msg_uid", "message_id"):
+                upstream_message_id = _bounded(raw.get(key), 256)
+                if upstream_message_id:
+                    return upstream_message_id
+
+        next_key = _bounded(data.get("LastMsgKey"), 256)
+        next_time = _as_int(data.get("LastMsgTime"), 0)
+        complete = str(data.get("Complete") or "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        cursor = (next_key, next_time)
+        if complete or not rows or not next_key or cursor in seen_cursors:
+            break
+        seen_cursors.add(cursor)
+        last_msg_key = next_key
+        if next_time > 0:
+            max_time = min(max_time, next_time)
+    return ""
+
+
+def _remember_tim_send_upstream_key(
+    payload: Mapping[str, Any], upstream_message_id: str
+) -> None:
+    key = _bounded(upstream_message_id, 256)
+    if not key:
+        return
+    canonical_message_id = _uuid(
+        payload.get("canonical_message_id"), field="canonical_message_id"
+    )
+    target_key = _tim_send_delivery_target_key(payload)
+    with session_scope() as db:
+        row = db.scalar(
+            select(MessageDelivery)
+            .where(
+                MessageDelivery.message_id == canonical_message_id,
+                MessageDelivery.channel == TIM_MIRROR_CHANNEL,
+                MessageDelivery.target_key == target_key,
+            )
+            .with_for_update()
+        )
+        if row is None:
+            return
+        row.payload = {
+            **dict(row.payload or {}),
+            "upstream_message_id": key,
+            "upstream_message_id_recovered": True,
+        }
+
+
+def _remember_tim_media_send_upstream_key(
+    payload: Mapping[str, Any], upstream_message_id: str
+) -> None:
+    """Backward-compatible name for text/media compensation persistence."""
+
+    _remember_tim_send_upstream_key(payload, upstream_message_id)
+
+
+def _tim_media_revoke_result(
+    payload: Mapping[str, Any],
+    sender: MessageMirrorTransport,
+    *,
+    delivery_id: uuid.UUID | None = None,
+) -> Any:
+    if delivery_id is not None and not _tim_mirror_delivery_is_processing(
+        delivery_id
+    ):
+        raise RuntimeError("TIM revoke was cancelled before upstream dispatch")
+    from_uid, to_uid = _tim_mirror_parties(payload)
+    send_status, upstream_message_id = _tim_media_send_upstream_key(payload)
+    if not upstream_message_id and isinstance(sender, MessageRecallLookupTransport):
+        if delivery_id is not None and not _tim_mirror_delivery_is_processing(
+            delivery_id
+        ):
+            raise RuntimeError(
+                "TIM revoke was cancelled before upstream history lookup"
+            )
+        upstream_message_id = _tim_recall_history_key(payload, sender)
+        if upstream_message_id:
+            _remember_tim_media_send_upstream_key(payload, upstream_message_id)
+    if not upstream_message_id:
+        raise RuntimeError(
+            f"TIM send result is not ready for revoke ({send_status or 'unknown'})"
+        )
+    if delivery_id is not None and not _tim_mirror_delivery_is_processing(
+        delivery_id
+    ):
+        raise RuntimeError("TIM revoke was cancelled before upstream dispatch")
+    result = sender.revoke_c2c(from_uid, to_uid, upstream_message_id)
+    if not bool(getattr(result, "ok", False)) and int(
+        getattr(result, "error_code", 0) or 0
+    ) not in {20022, 20023}:
+        return result
+    return result
+
+
+def _remember_cancelled_tim_upstream_id(
+    delivery_id: uuid.UUID,
+    upstream_message_id: str,
+) -> None:
+    if not upstream_message_id:
+        return
+    with session_scope() as db:
+        row = db.scalar(
+            select(MessageDelivery)
+            .where(
+                MessageDelivery.id == delivery_id,
+                MessageDelivery.channel == TIM_MIRROR_CHANNEL,
+            )
+            .with_for_update()
+        )
+        if row is None or str(row.status or "") != "cancelled":
+            return
+        row.payload = {
+            **dict(row.payload or {}),
+            "upstream_message_id": upstream_message_id[:256],
+            "upstream_send_completed_after_cancel": True,
+        }
+
+
+def _tim_mirror_upstream_id(result: Any) -> str:
+    data = getattr(result, "data", None)
+    if not isinstance(data, Mapping):
+        return ""
+    for key in ("MsgKey", "MsgUID", "msg_key", "msg_uid", "message_id"):
+        value = _bounded(data.get(key), 256)
+        if value:
+            return value
+    return ""
+
+
+def _tim_mirror_backoff_seconds(attempt: int) -> int:
+    exponent = min(max(0, int(attempt) - 1), 7)
+    return min(TIM_MIRROR_BACKOFF_MAX_SECONDS, 30 * (2**exponent))
+
+
+def _mark_tim_mirror_delivered(
+    delivery_id: uuid.UUID,
+    *,
+    upstream_message_id: str,
+) -> str:
+    with session_scope() as db:
+        row = SqlAlchemyCanonicalMessageStore(db).mark_tim_delivered(
+            delivery_id,
+            delivered_at=utcnow(),
+            upstream_message_id=upstream_message_id,
+        )
+        return str(row.status) if row is not None else "missing"
+
+
+def _mark_tim_mirror_failed(
+    delivery_id: uuid.UUID,
+    *,
+    attempt: int,
+    error: str,
+) -> tuple[str, int]:
+    delay = _tim_mirror_backoff_seconds(attempt)
+    with session_scope() as db:
+        row = SqlAlchemyCanonicalMessageStore(db).mark_tim_failed(
+            delivery_id,
+            error=error,
+            retry_at=utcnow() + timedelta(seconds=delay),
+        )
+        return (str(row.status) if row is not None else "missing", delay)
+
+
+def mirror_tim_message_delivery(
+    delivery_id: str,
+    *,
+    transport: MessageSendTransport | MessageMirrorTransport | None = None,
+) -> dict[str, Any]:
+    """Mirror one canonical local message to TIM without changing local success."""
+
+    operation_id = _uuid(delivery_id, field="delivery_id")
+    mode = compatibility_mode()
+    if mode is not CompatibilityMode.ENABLED:
+        return {
+            "ok": True,
+            "ignored": True,
+            "delivery_id": str(operation_id),
+            "reason": "legacy compatibility dispatch is disabled",
+            "compatibility_mode": mode.value,
+        }
+    claimed = _claim_tim_message_delivery(operation_id)
+    if claimed is None:
+        return {"ok": True, "ignored": True, "delivery_id": str(operation_id)}
+    payload = claimed.payload
+    operation = _bounded(payload.get("operation"), 16).lower() or "send"
+    message_type = _bounded(payload.get("message_type"), 32).lower() or "text"
+    try:
+        enforce_state_recheck = transport is None
+        sender = transport or _default_message_send_transport()
+        if operation == "revoke":
+            if not isinstance(sender, MessageMirrorTransport):
+                raise RuntimeError("TIM mirror transport cannot revoke messages")
+            result = _tim_media_revoke_result(
+                payload,
+                sender,
+                delivery_id=operation_id if enforce_state_recheck else None,
+            )
+        elif message_type == "text":
+            from_uid, to_uid, text, cloud_custom_data = _tim_mirror_send_values(
+                payload
+            )
+            if enforce_state_recheck and not _tim_mirror_delivery_is_processing(
+                operation_id
+            ):
+                raise RuntimeError("TIM text send was cancelled before upstream dispatch")
+            result = sender.send_text(
+                from_uid,
+                to_uid,
+                text,
+                cloud_custom_data=cloud_custom_data,
+                sync_other_machine=1,
+                idempotency_key=_bounded(
+                    payload.get("canonical_message_id"), 128
+                ),
+            )
+        else:
+            if not isinstance(sender, MessageMirrorTransport):
+                raise RuntimeError("TIM mirror transport cannot send media")
+            result = _tim_media_send_result(operation_id, payload, sender)
+        accepted_missing_revoke = operation == "revoke" and int(
+            getattr(result, "error_code", 0) or 0
+        ) in {20022, 20023}
+        if not bool(getattr(result, "ok", False)) and not accepted_missing_revoke:
+            code = int(getattr(result, "error_code", 0) or 0)
+            info = _bounded(getattr(result, "error_info", ""), 500)
+            raise RuntimeError(f"TIM mirror rejected ({code}): {info or 'unknown error'}")
+    except Exception as exc:
+        status, delay = _mark_tim_mirror_failed(
+            operation_id,
+            attempt=claimed.attempt,
+            error=str(exc)[:2000],
+        )
+        return {
+            "ok": False,
+            "delivery_id": str(operation_id),
+            "local_delivery_unchanged": True,
+            "retry": status == "retry",
+            "retry_after": delay if status == "retry" else 0,
+            "status": status,
+        }
+
+    upstream_message_id = _tim_mirror_upstream_id(result)
+    status = _mark_tim_mirror_delivered(
+        operation_id,
+        upstream_message_id=upstream_message_id,
+    )
+    if status == "cancelled" and operation == "send":
+        _remember_cancelled_tim_upstream_id(operation_id, upstream_message_id)
+    return {
+        "ok": status == "delivered",
+        "canonical_message_id": _bounded(payload.get("canonical_message_id"), 128),
+        "client_message_id": _bounded(payload.get("client_message_id"), 160),
+        "delivery_id": str(operation_id),
+        "local_delivery_unchanged": True,
+        "status": status,
+        "operation": operation,
+        "message_type": message_type,
+        "upstream_message_id": upstream_message_id,
+    }
+
+
+def _due_tim_mirror_deliveries(*, limit: int, now: datetime) -> list[tuple[uuid.UUID, int]]:
+    due_state = or_(
+        and_(
+            MessageDelivery.status.in_(("pending", "retry")),
+            MessageDelivery.available_at <= now,
+            or_(
+                MessageDelivery.locked_until.is_(None),
+                MessageDelivery.locked_until <= now,
+            ),
+        ),
+        and_(
+            MessageDelivery.status == "processing",
+            or_(
+                MessageDelivery.locked_until.is_(None),
+                MessageDelivery.locked_until <= now,
+            ),
+        ),
+    )
+    with session_scope() as db:
+        exhausted = list(
+            db.scalars(
+                select(MessageDelivery)
+                .where(
+                    MessageDelivery.channel == TIM_MIRROR_CHANNEL,
+                    MessageDelivery.required.is_(False),
+                    MessageDelivery.attempt_count >= MessageDelivery.max_attempts,
+                    due_state,
+                )
+                .with_for_update(skip_locked=True)
+                .limit(min(max(1, int(limit)), 100))
+            )
+        )
+        for row in exhausted:
+            row.status = "failed"
+            row.locked_by = None
+            row.locked_until = None
+            row.last_error = row.last_error or "TIM mirror retry budget exhausted"
+        rows = list(
+            db.scalars(
+                select(MessageDelivery)
+                .where(
+                    MessageDelivery.channel == TIM_MIRROR_CHANNEL,
+                    MessageDelivery.required.is_(False),
+                    MessageDelivery.attempt_count < MessageDelivery.max_attempts,
+                    due_state,
+                )
+                .order_by(MessageDelivery.available_at, MessageDelivery.created_at)
+                .with_for_update(skip_locked=True)
+                .limit(min(max(1, int(limit)), 100))
+            )
+        )
+        return [(row.id, int(row.attempt_count) + 1) for row in rows]
+
+
+def dispatch_due_tim_message_deliveries(
+    *,
+    connection: Redis | None = None,
+    limit: int = 20,
+) -> dict[str, int | bool]:
+    """Enqueue due TIM mirrors; the worker performs the authoritative claim."""
+
+    if not compatibility_dispatch_enabled():
+        return {"ok": True, "due": 0, "dispatched": 0, "queue_errors": 0}
+    candidates = _due_tim_mirror_deliveries(limit=limit, now=utcnow())
+    redis_connection = connection
+    if redis_connection is None:
+        redis_connection = Redis.from_url(get_settings().redis_url)
+    queue = Queue("sync", connection=redis_connection)
+    dispatched = 0
+    queue_errors = 0
+    for delivery_id, next_attempt in candidates:
+        try:
+            queue.enqueue(
+                "bbw_web.jobs.mirror_tim_message_delivery",
+                str(delivery_id),
+                job_id=f"mirror-tim-message-{delivery_id}-{next_attempt}",
+                job_timeout=TIM_MIRROR_JOB_TIMEOUT_SECONDS,
+                result_ttl=600,
+                failure_ttl=7 * 86400,
+            )
+            dispatched += 1
+        except Exception as exc:
+            if _duplicate_queue_error(exc):
+                dispatched += 1
+            else:
+                queue_errors += 1
+    return {
+        "ok": queue_errors == 0,
+        "due": len(candidates),
+        "dispatched": dispatched,
+        "queue_errors": queue_errors,
+    }
+
+
+def dispatch_due_compatibility_operations(
+    *,
+    limit: int | None = None,
+) -> dict[str, int | bool]:
+    """Run one bounded PostgreSQL-authoritative Banghua compatibility batch.
+
+    ``compatibility_outbox.dispatch_due`` owns row leases and converts every
+    provider failure into ``retry``/``failed`` state.  This RQ entry point
+    therefore completes normally when Banghua is unavailable and never turns
+    an already committed Web-local mutation into a failed product request.
+    """
+
+    from bbw_web.compatibility_outbox import dispatch_due
+
+    batch_size = (
+        max(1, min(int(limit), 100))
+        if limit is not None
+        else max(
+            1,
+            min(
+                100,
+                _as_int(
+                    os.getenv("BBW_COMPATIBILITY_OUTBOX_BATCH_SIZE"),
+                    20,
+                    minimum=1,
+                    maximum=100,
+                ),
+            ),
+        )
+    )
+    # One batch can contain several 30-second legacy calls.  Keep its row
+    # leases aligned with the RQ timeout so a second worker cannot reclaim the
+    # tail of the batch while this job is still processing it.
+    summary = dispatch_due(limit=batch_size, lease_seconds=900)
+    return {"ok": True, **summary}
+
+
+def _enqueue_compatibility_outbox_dispatch(
+    *,
+    connection: Redis,
+) -> dict[str, int | bool]:
+    """Enqueue at most one compatibility consumer without creating backlog."""
+
+    if not compatibility_dispatch_enabled():
+        return {"ok": True, "dispatched": 0, "queue_errors": 0}
+    queue = Queue("sync", connection=connection)
+    try:
+        queue.enqueue(
+            "bbw_web.jobs.dispatch_due_compatibility_operations",
+            job_id="dispatch-compatibility-outbox",
+            job_timeout=900,
+            result_ttl=30,
+            failure_ttl=90,
+        )
+        dispatched = 1
+        queue_errors = 0
+    except Exception as exc:
+        if _duplicate_queue_error(exc):
+            dispatched = 1
+            queue_errors = 0
+        else:
+            dispatched = 0
+            queue_errors = 1
+    return {
+        "ok": queue_errors == 0,
+        "dispatched": dispatched,
+        "queue_errors": queue_errors,
+    }
 
 
 def _claim_media_outboxes(
@@ -1307,6 +2184,12 @@ def _history_message_report(
     )
     if media:
         media.pop("_kind", None)
+    cloud_custom_data = (
+        item.get("cloud_custom_data")
+        or item.get("cloudCustomData")
+        or item.get("CloudCustomData")
+    )
+    local_identity = extract_local_message_identity(cloud_custom_data)
     identity = (
         item.get("id")
         or item.get("msg_key")
@@ -1320,6 +2203,9 @@ def _history_message_report(
         "direction": direction,
         "upstream_message_id": str(item.get("id") or ""),
         "message_key": str(item.get("msg_key") or item.get("MsgKey") or ""),
+        "canonical_message_id": local_identity.get("canonical_message_id", ""),
+        "client_message_id": local_identity.get("client_message_id", ""),
+        "client_message_key": local_identity.get("client_message_id", ""),
         "message_sequence": str(
             item.get("sequence") or item.get("msg_sequence") or item.get("MsgSeq") or ""
         ),
@@ -1342,11 +2228,7 @@ def _history_message_report(
         "read_at": str(item.get("read_time") or item.get("readTime") or ""),
         "flash_id": str(item.get("flash_unique_id") or ""),
         "media": media,
-        "quote": extract_message_quote(
-            item.get("cloud_custom_data")
-            or item.get("cloudCustomData")
-            or item.get("CloudCustomData")
-        ),
+        "quote": extract_message_quote(cloud_custom_data),
         "sender_upstream_uid": from_uid,
         "recipient_upstream_uid": to_uid,
     }
@@ -2048,10 +2930,490 @@ def _cursor_values(
     }
 
 
+@dataclass(frozen=True, slots=True)
+class _AutonomyReplyCandidate:
+    message_id: uuid.UUID
+    peer_upstream_uid: str
+    message_identity: str
+
+
+def _unanswered_autonomy_reply_candidates(
+    db: Any,
+    *,
+    owner_user_id: uuid.UUID,
+    limit: int,
+) -> list[_AutonomyReplyCandidate]:
+    """Return unanswered heads that have never been bound to an autonomy task.
+
+    Excluding existing task rows in SQL lets the database scan past old failed,
+    cancelled or otherwise terminal work instead of allowing those rows to
+    consume the scheduler's bounded candidate window forever.
+    """
+
+    later = aliased(Message)
+    later_exists = exists(
+        select(later.id).where(
+            later.owner_user_id == Message.owner_user_id,
+            later.conversation_id == Message.conversation_id,
+            or_(
+                later.occurred_at > Message.occurred_at,
+                and_(
+                    later.occurred_at == Message.occurred_at,
+                    later.id > Message.id,
+                ),
+            ),
+        )
+    )
+    existing_task = exists(
+        select(AiAgentAutonomyTask.id).where(
+            AiAgentAutonomyTask.owner_user_id == owner_user_id,
+            AiAgentAutonomyTask.source_message_id == Message.id,
+        )
+    )
+    metadata_origin = func.coalesce(
+        Message.extra_data.op("->>")("origin"), ""
+    )
+    client_key = func.coalesce(
+        Message.extra_data.op("->>")("client_message_key"),
+        Message.extra_data.op("->>")("client_message_id"),
+        "",
+    )
+    metadata_revoked = func.lower(
+        func.coalesce(Message.extra_data.op("->>")("revoked"), "false")
+    )
+    maximum = min(max(1, int(limit)), 50)
+    rows = list(
+        db.execute(
+            select(Message, Conversation)
+            .join(Conversation, Conversation.id == Message.conversation_id)
+            .where(
+                Message.owner_user_id == owner_user_id,
+                Conversation.owner_user_id == owner_user_id,
+                Message.provider == "web-local",
+                Conversation.provider == "web-local",
+                Message.direction == "incoming",
+                func.lower(Message.message_type).in_(("text", "timtextelem")),
+                func.length(func.btrim(func.coalesce(Message.body, ""))) > 0,
+                func.lower(Message.status) != "revoked",
+                metadata_revoked.notin_(("true", "1")),
+                func.lower(metadata_origin) != "agent",
+                ~client_key.like("agent:%"),
+                ~later_exists,
+                ~existing_task,
+                func.length(
+                    func.btrim(func.coalesce(Conversation.peer_upstream_uid, ""))
+                )
+                > 0,
+                or_(
+                    Message.sender_upstream_uid.is_(None),
+                    func.length(
+                        func.btrim(func.coalesce(Message.sender_upstream_uid, ""))
+                    )
+                    == 0,
+                    Message.sender_upstream_uid == Conversation.peer_upstream_uid,
+                ),
+            )
+            .order_by(Message.occurred_at.asc(), Message.id.asc())
+            .limit(maximum)
+        )
+    )
+    candidates: list[_AutonomyReplyCandidate] = []
+    for message, conversation in rows:
+        metadata = message.extra_data if isinstance(message.extra_data, Mapping) else {}
+        identity = str(metadata.get("canonical_message_id") or "").strip()
+        if not identity:
+            identity = f"{message.provider}:{message.upstream_message_id}"
+        candidates.append(
+            _AutonomyReplyCandidate(
+                message_id=message.id,
+                peer_upstream_uid=str(conversation.peer_upstream_uid or "").strip(),
+                message_identity=identity,
+            )
+        )
+    return candidates
+
+
+def _schedule_autonomy_owner(
+    owner_user_id: uuid.UUID,
+    *,
+    now: datetime,
+    task_limit: int,
+    failure_backoff_seconds: int,
+) -> dict[str, int | bool]:
+    """Create bounded, database-idempotent tasks for one authorized owner."""
+
+    from bbw_agent.autonomous import (
+        FOLLOW_USER,
+        PUBLISH_TEXT_POST,
+        SEND_PRIVATE_MESSAGE,
+        UNFOLLOW_USER,
+        AutonomyTaskType,
+        deterministic_task_key,
+        policy_budget_day,
+        quiet_window_end,
+    )
+    from bbw_agent.repositories import (
+        AgentAutonomySettingRepository,
+        AgentAutonomyTaskRepository,
+    )
+    from bbw_agent.runtime import policy_from_rows
+
+    created = 0
+    reused = 0
+    with session_scope() as db:
+        settings_repository = AgentAutonomySettingRepository(db)
+        snapshot = settings_repository.get_policy_snapshot(
+            owner_user_id,
+            for_update=True,
+        )
+        if snapshot is None:
+            return {"eligible": False, "created": 0, "reused": 0}
+        setting = snapshot["autonomy_setting"]
+        if (
+            not setting.user_enabled
+            or setting.halted_at is not None
+            or (
+                setting.next_run_at is not None
+                and setting.next_run_at > now
+            )
+        ):
+            return {"eligible": False, "created": 0, "reused": 0}
+        account = snapshot.get("external_account")
+        try:
+            policy = (
+                policy_from_rows(
+                    owner_user_id=owner_user_id,
+                    external_account_id=account.id,
+                    user=snapshot.get("user"),
+                    system=snapshot.get("system_setting"),
+                    autonomy_setting=setting,
+                    execution_setting=snapshot.get("execution_setting"),
+                    runner_setting=snapshot.get("agent_setting"),
+                    connection=snapshot.get("connection"),
+                )
+                if account is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            policy = None
+            setting.halted_at = now
+            setting.halted_reason = "autonomy_policy_invalid"
+            setting.next_run_at = None
+        if policy is None or not policy.active:
+            if setting.halted_at is None:
+                setting.next_run_at = now + timedelta(
+                    seconds=failure_backoff_seconds
+                )
+            setting.last_run_at = now
+            return {"eligible": False, "created": 0, "reused": 0}
+
+        if (
+            policy.relationship_actions_enabled
+            and FOLLOW_USER in policy.selected_actions
+            and UNFOLLOW_USER in policy.selected_actions
+        ):
+            setting.halted_at = now
+            setting.halted_reason = "autonomy_relationship_action_conflict"
+            setting.next_run_at = None
+            setting.last_run_at = now
+            setting.updated_at = now
+            return {"eligible": False, "created": 0, "reused": 0}
+
+        tasks = AgentAutonomyTaskRepository(db)
+        remaining = max(1, min(int(task_limit), 50))
+        if policy.auto_reply_enabled and remaining > 0:
+            candidates = _unanswered_autonomy_reply_candidates(
+                db,
+                owner_user_id=owner_user_id,
+                limit=50,
+            )
+            for candidate in candidates:
+                key = deterministic_task_key(
+                    owner_user_id=owner_user_id,
+                    task_type=AutonomyTaskType.REPLY_TO_MESSAGE,
+                    source_identity=candidate.message_identity,
+                )
+                _, was_created = tasks.enqueue(
+                    owner_user_id=owner_user_id,
+                    external_account_id=account.id,
+                    task_type=AutonomyTaskType.REPLY_TO_MESSAGE.value,
+                    action_type=SEND_PRIVATE_MESSAGE,
+                    idempotency_key=key,
+                    policy_version=policy.version,
+                    execution_setting_version=policy.execution_setting_version,
+                    runner_setting_version=policy.runner_setting_version,
+                    model_connection_id=policy.model_connection_id,
+                    runner_configuration_fingerprint=(
+                        policy.runner_configuration_fingerprint
+                    ),
+                    source_message_id=candidate.message_id,
+                    source_message_identity=candidate.message_identity,
+                    target_upstream_uid=candidate.peer_upstream_uid,
+                    generation_instruction=str(setting.operation_brief or ""),
+                    not_before=now,
+                )
+                if was_created:
+                    created += 1
+                    remaining -= 1
+                else:
+                    reused += 1
+                if remaining <= 0:
+                    break
+
+        post_due = bool(
+            policy.scheduled_posts_enabled
+            and remaining > 0
+            and (
+                setting.last_post_at is None
+                or setting.last_post_at
+                + timedelta(minutes=int(setting.post_interval_minutes))
+                <= now
+            )
+        )
+        if post_due:
+            scheduled_for = quiet_window_end(policy, now=now) or now
+            interval_seconds = int(setting.post_interval_minutes) * 60
+            slot = int(scheduled_for.timestamp()) // interval_seconds
+            source_identity = f"post:{policy.version}:{slot}"
+            key = deterministic_task_key(
+                owner_user_id=owner_user_id,
+                task_type=AutonomyTaskType.SCHEDULED_POST,
+                source_identity=source_identity,
+            )
+            _, was_created = tasks.enqueue(
+                owner_user_id=owner_user_id,
+                external_account_id=account.id,
+                task_type=AutonomyTaskType.SCHEDULED_POST.value,
+                action_type=PUBLISH_TEXT_POST,
+                idempotency_key=key,
+                policy_version=policy.version,
+                execution_setting_version=policy.execution_setting_version,
+                runner_setting_version=policy.runner_setting_version,
+                model_connection_id=policy.model_connection_id,
+                runner_configuration_fingerprint=(
+                    policy.runner_configuration_fingerprint
+                ),
+                schedule_slot=str(slot),
+                generation_instruction=str(setting.operation_brief or ""),
+                scheduled_for=scheduled_for,
+                not_before=scheduled_for,
+            )
+            created += int(was_created)
+            reused += int(not was_created)
+            remaining -= 1
+
+        if policy.relationship_actions_enabled and remaining > 0:
+            budget_day = policy_budget_day(policy, now=now).isoformat()
+            for target in sorted(policy.target_allowlist):
+                active = tasks.relationship_is_active(
+                    owner_user_id=owner_user_id,
+                    target_upstream_uid=target,
+                )
+                action = ""
+                task_type = None
+                if FOLLOW_USER in policy.selected_actions and not active:
+                    action = FOLLOW_USER
+                    task_type = AutonomyTaskType.FOLLOW_TARGET
+                elif (
+                    UNFOLLOW_USER in policy.selected_actions
+                    and FOLLOW_USER not in policy.selected_actions
+                    and active
+                ):
+                    action = UNFOLLOW_USER
+                    task_type = AutonomyTaskType.UNFOLLOW_TARGET
+                if task_type is None:
+                    continue
+                source_identity = f"relationship:{action}:{target}:{budget_day}"
+                key = deterministic_task_key(
+                    owner_user_id=owner_user_id,
+                    task_type=task_type,
+                    source_identity=source_identity,
+                )
+                _, was_created = tasks.enqueue(
+                    owner_user_id=owner_user_id,
+                    external_account_id=account.id,
+                    task_type=task_type.value,
+                    action_type=action,
+                    idempotency_key=key,
+                    policy_version=policy.version,
+                    execution_setting_version=policy.execution_setting_version,
+                    runner_setting_version=policy.runner_setting_version,
+                    model_connection_id=policy.model_connection_id,
+                    runner_configuration_fingerprint=(
+                        policy.runner_configuration_fingerprint
+                    ),
+                    schedule_slot=budget_day,
+                    target_upstream_uid=target,
+                    not_before=now,
+                )
+                created += int(was_created)
+                reused += int(not was_created)
+                remaining -= 1
+                if remaining <= 0:
+                    break
+
+        setting.last_run_at = now
+        setting.next_run_at = now + timedelta(seconds=60)
+        setting.updated_at = now
+    return {"eligible": True, "created": created, "reused": reused}
+
+
+def schedule_due_agent_runs(
+    *,
+    connection: Redis | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Scan due policies, create safe tasks and enqueue only opaque task IDs."""
+
+    from bbw_agent.repositories import (
+        AgentAutonomySettingRepository,
+        AgentAutonomyTaskRepository,
+    )
+
+    settings = get_settings()
+    if not bool(getattr(settings, "ai_agent_background_enabled", False)):
+        return {"ok": True, "enabled": False, "scheduled": 0}
+    batch_size = min(
+        max(
+            1,
+            int(
+                limit
+                if limit is not None
+                else getattr(settings, "ai_agent_dispatch_batch_size", 10)
+            ),
+        ),
+        50,
+    )
+    failure_backoff = min(
+        max(
+            60,
+            int(getattr(settings, "ai_agent_failure_backoff_seconds", 300)),
+        ),
+        3600,
+    )
+    now = utcnow()
+    with session_scope() as db:
+        stale_unknown = AgentAutonomyTaskRepository(
+            db
+        ).mark_expired_dispatching_unknown(
+            before=now - timedelta(seconds=600),
+            stable_error_code="worker_lost",
+        )
+        due_owner_ids = [
+            row.owner_user_id
+            for row in AgentAutonomySettingRepository(db).due(
+                at=now,
+                limit=batch_size,
+                for_update=False,
+            )
+        ]
+
+    created = 0
+    reused = 0
+    eligible = 0
+    for owner_user_id in due_owner_ids:
+        if created >= batch_size:
+            break
+        summary = _schedule_autonomy_owner(
+            owner_user_id,
+            now=now,
+            task_limit=batch_size - created,
+            failure_backoff_seconds=failure_backoff,
+        )
+        created += int(summary["created"])
+        reused += int(summary["reused"])
+        eligible += int(bool(summary["eligible"]))
+
+    with session_scope() as db:
+        task_ids = AgentAutonomyTaskRepository(db).due_task_ids(
+            now=now,
+            limit=batch_size,
+        )
+    redis_connection = connection or Redis.from_url(settings.redis_url)
+    queue = Queue("agent", connection=redis_connection)
+    dispatched = 0
+    queue_errors = 0
+    for task_id in task_ids:
+        try:
+            queue.enqueue(
+                "bbw_web.jobs.run_unattended_agent",
+                str(task_id),
+                job_id=f"autonomy-task-v1-{task_id}",
+                job_timeout=300,
+                result_ttl=0,
+                failure_ttl=300,
+            )
+            dispatched += 1
+        except Exception as exc:
+            if _duplicate_queue_error(exc):
+                dispatched += 1
+            else:
+                queue_errors += 1
+    return {
+        "ok": queue_errors == 0,
+        "enabled": True,
+        "owners_due": len(due_owner_ids),
+        "owners_eligible": eligible,
+        "tasks_created": created,
+        "tasks_reused": reused,
+        "tasks_due": len(task_ids),
+        "scheduled": dispatched,
+        "queue_errors": queue_errors,
+        "stale_dispatches_halted": stale_unknown,
+    }
+
+
+def run_unattended_agent(task_id: str) -> dict[str, Any]:
+    """Execute one database-bound task without any browser/provider session."""
+
+    from bbw_agent.autonomous import AgentAutonomyOrchestrator
+    from bbw_agent.runtime import (
+        ByokAgentAutonomyModelRunner,
+        FixedLayerAgentAutonomyDispatcher,
+        SqlAgentAutonomyStore,
+        SqlAlchemyAgentAutonomyDispatchGate,
+        bound_sql_agent_autonomy_repository_factory,
+    )
+    from bbw_web.persistence import RuntimePersistence
+
+    settings = get_settings()
+    if not bool(getattr(settings, "ai_agent_background_enabled", False)):
+        return {"ok": True, "enabled": False, "status": "disabled"}
+    parsed_task_id = _uuid(task_id, field="task_id")
+    persistence = RuntimePersistence(settings)
+    try:
+        orchestrator = AgentAutonomyOrchestrator(
+            store=SqlAgentAutonomyStore(
+                bound_sql_agent_autonomy_repository_factory(parsed_task_id)
+            ),
+            model_runner=ByokAgentAutonomyModelRunner(
+                settings=settings,
+                cipher=persistence.cipher,
+            ),
+            dispatcher=FixedLayerAgentAutonomyDispatcher(
+                persistence=persistence,
+                dispatch_gate=SqlAlchemyAgentAutonomyDispatchGate(),
+            ),
+            lease_seconds=300,
+        )
+        result = orchestrator.run_once(worker_id=_worker_identity())
+        return {
+            "ok": True,
+            "enabled": True,
+            "status": result.status,
+            "code": result.code,
+            "task_id": str(result.task_id) if result.task_id else None,
+        }
+    finally:
+        persistence.close()
+
+
 def schedule_due_syncs() -> dict[str, Any]:
     """Lease due accounts, enqueue reconciliation, and dispatch durable media work."""
 
     settings = get_settings()
+    mode = compatibility_mode(settings)
+    legacy_dispatch_enabled = mode is CompatibilityMode.ENABLED
     active_seconds = _setting_seconds(settings, "active_sync_seconds", "BBW_ACTIVE_SYNC_SECONDS", 300)
     inactive_seconds = _setting_seconds(
         settings, "inactive_sync_seconds", "BBW_INACTIVE_SYNC_SECONDS", 3600
@@ -2061,14 +3423,21 @@ def schedule_due_syncs() -> dict[str, Any]:
     candidates: list[tuple[uuid.UUID, uuid.UUID, int]] = []
     with session_scope() as db:
         active_ids = _active_owner_ids(db, now=now, active_seconds=active_seconds)
-        account_rows = list(
-            db.execute(
-                select(ExternalAccount, User)
-                .join(User, User.id == ExternalAccount.user_id)
-                .where(ExternalAccount.sync_enabled.is_(True), User.status == "active")
-                .order_by(ExternalAccount.last_sync_at.asc().nullsfirst())
-                .limit(500)
+        account_rows = (
+            list(
+                db.execute(
+                    select(ExternalAccount, User)
+                    .join(User, User.id == ExternalAccount.user_id)
+                    .where(
+                        ExternalAccount.sync_enabled.is_(True),
+                        User.status == "active",
+                    )
+                    .order_by(ExternalAccount.last_sync_at.asc().nullsfirst())
+                    .limit(500)
+                )
             )
+            if legacy_dispatch_enabled
+            else []
         )
         cursor_rows = {
             row.owner_user_id: row
@@ -2150,12 +3519,35 @@ def schedule_due_syncs() -> dict[str, Any]:
         limit=20,
     )
     media_dispatched = _dispatch_media_outboxes(limit=20)
+    tim_mirror_batch_size = max(
+        1,
+        min(
+            100,
+            _as_int(
+                os.getenv("BBW_TIM_MIRROR_BATCH_SIZE"),
+                20,
+                minimum=1,
+                maximum=100,
+            ),
+        ),
+    )
+    tim_mirrors = dispatch_due_tim_message_deliveries(
+        connection=connection,
+        limit=tim_mirror_batch_size,
+    )
+    compatibility = _enqueue_compatibility_outbox_dispatch(connection=connection)
     return {
         "ok": True,
+        "compatibility_mode": mode.value,
         "scheduled": len(scheduled),
         "queue_errors": queue_errors,
         "media_recovered": media_recovered,
         "media_dispatched": media_dispatched,
+        "tim_mirror_due": tim_mirrors["due"],
+        "tim_mirror_dispatched": tim_mirrors["dispatched"],
+        "tim_mirror_queue_errors": tim_mirrors["queue_errors"],
+        "compatibility_dispatched": compatibility["dispatched"],
+        "compatibility_queue_errors": compatibility["queue_errors"],
     }
 
 
@@ -2202,7 +3594,7 @@ def _save_sync_result(
 
 
 def _tim_c2c_unread_counts(
-    client: TimRestClient,
+    client: MessageHistoryTransport,
     account_uid: str,
     peers: Sequence[str],
 ) -> tuple[dict[str, int], int]:
@@ -2258,7 +3650,7 @@ def _tim_apply_outgoing_read_state(
 
 
 def _tim_recent_conversations(
-    client: TimRestClient,
+    client: MessageHistoryTransport,
     account_uid: str,
     *,
     max_pages: int,
@@ -2417,7 +3809,7 @@ def _durable_message_conversations(
 
 
 def _tim_roaming_history(
-    client: TimRestClient,
+    client: MessageHistoryTransport,
     *,
     account_uid: str,
     peer_uid: str,
@@ -2483,9 +3875,22 @@ def _tim_roaming_history(
     return ordered, request_count
 
 
-def sync_account_history(owner_user_id: str, external_account_id: str) -> dict[str, Any]:
+def sync_account_history(
+    owner_user_id: str,
+    external_account_id: str,
+    *,
+    transport_factory: Callable[[], MessageHistoryTransport] | None = None,
+) -> dict[str, Any]:
     """Reconcile C2C conversations/messages through server-owned TIM REST APIs."""
 
+    mode = compatibility_mode()
+    if mode is not CompatibilityMode.ENABLED:
+        return {
+            "ok": True,
+            "ignored": True,
+            "reason": "legacy compatibility dispatch is disabled",
+            "compatibility_mode": mode.value,
+        }
     owner_id = _uuid(owner_user_id, field="owner_user_id")
     account_id = _uuid(external_account_id, field="external_account_id")
     settings = get_settings()
@@ -2566,7 +3971,7 @@ def sync_account_history(owner_user_id: str, external_account_id: str) -> dict[s
         )
 
     watermark: datetime | None = previous_watermark
-    client = TimRestClient()
+    client = (transport_factory or _default_message_history_transport)()
     try:
         contact_fallback = False
         try:
@@ -3074,6 +4479,111 @@ def archive_media_job(outbox_id: str) -> dict[str, Any]:
             prepared.cleanup()
 
 
+def _cleanup_web_native_media(
+    settings: Settings,
+    storage: R2Storage,
+    *,
+    at: datetime,
+    limit: int = WEB_NATIVE_MEDIA_CLEANUP_BATCH,
+) -> dict[str, int]:
+    """Clean Web-native upload artifacts and release committed asset quota."""
+
+    from bbw_web.media_native.r2_adapter import R2PrivateMediaAdapter
+    from bbw_web.media_native.repository import SqlAlchemyMediaNativeRepository
+
+    bounded_limit = max(1, min(int(limit), 1000))
+    grace_seconds = max(
+        60 * 60,
+        min(
+            30 * 24 * 60 * 60,
+            int(
+                getattr(
+                    settings,
+                    "media_native_unsent_grace_seconds",
+                    WEB_NATIVE_MEDIA_UNSENT_GRACE_SECONDS,
+                )
+                or WEB_NATIVE_MEDIA_UNSENT_GRACE_SECONDS
+            ),
+        ),
+    )
+    unsent_grace = timedelta(seconds=grace_seconds)
+    upload_cleanup_grace = timedelta(
+        seconds=max(
+            5 * 60,
+            min(
+                24 * 60 * 60,
+                int(
+                    getattr(
+                        settings,
+                        "media_native_upload_cleanup_grace_seconds",
+                        WEB_NATIVE_UPLOAD_CLEANUP_GRACE_SECONDS,
+                    )
+                    or WEB_NATIVE_UPLOAD_CLEANUP_GRACE_SECONDS
+                ),
+            ),
+        )
+    )
+    adapter = R2PrivateMediaAdapter(settings, storage=storage)
+    result = {
+        "upload_intents_deleted": 0,
+        "upload_intent_errors": 0,
+        "assets_deleted": 0,
+        "asset_errors": 0,
+    }
+
+    with session_scope() as db:
+        intents = SqlAlchemyMediaNativeRepository(db).claim_expired_upload_intents(
+            at=at,
+            cleanup_grace=upload_cleanup_grace,
+            limit=bounded_limit,
+        )
+    for intent in intents:
+        try:
+            adapter.delete_upload_artifacts(intent)
+            with session_scope() as db:
+                deleted = SqlAlchemyMediaNativeRepository(
+                    db
+                ).delete_cancelled_upload_intent(intent.id)
+            if deleted:
+                result["upload_intents_deleted"] += 1
+        except Exception:
+            result["upload_intent_errors"] += 1
+            LOGGER.warning(
+                "Web-native upload artifact cleanup failed: intent_id=%s",
+                intent.id,
+                exc_info=True,
+            )
+
+    with session_scope() as db:
+        candidates = SqlAlchemyMediaNativeRepository(db).asset_cleanup_candidates(
+            at=at,
+            unsent_grace=unsent_grace,
+            limit=bounded_limit,
+        )
+    for asset_id, owner_user_id in candidates:
+        try:
+            with session_scope() as db:
+                deleted = SqlAlchemyMediaNativeRepository(
+                    db
+                ).delete_asset_and_release_quota(
+                    asset_id=asset_id,
+                    owner_user_id=owner_user_id,
+                    at=at,
+                    unsent_grace=unsent_grace,
+                    delete_object=adapter.delete_private_asset,
+                )
+            if deleted:
+                result["assets_deleted"] += 1
+        except Exception:
+            result["asset_errors"] += 1
+            LOGGER.warning(
+                "Web-native asset cleanup failed: asset_id=%s",
+                asset_id,
+                exc_info=True,
+            )
+    return result
+
+
 def cleanup_expired_data() -> dict[str, Any]:
     """Delete expired private R2 objects first, then release quota and purge rows."""
 
@@ -3179,6 +4689,10 @@ def cleanup_expired_data() -> dict[str, Any]:
         audit_deleted = retention.purge_expired_audit_logs(at=now)
         web_sessions_deleted, admin_sessions_deleted = retention.purge_stale_sessions(at=now)
         messages_deleted = retention.purge_expired_messages(at=now, limit=5000)
+        canonical_messages_deleted = retention.purge_expired_canonical_messages(
+            at=now,
+            limit=5000,
+        )
         match_history_deleted = _purge_expired_match_history(db, at=now, limit=5000)
         media_result = db.execute(
             delete(MediaObject).where(
@@ -3191,11 +4705,27 @@ def cleanup_expired_data() -> dict[str, Any]:
         outbox_cutoff = now - timedelta(days=max(180, int(settings.message_retention_days)))
         result = db.execute(
             delete(OperationOutbox).where(
-                OperationOutbox.status.in_(("completed", "failed")),
+                OperationOutbox.status.in_(("completed", "failed", "cancelled")),
                 OperationOutbox.updated_at <= outbox_cutoff,
             )
         )
         outboxes_deleted = int(result.rowcount or 0)
+    native_media_cleanup = {
+        "upload_intents_deleted": 0,
+        "upload_intent_errors": 0,
+        "assets_deleted": 0,
+        "asset_errors": 0,
+    }
+    if storage is not None:
+        try:
+            native_media_cleanup = _cleanup_web_native_media(
+                settings,
+                storage,
+                at=now,
+            )
+        except Exception:
+            native_media_cleanup["asset_errors"] += 1
+            LOGGER.warning("Web-native media cleanup batch failed", exc_info=True)
     return {
         "ok": True,
         "media_deleted": media_deleted,
@@ -3208,7 +4738,16 @@ def cleanup_expired_data() -> dict[str, Any]:
         "web_sessions_deleted": web_sessions_deleted,
         "admin_sessions_deleted": admin_sessions_deleted,
         "messages_deleted": messages_deleted,
+        "canonical_messages_deleted": canonical_messages_deleted,
         "match_history_deleted": match_history_deleted,
         "outboxes_deleted": outboxes_deleted,
+        "native_upload_intents_deleted": native_media_cleanup[
+            "upload_intents_deleted"
+        ],
+        "native_upload_intent_errors": native_media_cleanup[
+            "upload_intent_errors"
+        ],
+        "native_assets_deleted": native_media_cleanup["assets_deleted"],
+        "native_asset_errors": native_media_cleanup["asset_errors"],
         "r2_available": storage is not None,
     }

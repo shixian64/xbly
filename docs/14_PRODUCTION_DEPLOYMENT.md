@@ -136,7 +136,7 @@ Caddy 会覆盖传给应用的 `CF-Connecting-IP`、`X-Real-IP` 和 `X-Forwarded
 - 预签名 URL 的路径会被已授权浏览器看到，这是直接访问私有 R2 的必要例外；用户归档键保持随机、兼容缓存键只含摘要，且签名 URL 不得进入访问日志、审计详情或 Referrer。
 - 应用会按最近访问时间清理 `compat/moments/h264-main-1280-v1/`，默认保留 30 天、最多 2 GiB/2000 个对象；仍建议在 R2 为该前缀配置 30 天生命周期规则，作为 Redis 索引丢失时的兜底。
 
-如果前端需要通过 `fetch` 跨域读取签名 URL，再为 Bucket 配置只允许正式域名的 `GET`、`HEAD` CORS；不能使用 `*` 同时开放写入。
+Web-native 上传和私有媒体读取都会由浏览器通过预签名 URL 直接访问 R2，因此 Bucket 必须配置只允许正式 Web Origin 的 `PUT`、`GET`、`HEAD` CORS，并精确允许签名要求的 `Content-Type`、`Cache-Control` 和 `x-amz-meta-*` 请求头；禁止使用 `*` 开放写入。完整规则见第 12 节。
 
 ## 5. 首次部署
 
@@ -335,10 +335,12 @@ docker system df
 ### 7.4 媒体
 
 - 收到消息后异步下载媒体，校验实际文件头、MIME、扩展名和长度，再上传私有 R2。
+- Web-native 新媒体先由同源 API 创建短时上传意图，浏览器只使用服务端签发的预签名 PUT 写入本人随机 staging key；完成接口会复验对象大小、SHA-256、类型和元数据后才生成 PostgreSQL `MediaAsset`。浏览器不能选择 Bucket、对象 key、owner 或长期访问 URL。
+- 私聊附件、资料头像和动态媒体共用同一套本地 asset。头像与动态通过 owner-bound 当前引用授权，替换头像或删除动态后旧站内路径立即失效；已经签发给浏览器的 R2 GET URL 仍可能在最长 300 秒的签名有效期内可读，因此不能把路径失效描述成对象字节瞬时撤销。仍有当前引用的对象不得被清理或转为私聊附件。
 - 图片去除 EXIF/GPS；拒绝 SVG、脚本和伪装文件。
 - 当前 2 GB 服务器不运行 ClamAV。
 - 单用户总额度 100 MB，系统归档总额度 8 GiB。
-- 图片 10 MiB、音频 10 MiB、视频 50 MiB、普通附件 20 MiB。
+- 图片、闪图和音频各 20 MiB，视频 100 MiB，普通附件 40 MiB；语音时长最多 60 秒。
 - 闪图对接收用户保持一次查看语义，但服务器端和普通媒体一样保存 180 天。
 
 ### 7.5 日志与保留期
@@ -484,6 +486,7 @@ chmod 600 backups/*.dump
 - [ ] 普通用户无法读取其他用户聊天、媒体和关系数据。
 - [ ] 登录限流、异常 Turnstile、Session 超时和退出清理已验证。
 - [ ] 图片 EXIF 清理、文件类型拒绝、大小限制和 R2 私有下载已验证。
+- [ ] 浏览器预签名 PUT 只允许正式 Origin 和精确 staging key；头像替换、动态删除、动态可见范围及旧 `/api/media/native/.../content` 路径失效已在真实私有 R2 上验证。
 - [ ] HEVC 动态触发异步兼容转换，PC/手机能播放 H.264/AAC 版本，失败态只有“重试”且没有原视频打开/下载入口。
 - [ ] 浏览器实时上报和后台消息补漏都能幂等入库。
 - [ ] 日志中没有密码、Token、Cookie、聊天正文和 R2 Secret。
@@ -516,15 +519,15 @@ chmod 600 backups/*.dump
 
 ## 12. R2 浏览器访问策略
 
-Bucket 必须保持私有。用户归档对象只签发最长 5 分钟的 GET 地址；动态兼容视频因最长可播放 10 分钟，签名最长 15 分钟。若管理端或用户端需要通过 `fetch`、音视频 Range 请求访问签名地址，应在 R2 配置最小 CORS：
+Bucket 必须保持私有。用户归档对象只签发最长 5 分钟的 GET 地址；动态兼容视频因最长可播放 10 分钟，签名最长 15 分钟。Web-native 上传还会签发只允许写入随机 staging key 的短时 PUT，应用完成接口复验后才转为可用 asset。R2 CORS 必须只允许正式 Web Origin，并覆盖读取与这条受控直传链路：
 
 - Allowed Origins：只填写正式站点 `https://你的域名`。
-- Allowed Methods：`GET`、`HEAD`。
-- Allowed Headers：`Range`。
+- Allowed Methods：`PUT`、`GET`、`HEAD`。
+- Allowed Headers：`Range`、`Content-Type`、`Cache-Control`、`x-amz-meta-*`。
 - Expose Headers：`ETag`、`Content-Length`、`Content-Range`、`Accept-Ranges`。
 - Max Age：不超过 300 秒。
 
-不要允许任意 Origin，不要开放 `PUT`/`DELETE` 给浏览器，也不要启用 R2.dev 公共地址。更换 Bucket 前必须迁移旧对象和数据库元数据；清理任务会安全拒绝跨 Bucket 删除，避免误删其他存储空间。
+不要允许任意 Origin，不要开放浏览器 `DELETE`，也不要启用 R2.dev 公共地址。允许 `PUT` 不等于公开写入：浏览器仍必须持有服务端为本人、精确对象 key、精确 Content-Type/Cache-Control/metadata 签发的短时 URL。更换 Bucket 前必须迁移旧对象和数据库元数据；清理任务会安全拒绝跨 Bucket 删除，避免误删其他存储空间。
 
 ## 13. 已明确暂缓或受外部条件限制的事项
 
