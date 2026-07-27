@@ -855,6 +855,17 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         ).hexdigest()[:16]
         self.assertEqual(match.group(1), expected)
 
+    def test_style_profile_uses_an_existing_timestamp_formatter(self) -> None:
+        app = self.read("bbw_web/static/app.js")
+        style = self.fragment(
+            app,
+            "function agentStyleProfileHtml(profile)",
+            "function aiAgentExecutionActionLabel(action)",
+        )
+
+        self.assertIn("formatBottleTime(profile.generated_at)", style)
+        self.assertNotIn("formatDate(", app)
+
 
 if __name__ == "__main__":
     unittest.main()

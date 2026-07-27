@@ -15985,7 +15985,7 @@ function agentStyleProfileHtml(profile) {
     .join("");
   return `<div class="notice"><strong>${esc(profile.summary || "已生成语言风格")}</strong><div>基于 ${esc(
     profile.source_message_count || 0
-  )} 条本人历史消息，生成于 ${esc(formatDate(profile.generated_at))}</div></div>${
+  )} 条本人历史消息，生成于 ${esc(formatBottleTime(profile.generated_at))}</div></div>${
     rows ? `<div class="kv-list">${rows}</div>` : ""
   }`;
 }
