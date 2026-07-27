@@ -2062,8 +2062,8 @@ class MediaQuotaService:
         user = self.users.get(owner_user_id, for_update=True)
         if user is None or user.status != "active":
             raise NotFoundError("active user was not found")
-        # 配置只允许缩小已有配额，不会在未审计的情况下意外扩大数据库限额。
-        effective_user_quota = min(user.media_quota_bytes, self.settings.per_user_media_quota_bytes)
+        # 用户表额度是受审计的账号级权威值；配置仅作为新账号初始额度。
+        effective_user_quota = int(user.media_quota_bytes)
         effective_system_quota = min(system.quota_bytes, self.settings.global_media_quota_bytes)
         if user.media_used_bytes + size_bytes > effective_user_quota:
             raise QuotaExceeded("user media quota exceeded")

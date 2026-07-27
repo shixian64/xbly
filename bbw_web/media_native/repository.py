@@ -505,7 +505,6 @@ class SqlAlchemyMediaNativeRepository:
         self,
         db: Session,
         *,
-        user_quota_bytes: int | None = None,
         system_quota_bytes: int | None = None,
         compatibility_mode: str | None = None,
     ) -> None:
@@ -514,9 +513,6 @@ class SqlAlchemyMediaNativeRepository:
             normalize_compatibility_mode(compatibility_mode)
             if compatibility_mode is not None
             else resolve_compatibility_mode()
-        )
-        self.user_quota_bytes = (
-            max(1, int(user_quota_bytes)) if user_quota_bytes is not None else None
         )
         self.system_quota_bytes = (
             max(1, int(system_quota_bytes))
@@ -582,8 +578,6 @@ class SqlAlchemyMediaNativeRepository:
             or 0
         )
         user_limit = int(user.media_quota_bytes)
-        if self.user_quota_bytes is not None:
-            user_limit = min(user_limit, self.user_quota_bytes)
         system_limit = int(system.quota_bytes)
         if self.system_quota_bytes is not None:
             system_limit = min(system_limit, self.system_quota_bytes)

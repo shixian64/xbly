@@ -184,10 +184,6 @@ def _service_context(
     with session_scope() as db:
         repository = SqlAlchemyMediaNativeRepository(
             db,
-            user_quota_bytes=int(
-                getattr(settings, "per_user_media_quota_bytes", 0) or 0
-            )
-            or None,
             system_quota_bytes=int(
                 getattr(settings, "global_media_quota_bytes", 0) or 0
             )

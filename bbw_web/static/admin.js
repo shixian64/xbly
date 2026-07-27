@@ -20,6 +20,7 @@ const ADMIN_ENDPOINTS = Object.freeze({
   users: `${ADMIN_API_ROOT}/users`,
   user: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}`,
   userStatus: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/status`,
+  userMediaQuota: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/media-quota`,
   userMatchPoolOnlineList: (userId) =>
     `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/match-pool-online-list`,
   userNearbyCustomCity: (userId) =>
@@ -49,6 +50,7 @@ const ADMIN_ENDPOINTS = Object.freeze({
 
 const ADMIN_PAGE_LIMIT = 25;
 const ADMIN_DETAIL_LIMIT = 50;
+const ADMIN_MEBIBYTE = 1024 * 1024;
 const CREDENTIAL_DISPLAY_MS = 60 * 1000;
 const ADMIN_COMPACT_NAV_QUERY = window.matchMedia("(max-width: 980px)");
 const ADMIN_VIEW_META = Object.freeze({
@@ -156,6 +158,7 @@ const ADMIN_STATE = {
   pendingRawResponse: null,
   rawDetailVisible: false,
   pendingUserStatus: null,
+  pendingUserMediaQuota: null,
   pendingMatchPoolOnlineList: null,
   pendingNearbyCustomCity: null,
   pendingByokModelRunnerGlobal: null,
@@ -186,6 +189,8 @@ const ADMIN_FIELD_LABELS = Object.freeze({
   disabled_at: "停用时间",
   media_quota_bytes: "媒体额度",
   media_used_bytes: "媒体已用空间",
+  media_pending_bytes: "有效上传预留",
+  media_quota_limit_bytes: "单用户额度上限",
   chat_retention_days: "聊天保存天数",
   match_pool_online_list_enabled: "非匹配主动私信权限",
   nearby_custom_city_enabled: "自定义城市筛选权限",
@@ -832,6 +837,13 @@ function closeUserStatusDialog() {
   if (dialog.open) dialog.close();
 }
 
+function closeUserMediaQuotaDialog() {
+  ADMIN_STATE.pendingUserMediaQuota = null;
+  clearInputValues($("admin-user-media-quota-form"));
+  const dialog = $("admin-user-media-quota-dialog");
+  if (dialog.open) dialog.close();
+}
+
 function closeMatchPoolOnlineListDialog() {
   ADMIN_STATE.pendingMatchPoolOnlineList = null;
   clearInputValues($("admin-match-pool-online-list-form"));
@@ -946,6 +958,7 @@ function clearSensitiveDom({ clearData = true } = {}) {
   clearTotpEnrollment();
   closeMediaDialog();
   closeUserStatusDialog();
+  closeUserMediaQuotaDialog();
   closeMatchPoolOnlineListDialog();
   closeNearbyCustomCityDialog();
   closeByokModelRunnerGlobalDialog();
@@ -1720,13 +1733,42 @@ function renderUserProfile() {
     dataContent,
     {
       media_used_bytes: user.media_used_bytes,
+      media_pending_bytes: user.media_pending_bytes,
       media_quota_bytes: user.media_quota_bytes,
+      media_quota_limit_bytes: user.media_quota_limit_bytes,
       chat_retention_days: user.chat_retention_days,
       invite_code_id: user.invite_code_id,
     },
-    ["media_used_bytes", "media_quota_bytes", "chat_retention_days", "invite_code_id"]
+    [
+      "media_used_bytes",
+      "media_pending_bytes",
+      "media_quota_bytes",
+      "media_quota_limit_bytes",
+      "chat_retention_days",
+      "invite_code_id",
+    ]
   );
   dataSection.appendChild(dataContent);
+  const quotaPanel = element("section", "admin-feature-panel");
+  const quotaCopy = element("div", "admin-feature-panel-copy");
+  const mediaUsedBytes = Math.max(0, Number(user.media_used_bytes) || 0);
+  const mediaPendingBytes = Math.max(0, Number(user.media_pending_bytes) || 0);
+  const mediaQuotaBytes = Math.max(0, Number(user.media_quota_bytes) || 0);
+  const mediaRemainingBytes = Math.max(0, mediaQuotaBytes - mediaUsedBytes - mediaPendingBytes);
+  quotaCopy.append(
+    element("h4", "", "媒体存储额度"),
+    element(
+      "p",
+      "",
+      `已用 ${formatBytes(mediaUsedBytes)}，有效上传预留 ${formatBytes(mediaPendingBytes)}，当前可用 ${formatBytes(mediaRemainingBytes)}。`
+    )
+  );
+  const quotaButton = element("button", "admin-button admin-button-secondary", "调整媒体额度");
+  quotaButton.type = "button";
+  quotaButton.disabled = !ADMIN_STATE.selectedUserId;
+  quotaButton.addEventListener("click", openUserMediaQuotaDialog);
+  quotaPanel.append(quotaCopy, quotaButton);
+  dataSection.appendChild(quotaPanel);
   container.appendChild(dataSection);
 
   const advancedSection = element("details", "admin-detail-section");
@@ -1992,6 +2034,35 @@ function openUserStatusDialog(targetStatus) {
   const dialog = $("admin-user-status-dialog");
   if (!dialog.open) dialog.showModal();
   setTimeout(() => $("admin-user-status-reason").focus(), 0);
+}
+
+function openUserMediaQuotaDialog() {
+  if (!ADMIN_STATE.selectedUserId) return;
+  const user = ADMIN_STATE.selectedUser || {};
+  const usedBytes = Math.max(0, Number(user.media_used_bytes) || 0);
+  const pendingBytes = Math.max(0, Number(user.media_pending_bytes) || 0);
+  const quotaBytes = Math.max(ADMIN_MEBIBYTE, Number(user.media_quota_bytes) || ADMIN_MEBIBYTE);
+  const limitBytes = Math.max(0, Number(user.media_quota_limit_bytes) || 0);
+  ADMIN_STATE.pendingUserMediaQuota = {
+    userId: ADMIN_STATE.selectedUserId,
+    reservedBytes: usedBytes + pendingBytes,
+    limitBytes,
+  };
+  clearInputValues($("admin-user-media-quota-form"));
+  $("admin-user-media-quota-description").textContent =
+    `当前额度 ${formatBytes(quotaBytes)}，已用与有效上传预留合计 ${formatBytes(usedBytes + pendingBytes)}` +
+    (limitBytes > 0 ? `，单用户最高可设置为 ${formatBytes(limitBytes)}。` : "。");
+  const input = $("admin-user-media-quota-mib");
+  input.min = String(Math.max(1, Math.ceil((usedBytes + pendingBytes) / ADMIN_MEBIBYTE)));
+  if (limitBytes > 0) input.max = String(Math.floor(limitBytes / ADMIN_MEBIBYTE));
+  else input.removeAttribute("max");
+  input.value = String(Math.ceil(quotaBytes / ADMIN_MEBIBYTE));
+  const dialog = $("admin-user-media-quota-dialog");
+  if (!dialog.open) dialog.showModal();
+  setTimeout(() => {
+    input.focus();
+    input.select();
+  }, 0);
 }
 
 function openMatchPoolOnlineListDialog(enabled) {
@@ -3030,6 +3101,7 @@ const AUDIT_ACTION_LABELS = {
   "user.list": "查看用户列表",
   "user.view": "查看用户详情",
   "user.status_changed": "修改用户状态",
+  "user.media_quota_changed": "调整用户媒体额度",
   "user.match_pool_online_list_changed": "修改主动私信授权",
   "user.nearby_custom_city_changed": "修改自定义城市授权",
   "user.byok_model_runner_changed": "修改用户 BYOK 模型运行器授权",
@@ -3969,6 +4041,52 @@ $("admin-user-status-cancel").addEventListener("click", closeUserStatusDialog);
 $("admin-user-status-dialog").addEventListener("cancel", (event) => {
   event.preventDefault();
   closeUserStatusDialog();
+});
+
+$("admin-user-media-quota-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const button = $("admin-user-media-quota-submit");
+  void withPending(button, async () => {
+    const pending = ADMIN_STATE.pendingUserMediaQuota;
+    const requestState = captureUserDetailRequest("profile");
+    const quotaMib = Number($("admin-user-media-quota-mib").value);
+    const reason = $("admin-user-media-quota-reason").value.trim();
+    if (!pending?.userId) {
+      throw new AdminApiError("媒体额度操作已经失效，请重新打开用户详情");
+    }
+    if (!Number.isSafeInteger(quotaMib) || quotaMib < 1) {
+      throw new AdminApiError("请输入有效的整数兆字节额度");
+    }
+    const quotaBytes = quotaMib * ADMIN_MEBIBYTE;
+    if (!Number.isSafeInteger(quotaBytes)) {
+      throw new AdminApiError("媒体额度数值过大");
+    }
+    if (quotaBytes < pending.reservedBytes) {
+      throw new AdminApiError("新额度不能低于当前已用空间与有效上传预留之和");
+    }
+    if (pending.limitBytes > 0 && quotaBytes > pending.limitBytes) {
+      throw new AdminApiError("新额度不能超过系统媒体总额度");
+    }
+    if (reason.length < 3) throw new AdminApiError("请填写至少三个字符的操作理由");
+    const data = await adminApi(ADMIN_ENDPOINTS.userMediaQuota(pending.userId), {
+      method: "POST",
+      body: JSON.stringify({ quota_bytes: quotaBytes, reason }),
+    });
+    const updated = data.user || data.data?.user || data.data || {};
+    closeUserMediaQuotaDialog();
+    if (isCurrentUserDetailRequest(requestState) && requestState.userId === pending.userId) {
+      ADMIN_STATE.selectedUser = { ...(ADMIN_STATE.selectedUser || {}), ...updated };
+      renderUserProfile();
+    }
+    ADMIN_STATE.needsRefresh = true;
+    toast(`用户媒体额度已调整为 ${formatBytes(updated.media_quota_bytes || quotaBytes)}`, "success", 4200);
+  });
+});
+
+$("admin-user-media-quota-cancel").addEventListener("click", closeUserMediaQuotaDialog);
+$("admin-user-media-quota-dialog").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeUserMediaQuotaDialog();
 });
 
 $("admin-match-pool-online-list-form").addEventListener("submit", (event) => {

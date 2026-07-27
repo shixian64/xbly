@@ -49,6 +49,7 @@ from bbw_prod.models import (
     ExternalAccount,
     InviteCode,
     MediaObject,
+    MediaUploadIntent,
     Message,
     RawUpstreamResponse,
     Relationship,
@@ -92,6 +93,7 @@ __all__ = ["bootstrap_initial_admin", "router"]
 
 _MAX_PAGE = 1_000
 _MAX_LIMIT = 50
+_SIGNED_BIGINT_MAX = 9_223_372_036_854_775_807
 _PUBLIC_JSON_MAX_NODES = 5_000
 _PUBLIC_JSON_MAX_CHARS = 64_000
 _PUBLIC_LIST_JSON_MAX_NODES = 1_000
@@ -228,6 +230,16 @@ class InviteCreateBody(_StrictBody):
 
 class UserStatusBody(_StrictBody):
     status: Literal["active", "disabled"]
+    reason: str = Field(min_length=3, max_length=500)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def strip_reason(cls, value: str) -> str:
+        return value.strip()
+
+
+class UserMediaQuotaBody(_StrictBody):
+    quota_bytes: int = Field(ge=1, le=_SIGNED_BIGINT_MAX)
     reason: str = Field(min_length=3, max_length=500)
 
     @field_validator("reason", mode="before")
@@ -1059,6 +1071,34 @@ def _invite_public(row: InviteCode) -> dict[str, Any]:
         "created_at": _iso(row.created_at),
         "updated_at": _iso(row.updated_at),
     }
+
+
+def _effective_system_media_quota(
+    settings: Any,
+    quota: SystemStorageQuota | None,
+) -> int:
+    configured = max(1, int(settings.global_media_quota_bytes))
+    return min(int(quota.quota_bytes), configured) if quota is not None else configured
+
+
+def _active_user_media_pending_bytes(
+    db: Any,
+    user_id: uuid.UUID,
+    *,
+    at: datetime,
+) -> int:
+    return int(
+        db.scalar(
+            select(
+                func.coalesce(func.sum(MediaUploadIntent.expected_size_bytes), 0)
+            ).where(
+                MediaUploadIntent.owner_user_id == user_id,
+                MediaUploadIntent.status == "pending",
+                MediaUploadIntent.expires_at > at,
+            )
+        )
+        or 0
+    )
 
 
 def _user_public(user: User, account: ExternalAccount | None) -> dict[str, Any]:
@@ -2669,8 +2709,21 @@ def user_detail(
                     or 0
                 ),
             }
+            system_quota = db.scalar(
+                select(SystemStorageQuota).where(SystemStorageQuota.id == 1)
+            )
+            pending_media_bytes = _active_user_media_pending_bytes(
+                db,
+                user_id,
+                at=now,
+            )
             item = {
                 **_user_public(user, account),
+                "media_pending_bytes": pending_media_bytes,
+                "media_quota_limit_bytes": _effective_system_media_quota(
+                    _settings(request),
+                    system_quota,
+                ),
                 "profile": _public_json(user.profile),
                 "device": _public_json(account.device_data) if account else {},
                 "invite_code_id": str(user.invite_code_id) if user.invite_code_id else None,
@@ -2689,6 +2742,87 @@ def user_detail(
             _raise_service_error(exc)
         raise
     return {"ok": True, "user": item}
+
+
+@router.post("/users/{user_id}/media-quota")
+def set_user_media_quota(
+    user_id: uuid.UUID,
+    body: UserMediaQuotaBody,
+    request: Request,
+    context: AdminContext = Depends(_admin_context),
+) -> dict[str, Any]:
+    try:
+        with session_scope() as db:
+            # 媒体上传同样先锁系统账本再锁用户，保持一致顺序避免死锁。
+            system_quota = db.scalar(
+                select(SystemStorageQuota)
+                .where(SystemStorageQuota.id == 1)
+                .with_for_update()
+            )
+            if system_quota is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="系统媒体配额账本不可用",
+                )
+            user = _require_user(db, user_id, for_update=True)
+            now = utcnow()
+            pending_media_bytes = _active_user_media_pending_bytes(
+                db,
+                user_id,
+                at=now,
+            )
+            old_quota_bytes = int(user.media_quota_bytes)
+            new_quota_bytes = int(body.quota_bytes)
+            reserved_bytes = int(user.media_used_bytes) + pending_media_bytes
+            quota_limit_bytes = _effective_system_media_quota(
+                _settings(request),
+                system_quota,
+            )
+            if new_quota_bytes < reserved_bytes:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "新媒体额度不能低于当前已用空间与有效上传预留之和"
+                    ),
+                )
+            if new_quota_bytes > quota_limit_bytes:
+                raise HTTPException(
+                    status_code=400,
+                    detail="用户媒体额度不能超过系统媒体总额度",
+                )
+
+            changed = old_quota_bytes != new_quota_bytes
+            user.media_quota_bytes = new_quota_bytes
+            db.flush()
+            account = ExternalAccountRepository(db).get_for_user(user_id)
+            _audit_service(db, request).record(
+                actor_type="admin",
+                action="user.media_quota_changed",
+                admin_user_id=context.admin_user_id,
+                target_user_id=user_id,
+                resource_type="user_quota",
+                resource_id="media",
+                reason=body.reason,
+                client_ip=context.client_ip,
+                details={
+                    "old_quota_bytes": old_quota_bytes,
+                    "new_quota_bytes": new_quota_bytes,
+                    "media_used_bytes": int(user.media_used_bytes),
+                    "media_pending_bytes": pending_media_bytes,
+                    "system_quota_limit_bytes": quota_limit_bytes,
+                    "changed": changed,
+                },
+            )
+            item = {
+                **_user_public(user, account),
+                "media_pending_bytes": pending_media_bytes,
+                "media_quota_limit_bytes": quota_limit_bytes,
+            }
+    except Exception as exc:
+        if isinstance(exc, ServiceError):
+            _raise_service_error(exc)
+        raise
+    return {"ok": True, "user": item, "changed": changed}
 
 
 @router.post("/users/{user_id}/status")

@@ -158,6 +158,11 @@ class MediaNativeRepositoryContractTests(unittest.TestCase):
         self.assertIn("user.media_used_bytes += finalized.size_bytes", source)
         self.assertIn("system.used_bytes += finalized.size_bytes", source)
         self.assertIn("MediaQuotaExceeded", source)
+        quota_source = inspect.getsource(
+            SqlAlchemyMediaNativeRepository._quota_state_for_update
+        )
+        self.assertIn("user_limit = int(user.media_quota_bytes)", quota_source)
+        self.assertNotIn("min(user_limit", quota_source)
 
     def test_lifecycle_cleanup_is_reference_safe_retryable_and_quota_atomic(self) -> None:
         claim_source = inspect.getsource(

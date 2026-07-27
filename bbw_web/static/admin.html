@@ -570,6 +570,27 @@
     </form>
   </dialog>
 
+  <dialog id="admin-user-media-quota-dialog" class="admin-dialog" aria-labelledby="admin-user-media-quota-title">
+    <form id="admin-user-media-quota-form" class="admin-dialog-card" method="post" action="/admin" novalidate>
+      <header>
+        <h2 id="admin-user-media-quota-title">调整用户媒体额度</h2>
+        <p id="admin-user-media-quota-description"></p>
+      </header>
+      <div class="admin-field">
+        <label for="admin-user-media-quota-mib">新额度（兆字节）</label>
+        <input id="admin-user-media-quota-mib" name="quota_mib" type="number" inputmode="numeric" min="1" step="1" required>
+      </div>
+      <div class="admin-field">
+        <label for="admin-user-media-quota-reason">操作理由</label>
+        <textarea id="admin-user-media-quota-reason" name="reason" rows="3" minlength="3" maxlength="500" required></textarea>
+      </div>
+      <div class="admin-dialog-actions">
+        <button id="admin-user-media-quota-submit" class="admin-button admin-button-primary" type="submit">确认调整额度</button>
+        <button id="admin-user-media-quota-cancel" class="admin-button admin-button-secondary" type="button">取消</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="admin-match-pool-online-list-dialog" class="admin-dialog" aria-labelledby="admin-match-pool-online-list-title">
     <form id="admin-match-pool-online-list-form" class="admin-dialog-card" method="post" action="/admin" novalidate>
       <header>

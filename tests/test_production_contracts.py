@@ -399,6 +399,7 @@ class ProductionContractTests(unittest.TestCase):
             "/users",
             "/users/{user_id}",
             "/users/{user_id}/status",
+            "/users/{user_id}/media-quota",
             "/users/{user_id}/match-pool-online-list",
             "/users/{user_id}/nearby-custom-city",
             "/users/{user_id}/credentials",
@@ -434,6 +435,10 @@ class ProductionContractTests(unittest.TestCase):
         self.assertNotIn("preserveUnlock: true", js)
         self.assertIn("ADMIN_ENDPOINTS.userStatus", js)
         self.assertIn('id="admin-user-status-dialog"', html)
+        self.assertIn("ADMIN_ENDPOINTS.userMediaQuota", js)
+        self.assertIn('id="admin-user-media-quota-dialog"', html)
+        self.assertIn("user.media_quota_changed", api)
+        self.assertIn("调整媒体额度", js)
         self.assertIn("ADMIN_ENDPOINTS.userMatchPoolOnlineList", js)
         self.assertIn('id="admin-match-pool-online-list-dialog"', html)
         self.assertIn("ADMIN_ENDPOINTS.userNearbyCustomCity", js)
@@ -445,6 +450,29 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn("在线用户列表、资料、动态和好友申请始终可用", js)
         self.assertIn("user.nearby_custom_city_changed", api)
         self.assertIn("附近的人自定义城市", js)
+
+    def test_admin_media_quota_is_account_authoritative_and_audited(self) -> None:
+        admin_api = self.read("bbw_web/admin_api.py")
+        native_api = self.read("bbw_web/native_media_api.py")
+        native_repository = self.read("bbw_web/media_native/repository.py")
+        services = self.read("bbw_prod/services.py")
+
+        handler = admin_api.split(
+            '@router.post("/users/{user_id}/media-quota")', 1
+        )[1].split('@router.post("/users/{user_id}/status")', 1)[0]
+        self.assertIn("class UserMediaQuotaBody", admin_api)
+        self.assertIn("select(SystemStorageQuota)", handler)
+        self.assertIn(".with_for_update()", handler)
+        self.assertIn("_active_user_media_pending_bytes", handler)
+        self.assertIn("reserved_bytes", handler)
+        self.assertIn("user.media_quota_changed", handler)
+        self.assertIn("system_quota_limit_bytes", handler)
+        self.assertNotIn("user_quota_bytes=", native_api)
+        self.assertNotIn("self.user_quota_bytes", native_repository)
+        self.assertIn(
+            "effective_user_quota = int(user.media_quota_bytes)",
+            services,
+        )
 
     def test_private_message_policy_uses_server_owned_match_and_conversation_grants(self) -> None:
         persistence = self.read("bbw_web/persistence.py")
