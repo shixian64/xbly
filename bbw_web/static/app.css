@@ -6896,6 +6896,15 @@ html.flash-viewing body {
   margin: 0 auto;
 }
 
+.agent-page .notice,
+.agent-page .kv-row,
+.agent-page .field-help,
+.agent-page .result-panel {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
 .agent-overview {
   display: grid;
   min-width: 0;
@@ -7111,9 +7120,26 @@ html.flash-viewing body {
   opacity: 0.62;
 }
 
-.agent-social-capability input {
-  flex: 0 0 auto;
+.agent-social-capability input[type="checkbox"] {
+  width: 18px;
+  min-width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
   margin-top: 0.14rem;
+  border-radius: 5px;
+  padding: 0;
+  accent-color: var(--brand);
+  box-shadow: none;
+}
+
+.agent-social-capability input[type="checkbox"]:focus-visible {
+  outline: 3px solid rgba(115, 87, 217, 0.42);
+  outline-offset: 3px;
+  box-shadow: 0 0 0 4px rgba(115, 87, 217, 0.12);
+}
+
+.agent-social-capability:has(input[type="checkbox"]:focus-visible) {
+  border-color: rgba(115, 87, 217, 0.38);
 }
 
 .agent-social-capability span {

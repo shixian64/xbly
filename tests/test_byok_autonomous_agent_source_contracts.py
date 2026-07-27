@@ -1010,6 +1010,27 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         ).hexdigest()[:16]
         self.assertEqual(css_match.group(1), css_expected)
 
+    def test_mobile_agent_capability_checkbox_keeps_native_control_size(self) -> None:
+        css = self.read("bbw_web/static/app.css")
+        wrapping = self.fragment(
+            css,
+            ".agent-page .notice,",
+            ".agent-overview {",
+        )
+        checkbox = self.fragment(
+            css,
+            '.agent-social-capability input[type="checkbox"] {',
+            '.agent-social-capability input[type="checkbox"]:focus-visible {',
+        )
+        self.assertIn(".agent-page .result-panel", wrapping)
+        self.assertIn("max-width: 100%", wrapping)
+        self.assertIn("overflow-wrap: anywhere", wrapping)
+        self.assertIn("width: 18px", checkbox)
+        self.assertIn("min-width: 18px", checkbox)
+        self.assertIn("height: 18px", checkbox)
+        self.assertIn("flex: 0 0 18px", checkbox)
+        self.assertIn("padding: 0", checkbox)
+
     def test_external_social_results_are_archived_in_normal_domain_records(self) -> None:
         match, _ = self.function_source(
             "bbw_agent/action_executor.py", "_request_text_match"
