@@ -47,10 +47,14 @@ from bbw_agent.autonomous import (  # noqa: E402
     GeneratedText,
     MessageDirection,
     TaskCompletion,
+    allowed_relationship_address_terms,
+    autonomy_reply_message_is_eligible,
     deterministic_action_key,
     deterministic_task_key,
     quiet_window_end,
+    sanitize_social_style_profile,
     task_is_reclaimable,
+    unapproved_relationship_address_terms,
 )
 from bbw_agent.runtime import (  # noqa: E402
     AgentAutonomyDispatchContext,
@@ -103,6 +107,7 @@ def policy(**changes: object) -> AgentAutonomyPolicy:
         "auto_reply_enabled": True,
         "scheduled_posts_enabled": True,
         "relationship_actions_enabled": True,
+        "auto_reply_started_at": NOW - timedelta(minutes=5),
         "discovery_enabled": True,
         "text_match_enabled": True,
         "proactive_message_enabled": True,
@@ -533,6 +538,62 @@ class AgentAutonomyPolicyContractTests(unittest.TestCase):
         self.assertTrue(task_is_reclaimable(generating, now=NOW))
         self.assertFalse(task_is_reclaimable(dispatching, now=NOW))
 
+    def test_auto_reply_requires_a_durable_activation_watermark(self) -> None:
+        with self.assertRaises(ValueError):
+            policy(auto_reply_started_at=None)
+
+    def test_reply_message_gate_skips_terminal_and_provider_messages(self) -> None:
+        for body, options in (
+            ("嗯", {}),
+            ("😂谢谢", {}),
+            ("[TUIEmoji_Moon]", {}),
+            ("我们已经是好友了，来聊天吧", {}),
+            ("ㅤ 关注你了,快去看看吧！", {"peer_upstream_uid": "1"}),
+            ("你在吗", {"conversation_title": "已注销或封禁"}),
+        ):
+            with self.subTest(body=body):
+                self.assertFalse(
+                    autonomy_reply_message_is_eligible(body, **options)
+                )
+        self.assertTrue(autonomy_reply_message_is_eligible("刚刚吃完饭"))
+        self.assertTrue(autonomy_reply_message_is_eligible("你明天有空吗？"))
+
+    def test_global_style_drops_contact_specific_address_terms(self) -> None:
+        summary, traits = sanitize_social_style_profile(
+            "轻松亲昵，常用宠物式昵称，短句自然",
+            {
+                "vocabulary": "贱狗、小傻狗、日常简单词",
+                "do": ["用亲昵调侃称呼如狗狗/傻狗", "多用短句"],
+            },
+        )
+
+        serialized = f"{summary}{traits}"
+        self.assertNotIn("小傻狗", serialized)
+        self.assertNotIn("狗狗", serialized)
+        self.assertIn("短句", serialized)
+        self.assertIn("不要跨联系人复用昵称或关系型称呼", serialized)
+
+    def test_address_terms_require_repeated_use_with_the_same_peer(self) -> None:
+        self.assertEqual(
+            allowed_relationship_address_terms(["晚安小傻狗"]),
+            (),
+        )
+        allowed = allowed_relationship_address_terms(
+            ["晚安小傻狗", "你干嘛呢小傻狗"]
+        )
+        self.assertIn("小傻狗", allowed)
+        self.assertEqual(
+            unapproved_relationship_address_terms(
+                "不客气呀小傻狗",
+                allowed_terms=allowed,
+            ),
+            (),
+        )
+        self.assertIn(
+            "小傻狗",
+            unapproved_relationship_address_terms("不客气呀小傻狗"),
+        )
+
     def test_cross_midnight_quiet_window_returns_next_allowed_time(self) -> None:
         configured = policy(
             quiet_start_minute=22 * 60,
@@ -568,6 +629,39 @@ class AgentAutonomyOrchestratorTests(unittest.TestCase):
         self.assertEqual(reservation.minimum_interval_seconds, 120)
         self.assertEqual(store.finish_lease_tokens[-1], "permit-001")
         self.assertTrue(store.completions[-1].reset_failures)
+
+    def test_old_or_terminal_inbound_is_skipped_before_model_generation(self) -> None:
+        for head in (
+            replace(inbound_head(), occurred_at=NOW - timedelta(hours=3)),
+            replace(inbound_head(), body="嗯"),
+            replace(inbound_head(), body="😂谢谢"),
+        ):
+            with self.subTest(body=head.body, occurred_at=head.occurred_at):
+                store = FakeStore(task(), policy(), heads=[head])
+                runner, model, dispatcher = orchestrator(store)
+
+                result = runner.run_once(worker_id="worker-001")
+
+                self.assertEqual(result.status, AutonomyTaskStatus.STALE.value)
+                self.assertEqual(result.code, "inbound_message_already_handled")
+                self.assertEqual(model.reply_calls, 0)
+                self.assertEqual(dispatcher.commands, [])
+
+    def test_model_no_reply_decision_is_a_safe_skip_not_a_failure(self) -> None:
+        store = FakeStore(task(), policy(), heads=[inbound_head()])
+        model = FakeModel()
+        model.error = AgentAutonomyModelError(
+            "reply_not_needed",
+            "不需要回复",
+        )
+        runner, model, dispatcher = orchestrator(store, model=model)
+
+        result = runner.run_once(worker_id="worker-001")
+
+        self.assertEqual(result.status, AutonomyTaskStatus.STALE.value)
+        self.assertEqual(result.code, "reply_not_needed")
+        self.assertFalse(store.completions[-1].count_failure)
+        self.assertEqual(dispatcher.commands, [])
 
     def test_outgoing_or_already_replied_head_is_stale_without_model_call(self) -> None:
         head = replace(
@@ -930,6 +1024,7 @@ class AgentAutonomyRuntimeAdapterTests(unittest.TestCase):
             version=4,
             user_enabled=True,
             auto_reply_enabled=True,
+            auto_reply_started_at=NOW - timedelta(minutes=5),
             scheduled_post_enabled=True,
             managed_relationships_enabled=True,
             discovery_enabled=True,

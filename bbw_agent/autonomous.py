@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
@@ -53,6 +54,10 @@ MAX_IDEMPOTENCY_LENGTH = 160
 AUTONOMOUS_BROWSE_DAILY_LIMIT = 8
 AUTONOMOUS_MATCH_DAILY_LIMIT = 6
 AUTONOMOUS_OUTREACH_DAILY_LIMIT = 6
+AUTONOMY_REPLY_MAX_AGE_SECONDS = 2 * 60 * 60
+AUTONOMY_REPLY_CLOCK_SKEW_SECONDS = 5 * 60
+AUTONOMY_REPLY_SESSION_GAP_SECONDS = 6 * 60 * 60
+AUTONOMY_NO_REPLY_SENTINEL = "[[NO_REPLY]]"
 _STABLE_CODE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 _AUTONOMOUS_LINK = re.compile(r"(?i)(?:https?://|www\.)\S+")
 _AUTONOMOUS_CREDENTIAL = re.compile(
@@ -66,6 +71,256 @@ _AUTONOMOUS_EMAIL = re.compile(
     r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\b"
 )
 _AUTONOMOUS_PHONE = re.compile(r"(?<!\d)(?:\+?86[- ]?)?1[3-9]\d{9}(?!\d)")
+_AUTONOMY_TUI_EMOJI_ONLY = re.compile(
+    r"^(?:\s*\[TUIEmoji_[A-Za-z0-9_]+\]\s*)+$"
+)
+_AUTONOMY_SYSTEM_MESSAGE_MARKERS = (
+    "我们已经是好友了，来聊天吧",
+    "我们已经是好友了,来聊天吧",
+    "你们已经是好友了，来聊天吧",
+    "关注你了,快去看看吧",
+    "关注你了，快去看看吧",
+)
+_AUTONOMY_UNAVAILABLE_CONVERSATION_MARKERS = (
+    "已注销",
+    "已封禁",
+    "注销或封禁",
+)
+_AUTONOMY_TERMINAL_MESSAGE_TOKENS = frozenset(
+    {
+        "ok",
+        "不客气",
+        "嗯",
+        "嗯嗯",
+        "嗯呢",
+        "嗯哼",
+        "哦",
+        "噢",
+        "嗷",
+        "嗷嗷",
+        "好",
+        "好呀",
+        "好啊",
+        "好吧",
+        "好的",
+        "好哒",
+        "好呢",
+        "好滴",
+        "好嘞",
+        "行",
+        "行吧",
+        "可以",
+        "收到",
+        "知道了",
+        "没事",
+        "没事的",
+        "谢谢",
+        "谢谢啦",
+        "谢谢呀",
+        "谢谢你",
+        "谢啦",
+        "谢了",
+        "晚安",
+        "哈哈",
+        "哈哈哈",
+        "哈哈哈哈",
+    }
+)
+AUTONOMY_RELATIONSHIP_ADDRESS_TERMS = tuple(
+    sorted(
+        {
+            "亲爱的",
+            "小宝贝",
+            "臭宝贝",
+            "宝贝",
+            "宝宝",
+            "乖乖",
+            "老公",
+            "老婆",
+            "哥哥",
+            "姐姐",
+            "小哥哥",
+            "小姐姐",
+            "弟弟",
+            "妹妹",
+            "小可爱",
+            "可爱鬼",
+            "亲亲",
+            "臭宝",
+            "乖宝",
+            "崽崽",
+            "小傻狗",
+            "臭狗狗",
+            "贱狗",
+            "傻狗",
+            "狗狗",
+            "猪猪",
+            "小猪",
+            "小笨蛋",
+            "笨蛋",
+            "小傻瓜",
+            "傻瓜",
+        },
+        key=lambda value: (-len(value), value),
+    )
+)
+_AUTONOMY_STYLE_RELATIONSHIP_MARKERS = (
+    "关系型称呼",
+    "关系称呼",
+    "亲昵称呼",
+    "宠物式昵称",
+    "昵称",
+    "称呼",
+    "亲昵",
+    *AUTONOMY_RELATIONSHIP_ADDRESS_TERMS,
+)
+
+
+def _normalized_autonomy_message_text(value: object) -> str:
+    return unicodedata.normalize("NFKC", str(value or "")).strip()
+
+
+def _autonomy_semantic_token(value: object) -> str:
+    text = _normalized_autonomy_message_text(value)
+    if not text or _AUTONOMY_TUI_EMOJI_ONLY.fullmatch(text):
+        return ""
+    return "".join(
+        character.casefold()
+        for character in text
+        if unicodedata.category(character)[:1] not in {"C", "P", "S", "Z"}
+    )
+
+
+def autonomy_reply_message_is_eligible(
+    body: object,
+    *,
+    sender_upstream_uid: object = "",
+    peer_upstream_uid: object = "",
+    conversation_title: object = "",
+) -> bool:
+    """Return whether an inbound head is meaningful enough for auto-reply.
+
+    The gate is intentionally conservative: skipping a low-information message
+    is safer than manufacturing a new topic or replying to a provider notice.
+    """
+
+    text = _normalized_autonomy_message_text(body)
+    sender = str(sender_upstream_uid or "").strip()
+    peer = str(peer_upstream_uid or "").strip()
+    title = _normalized_autonomy_message_text(conversation_title)
+    if not text or sender == "1" or peer == "1":
+        return False
+    if any(marker in title for marker in _AUTONOMY_UNAVAILABLE_CONVERSATION_MARKERS):
+        return False
+    compact = "".join(text.split())
+    if any(marker in compact for marker in _AUTONOMY_SYSTEM_MESSAGE_MARKERS):
+        return False
+    token = _autonomy_semantic_token(text)
+    if not token or token in _AUTONOMY_TERMINAL_MESSAGE_TOKENS:
+        return False
+    if token.isdecimal():
+        return False
+    return True
+
+
+def autonomy_reply_message_is_fresh(
+    occurred_at: datetime,
+    *,
+    now: datetime,
+    started_at: datetime | None = None,
+    max_age_seconds: int = AUTONOMY_REPLY_MAX_AGE_SECONDS,
+) -> bool:
+    occurred = _aware_utc(occurred_at)
+    current = _aware_utc(now)
+    if started_at is not None and occurred < _aware_utc(started_at):
+        return False
+    age = current - occurred
+    return bool(
+        age >= -timedelta(seconds=AUTONOMY_REPLY_CLOCK_SKEW_SECONDS)
+        and age <= timedelta(seconds=max(1, int(max_age_seconds)))
+    )
+
+
+def allowed_relationship_address_terms(
+    outgoing_messages: Sequence[object],
+    *,
+    minimum_occurrences: int = 2,
+) -> tuple[str, ...]:
+    minimum = max(2, int(minimum_occurrences))
+    normalized = [
+        _normalized_autonomy_message_text(value) for value in outgoing_messages
+    ]
+    return tuple(
+        term
+        for term in AUTONOMY_RELATIONSHIP_ADDRESS_TERMS
+        if sum(term in message for message in normalized) >= minimum
+    )
+
+
+def unapproved_relationship_address_terms(
+    text: object,
+    *,
+    allowed_terms: Sequence[str] = (),
+) -> tuple[str, ...]:
+    normalized = _normalized_autonomy_message_text(text)
+    allowed = {str(value or "").strip() for value in allowed_terms}
+    return tuple(
+        term
+        for term in AUTONOMY_RELATIONSHIP_ADDRESS_TERMS
+        if term in normalized and term not in allowed
+    )
+
+
+def _sanitize_style_text(value: object) -> str:
+    text = _normalized_autonomy_message_text(value)
+    if not text:
+        return ""
+    fragments = re.split(r"[，,。；;\n]+", text)
+    safe = [
+        fragment.strip()
+        for fragment in fragments
+        if fragment.strip()
+        and not any(
+            marker.casefold() in fragment.casefold()
+            for marker in _AUTONOMY_STYLE_RELATIONSHIP_MARKERS
+        )
+    ]
+    return "，".join(safe)
+
+
+def sanitize_social_style_profile(
+    summary: object,
+    traits: Mapping[str, object] | None,
+) -> tuple[str, dict[str, object]]:
+    """Remove contact-specific nicknames from a global writing profile."""
+
+    safe_summary = _sanitize_style_text(summary)
+    safe_traits: dict[str, object] = {}
+    source = traits if isinstance(traits, Mapping) else {}
+    for key in ("tone", "sentence_pattern", "vocabulary", "punctuation", "expressions"):
+        safe_value = _sanitize_style_text(source.get(key))
+        if safe_value:
+            safe_traits[key] = safe_value[:500]
+    for key in ("do", "avoid"):
+        raw_items = source.get(key)
+        if not isinstance(raw_items, Sequence) or isinstance(
+            raw_items,
+            (str, bytes),
+        ):
+            continue
+        items = [
+            safe_item[:200]
+            for item in raw_items[:10]
+            if (safe_item := _sanitize_style_text(item))
+        ]
+        if items:
+            safe_traits[key] = items
+    avoid = list(safe_traits.get("avoid") or [])
+    boundary = "不要跨联系人复用昵称或关系型称呼"
+    if boundary not in avoid:
+        avoid.append(boundary)
+    safe_traits["avoid"] = avoid[:10]
+    return safe_summary[:1000], safe_traits
 
 
 class AgentAutonomyError(RuntimeError):
@@ -240,6 +495,7 @@ class AgentAutonomyPolicy:
     auto_reply_enabled: bool
     scheduled_posts_enabled: bool
     relationship_actions_enabled: bool
+    auto_reply_started_at: datetime | None = None
     discovery_enabled: bool = False
     text_match_enabled: bool = False
     proactive_message_enabled: bool = False
@@ -304,6 +560,13 @@ class AgentAutonomyPolicy:
                 raise ValueError("equal quiet boundaries are ambiguous")
         if self.auto_reply_enabled and SEND_PRIVATE_MESSAGE not in actions:
             raise ValueError("auto reply requires the private-message action")
+        reply_started_at = (
+            _aware_utc(self.auto_reply_started_at)
+            if self.auto_reply_started_at is not None
+            else None
+        )
+        if self.auto_reply_enabled and reply_started_at is None:
+            raise ValueError("auto reply requires an activation watermark")
         if self.scheduled_posts_enabled and PUBLISH_TEXT_POST not in actions:
             raise ValueError("scheduled posts require the publish action")
         if self.relationship_actions_enabled and not (
@@ -324,6 +587,7 @@ class AgentAutonomyPolicy:
             raise ValueError("friend requests require the friend-request action")
         object.__setattr__(self, "selected_actions", actions)
         object.__setattr__(self, "target_allowlist", targets)
+        object.__setattr__(self, "auto_reply_started_at", reply_started_at)
         object.__setattr__(self, "daily_total_limit", total_limit)
         object.__setattr__(self, "daily_action_limits", limits)
         object.__setattr__(
@@ -469,8 +733,15 @@ class ConversationHead:
     occurred_at: datetime
     revoked: bool = False
     has_outgoing_after: bool = False
+    conversation_title: str = ""
 
-    def is_unanswered_inbound(self, expected_identity: str) -> bool:
+    def is_unanswered_inbound(
+        self,
+        expected_identity: str,
+        *,
+        now: datetime | None = None,
+        started_at: datetime | None = None,
+    ) -> bool:
         message_type = str(self.message_type or "").strip().lower()
         return bool(
             self.message_identity == str(expected_identity or "").strip()
@@ -479,6 +750,19 @@ class ConversationHead:
             and str(self.body or "").strip()
             and not self.revoked
             and not self.has_outgoing_after
+            and autonomy_reply_message_is_eligible(
+                self.body,
+                peer_upstream_uid=self.peer_upstream_uid,
+                conversation_title=self.conversation_title,
+            )
+            and (
+                now is None
+                or autonomy_reply_message_is_fresh(
+                    self.occurred_at,
+                    now=now,
+                    started_at=started_at,
+                )
+            )
         )
 
 
@@ -935,7 +1219,9 @@ class AgentAutonomyOrchestrator:
                 peer_upstream_uid=task.target_upstream_uid,
             )
             if head is None or not head.is_unanswered_inbound(
-                task.source_message_identity
+                task.source_message_identity,
+                now=now,
+                started_at=policy.auto_reply_started_at,
             ):
                 return self._finish(
                     task,
@@ -1047,7 +1333,9 @@ class AgentAutonomyOrchestrator:
                     peer_upstream_uid=task.target_upstream_uid,
                 )
                 if head is None or not head.is_unanswered_inbound(
-                    task.source_message_identity
+                    task.source_message_identity,
+                    now=now,
+                    started_at=policy.auto_reply_started_at,
                 ):
                     return self._finish(
                         task,
@@ -1366,12 +1654,21 @@ class AgentAutonomyOrchestrator:
         *,
         now: datetime,
     ) -> AgentAutonomyRunResult:
+        safe_skip = exc.code in {
+            "inbound_message_stale",
+            "reply_contains_unapproved_address",
+            "reply_not_needed",
+        }
         return self._finish(
             task,
             TaskCompletion(
-                status=AutonomyTaskStatus.FAILED,
+                status=(
+                    AutonomyTaskStatus.STALE
+                    if safe_skip
+                    else AutonomyTaskStatus.FAILED
+                ),
                 stable_error_code=exc.code,
-                count_failure=True,
+                count_failure=not safe_skip,
             ),
             now=now,
         )

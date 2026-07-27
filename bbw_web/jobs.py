@@ -34,6 +34,12 @@ from bbw_agent.repositories import (
     AgentActionExecutionRepository,
     AgentRunRepository,
 )
+from bbw_agent.autonomous import (
+    AUTONOMY_REPLY_CLOCK_SKEW_SECONDS,
+    AUTONOMY_REPLY_MAX_AGE_SECONDS,
+    autonomy_reply_message_is_eligible,
+    autonomy_reply_message_is_fresh,
+)
 from bbw_prod.compatibility import (
     CompatibilityMode,
     compatibility_dispatch_enabled,
@@ -2974,9 +2980,11 @@ def _unanswered_autonomy_reply_candidates(
     db: Any,
     *,
     owner_user_id: uuid.UUID,
+    not_before: datetime,
+    now: datetime,
     limit: int,
 ) -> list[_AutonomyReplyCandidate]:
-    """Return unanswered heads that have never been bound to an autonomy task.
+    """Return fresh, meaningful unanswered heads not already bound to a task.
 
     Excluding existing task rows in SQL lets the database scan past old failed,
     cancelled or otherwise terminal work instead of allowing those rows to
@@ -3003,6 +3011,16 @@ def _unanswered_autonomy_reply_candidates(
             AiAgentAutonomyTask.source_message_id == Message.id,
         )
     )
+    blocked_target = exists(
+        select(Relationship.id).where(
+            Relationship.owner_user_id == owner_user_id,
+            Relationship.subject_upstream_uid
+            == Conversation.peer_upstream_uid,
+            Relationship.kind.in_(("blacklist", "blacklisted_by")),
+            Relationship.status == "active",
+            Relationship.ended_at.is_(None),
+        )
+    )
     metadata_origin = func.coalesce(
         Message.extra_data.op("->>")("origin"), ""
     )
@@ -3025,6 +3043,7 @@ def _unanswered_autonomy_reply_candidates(
                 Message.provider.in_(("web-local", CHAT_PROVIDER)),
                 Conversation.provider.in_(("web-local", CHAT_PROVIDER)),
                 Message.provider == Conversation.provider,
+                func.lower(Conversation.kind) == "direct",
                 Message.direction == "incoming",
                 func.lower(Message.message_type).in_(("text", "timtextelem")),
                 func.length(func.btrim(func.coalesce(Message.body, ""))) > 0,
@@ -3034,6 +3053,10 @@ def _unanswered_autonomy_reply_candidates(
                 ~client_key.like("agent:%"),
                 ~later_exists,
                 ~existing_task,
+                ~blocked_target,
+                Message.occurred_at >= not_before,
+                Message.occurred_at
+                <= now + timedelta(seconds=AUTONOMY_REPLY_CLOCK_SKEW_SECONDS),
                 func.length(
                     func.btrim(func.coalesce(Conversation.peer_upstream_uid, ""))
                 )
@@ -3047,23 +3070,39 @@ def _unanswered_autonomy_reply_candidates(
                     Message.sender_upstream_uid == Conversation.peer_upstream_uid,
                 ),
             )
-            .order_by(Message.occurred_at.asc(), Message.id.asc())
-            .limit(maximum)
+            .order_by(Message.occurred_at.desc(), Message.id.desc())
+            .limit(min(maximum * 4, 200))
         )
     )
     candidates: list[_AutonomyReplyCandidate] = []
     for message, conversation in rows:
         metadata = message.extra_data if isinstance(message.extra_data, Mapping) else {}
+        peer = str(conversation.peer_upstream_uid or "").strip()
+        if not autonomy_reply_message_is_fresh(
+            message.occurred_at,
+            now=now,
+            started_at=not_before,
+        ):
+            continue
+        if not autonomy_reply_message_is_eligible(
+            message.body,
+            sender_upstream_uid=message.sender_upstream_uid,
+            peer_upstream_uid=peer,
+            conversation_title=conversation.title,
+        ):
+            continue
         identity = str(metadata.get("canonical_message_id") or "").strip()
         if not identity:
             identity = f"{message.provider}:{message.upstream_message_id}"
         candidates.append(
             _AutonomyReplyCandidate(
                 message_id=message.id,
-                peer_upstream_uid=str(conversation.peer_upstream_uid or "").strip(),
+                peer_upstream_uid=peer,
                 message_identity=identity,
             )
         )
+        if len(candidates) >= maximum:
+            break
     return candidates
 
 
@@ -3239,11 +3278,25 @@ def _schedule_autonomy_owner(
 
         tasks = AgentAutonomyTaskRepository(db)
         remaining = max(1, min(int(task_limit), 50))
-        if policy.auto_reply_enabled and remaining > 0:
+        if (
+            policy.auto_reply_enabled
+            and remaining > 0
+            and setting.auto_reply_started_at is not None
+            and not tasks.has_open_task_type(
+                owner_user_id=owner_user_id,
+                task_type=AutonomyTaskType.REPLY_TO_MESSAGE.value,
+            )
+        ):
+            reply_not_before = max(
+                setting.auto_reply_started_at,
+                now - timedelta(seconds=AUTONOMY_REPLY_MAX_AGE_SECONDS),
+            )
             candidates = _unanswered_autonomy_reply_candidates(
                 db,
                 owner_user_id=owner_user_id,
-                limit=50,
+                not_before=reply_not_before,
+                now=now,
+                limit=1,
             )
             for candidate in candidates:
                 key = deterministic_task_key(

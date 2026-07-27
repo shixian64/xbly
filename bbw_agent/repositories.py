@@ -32,6 +32,10 @@ from bbw_prod.models import (
     User,
     utcnow,
 )
+from .autonomous import (
+    autonomy_reply_message_is_eligible,
+    autonomy_reply_message_is_fresh,
+)
 
 
 SUPPORTED_ACCOUNT_ACTION_TYPES = frozenset(
@@ -1091,6 +1095,7 @@ class AutonomyConversationHeadRow:
     body: str
     occurred_at: datetime
     revoked: bool
+    conversation_title: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1332,6 +1337,7 @@ class AgentAutonomySettingRepository:
             owner_user_id=owner_user_id,
             user_enabled=False,
             auto_reply_enabled=False,
+            auto_reply_started_at=None,
             scheduled_post_enabled=False,
             managed_relationships_enabled=False,
             discovery_enabled=False,
@@ -1482,9 +1488,16 @@ class AgentAutonomySettingRepository:
             raise ValueError("friend requests require a positive daily budget")
 
         row = self.get_or_create(owner_user_id, for_update=True)
+        now = utcnow()
+        reply_watermark = (
+            row.auto_reply_started_at
+            if reply and bool(row.auto_reply_enabled) and row.auto_reply_started_at
+            else now if reply else None
+        )
         values = {
             "user_enabled": enabled,
             "auto_reply_enabled": reply,
+            "auto_reply_started_at": reply_watermark,
             "scheduled_post_enabled": posts,
             "managed_relationships_enabled": relationships,
             "discovery_enabled": discovery,
@@ -1519,8 +1532,8 @@ class AgentAutonomySettingRepository:
             row.consecutive_failures = 0
             row.halted_at = None
             row.halted_reason = None
-            row.next_run_at = utcnow() if enabled else None
-            row.updated_at = utcnow()
+            row.next_run_at = now if enabled else None
+            row.updated_at = now
             self.db.flush()
         return row
 
@@ -1550,6 +1563,7 @@ class AgentAutonomySettingRepository:
         now = utcnow()
         row.user_enabled = False
         row.auto_reply_enabled = False
+        row.auto_reply_started_at = None
         row.scheduled_post_enabled = False
         row.managed_relationships_enabled = False
         row.discovery_enabled = False
@@ -1593,6 +1607,7 @@ class AgentAutonomySettingRepository:
             .values(
                 user_enabled=False,
                 auto_reply_enabled=False,
+                auto_reply_started_at=None,
                 scheduled_post_enabled=False,
                 managed_relationships_enabled=False,
                 discovery_enabled=False,
@@ -2341,6 +2356,7 @@ class AgentAutonomyTaskRepository:
             body=str(message.body or ""),
             occurred_at=message.occurred_at,
             revoked=_autonomy_message_revoked(message),
+            conversation_title=str(conversation.title or ""),
         )
 
     def unanswered_inbound_candidates(
@@ -2414,6 +2430,7 @@ class AgentAutonomyTaskRepository:
                     body=str(message.body or ""),
                     occurred_at=message.occurred_at,
                     revoked=False,
+                    conversation_title=str(conversation.title or ""),
                 )
             )
         return candidates
@@ -2486,6 +2503,16 @@ class AgentAutonomyTaskRepository:
                 or str(head.message_type or "").strip().lower()
                 not in {"text", "timtextelem"}
                 or not str(head.body or "").strip()
+                or not autonomy_reply_message_is_eligible(
+                    head.body,
+                    peer_upstream_uid=head.peer_upstream_uid,
+                    conversation_title=head.conversation_title,
+                )
+                or not autonomy_reply_message_is_fresh(
+                    head.occurred_at,
+                    now=request.now,
+                    started_at=setting.auto_reply_started_at,
+                )
             ):
                 return DispatchReservationDecision(
                     DispatchDecisionCode.SOURCE_STALE
@@ -2831,6 +2858,9 @@ class AgentAutonomyTaskRepository:
         )()
         if self._dispatch_gate_code(task=task, request=request, snapshot=snapshot) is not None:
             return None
+        assert snapshot is not None
+        setting = snapshot["autonomy_setting"]
+        dispatch_now = utcnow()
         if task.task_type == "reply_to_message":
             head = self.get_conversation_head(
                 owner_user_id=task.owner_user_id,
@@ -2844,6 +2874,16 @@ class AgentAutonomyTaskRepository:
                 or str(head.message_type or "").strip().lower()
                 not in {"text", "timtextelem"}
                 or not str(head.body or "").strip()
+                or not autonomy_reply_message_is_eligible(
+                    head.body,
+                    peer_upstream_uid=head.peer_upstream_uid,
+                    conversation_title=head.conversation_title,
+                )
+                or not autonomy_reply_message_is_fresh(
+                    head.occurred_at,
+                    now=dispatch_now,
+                    started_at=setting.auto_reply_started_at,
+                )
             ):
                 return None
         elif task.task_type == "proactive_message" and self.get_conversation_head(
@@ -2851,10 +2891,10 @@ class AgentAutonomyTaskRepository:
             peer_upstream_uid=str(task.target_upstream_uid or ""),
         ) is not None:
             return None
-        assert snapshot is not None
-        setting = snapshot["autonomy_setting"]
         try:
-            local_now = utcnow().astimezone(ZoneInfo(str(setting.timezone or "UTC")))
+            local_now = dispatch_now.astimezone(
+                ZoneInfo(str(setting.timezone or "UTC"))
+            )
         except ZoneInfoNotFoundError:
             return None
         start_minute = int(setting.active_start_minute)

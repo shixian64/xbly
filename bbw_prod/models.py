@@ -956,6 +956,10 @@ class AiAgentAutonomySetting(
             name="ai_agent_autonomy_reply_requires_action",
         ),
         CheckConstraint(
+            "NOT auto_reply_enabled OR auto_reply_started_at IS NOT NULL",
+            name="ai_agent_autonomy_reply_requires_watermark",
+        ),
+        CheckConstraint(
             "NOT scheduled_post_enabled OR "
             "(user_enabled AND allowed_actions ? 'publish_text_post' "
             "AND daily_post_limit >= 1)",
@@ -1022,6 +1026,9 @@ class AiAgentAutonomySetting(
     )
     auto_reply_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    auto_reply_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
     )
     scheduled_post_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")

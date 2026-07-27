@@ -718,6 +718,7 @@ class ByokAutonomySettingRepositoryTests(unittest.TestCase):
         return AiAgentAutonomySetting(
             id=uuid.uuid4(),
             owner_user_id=owner_id,
+            auto_reply_started_at=datetime(2026, 7, 25, 11, 0, tzinfo=UTC),
             consecutive_failures=0,
             version=7,
             **self._POLICY_KWARGS,
@@ -778,6 +779,32 @@ class ByokAutonomySettingRepositoryTests(unittest.TestCase):
         self.assertIsNone(row.halted_at)
         self.assertIsNone(row.halted_reason)
         self.assertEqual(row.consecutive_failures, 0)
+
+    def test_auto_reply_watermark_resets_on_each_new_enablement(self) -> None:
+        owner_id = uuid.uuid4()
+        row = self._existing_row(owner_id)
+        original_watermark = row.auto_reply_started_at
+        session = _ScalarSession(row)
+        disabled_kwargs = dict(
+            self._POLICY_KWARGS,
+            user_enabled=False,
+            auto_reply_enabled=False,
+        )
+
+        AgentAutonomySettingRepository(session).configure(
+            owner_id,
+            **disabled_kwargs,
+        )
+        self.assertIsNone(row.auto_reply_started_at)
+
+        session = _ScalarSession(row)
+        AgentAutonomySettingRepository(session).configure(
+            owner_id,
+            **self._POLICY_KWARGS,
+        )
+        self.assertIsNotNone(row.auto_reply_started_at)
+        self.assertNotEqual(row.auto_reply_started_at, original_watermark)
+        self.assertEqual(row.version, 9)
         self.assertEqual(session.flushed, 1)
 
 

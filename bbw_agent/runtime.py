@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .autonomous import (
+    AUTONOMY_NO_REPLY_SENTINEL,
     AUTONOMOUS_BROWSE_DAILY_LIMIT,
     AUTONOMOUS_MATCH_DAILY_LIMIT,
     BROWSE_ONLINE_USERS,
@@ -44,7 +45,9 @@ from .autonomous import (
     GeneratedText,
     MessageDirection,
     MAX_AUTONOMOUS_TEXT_LENGTH,
+    sanitize_social_style_profile,
     TaskCompletion,
+    unapproved_relationship_address_terms,
 )
 
 
@@ -321,6 +324,7 @@ class SqlAlchemyAgentAutonomyRepository:
             occurred_at=row.occurred_at,
             revoked=bool(row.revoked),
             has_outgoing_after=False,
+            conversation_title=str(row.conversation_title or ""),
         )
 
     def begin_generation(self, **kwargs: Any) -> bool:
@@ -384,9 +388,15 @@ def policy_from_rows(
     managed_targets = frozenset(
         getattr(autonomy_setting, "managed_target_uids", ()) or ()
     )
+    auto_reply_started_at = getattr(
+        autonomy_setting,
+        "auto_reply_started_at",
+        None,
+    )
     auto_reply_enabled = bool(
         getattr(autonomy_setting, "auto_reply_enabled", False)
         and SEND_PRIVATE_MESSAGE in selected_actions
+        and auto_reply_started_at is not None
     )
     scheduled_posts_enabled = bool(
         getattr(autonomy_setting, "scheduled_post_enabled", False)
@@ -489,6 +499,7 @@ def policy_from_rows(
             auto_reply_enabled=auto_reply_enabled,
             scheduled_posts_enabled=scheduled_posts_enabled,
             relationship_actions_enabled=relationship_actions_enabled,
+            auto_reply_started_at=auto_reply_started_at,
             discovery_enabled=discovery_enabled,
             text_match_enabled=text_match_enabled,
             proactive_message_enabled=proactive_message_enabled,
@@ -601,6 +612,10 @@ def _post_generation_messages(
     style_traits: dict[str, object],
     custom_instructions: str,
 ) -> tuple[dict[str, str], ...]:
+    safe_summary, safe_traits = sanitize_social_style_profile(
+        style_summary,
+        style_traits,
+    )
     system = (
         "你是自动社交账号的公开文字动态生成器。你只能输出一条纯文字动态，"
         "不得调用工具、不得声称已经执行发布、不得索取或输出密钥、Cookie、"
@@ -612,8 +627,8 @@ def _post_generation_messages(
     payload = {
         "operation_brief": str(instruction or "").strip()[:4_000],
         "style_profile": {
-            "summary": str(style_summary or "")[:1_000],
-            "traits": style_traits,
+            "summary": safe_summary,
+            "traits": safe_traits,
         },
         "writing_preferences": str(custom_instructions or "")[:4_000],
     }
@@ -639,6 +654,10 @@ def _outreach_generation_messages(
     style_traits: dict[str, object],
     custom_instructions: str,
 ) -> tuple[dict[str, str], ...]:
+    safe_summary, safe_traits = sanitize_social_style_profile(
+        style_summary,
+        style_traits,
+    )
     friend_request = task_type == AutonomyTaskType.REQUEST_FRIEND
     system = (
         "你是自动社交账号的好友申请文字生成器。你只能输出一条自然、克制的好友申请，"
@@ -650,13 +669,16 @@ def _outreach_generation_messages(
         "你是自动社交账号的首次私信生成器。你只能输出一条自然、礼貌、不过度热情的开场白，"
         "不得调用工具、不得声称已经执行发送、不得索取或输出密钥、Cookie、Token、账号或密码。"
         "不得编造双方已经认识、见过或拥有共同经历，不得诱导转移到其他平台或索取联系方式。"
+        "不得使用宝宝、宝贝、哥哥、姐姐、狗狗等昵称、亲昵称呼或关系称呼。"
         "只返回私信正文，不加标题、引号、Markdown或解释，正文保持简短。"
     )
+    if friend_request:
+        system += "不得使用宝宝、宝贝、哥哥、姐姐、狗狗等昵称、亲昵称呼或关系称呼。"
     payload = {
         "operation_brief": str(instruction or "").strip()[:4_000],
         "style_profile": {
-            "summary": str(style_summary or "")[:1_000],
-            "traits": style_traits,
+            "summary": safe_summary,
+            "traits": safe_traits,
         },
         "writing_preferences": str(custom_instructions or "")[:4_000],
     }
@@ -707,6 +729,29 @@ class ByokAgentAutonomyModelRunner(AgentAutonomyModelRunner):
             raise AgentAutonomyModelError(
                 "generated_text_too_long",
                 "模型生成内容超过两千字，本次未执行",
+            )
+        return text
+
+    @classmethod
+    def _validated_reply_text(
+        cls,
+        value: object,
+        *,
+        allowed_address_terms: Sequence[str] = (),
+    ) -> str:
+        text = cls._validated_completion_text(value)
+        if AUTONOMY_NO_REPLY_SENTINEL in text.strip("` \t\r\n"):
+            raise AgentAutonomyModelError(
+                "reply_not_needed",
+                "当前消息不需要自动回复，本次未执行账号操作",
+            )
+        if unapproved_relationship_address_terms(
+            text,
+            allowed_terms=allowed_address_terms,
+        ):
+            raise AgentAutonomyModelError(
+                "reply_contains_unapproved_address",
+                "模型使用了当前联系人未授权的称呼，本次未执行账号操作",
             )
         return text
 
@@ -866,6 +911,7 @@ class ByokAgentAutonomyModelRunner(AgentAutonomyModelRunner):
                     objective=task.generation_instruction
                     or "回复对方最后一条尚未回复的消息",
                     runtime=runtime,
+                    autonomous=True,
                 )
             run_id, cached = self._begin_model_run(
                 task=task,
@@ -877,16 +923,27 @@ class ByokAgentAutonomyModelRunner(AgentAutonomyModelRunner):
             )
             if cached is not None:
                 self._ensure_runtime_current(runtime)
-                return cached
+                return GeneratedText(
+                    self._validated_reply_text(
+                        cached.text,
+                        allowed_address_terms=plan.allowed_address_terms,
+                    ),
+                    input_tokens=cached.input_tokens,
+                    output_tokens=cached.output_tokens,
+                    latency_ms=cached.latency_ms,
+                )
             completion = self.gateway_factory(self.settings).complete(
                 base_url=runtime.base_url,
                 api_key=runtime.api_key,
                 model=runtime.model,
                 messages=plan.messages,
-                temperature=runtime.temperature,
+                temperature=min(runtime.temperature, 0.3),
                 max_output_tokens=min(runtime.max_output_tokens, 800),
             )
-            text = self._validated_completion_text(completion.text)
+            text = self._validated_reply_text(
+                completion.text,
+                allowed_address_terms=plan.allowed_address_terms,
+            )
             self._ensure_runtime_current(runtime)
             self._succeed_model_run(
                 task=task,
@@ -1074,16 +1131,21 @@ class ByokAgentAutonomyModelRunner(AgentAutonomyModelRunner):
             )
             if cached is not None:
                 self._ensure_runtime_current(runtime)
-                return cached
+                return GeneratedText(
+                    self._validated_reply_text(cached.text),
+                    input_tokens=cached.input_tokens,
+                    output_tokens=cached.output_tokens,
+                    latency_ms=cached.latency_ms,
+                )
             completion = self.gateway_factory(self.settings).complete(
                 base_url=runtime.base_url,
                 api_key=runtime.api_key,
                 model=runtime.model,
                 messages=messages,
-                temperature=runtime.temperature,
+                temperature=min(runtime.temperature, 0.3),
                 max_output_tokens=min(runtime.max_output_tokens, 300),
             )
-            text = self._validated_completion_text(completion.text)
+            text = self._validated_reply_text(completion.text)
             self._ensure_runtime_current(runtime)
             self._succeed_model_run(
                 task=task,

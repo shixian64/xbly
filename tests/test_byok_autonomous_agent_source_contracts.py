@@ -220,6 +220,44 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
             "reply_actions + post_actions + relationship_actions", downgrade
         )
 
+    def test_0019_migration_and_scheduler_fail_closed_on_old_replies(self) -> None:
+        migration = self.read(
+            "migrations/versions/20260727_0019_safe_autonomy_replies.py"
+        )
+        self.assertIn('revision: str = "20260727_0019"', migration)
+        self.assertIn(
+            'down_revision: Union[str, Sequence[str], None] = "20260727_0018"',
+            migration,
+        )
+        self.assertIn('"auto_reply_started_at"', migration)
+        self.assertIn("SET auto_reply_started_at = now()", migration)
+        self.assertIn("ai_agent_autonomy_reply_requires_watermark", migration)
+
+        models = self.read("bbw_prod/models.py")
+        setting = self.fragment(
+            models,
+            "class AiAgentAutonomySetting(",
+            "class AiStyleProfile(",
+        )
+        self.assertIn("auto_reply_started_at: Mapped[datetime | None]", setting)
+        self.assertIn("ai_agent_autonomy_reply_requires_watermark", setting)
+
+        scheduler, _ = self.function_source(
+            "bbw_web/jobs.py", "_unanswered_autonomy_reply_candidates"
+        )
+        self.assertIn("Message.occurred_at >= not_before", scheduler)
+        self.assertIn("autonomy_reply_message_is_eligible(", scheduler)
+        self.assertIn("autonomy_reply_message_is_fresh(", scheduler)
+        self.assertIn("Message.occurred_at.desc()", scheduler)
+        self.assertNotIn("Message.occurred_at.asc()", scheduler)
+
+        owner_scheduler, _ = self.function_source(
+            "bbw_web/jobs.py", "_schedule_autonomy_owner"
+        )
+        self.assertIn("setting.auto_reply_started_at is not None", owner_scheduler)
+        self.assertIn("tasks.has_open_task_type(", owner_scheduler)
+        self.assertIn("limit=1", owner_scheduler)
+
     def test_agent_run_type_constraints_use_alembic_complete_names(self) -> None:
         for migration in (
             "migrations/versions/20260725_0015_byok_account_actions.py",
@@ -717,6 +755,33 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         self.assertIn("row.completed_at = utcnow()", run_fail)
         self.assertIn("self.db.flush()", run_fail)
         self.assertIn("return row", run_fail)
+
+    def test_autonomous_reply_prompt_has_time_and_contact_boundaries(self) -> None:
+        draft, _ = self.function_source(
+            "bbw_agent/services.py", "build_reply_draft_plan"
+        )
+        for binding in (
+            "AUTONOMY_REPLY_SESSION_GAP_SECONDS",
+            '"occurred_at"',
+            '"seconds_ago"',
+            '"allowed_address_terms"',
+            "sanitize_social_style_profile(",
+            "AUTONOMY_NO_REPLY_SENTINEL",
+            "不得续接已经中断的旧话题",
+            "列表为空时完全不要称呼对方",
+        ):
+            self.assertIn(binding, draft)
+
+        reply, _ = self.function_source("bbw_agent/runtime.py", "generate_reply")
+        self.assertIn("autonomous=True", reply)
+        self.assertIn("temperature=min(runtime.temperature, 0.3)", reply)
+        self.assertIn("self._validated_reply_text(", reply)
+
+        style, _ = self.function_source(
+            "bbw_agent/services.py", "build_style_analysis_plan"
+        )
+        self.assertIn("不同联系人之间的昵称", style)
+        self.assertIn("不得写入 summary", style)
 
     def test_final_gate_binds_runner_snapshot_and_atomic_reply_source(self) -> None:
         gate, _ = self.function_source(
