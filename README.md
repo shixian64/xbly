@@ -22,9 +22,10 @@
 | v154 action catalog（历史分析保留） | ✅ 非商业 action 可调用 | `app.call*` · `call_url` · multipart；商业 action 统一停用 |
 | 匹配 / 任务 / 资料 / 社交 / 房间 | ✅ HTTP | 各 `modules/*` |
 | IM 凭证（腾讯 UserSig / 融云） | ✅ 凭证 | `app.native.im` |
-| 已迁移 Web 账号间私聊（文本与富媒体） | ✅ PostgreSQL + 私有 R2 本地权威 | `bbw_web.messaging`、`bbw_web.media_native`；TIM 仅异步兼容镜像 |
-| Web-local 资料、关系与动态 | ✅ PostgreSQL + 私有 R2 本地权威 | 完整资料含 owner-bound 头像；动态支持文字、最多 9 图或单视频；私有头像/媒体动态不承诺旧 APK 可见 |
-| 与未迁移账号或 APK 互通 | ⚠️ 仍需 TIM / Banghua | 本地成功不依赖兼容镜像；外部服务死亡后该互通停止 |
+| Web 私聊（文本与富媒体） | ✅ TIM 权威 | 文字优先 TIM SDK、TIM REST 兜底；图片、语音、视频和文件走 TIM SDK；闪图走原 APK 接口 |
+| Web 资料、关系、在线/附近、匹配与动态 | ✅ 原 APK 接口权威 | Web BFF 只做鉴权、参数归一和结果展示，不以 PostgreSQL 本地实现替代产品接口 |
+| PostgreSQL / Redis / 私有 R2 | ✅ 辅助存储 | Session、缓存、聊天归档、权限镜像、历史兼容媒体及 Agent 数据；不作为产品社交与消息权威 |
+| 与 APK 账号互通 | ✅ 依赖原服务 | 资料、关系、发现、匹配和动态依赖 Banghua/APK 服务；私聊依赖 TIM，外部服务不可用时不切换到 Web 本地权威 |
 | 刷脸实名 | ⚠️ 仅 HTTP 编排 | `app.native.face` · 活体靠阿里云 |
 | 服务端会员权益 | ✅ 只读保留 | 登录和资料响应中的 `vip` / `svip` 状态 |
 | 产品化 Web App（PC/手机） | ✅ 主流程 | 本地：`python -m bbw_web`；生产：`compose.yaml` + `bbw_web.api` |

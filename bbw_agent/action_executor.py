@@ -319,7 +319,7 @@ def _provider_web_user(identity: ActionIdentity, persistence: Any) -> Any:
         _close_restored_web_user(web_user)
         raise AccountActionError(
             "external_channel_disabled",
-            "当前账号只启用了 Web 本地通道，无法操作尚未迁移的外部目标",
+            "当前会话不是原账号服务会话，请重新登录后再执行账号操作",
             status_code=409,
         )
     # Account actions must not silently broaden into a credential refresh or

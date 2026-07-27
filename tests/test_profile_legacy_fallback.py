@@ -56,6 +56,9 @@ class _LegacyProfileHandler:
     def do_GET(self) -> None:
         return None
 
+    def do_POST(self) -> None:
+        return None
+
     def finish_capture(self) -> tuple[int, list[tuple[str, str]], bytes]:
         user = {"id": "9", "uid": "9", "nickname": "上游用户"}
         body = json.dumps(
@@ -74,7 +77,7 @@ def _request(
     method: str = "GET",
     path: str = "/api/profile/user",
     query: str = "uid=9",
-    upstream_auth_mode: str = "provider-first",
+    upstream_auth_mode: str = "provider-only",
     body: dict[str, object] | None = None,
 ) -> tuple[Request, bytes]:
     raw_body = json.dumps(body or {}).encode("utf-8") if method == "POST" else b""
@@ -125,7 +128,7 @@ def _payload(response: object) -> dict[str, object]:
     return json.loads(bytes(response.body).decode("utf-8"))
 
 
-class ProfileLegacyFallbackDispatchTests(unittest.TestCase):
+class ProfileApkProviderDispatchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.previous_store = bff_server.STORE
         bff_server.STORE = _Store()
@@ -134,26 +137,13 @@ class ProfileLegacyFallbackDispatchTests(unittest.TestCase):
     def tearDown(self) -> None:
         bff_server.STORE = self.previous_store
 
-    @staticmethod
-    def _unavailable(*, fallback: bool) -> native_social_api.NativeSocialResponse:
-        return native_social_api.NativeSocialResponse(
-            status=404,
-            payload={
-                "ok": False,
-                "code": "SOCIAL_TARGET_UNAVAILABLE",
-                "error": "目标账号不存在、未迁移或已停用",
-                "source": "web-local",
-            },
-            legacy_read_fallback_allowed=fallback,
-        )
-
-    def test_provider_first_unmigrated_profile_uses_legacy_read(self) -> None:
+    def test_profile_read_uses_apk_provider_without_native_lookup(self) -> None:
         request, raw_body = _request()
         with (
             patch.object(
                 native_social_api,
                 "dispatch_social_native",
-                return_value=self._unavailable(fallback=True),
+                side_effect=AssertionError("profile read entered native dispatcher"),
             ),
             patch.object(web_api, "CapturingHandler", _LegacyProfileHandler),
         ):
@@ -163,57 +153,26 @@ class ProfileLegacyFallbackDispatchTests(unittest.TestCase):
         self.assertEqual(_payload(response)["user"]["nickname"], "上游用户")
         self.assertEqual(_LegacyProfileHandler.calls, 1)
 
-    def test_local_only_never_uses_legacy_profile_read(self) -> None:
+    def test_profile_read_rejects_retired_local_auth_mode(self) -> None:
         request, raw_body = _request(upstream_auth_mode="local-only")
         with (
             patch.object(
                 native_social_api,
                 "dispatch_social_native",
-                return_value=self._unavailable(fallback=True),
+                side_effect=AssertionError("profile read entered native dispatcher"),
             ),
             patch.object(
                 web_api,
                 "CapturingHandler",
-                side_effect=AssertionError("local-only contacted provider"),
+                side_effect=AssertionError("retired mode reached provider dispatch"),
             ),
         ):
             response = web_api._legacy_dispatch_sync(request, raw_body)
 
-        self.assertEqual(response.status_code, 404)
-        self.assertEqual(_payload(response)["code"], "SOCIAL_TARGET_UNAVAILABLE")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(_payload(response)["code"], "UPSTREAM_AUTH_MODE_UNSUPPORTED")
 
-    def test_inactive_or_migrated_target_never_uses_legacy_profile_read(self) -> None:
-        cases = (
-            self._unavailable(fallback=False),
-            native_social_api.NativeSocialResponse(
-                status=200,
-                payload={
-                    "ok": True,
-                    "user": {"uid": "9", "nickname": "本地用户"},
-                    "source": "web-local",
-                },
-            ),
-        )
-        for native_response in cases:
-            with self.subTest(status=native_response.status):
-                request, raw_body = _request()
-                with (
-                    patch.object(
-                        native_social_api,
-                        "dispatch_social_native",
-                        return_value=native_response,
-                    ),
-                    patch.object(
-                        web_api,
-                        "CapturingHandler",
-                        side_effect=AssertionError("provider must not be contacted"),
-                    ),
-                ):
-                    response = web_api._legacy_dispatch_sync(request, raw_body)
-
-                self.assertEqual(response.status_code, native_response.status)
-
-    def test_write_path_ignores_legacy_read_fallback_marker(self) -> None:
+    def test_profile_visit_write_uses_apk_provider(self) -> None:
         request, raw_body = _request(
             method="POST",
             path="/api/social/visit",
@@ -224,18 +183,14 @@ class ProfileLegacyFallbackDispatchTests(unittest.TestCase):
             patch.object(
                 native_social_api,
                 "dispatch_social_native",
-                return_value=self._unavailable(fallback=True),
+                side_effect=AssertionError("profile visit entered native dispatcher"),
             ),
-            patch.object(
-                web_api,
-                "CapturingHandler",
-                side_effect=AssertionError("write path contacted provider"),
-            ),
+            patch.object(web_api, "CapturingHandler", _LegacyProfileHandler),
         ):
             response = web_api._legacy_dispatch_sync(request, raw_body)
 
-        self.assertEqual(response.status_code, 404)
-        self.assertEqual(_payload(response)["code"], "SOCIAL_TARGET_UNAVAILABLE")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(_LegacyProfileHandler.calls, 1)
 
 
 if __name__ == "__main__":

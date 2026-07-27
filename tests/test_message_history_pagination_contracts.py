@@ -107,7 +107,7 @@ class MessageHistoryPaginationFrontendTests(unittest.TestCase):
             index_html,
         )
 
-    def test_canonical_web_message_does_not_offer_tim_only_recall(self) -> None:
+    def test_retired_web_local_message_does_not_offer_tim_recall(self) -> None:
         app_js = (ROOT / "bbw_web" / "static" / "app.js").read_text(
             encoding="utf-8-sig"
         )
@@ -115,10 +115,11 @@ class MessageHistoryPaginationFrontendTests(unittest.TestCase):
             "function recalledMessageText", 1
         )[0]
 
-        self.assertIn("entry?.canonicalMessageId", revoke_action)
-        self.assertIn('String(entry?.source || "").toLowerCase() === "web-local"', revoke_action)
+        self.assertIn("if (isWebLocalCanonicalMessage(entry)) return null;", revoke_action)
+        self.assertIn("const hasSdkMessage = Boolean(entry.rawMessage);", revoke_action)
+        self.assertIn("const hasRestKey = Boolean(entry.msgKey);", revoke_action)
         self.assertLess(
-            revoke_action.index("entry?.canonicalMessageId"),
+            revoke_action.index("isWebLocalCanonicalMessage(entry)"),
             revoke_action.index("const eligible"),
         )
 

@@ -4541,7 +4541,6 @@ function clearViewCacheKey() {}
 function clearViewCachePrefix() {}
 function syncPrivateMessageControls() {}
 function updateImConnectionStatus() {}
-function webLocalDependencyMode() { return false; }
 function cleanupIM() {
   S.imMode = "";
   S.chat = null;
@@ -4637,7 +4636,7 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
             composer_panel,
         )
         self.assertIn(
-            "const stickerAction = !webLocalDependencyMode() && S.directImCredentialsEnabled && S.messagePolicyReady",
+            "const stickerAction = S.directImCredentialsEnabled && S.messagePolicyReady",
             composer_panel,
         )
         self.assertIn('data-kind="flash"', composer_panel)
@@ -5216,7 +5215,7 @@ if (merged.profile_resolved !== false) throw new Error("partial merged profile m
         )[1].split("void refreshVisiblePeerPresence", 1)[0]
         self.assertIn("recalculateUnreadTotal();", tim_conversation_sync)
 
-    def test_web_local_dependency_mode_prioritizes_archive_and_keeps_local_unread(self) -> None:
+    def test_web_uses_provider_tim_as_authority_and_archive_only_as_history(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
         connect = app_js.split("async function ensureTimConnected", 1)[1].split(
@@ -5225,17 +5224,11 @@ if (merged.profile_resolved !== false) throw new Error("partial merged profile m
         load_messages = app_js.split("async function loadConversationMessages", 1)[1].split(
             "function oldestPeerMessageTimestamp", 1
         )[0]
-        send_text = app_js.split("async function sendTextMessage", 1)[1].split(
-            "function progressRatio", 1
-        )[0]
         normalize = app_js.split("function normalizeConversationSummary", 1)[1].split(
             "function filterDismissedConversations", 1
         )[0]
         dependency_mode = app_js.split("function applyDependencyMode", 1)[1].split(
             "function applyUser", 1
-        )[0]
-        capabilities = app_js.split("function applyCapabilities", 1)[1].split(
-            "function setLoginMode", 1
         )[0]
         composer_panel = app_js.split("function chatComposerPanelHtml()", 1)[1].split(
             "function chatComposerQuoteHtml", 1
@@ -5245,22 +5238,22 @@ if (merged.profile_resolved !== false) throw new Error("partial merged profile m
         )[0]
 
         self.assertIn('dependencyMode: "provider"', app_js)
-        self.assertIn("function webLocalDependencyMode", app_js)
-        self.assertIn('S.dependencyMode = local ? "web-local/degraded"', app_js)
-        self.assertIn("if (webLocalDependencyMode())", connect)
-        self.assertLess(
-            connect.index("if (webLocalDependencyMode())"),
-            connect.index("ensureTimSdkLoaded()"),
+        self.assertNotIn("function webLocalDependencyMode", app_js)
+        self.assertIn('S.dependencyMode = "provider";', dependency_mode)
+        self.assertIn("ensureTimSdkLoaded()", connect)
+        self.assertNotIn("webLocalDependencyMode", connect)
+        self.assertIn('api(`/api/im/messages?peer=', load_messages)
+        self.assertIn('api(`/api/archive/messages?peer=', load_messages)
+        self.assertIn("S.chat.getMessageList", load_messages)
+        self.assertNotIn("localOnly", load_messages)
+        self.assertNotIn("archiveOnly", load_messages)
+        self.assertIn(
+            "const stickerAction = S.directImCredentialsEnabled && S.messagePolicyReady",
+            composer_panel,
         )
-        self.assertIn("const localOnly = archiveOnly || webLocalDependencyMode();", load_messages)
-        self.assertIn("if (!localOnly)", load_messages)
-        self.assertIn("archiveOnly: true", send_text)
-        self.assertIn('provider === "web-local"', normalize)
-        self.assertIn("conversation.unread_authoritative === true", normalize)
-        self.assertIn("S.directImCredentialsEnabled = false;", dependency_mode)
-        self.assertIn("!webLocalDependencyMode()", capabilities)
-        self.assertIn('if (webLocalDependencyMode()) return "";', composer_panel)
         self.assertIn("const richMessageActionsAvailable = S.messagePolicyReady;", composer)
+        self.assertNotIn("/api/im/media/messages", app_js)
+        self.assertNotIn("/api/im/media/uploads", app_js)
 
         node = shutil.which("node")
         if not node:
@@ -5272,12 +5265,12 @@ if (merged.profile_resolved !== false) throw new Error("partial merged profile m
             "function normalizeConversationSummary"
             + normalize
             + "\n"
-            + "const local = normalizeConversationSummary({source:'archive',provider:'web-local',"
-            + "unread_count:5,unread_authoritative:true,last_message:'新消息'}, {authority:'archive'});\n"
-            + "if (local.unread_count !== 5 || local.unread_authoritative !== true) throw new Error('local unread lost');\n"
-            + "const legacy = normalizeConversationSummary({source:'archive',provider:'tim',"
-            + "unread_count:5,unread_authoritative:true,last_message:'旧消息'}, {authority:'archive'});\n"
-            + "if (legacy.unread_count !== 0 || legacy.unread_authoritative !== false) throw new Error('legacy archive became authoritative');\n"
+            + "for (const provider of ['web-local', 'tim']) {\n"
+            + "  const archived = normalizeConversationSummary({source:'archive',provider,"
+            + "unread_count:5,unread_authoritative:true,last_message:'历史消息'}, {authority:'archive'});\n"
+            + "  if (archived.unread_count !== 0 || archived.unread_authoritative !== false) "
+            + "throw new Error('archive became authoritative: ' + provider);\n"
+            + "}\n"
         )
         result = subprocess.run(
             [node, "-e", script],
@@ -5289,7 +5282,7 @@ if (merged.profile_resolved !== false) throw new Error("partial merged profile m
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_web_local_archive_polling_avoids_legacy_history_and_closes_read_loop(self) -> None:
+    def test_provider_history_fetches_original_service_for_current_and_older_messages(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
         load_messages = app_js.split("async function loadConversationMessages", 1)[1].split(
@@ -5299,137 +5292,16 @@ if (merged.profile_resolved !== false) throw new Error("partial merged profile m
             "function recalculateUnreadTotal", 1
         )[0]
 
-        self.assertIn("const receivedMessageChanged =", load_messages)
-        self.assertIn("receivedMessageChanged &&", load_messages)
-        self.assertIn('S.route === "msg" &&', load_messages)
-        self.assertIn("!document.hidden", load_messages)
-        self.assertIn("markConversationRead(target);", load_messages)
-        self.assertIn("const localOnly = webLocalDependencyMode();", load_older)
-        self.assertIn("if (!localOnly)", load_older)
-
-        node = shutil.which("node")
-        if not node:
-            self.skipTest("node is not installed")
-        script = (
-            r"""
-const calls = [];
-let readCount = 0;
-let refreshedCount = 0;
-let toastCount = 0;
-const document = { hidden: false };
-const S = {
-  user: { uid: "42" },
-  route: "msg",
-  activePeer: "9",
-  imMode: "rest",
-  chat: null,
-  imMessages: [],
-  imMessageLoadingPeers: new Set(),
-  imMessageLoadedPeers: new Set(),
-  imArchiveLoadedPeers: new Set(),
-  imMessageArchiveCursors: new Map(),
-  imMessageOlderLoadingPeers: new Set(),
-  imMessageHistoryExhaustedPeers: new Set(),
-};
-function webLocalDependencyMode() { return true; }
-async function api(path) {
-  calls.push(path);
-  if (!path.startsWith("/api/archive/messages?")) {
-    throw new Error(`legacy history called: ${path}`);
-  }
-  return {
-    ok: true,
-    data: {
-      ok: true,
-      items: path.includes("&before=")
-        ? []
-        : [{ id: "incoming-1", flow: "in", source: "archive", text: "新消息" }],
-      has_more: false,
-    },
-  };
-}
-function itemsOf(data) { return Array.isArray(data?.items) ? data.items : []; }
-function timMessageEntry(item, peer) {
-  return { ...item, peer, type: item.flow === "out" ? "mine" : "" };
-}
-function mergePendingMessageRevocations(_peer, entries) { return entries; }
-function mergePeerMessages(_peer, entries) {
-  if (!entries.length) return false;
-  S.imMessages.push(...entries);
-  return true;
-}
-function refreshChatLog() {}
-function archiveMessageBestEffort() {}
-function archiveRemoteUrl() { return ""; }
-function messageIdentityKey(entry) { return String(entry.id || ""); }
-function markConversationRead(peer) {
-  if (peer !== "9") throw new Error("wrong read peer");
-  readCount += 1;
-}
-function refreshMessageConversationRegion() { refreshedCount += 1; }
-function scheduleSdkMessageReadReceipts() {}
-function revealOlderRenderedMessages() { return false; }
-function oldestPeerMessageTimestamp() { return 2000; }
-function chatHistoryStatusHtml() { return ""; }
-function expandChatMessageRenderLimit() {}
-function renderChatLog() {}
-function requestAnimationFrame(callback) { callback(); }
-function toast() { toastCount += 1; }
-"""
-            + "async function loadConversationMessages"
-            + load_messages
-            + "\nasync function loadOlderConversationMessages"
-            + load_older
-            + r"""
-(async () => {
-  await loadConversationMessages("9", { force: true });
-  if (calls.length !== 1 || !calls[0].startsWith("/api/archive/messages?")) {
-    throw new Error(`unexpected active-poll calls: ${JSON.stringify(calls)}`);
-  }
-  if (readCount !== 1 || refreshedCount !== 1) {
-    throw new Error(`local read loop not closed: read=${readCount} refresh=${refreshedCount}`);
-  }
-  document.hidden = true;
-  await loadConversationMessages("9", { force: true });
-  if (readCount !== 1 || refreshedCount !== 1) {
-    throw new Error("hidden local conversation was incorrectly marked read");
-  }
-  document.hidden = false;
-
-  calls.length = 0;
-  S.imMessages = [{ id: "current", peer: "9", timestamp: 2000 }];
-  S.imMessageLoadedPeers.add("9");
-  const log = {
-    scrollHeight: 100,
-    scrollTop: 20,
-    isConnected: true,
-    querySelector() { return null; },
-    insertAdjacentHTML() {},
-  };
-  const loaded = await loadOlderConversationMessages("9", log);
-  if (loaded !== false) throw new Error("empty local history unexpectedly added messages");
-  if (calls.length !== 1 || !calls[0].startsWith("/api/archive/messages?")) {
-    throw new Error(`unexpected older-history calls: ${JSON.stringify(calls)}`);
-  }
-  if (!S.imMessageHistoryExhaustedPeers.has("9")) {
-    throw new Error("local archive exhaustion was not remembered");
-  }
-  if (toastCount !== 0) throw new Error("local archive exhaustion showed an upstream error");
-})().catch((error) => {
-  console.error(error && error.stack ? error.stack : error);
-  process.exitCode = 1;
-});
-"""
-        )
-        result = subprocess.run(
-            [node, "-e", script],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('/api/im/messages?peer=', load_messages)
+        self.assertIn('/api/archive/messages?peer=', load_messages)
+        self.assertIn("S.chat.getMessageList", load_messages)
+        self.assertIn('/api/im/messages?peer=', load_older)
+        self.assertIn('/api/archive/messages?', load_older)
+        self.assertNotIn("webLocalDependencyMode", load_messages)
+        self.assertNotIn("webLocalDependencyMode", load_older)
+        self.assertNotIn("localOnly", load_messages)
+        self.assertNotIn("localOnly", load_older)
+        self.assertNotIn("markConversationRead(target)", load_messages)
 
     def test_mobile_chat_keeps_following_the_bottom_while_layout_settles(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -5662,18 +5534,24 @@ function assert(condition, message) {
         self.assertIn("appendLocalMessage(pending)", send_text)
         self.assertLess(
             send_text.index("appendLocalMessage(pending)"),
+            send_text.index("S.chat.sendMessage(message)"),
+        )
+        self.assertLess(
+            send_text.index("appendLocalMessage(pending)"),
             send_text.index('await api("/api/im/rest/send"'),
         )
         self.assertIn("client_message_id: pendingID", send_text)
         self.assertIn("quote: messageQuote", send_text)
-        self.assertNotIn("S.chat.sendMessage", send_text)
-        self.assertNotIn("S.chat.createTextMessage", send_text)
-        self.assertIn("canonicalMessageID(response)", send_text)
+        self.assertIn("S.chat.createTextMessage(options)", send_text)
+        self.assertIn("S.chat.sendMessage(message)", send_text)
+        self.assertIn('api("/api/im/rest/send"', send_text)
+        self.assertIn('source: "rest"', send_text)
+        self.assertIn('provider: "tim-rest"', send_text)
         self.assertIn("response.message_id", send_text)
         self.assertIn("response.msg_uid", send_text)
-        self.assertIn("responseMessage.id", send_text)
-        self.assertIn("response.compatibility_sync", send_text)
-        self.assertIn("response.tim_mirror_status", send_text)
+        self.assertNotIn("canonicalMessageID(response)", send_text)
+        self.assertNotIn("response.compatibility_sync", send_text)
+        self.assertNotIn("response.tim_mirror_status", send_text)
         self.assertIn("updateLocalMessage(pendingID, replacement)", send_text)
         self.assertIn('delivery: "failed"', send_text)
         self.assertIn("consumeSubmittedChatDraft", send_form)
@@ -6125,11 +6003,6 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
     def test_web_native_rich_media_recording_and_flash_are_wired(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
-        asset_upload = self._app_fragment(
-            app_js,
-            "async function createNativeMediaAsset",
-            "async function sendTimMediaFile",
-        )
         media_send = self._app_fragment(
             app_js,
             "async function sendTimMediaFile",
@@ -6146,20 +6019,21 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
             "async function pageNearby",
         )
 
-        self.assertIn('api("/api/im/media/uploads"', asset_upload)
-        self.assertIn("uploadNativeMediaObject(intent, file", asset_upload)
-        self.assertIn('`/api/im/media/uploads/${encodeURIComponent', asset_upload)
-        self.assertIn('api("/api/im/media/messages"', media_send)
-        self.assertIn('source: "web-local"', media_send)
-        self.assertIn('provider: "web-local"', media_send)
-        self.assertIn("canonicalAuthority: true", media_send)
-        self.assertNotIn("ensureTimMediaReady()", media_send)
-        self.assertNotIn("chat.createImageMessage", media_send)
-        self.assertNotIn("chat.createAudioMessage", media_send)
+        self.assertNotIn("/api/im/media/uploads", app_js)
+        self.assertNotIn("/api/im/media/messages", app_js)
+        self.assertIn("ensureTimMediaReady()", media_send)
+        self.assertIn("chat.createImageMessage(options)", media_send)
+        self.assertIn("chat.createAudioMessage(options)", media_send)
+        self.assertIn("chat.createVideoMessage(options)", media_send)
+        self.assertIn("chat.createFileMessage(options)", media_send)
+        self.assertIn("chat.sendMessage(message)", media_send)
+        self.assertNotIn('source: "web-local"', media_send)
+        self.assertNotIn('provider: "web-local"', media_send)
         self.assertIn("new MediaRecorder(", app_js)
-        self.assertIn('api("/api/im/media/messages"', flash_send)
-        self.assertIn("flash: true", flash_send)
-        self.assertIn('source: "web-local"', flash_send)
+        self.assertIn("const form = new FormData();", flash_send)
+        self.assertIn('form.append("file", file', flash_send)
+        self.assertIn('api("/api/im/flash/send"', flash_send)
+        self.assertNotIn('source: "web-local"', flash_send)
         self.assertIn('`/api/im/media/attachments/${encodeURIComponent(id)}/claim`', flash_view)
         self.assertIn('api("/api/im/flash/get"', app_js)
         self.assertIn('api("/api/im/flash/ack"', app_js)
@@ -6413,9 +6287,11 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
         self.assertIn('"remoteVideoUrl"', entry_media)
         self.assertIn("URL.revokeObjectURL(url)", object_urls)
         self.assertIn("collectBlobObjectUrls", object_urls)
-        self.assertIn('api("/api/im/media/messages"', sender)
-        self.assertIn("url: localMedia.url", sender)
-        self.assertIn("native: true", sender)
+        self.assertIn("ensureTimMediaReady()", sender)
+        self.assertIn("chat.createImageMessage(options)", sender)
+        self.assertIn("chat.sendMessage(message)", sender)
+        self.assertNotIn('/api/im/media/messages', sender)
+        self.assertNotIn('native: true', sender)
         self.assertIn("if (!mediaReferencesUrl(replacement.media, localMedia.url))", sender)
         self.assertIn("revokeChatObjectUrl(localMedia.url)", sender)
         self.assertIn('`/api/im/media/attachments/${encodeURIComponent(id)}/access`', private_access)
@@ -6546,9 +6422,11 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
         self.assertIn("录音需要安全网页环境或本机访问", availability)
         self.assertIn("voiceRecordingAvailability()", recording)
         self.assertIn('sendTimMediaFile("audio", file', recording)
-        self.assertIn("Web 本地文字和媒体可用", connection_status)
-        self.assertNotIn("仅支持文本发送", connection_status)
-        self.assertIn('api("/api/im/media/messages"', native_sender)
+        self.assertIn("文本备用通道", connection_status)
+        self.assertNotIn("Web 本地文字和媒体可用", connection_status)
+        self.assertIn("ensureTimMediaReady()", native_sender)
+        self.assertIn("chat.createAudioMessage(options)", native_sender)
+        self.assertNotIn('/api/im/media/messages', native_sender)
 
     def test_voice_messages_use_compact_bubbles_and_web_voice_to_text(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -7084,67 +6962,61 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
         self.assertIn("overflow: visible", capability)
         self.assertIn("outline-offset: -", capability_focus)
 
-    def test_profile_avatar_uses_owner_bound_native_asset_and_full_local_profile_editor(self) -> None:
+    def test_profile_editor_uses_apk_reset_without_local_avatar_or_password(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
-        app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
         page_me = self._app_fragment(app_js, "async function pageMe", "function agentConnectionStatusText")
         forms = self._app_fragment(app_js, "async function handleProductForm", "function applyFeatureEnvelope")
-        avatar_form = forms.split('if (kind === "profile-avatar")', 1)[1].split(
-            'if (kind === "profile-details")', 1
-        )[0]
         details_form = forms.split('if (kind === "profile-details")', 1)[1].split(
-            'if (kind === "local-password-change")', 1
+            'if (kind === "referral-set")', 1
         )[0]
 
-        self.assertIn('data-form="profile-avatar"', page_me)
-        self.assertIn('input class="sr-only" id="profile-avatar-file"', page_me)
         self.assertIn('data-form="profile-details"', page_me)
+        self.assertIn("资料以原账号服务为准", page_me)
+        self.assertIn("原 APK 接口", page_me)
         for field in ("nickname", "signature", "city", "gender"):
             self.assertIn(f'name="{field}"', page_me)
-        self.assertIn('normalizeChatPickerFile("image", rawFile)', app_js)
-        self.assertIn('validateChatFile("image", file)', app_js)
-        self.assertIn('createNativeMediaAsset("image", draft.file', avatar_form)
-        self.assertIn('avatar_asset_id: draft.assetId', avatar_form)
-        self.assertNotIn("previewUrl", avatar_form.split('body: JSON.stringify({', 1)[1].split("}),", 1)[0])
-        self.assertNotIn("avatar:", avatar_form)
+        self.assertNotIn('data-form="profile-avatar"', page_me)
+        self.assertNotIn("profile-avatar-file", page_me)
+        self.assertNotIn('data-form="local-password-change"', page_me)
+        self.assertNotIn("avatar_asset_id", app_js)
+        self.assertNotIn('/api/auth/password', app_js)
         self.assertIn('api("/api/profile/reset"', details_form)
-        self.assertIn("clearProfileAvatarDraft()", avatar_form)
-        self.assertIn("clearMomentCache()", avatar_form)
-        self.assertIn(".profile-avatar-preview", app_css)
-        self.assertIn(".media-upload-track", app_css)
+        self.assertIn("type: item.type", details_form)
+        self.assertIn("value: item.value", details_form)
+        self.assertIn("operation_id: newProfileOperationId(item.field)", details_form)
+        self.assertIn("clearMomentCache()", details_form)
 
-    def test_moment_composer_uploads_native_assets_without_client_media_urls(self) -> None:
+    def test_moment_composer_publishes_text_only_through_original_service(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
-        app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
         page = self._app_fragment(app_js, "async function pageMoments", "function syncMomentsTabUI")
         forms = self._app_fragment(app_js, "async function handleProductForm", "function applyFeatureEnvelope")
         publish = forms.split('if (kind === "moment-publish")', 1)[1].split(
             'if (kind === "moment-comment")', 1
         )[0]
 
-        self.assertIn('data-moment-media="image"', page)
-        self.assertIn('data-moment-media="video"', page)
-        image_input = page.split('data-moment-media="image"', 1)[1].split("/>", 1)[0]
-        video_input = page.split('data-moment-media="video"', 1)[1].split("/>", 1)[0]
-        self.assertIn("multiple", image_input)
-        self.assertNotIn("multiple", video_input)
-        self.assertNotIn('placeholder="分享此刻的想法，也可以只发布图片或视频" required', page)
-        self.assertIn("S.momentMediaDraft.length + files.length > 9", app_js)
-        self.assertIn("图片和视频不能同时发布", app_js)
-        self.assertIn("createNativeMediaAsset(draft.kind, draft.file", app_js)
-        self.assertIn("media_asset_ids: mediaAssetIds", publish)
+        self.assertIn('placeholder="分享此刻的想法" required', page)
+        self.assertNotIn('data-moment-media="image"', page)
+        self.assertNotIn('data-moment-media="video"', page)
+        self.assertNotIn("media_asset_ids", app_js)
+        self.assertNotIn("createNativeMediaAsset", app_js)
+        self.assertNotIn("/api/im/media/uploads", app_js)
+        self.assertIn('api("/api/moments/publish"', publish)
         request_body = publish.split('body: JSON.stringify({', 1)[1].split("}),", 1)[0]
-        self.assertNotIn("pictures:", request_body)
-        self.assertNotIn("video:", request_body)
-        self.assertNotIn("cover:", request_body)
-        self.assertIn("draft.assetId", app_js)
-        self.assertIn("clearMomentMediaDraft()", publish)
-        self.assertIn(".moment-compose-preview-grid", app_css)
-        self.assertIn('form[data-form="moment-publish"]', app_js)
-        self.assertIn("S.momentMediaUploading", app_js)
-        self.assertIn('form.dataset.composeLocked === "true"', app_js)
+        for field in (
+            "text,",
+            "visibility_scope:",
+            "topic:",
+            'plate: "动态"',
+            "comment_forbid:",
+            "hide_comment:",
+        ):
+            self.assertIn(field, request_body)
+        for local_media_field in ("media_asset_ids", "pictures:", "video:", "cover:"):
+            self.assertNotIn(local_media_field, request_body)
+        self.assertIn("form.reset()", publish)
+        self.assertIn("clearMomentCache()", publish)
 
     def test_native_profile_and_moment_media_paths_remain_same_origin_and_current(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -7163,7 +7035,8 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
         self.assertIn("pictureHtml || videoHtml", moment_media)
         self.assertNotIn("这条动态没有文字内容", moment_card)
         self.assertIn('String(post.content || "").trim()', moment_card)
-        self.assertIn("clearComposeDrafts()", app_js)
+        self.assertNotIn("clearComposeDrafts()", app_js)
+        self.assertNotIn("composeObjectUrls", app_js)
 
     def test_static_asset_cache_versions_match_content_hashes(self) -> None:
         root = Path(__file__).resolve().parents[1]

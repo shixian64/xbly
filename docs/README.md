@@ -14,7 +14,7 @@
 4. [04_FINDINGS](./04_FINDINGS.md) — 风险清单  
 5. 生产部署：[14](./14_PRODUCTION_DEPLOYMENT.md)
 6. 性能优化：[16](./16_PERFORMANCE_OPTIMIZATION.md)
-7. Web 去核心依赖迁移：[17](./17_WEB_PROVIDER_MIGRATION.md)
+7. 已退役的 Web 本地权威迁移方案（历史记录）：[17](./17_WEB_PROVIDER_MIGRATION.md)
 8. 内置 BYOK 模型运行器、账号动作与受控无人值守 Agent：[18](./18_BYOK_MODEL_RUNNER.md)
 9. 专题：实名 [08](./08_RP_VERIFY_BYPASS_ANALYSIS.md) / 游客 [09](./09_GUEST_CAPABILITY_MATRIX.md) / 覆盖 [11](./11_FEATURE_REALNAME_AND_COVERAGE.md) / 原生 [12](./12_NATIVE_INTEGRATION.md) / v154 [13](./13_APK_V154_DIFF.md)
 
@@ -41,7 +41,7 @@
 | [14_PRODUCTION_DEPLOYMENT.md](./14_PRODUCTION_DEPLOYMENT.md) | Docker、PostgreSQL、Redis、R2、管理端、安全与运维 |
 | [15_APK_SECURITY_AUDIT.md](./15_APK_SECURITY_AUDIT.md) | APK 安全审计补充记录 |
 | [16_PERFORMANCE_OPTIMIZATION.md](./16_PERFORMANCE_OPTIMIZATION.md) | Web 首屏、数据链路、后台任务与流畅度优化 |
-| [17_WEB_PROVIDER_MIGRATION.md](./17_WEB_PROVIDER_MIGRATION.md) | 已迁移账号本地密码、Web 本地权威消息、Banghua/TIM 降级矩阵与 APK 退役门槛 |
+| [17_WEB_PROVIDER_MIGRATION.md](./17_WEB_PROVIDER_MIGRATION.md) | 已退役的 Web 本地权威迁移设计，仅供历史追溯；当前产品接口以原 APK/TIM 为权威 |
 | [18_BYOK_MODEL_RUNNER.md](./18_BYOK_MODEL_RUNNER.md) | 内置 BYOK 模型运行器、三层管理与用户门禁、固定账号动作、专用 Agent Worker、受控无人值守范围与安全边界 |
 | [DEEP_DIVE.md](./DEEP_DIVE.md) | 早期深挖（已并入 01/02/04） |
 | [api_catalog.json](./api_catalog.json) | action 目录 |

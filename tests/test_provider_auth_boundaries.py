@@ -14,7 +14,6 @@ if str(ROOT) not in sys.path:
 import httpx  # noqa: E402
 from starlette.requests import Request  # noqa: E402
 
-from bbw_prod.services import PermissionDenied  # noqa: E402
 from bbw_web import api as web_api  # noqa: E402
 from bbw_web import bff_server  # noqa: E402
 from bbw_web.providers import (  # noqa: E402
@@ -261,10 +260,12 @@ class ApiLocalFallbackBoundaryTests(unittest.TestCase):
         def __init__(self, upstream_error: Exception | None) -> None:
             self.upstream_error = upstream_error
             self.web_user = ApiLocalFallbackBoundaryTests.WebUser()
+            self.login_calls: list[dict[str, object]] = []
             self.put_calls: list[object] = []
             self.drop_calls: list[str] = []
 
-        def login_password(self, *_args: object, **_kwargs: object) -> object:
+        def login_password(self, *args: object, **kwargs: object) -> object:
+            self.login_calls.append({"args": args, "kwargs": kwargs})
             if self.upstream_error is not None:
                 raise self.upstream_error
             return self.web_user
@@ -305,6 +306,7 @@ class ApiLocalFallbackBoundaryTests(unittest.TestCase):
             self.public_precheck_calls: list[dict[str, object]] = []
             self.local_precheck_calls: list[dict[str, object]] = []
             self.account_precheck_calls: list[str] = []
+            self.complete_login_calls: list[dict[str, object]] = []
 
         def require_identity(self, _sid: str) -> None:
             return None
@@ -314,7 +316,7 @@ class ApiLocalFallbackBoundaryTests(unittest.TestCase):
 
         def precheck_login_credentials(self, **kwargs: object) -> object:
             self.public_precheck_calls.append(dict(kwargs))
-            return self._login_context()
+            return self.precheck_account(phone=str(kwargs.get("phone") or ""))
 
         def precheck_local_password_credentials(self, **kwargs: object) -> str:
             self.local_precheck_calls.append(dict(kwargs))
@@ -343,6 +345,10 @@ class ApiLocalFallbackBoundaryTests(unittest.TestCase):
                 identity=SimpleNamespace(user_id="user-42"),
                 web_user=ApiLocalFallbackBoundaryTests.WebUser(),
             )
+
+        def complete_login(self, **kwargs: object) -> object:
+            self.complete_login_calls.append(dict(kwargs))
+            return SimpleNamespace(user_id="user-42")
 
         def record_login_failure(self, *, phone: str, client_ip: str) -> None:
             self.login_failures.append({"phone": phone, "client_ip": client_ip})
@@ -410,62 +416,64 @@ class ApiLocalFallbackBoundaryTests(unittest.TestCase):
         response = web_api._legacy_dispatch_sync(Request(scope), raw_body)
         return response, store, persistence
 
-    def test_upstream_unavailable_uses_local_password_and_issues_cookie(self) -> None:
+    def test_upstream_unavailable_never_uses_local_password(self) -> None:
         response, store, persistence = self._request(
             ProviderUnavailable("connection failed", upstream_status=-1)
         )
 
         payload = json.loads(bytes(response.body).decode("utf-8"))
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(payload["auth_source"], "web-local")
-        self.assertEqual(payload["dependency_mode"], "degraded")
-        self.assertEqual(len(persistence.local_precheck_calls), 1)
-        self.assertEqual(persistence.public_precheck_calls, [])
-        self.assertEqual(persistence.account_precheck_calls, [])
-        self.assertEqual(len(persistence.local_login_calls), 1)
-        self.assertEqual(
-            persistence.local_login_calls[0]["password"], "web-password"
-        )
-        self.assertEqual(len(store.put_calls), 1)
-        self.assertIn(
-            f"{bff_server.COOKIE_NAME}=local-session-id-0123456789abcdef",
-            response.headers.get("set-cookie", ""),
-        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(payload["code"], "UPSTREAM_AUTH_UNAVAILABLE")
+        self.assertIs(payload["retryable"], True)
+        self.assertEqual(len(persistence.public_precheck_calls), 1)
+        self.assertEqual(persistence.account_precheck_calls, ["13800138000"])
+        self.assertEqual(persistence.local_precheck_calls, [])
+        self.assertEqual(persistence.local_login_calls, [])
+        self.assertEqual(persistence.complete_login_calls, [])
+        self.assertEqual(len(store.login_calls), 1)
+        self.assertEqual(store.put_calls, [])
+        self.assertNotIn(bff_server.COOKIE_NAME, response.headers.get("set-cookie", ""))
 
-    def test_unavailable_suspended_account_uses_uniform_local_rejection(self) -> None:
+    def test_suspended_account_is_rejected_before_provider_login(self) -> None:
         response, store, persistence = self._request(
             ProviderUnavailable("connection failed", upstream_status=-1),
-            local_error=PermissionDenied("user account is not active"),
-        )
-
-        payload = json.loads(bytes(response.body).decode("utf-8"))
-        self.assertEqual(response.status_code, 401)
-        self.assertEqual(payload["code"], "LOCAL_AUTH_REJECTED")
-        self.assertEqual(len(persistence.local_precheck_calls), 1)
-        self.assertEqual(persistence.public_precheck_calls, [])
-        self.assertEqual(persistence.account_precheck_calls, [])
-        self.assertEqual(len(persistence.local_login_calls), 1)
-        self.assertEqual(len(persistence.login_failures), 1)
-        self.assertEqual(store.put_calls, [])
-
-    def test_account_state_is_resolved_only_after_upstream_success(self) -> None:
-        response, store, persistence = self._request(
-            None,
             account_error=PermissionError("账号不可用"),
         )
 
         payload = json.loads(bytes(response.body).decode("utf-8"))
         self.assertEqual(response.status_code, 403)
         self.assertEqual(payload["error"], "账号不可用")
-        self.assertEqual(len(persistence.local_precheck_calls), 1)
-        self.assertEqual(persistence.public_precheck_calls, [])
-        self.assertEqual(
-            persistence.account_precheck_calls,
-            ["13800138000"],
-        )
+        self.assertEqual(len(persistence.public_precheck_calls), 1)
+        self.assertEqual(persistence.account_precheck_calls, ["13800138000"])
+        self.assertEqual(persistence.local_precheck_calls, [])
         self.assertEqual(persistence.local_login_calls, [])
-        self.assertEqual(store.drop_calls, [store.web_user.web_sid])
-        self.assertNotIn(bff_server.COOKIE_NAME, response.headers.get("set-cookie", ""))
+        self.assertEqual(persistence.complete_login_calls, [])
+        self.assertEqual(store.login_calls, [])
+        self.assertEqual(persistence.login_failures, [])
+        self.assertEqual(store.put_calls, [])
+
+    def test_provider_success_is_persisted_without_local_password(self) -> None:
+        response, store, persistence = self._request(None)
+
+        payload = json.loads(bytes(response.body).decode("utf-8"))
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(payload["ok"], True)
+        self.assertEqual(len(persistence.public_precheck_calls), 1)
+        self.assertEqual(persistence.account_precheck_calls, ["13800138000"])
+        self.assertEqual(persistence.local_precheck_calls, [])
+        self.assertEqual(persistence.local_login_calls, [])
+        self.assertEqual(len(persistence.complete_login_calls), 1)
+        self.assertEqual(len(store.login_calls), 1)
+        self.assertEqual(store.drop_calls, [])
+        cookie_headers = [
+            value.decode("latin-1")
+            for name, value in response.raw_headers
+            if name.lower() == b"set-cookie"
+        ]
+        self.assertIn(
+            f"{bff_server.COOKIE_NAME}={store.web_user.web_sid}",
+            "\n".join(cookie_headers),
+        )
 
     def test_explicit_upstream_rejection_never_calls_local_password(self) -> None:
         response, store, persistence = self._request(
@@ -475,10 +483,11 @@ class ApiLocalFallbackBoundaryTests(unittest.TestCase):
         payload = json.loads(bytes(response.body).decode("utf-8"))
         self.assertEqual(response.status_code, 401)
         self.assertEqual(payload["code"], "UPSTREAM_AUTH_REJECTED")
-        self.assertEqual(len(persistence.local_precheck_calls), 1)
-        self.assertEqual(persistence.public_precheck_calls, [])
-        self.assertEqual(persistence.account_precheck_calls, [])
+        self.assertEqual(len(persistence.public_precheck_calls), 1)
+        self.assertEqual(persistence.account_precheck_calls, ["13800138000"])
+        self.assertEqual(persistence.local_precheck_calls, [])
         self.assertEqual(persistence.local_login_calls, [])
+        self.assertEqual(persistence.complete_login_calls, [])
         self.assertEqual(store.put_calls, [])
         self.assertNotIn(bff_server.COOKIE_NAME, response.headers.get("set-cookie", ""))
 
@@ -490,10 +499,11 @@ class ApiLocalFallbackBoundaryTests(unittest.TestCase):
         payload = json.loads(bytes(response.body).decode("utf-8"))
         self.assertEqual(response.status_code, 400)
         self.assertNotEqual(payload.get("code"), "UPSTREAM_AUTH_UNAVAILABLE")
-        self.assertEqual(len(persistence.local_precheck_calls), 1)
-        self.assertEqual(persistence.public_precheck_calls, [])
-        self.assertEqual(persistence.account_precheck_calls, [])
+        self.assertEqual(len(persistence.public_precheck_calls), 1)
+        self.assertEqual(persistence.account_precheck_calls, ["13800138000"])
+        self.assertEqual(persistence.local_precheck_calls, [])
         self.assertEqual(persistence.local_login_calls, [])
+        self.assertEqual(persistence.complete_login_calls, [])
         self.assertEqual(store.put_calls, [])
         self.assertNotIn(bff_server.COOKIE_NAME, response.headers.get("set-cookie", ""))
 
@@ -519,8 +529,10 @@ class ApiLocalFallbackBoundaryTests(unittest.TestCase):
         self.assertIs(payload["retryable"], True)
         # 未进入本地密码回退，也未留下会话或 cookie。
         self.assertEqual(persistence.local_login_calls, [])
-        self.assertEqual(persistence.public_precheck_calls, [])
-        self.assertEqual(persistence.account_precheck_calls, [])
+        self.assertEqual(len(persistence.public_precheck_calls), 1)
+        self.assertEqual(persistence.account_precheck_calls, ["13800138000"])
+        self.assertEqual(persistence.local_precheck_calls, [])
+        self.assertEqual(persistence.complete_login_calls, [])
         self.assertEqual(store.users, {})
         self.assertNotIn(bff_server.COOKIE_NAME, response.headers.get("set-cookie", ""))
 

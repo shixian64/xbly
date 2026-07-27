@@ -216,11 +216,6 @@ const S = {
   momentsTab: "推荐",
   momentsSearch: "",
   momentsFeedSeq: 0,
-  profileAvatarDraft: null,
-  momentMediaDraft: [],
-  momentMediaUploading: false,
-  momentPublishRequestId: "",
-  composeObjectUrls: new Set(),
   momentViewObserver: null,
   momentViewRetryTimers: new Set(),
   momentViewScanScheduled: false,
@@ -1073,7 +1068,6 @@ async function api(path, options = {}) {
       clearFlashAckDeliveryState();
       S._imConnecting = null;
       S.imConnectingGeneration = -1;
-      clearComposeDrafts();
       scrubAuthenticatedDom();
       applyUser(null);
       if (VOICE_MATCH_ENABLED) void cleanupVoiceMatch({ disconnect: true });
@@ -1784,19 +1778,9 @@ function showLogin(show, clearSecrets = false) {
   }
 }
 
-function webLocalDependencyMode() {
-  return false;
-}
-
 function applyDependencyMode(data) {
-  if (!data || typeof data !== "object") return false;
-  const hasMode = Object.prototype.hasOwnProperty.call(data, "dependency_mode");
-  const hasSource = Object.prototype.hasOwnProperty.call(data, "auth_source");
-  if (!hasMode && !hasSource) return webLocalDependencyMode();
-  const authenticationSource = String(data.auth_source || "").trim().toLowerCase();
-  const dependencyMode = String(data.dependency_mode || "").trim().toLowerCase();
-  S.authenticationSource = authenticationSource;
-  S.dependencyMode = dependencyMode || "provider";
+  S.authenticationSource = String(data?.auth_source || "").trim().toLowerCase();
+  S.dependencyMode = "provider";
   return false;
 }
 
@@ -2890,7 +2874,6 @@ async function loadConversationPreview(peer, activityTimestamp, { refreshList = 
   const target = String(peer || "").trim();
   const activity = Math.max(0, Number(activityTimestamp || 0));
   const generation = S.sessionGeneration;
-  if (webLocalDependencyMode()) return false;
   if (!target || !activity || S.conversationPreviewLoadingPeers.has(target)) return false;
   S.conversationPreviewLoadingPeers.add(target);
   try {
@@ -3018,9 +3001,6 @@ function loadArchivedConversationSummary({ force = false } = {}) {
 }
 
 function refreshConversationSummary({ force = false } = {}) {
-  if (webLocalDependencyMode()) {
-    return loadArchivedConversationSummary({ force: true });
-  }
   const now = Date.now();
   if (S.conversationRefreshPromise) return S.conversationRefreshPromise;
   if (now < S.conversationNextRefreshAt) return Promise.resolve(S.conversations);
@@ -3702,7 +3682,6 @@ async function hydrateMeStats(signal, { force = false } = {}) {
 
 function hydrateRenderedRoute(route, signal, seq) {
   if (route === "me") {
-    renderProfileAvatarDraft();
     void hydrateMeStats(signal).catch((error) => {
       if (error?.name !== "AbortError" && seq === S.routeSeq && S.route === "me") {
         console.info("[me-stats]", error?.message || error);
@@ -3718,10 +3697,6 @@ function hydrateRenderedRoute(route, signal, seq) {
   }
   if (route === "match" && S.matchTab === "match") hydrateMatchStatusPolling();
   if (route === "moments") {
-    setMomentComposeLocked(
-      document.querySelector('form[data-form="moment-publish"]'),
-      S.momentMediaUploading
-    );
     observeMomentCards();
   }
   if (route === "agent") {
@@ -5540,283 +5515,10 @@ function clearMomentCache() {
   clearViewCacheKey("me");
 }
 
-function newComposeRequestId(prefix = "compose") {
+function newProfileOperationId(field) {
+  const prefix = `profile-${String(field || "details")}`;
   if (typeof window.crypto?.randomUUID === "function") return `${prefix}-${window.crypto.randomUUID()}`;
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 14)}`;
-}
-
-function createComposeObjectUrl(file) {
-  const url = URL.createObjectURL(file);
-  S.composeObjectUrls.add(url);
-  return url;
-}
-
-function revokeComposeObjectUrl(url) {
-  const value = String(url || "");
-  if (!value || !S.composeObjectUrls.has(value)) return;
-  URL.revokeObjectURL(value);
-  S.composeObjectUrls.delete(value);
-}
-
-function revokeAllComposeObjectUrls() {
-  [...S.composeObjectUrls].forEach((url) => URL.revokeObjectURL(url));
-  S.composeObjectUrls.clear();
-}
-
-function profileAvatarPreviewHtml(user = S.user) {
-  const draft = S.profileAvatarDraft;
-  const src = String(draft?.previewUrl || mediaUrl(validAvatarValue(user?.avatar, user?.portrait)) || "");
-  if (!src) return "";
-  return `<img src="${esc(src)}" alt="${draft ? "所选头像预览" : "当前头像"}" loading="eager" decoding="async" referrerpolicy="no-referrer" />`;
-}
-
-function profileAvatarDraftStatus() {
-  const draft = S.profileAvatarDraft;
-  if (!draft) return "请选择本地图片作为新头像";
-  if (draft.uploading) return `正在上传 ${Math.round(Math.max(0, Math.min(1, Number(draft.progress || 0))) * 100)}%`;
-  if (draft.assetId) return "图片已上传，正在等待保存或可直接重试保存";
-  if (draft.error) return String(draft.error);
-  return `${draft.file?.name || "所选图片"} · ${formatFileSize(draft.file?.size || 0)}`;
-}
-
-function renderProfileAvatarDraft({ refreshPreview = true } = {}) {
-  const preview = document.querySelector("[data-profile-avatar-preview]");
-  if (preview && refreshPreview) {
-    const html = profileAvatarPreviewHtml();
-    preview.innerHTML = html;
-    preview.hidden = !html;
-  }
-  const status = document.querySelector("[data-profile-avatar-status]");
-  if (status) status.textContent = profileAvatarDraftStatus();
-  const progress = document.querySelector("[data-profile-avatar-progress]");
-  if (progress) {
-    progress.value = Math.round(Math.max(0, Math.min(1, Number(S.profileAvatarDraft?.progress || 0))) * 100);
-    progress.hidden = !S.profileAvatarDraft?.uploading;
-  }
-  const remove = document.querySelector('[data-action="profile-avatar-remove"]');
-  if (remove) {
-    const locked = !S.profileAvatarDraft || Boolean(S.profileAvatarDraft.uploading);
-    remove.dataset.locked = String(locked);
-    remove.disabled = locked;
-  }
-  const submit = document.querySelector("[data-profile-avatar-submit]");
-  if (submit) {
-    const locked = !S.profileAvatarDraft || Boolean(S.profileAvatarDraft.uploading);
-    submit.dataset.locked = String(locked);
-    if (submit.dataset.pending !== "true") submit.disabled = locked;
-  }
-}
-
-function clearProfileAvatarDraft({ render = true } = {}) {
-  revokeComposeObjectUrl(S.profileAvatarDraft?.previewUrl);
-  S.profileAvatarDraft = null;
-  const input = document.querySelector("input[data-profile-avatar]");
-  if (input) input.value = "";
-  if (render) renderProfileAvatarDraft();
-}
-
-function selectProfileAvatarFile(rawFile) {
-  const file = normalizeChatPickerFile("image", rawFile);
-  validateChatFile("image", file);
-  clearProfileAvatarDraft({ render: false });
-  S.profileAvatarDraft = {
-    file,
-    previewUrl: createComposeObjectUrl(file),
-    assetId: "",
-    progress: 0,
-    uploading: false,
-    error: "",
-  };
-  renderProfileAvatarDraft();
-}
-
-function momentMediaDraftStatus(draft) {
-  if (draft.uploading) return `正在上传 ${Math.round(Math.max(0, Math.min(1, Number(draft.progress || 0))) * 100)}%`;
-  if (draft.assetId) return "已上传，等待发布";
-  if (draft.error) return String(draft.error);
-  return `${draft.file?.name || (draft.kind === "video" ? "所选视频" : "所选图片")} · ${formatFileSize(
-    draft.file?.size || 0
-  )}`;
-}
-
-function momentMediaDraftHtml() {
-  return S.momentMediaDraft
-    .map((draft) => {
-      const media =
-        draft.kind === "video"
-          ? `<video src="${esc(draft.previewUrl)}" controls controlslist="nodownload noremoteplayback" disablepictureinpicture disableremoteplayback muted playsinline preload="metadata"></video>`
-          : `<img src="${esc(draft.previewUrl)}" alt="所选动态图片预览" loading="eager" decoding="async" />`;
-      return `<article class="moment-compose-preview-item" data-moment-draft-id="${esc(draft.id)}">
-        <div class="moment-compose-preview-media">${media}</div>
-        <div class="moment-compose-preview-meta"><span>${esc(momentMediaDraftStatus(draft))}</span><button type="button" class="btn soft small" data-action="moment-media-remove" data-draft-id="${esc(
-          draft.id
-        )}" ${S.momentMediaUploading ? "disabled" : ""}>移除</button></div>
-        <progress class="media-upload-track" data-moment-draft-progress max="100" value="${Math.round(
-          Math.max(0, Math.min(1, Number(draft.progress || 0))) * 100
-        )}" ${draft.uploading ? "" : "hidden"}></progress>
-      </article>`;
-    })
-    .join("");
-}
-
-function renderMomentMediaDraft() {
-  const preview = document.querySelector("[data-moment-media-preview]");
-  if (preview) {
-    preview.innerHTML = momentMediaDraftHtml();
-    preview.hidden = !S.momentMediaDraft.length;
-  }
-  const status = document.querySelector("[data-moment-media-status]");
-  if (status) {
-    const pictures = S.momentMediaDraft.filter((draft) => draft.kind === "image").length;
-    const videos = S.momentMediaDraft.filter((draft) => draft.kind === "video").length;
-    status.textContent = videos ? "已选择 1 个视频" : pictures ? `已选择 ${pictures} 张图片，最多 9 张` : "可选择最多 9 张图片，或 1 个视频";
-  }
-  const clear = document.querySelector('[data-action="moment-media-clear"]');
-  if (clear) {
-    const locked = !S.momentMediaDraft.length || S.momentMediaUploading;
-    clear.dataset.locked = String(locked);
-    clear.disabled = locked;
-  }
-}
-
-function updateMomentMediaDraftProgress(draft) {
-  const item = [...document.querySelectorAll("[data-moment-draft-id]")].find(
-    (element) => element.dataset.momentDraftId === draft.id
-  );
-  if (!item) return;
-  const status = item.querySelector(".moment-compose-preview-meta span");
-  if (status) status.textContent = momentMediaDraftStatus(draft);
-  const progress = item.querySelector("[data-moment-draft-progress]");
-  if (progress) {
-    progress.value = Math.round(Math.max(0, Math.min(1, Number(draft.progress || 0))) * 100);
-    progress.hidden = !draft.uploading;
-  }
-}
-
-function clearMomentMediaDraft({ render = true } = {}) {
-  S.momentMediaDraft.forEach((draft) => revokeComposeObjectUrl(draft.previewUrl));
-  S.momentMediaDraft = [];
-  S.momentPublishRequestId = "";
-  document.querySelectorAll("input[data-moment-media]").forEach((input) => {
-    input.value = "";
-  });
-  if (render) renderMomentMediaDraft();
-}
-
-function removeMomentMediaDraft(draftId) {
-  const target = String(draftId || "");
-  const draft = S.momentMediaDraft.find((item) => item.id === target);
-  if (!draft) return;
-  revokeComposeObjectUrl(draft.previewUrl);
-  S.momentMediaDraft = S.momentMediaDraft.filter((item) => item !== draft);
-  S.momentPublishRequestId = "";
-  renderMomentMediaDraft();
-}
-
-function selectMomentMediaFiles(kind, rawFiles) {
-  if (S.momentMediaUploading) throw new Error("媒体正在上传，请等待当前发布结束");
-  const files = [...(rawFiles || [])].map((file) => normalizeChatPickerFile(kind, file));
-  if (!files.length) return;
-  if (kind === "video") {
-    if (files.length !== 1) throw new Error("动态视频每次只能选择 1 个");
-    if (S.momentMediaDraft.length) throw new Error("图片和视频不能同时发布，请先清除已选媒体");
-  } else {
-    if (S.momentMediaDraft.some((draft) => draft.kind === "video")) {
-      throw new Error("图片和视频不能同时发布，请先清除已选视频");
-    }
-    if (S.momentMediaDraft.length + files.length > 9) throw new Error("动态图片最多选择 9 张");
-  }
-  files.forEach((file) => validateChatFile(kind, file));
-  const fingerprints = new Set(
-    S.momentMediaDraft.map((draft) => `${draft.file?.name || ""}:${draft.file?.size || 0}:${draft.file?.lastModified || 0}`)
-  );
-  files.forEach((file) => {
-    const fingerprint = `${file.name || ""}:${file.size || 0}:${file.lastModified || 0}`;
-    if (fingerprints.has(fingerprint)) throw new Error("不能重复选择同一个媒体文件");
-    fingerprints.add(fingerprint);
-  });
-  S.momentMediaDraft.push(
-    ...files.map((file) => ({
-      id: newComposeRequestId("moment-media"),
-      kind,
-      file,
-      previewUrl: createComposeObjectUrl(file),
-      assetId: "",
-      progress: 0,
-      uploading: false,
-      error: "",
-    }))
-  );
-  S.momentPublishRequestId = "";
-  renderMomentMediaDraft();
-}
-
-function setMomentComposeLocked(form, locked) {
-  S.momentMediaUploading = Boolean(locked);
-  if (!form) return;
-  const wasLocked = form.dataset.composeLocked === "true";
-  if (wasLocked === Boolean(locked)) {
-    renderMomentMediaDraft();
-    return;
-  }
-  form.dataset.composeLocked = String(Boolean(locked));
-  form.classList.toggle("is-uploading", Boolean(locked));
-  form.setAttribute("aria-busy", String(Boolean(locked)));
-  form.querySelectorAll("input, textarea, select, button").forEach((control) => {
-    if (locked) {
-      control.dataset.composeWasDisabled = control.disabled ? "1" : "0";
-      control.disabled = true;
-    } else {
-      control.disabled = control.dataset.composeWasDisabled === "1";
-      delete control.dataset.composeWasDisabled;
-    }
-  });
-  renderMomentMediaDraft();
-}
-
-async function ensureMomentMediaAssets() {
-  const drafts = [...S.momentMediaDraft];
-  const pending = drafts.filter((draft) => !draft.assetId);
-  const failures = [];
-  let cursor = 0;
-  const worker = async () => {
-    while (cursor < pending.length) {
-      const index = cursor;
-      cursor += 1;
-      const draft = pending[index];
-      draft.uploading = true;
-      draft.error = "";
-      renderMomentMediaDraft();
-      try {
-        const asset = await createNativeMediaAsset(draft.kind, draft.file, (progress) => {
-          draft.progress = progress;
-          updateMomentMediaDraftProgress(draft);
-        });
-        draft.assetId = String(asset.asset_id || "");
-        draft.progress = 1;
-        if (!draft.assetId) throw new Error("媒体上传完成但未返回可用资产编号");
-      } catch (error) {
-        draft.error = String(error?.message || error || "媒体上传失败");
-        failures.push(error instanceof Error ? error : new Error(draft.error));
-      } finally {
-        draft.uploading = false;
-        renderMomentMediaDraft();
-      }
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(3, pending.length) }, () => worker()));
-  if (failures.length) throw failures[0];
-  const assetIds = drafts.map((draft) => String(draft.assetId || ""));
-  if (assetIds.some((assetId) => !assetId)) throw new Error("仍有媒体尚未上传完成");
-  if (new Set(assetIds).size !== assetIds.length) throw new Error("不能重复发布相同的媒体内容，请移除重复项后重试");
-  return assetIds;
-}
-
-function clearComposeDrafts() {
-  clearProfileAvatarDraft({ render: false });
-  clearMomentMediaDraft({ render: false });
-  S.momentMediaUploading = false;
-  revokeAllComposeObjectUrls();
 }
 
 function resetMomentViewTaskAssist() {
@@ -9298,25 +9000,21 @@ function mergePeerMessages(peer, incoming) {
   return !peerMessageRevisionEquals(previousRevision, peerMessageRevision(target));
 }
 
-async function loadConversationMessages(peer, { force = false, archiveOnly = false } = {}) {
+async function loadConversationMessages(peer, { force = false } = {}) {
   const target = String(peer || "").trim();
   if (!target || S.imMessageLoadingPeers.has(target)) return;
   if (!force && S.imMessageLoadedPeers.has(target)) return;
   const wasLoaded = S.imMessageLoadedPeers.has(target);
   const shouldLoadArchive = force || !S.imArchiveLoadedPeers.has(target);
-  const localOnly = archiveOnly || webLocalDependencyMode();
   S.imMessageLoadingPeers.add(target);
   if (!wasLoaded && S.activePeer === target) refreshChatLog();
   const me = String(S.user?.uid || S.user?.id || "");
-  const tasks = [];
-  if (!localOnly) {
-    tasks.push(
-      api(`/api/im/messages?peer=${encodeURIComponent(target)}`, { timeout: 10000 }).then(({ data, ok }) => {
-        if (!ok || data?.ok === false) throw new Error("服务器聊天记录暂时不可用");
-        return itemsOf(data).map((item) => timMessageEntry({ ...item, source: "http" }, target, me));
-      })
-    );
-  }
+  const tasks = [
+    api(`/api/im/messages?peer=${encodeURIComponent(target)}`, { timeout: 10000 }).then(({ data, ok }) => {
+      if (!ok || data?.ok === false) throw new Error("服务器聊天记录暂时不可用");
+      return itemsOf(data).map((item) => timMessageEntry({ ...item, source: "http" }, target, me));
+    }),
+  ];
   if (shouldLoadArchive) {
     tasks.push(
       api(`/api/archive/messages?peer=${encodeURIComponent(target)}&limit=200`, { timeout: 6000 }).then(
@@ -9334,7 +9032,7 @@ async function loadConversationMessages(peer, { force = false, archiveOnly = fal
       )
     );
   }
-  if (!localOnly && S.imMode === "sdk" && S.chat && typeof S.chat.getMessageList === "function") {
+  if (S.imMode === "sdk" && S.chat && typeof S.chat.getMessageList === "function") {
     tasks.push(
       withTimeout(
         S.chat.getMessageList({ conversationID: `C2C${target}`, count: 30 }),
@@ -9357,8 +9055,6 @@ async function loadConversationMessages(peer, { force = false, archiveOnly = fal
       fulfilled.flat()
     );
     const changed = mergePeerMessages(target, incoming);
-    const receivedMessageChanged =
-      changed && incoming.some((entry) => entry.type !== "mine" && entry.type !== "system");
     const archiveCandidates = new Map();
     incoming.forEach((entry) => {
       if (["archive", "http", "history"].includes(String(entry.source || "").toLowerCase())) return;
@@ -9374,18 +9070,6 @@ async function loadConversationMessages(peer, { force = false, archiveOnly = fal
     S.imMessageLoadedPeers.add(target);
     if (S.activePeer === target) {
       if (changed) refreshChatLog();
-      if (
-        localOnly &&
-        receivedMessageChanged &&
-        S.route === "msg" &&
-        !document.hidden
-      ) {
-        // In Web-local mode there is no realtime SDK event to close the read
-        // loop. Treat newly-polled incoming messages as read while their
-        // conversation is already open, matching the realtime branch.
-        markConversationRead(target);
-        refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
-      }
       scheduleSdkMessageReadReceipts(target);
     }
   } finally {
@@ -9460,23 +9144,19 @@ async function loadOlderConversationMessages(peer, log = $("im-log")) {
   log.insertAdjacentHTML("afterbegin", chatHistoryStatusHtml());
 
   const pageSize = 200;
-  const localOnly = webLocalDependencyMode();
-  const tasks = [];
-  if (!localOnly) {
-    tasks.push(
-      api(
-        `/api/im/messages?peer=${encodeURIComponent(target)}&before=${encodeURIComponent(beforeSeconds)}`,
-        { timeout: 12000 }
-      ).then(({ data, ok }) => {
-        if (!ok || data?.ok === false) throw new Error("服务器聊天记录暂时不可用");
-        const items = itemsOf(data);
-        return {
-          entries: items.map((item) => timMessageEntry({ ...item, source: "http" }, target, me)),
-          hasMore: data?.has_more === true || items.length >= pageSize,
-        };
-      })
-    );
-  }
+  const tasks = [
+    api(
+      `/api/im/messages?peer=${encodeURIComponent(target)}&before=${encodeURIComponent(beforeSeconds)}`,
+      { timeout: 12000 }
+    ).then(({ data, ok }) => {
+      if (!ok || data?.ok === false) throw new Error("服务器聊天记录暂时不可用");
+      const items = itemsOf(data);
+      return {
+        entries: items.map((item) => timMessageEntry({ ...item, source: "http" }, target, me)),
+        hasMore: data?.has_more === true || items.length >= pageSize,
+      };
+    }),
+  ];
   const archiveParams = new URLSearchParams({
     peer: target,
     limit: String(pageSize),
@@ -10952,7 +10632,6 @@ function chatTuiEmojiItemHtml(emoji) {
 
 function chatComposerPanelHtml() {
   if (S.imComposerPanel === "sticker") {
-    if (webLocalDependencyMode()) return "";
     const groups = chatStickerGroups();
     const activeGroup = activeStickerGroup();
     const body = activeGroup
@@ -10984,7 +10663,7 @@ function chatComposerPanelHtml() {
     const flashAction = S.messagePolicyReady
       ? '<button type="button" class="chat-more-action" data-action="pick-chat-file" data-kind="flash"><strong>闪图</strong><span>阅后失效的图片</span></button>'
       : "";
-    const stickerAction = !webLocalDependencyMode() && S.directImCredentialsEnabled && S.messagePolicyReady
+    const stickerAction = S.directImCredentialsEnabled && S.messagePolicyReady
       ? '<button type="button" class="chat-more-action" data-action="toggle-chat-panel" data-panel="sticker"><strong>表情包</strong><span>内置表情与收藏表情</span></button>'
       : "";
     return `<section class="chat-composer-panel chat-more-panel ui-scrollbar" aria-label="更多消息功能"><div class="chat-panel-head"><strong>更多功能</strong><span>选择要发送的内容</span></div><div class="chat-more-grid">
@@ -11868,60 +11547,6 @@ async function revokeChatMessage(id) {
   if (!entry || !actionInfo) throw new Error("这条消息当前无法撤回");
   if (!window.confirm("确认撤回这条消息？")) return false;
 
-  if (actionInfo.mode === "native-text") {
-    const { data, ok } = await api("/api/im/rest/revoke", {
-      method: "POST",
-      body: JSON.stringify({
-        to: entry.peer,
-        canonical_message_id: actionInfo.canonicalMessageId,
-      }),
-      timeout: 15000,
-    });
-    if (!ok || data?.ok === false) {
-      const info = errorInfo(data, "撤回失败");
-      throw new Error([info.title, info.detail].filter(Boolean).join(" · "));
-    }
-    const canonicalMessageId = String(
-      data.canonical_message_id || actionInfo.canonicalMessageId || entry.canonicalMessageId || ""
-    );
-    const revoked = markLocalMessageRevoked(entry, {
-      id: canonicalMessageId || entry.id,
-      canonicalMessageId,
-      recalledText: String(data.recalled_text || entry.recalledText || entry.text || ""),
-      source: "web-local",
-      provider: "web-local",
-      canonicalAuthority: true,
-      tim_mirror_status: String(data.tim_mirror_status || ""),
-      compatibility_sync: data.compatibility_sync ?? null,
-    });
-    toast("消息已撤回");
-    void loadConversationMessages(entry.peer, { force: true, archiveOnly: true });
-    return Boolean(revoked);
-  }
-
-  if (actionInfo.mode === "native-media") {
-    const { data, ok } = await api(
-      `/api/im/media/attachments/${encodeURIComponent(actionInfo.attachmentId)}/revoke`,
-      { method: "POST", body: JSON.stringify({}), timeout: 15000 }
-    );
-    if (!ok || data?.ok === false) {
-      const info = errorInfo(data, "撤回失败");
-      throw new Error([info.title, info.detail].filter(Boolean).join(" · "));
-    }
-    const revoked = markLocalMessageRevoked(entry, {
-      canonicalMessageId: String(data.canonical_message_id || entry.canonicalMessageId || ""),
-      attachmentId: String(data.attachment_id || actionInfo.attachmentId),
-      source: "web-local",
-      provider: "web-local",
-      canonicalAuthority: true,
-      tim_mirror_status: String(data.tim_mirror_status || ""),
-      compatibility_sync: data.compatibility_sync ?? null,
-    });
-    toast("消息已撤回");
-    void loadConversationMessages(entry.peer, { force: true, archiveOnly: true });
-    return Boolean(revoked);
-  }
-
   const attempts = actionInfo.outsideDefaultWindow && entry.msgKey ? ["rest", "sdk"] : ["sdk", "rest"];
   const errors = [];
   for (const mode of attempts) {
@@ -12276,73 +11901,6 @@ function createLocalMedia(file, kind, meta = {}) {
     };
   }
   return { url, name: file.name || "文件", size: file.size };
-}
-
-async function sha256ChatFile(file) {
-  if (!window.crypto?.subtle || typeof file?.arrayBuffer !== "function") {
-    throw new Error("当前浏览器无法计算媒体摘要，请升级浏览器后重试");
-  }
-  const bytes = await file.arrayBuffer();
-  const digest = await window.crypto.subtle.digest("SHA-256", bytes);
-  return [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, "0")).join("");
-}
-
-function uploadNativeMediaObject(target, file, onProgress) {
-  const uploadUrl = String(target?.upload_url || "").trim();
-  if (!uploadUrl) return Promise.reject(new Error("媒体上传地址不可用"));
-  return new Promise((resolve, reject) => {
-    const request = new XMLHttpRequest();
-    request.open(String(target.method || "PUT"), uploadUrl, true);
-    request.timeout = Math.max(120000, Math.min(20 * 60 * 1000, Math.ceil(file.size / (128 * 1024)) * 1000));
-    Object.entries(target.headers || {}).forEach(([name, value]) => {
-      request.setRequestHeader(String(name), String(value));
-    });
-    request.upload.onprogress = (event) => {
-      if (event.lengthComputable && event.total > 0) onProgress?.(event.loaded / event.total);
-    };
-    request.onload = () => {
-      if (request.status >= 200 && request.status < 300) resolve(true);
-      else reject(new Error(`媒体上传失败，存储服务返回 ${request.status || "未知状态"}`));
-    };
-    request.onerror = () => reject(new Error("媒体上传网络失败"));
-    request.ontimeout = () => reject(new Error("媒体上传超时"));
-    request.onabort = () => reject(new DOMException("媒体上传已取消", "AbortError"));
-    request.send(file);
-  });
-}
-
-async function createNativeMediaAsset(kind, file, onProgress) {
-  onProgress?.(0.01);
-  const sha256 = await sha256ChatFile(file);
-  onProgress?.(0.05);
-  const contentType = String(file.type || "application/octet-stream").split(";", 1)[0].trim().toLowerCase();
-  const { data: intent, ok: intentOk } = await api("/api/im/media/uploads", {
-    method: "POST",
-    body: JSON.stringify({
-      kind,
-      filename: file.name || `${kind}-${Date.now()}`,
-      content_type: contentType || "application/octet-stream",
-      size_bytes: file.size,
-      sha256,
-    }),
-    timeout: 15000,
-  });
-  if (!intentOk || intent?.ok === false) {
-    const info = errorInfo(intent, "无法创建媒体上传任务");
-    throw new Error([info.title, info.detail].filter(Boolean).join(" · "));
-  }
-  await uploadNativeMediaObject(intent, file, (ratio) => onProgress?.(0.05 + ratio * 0.8));
-  onProgress?.(0.88);
-  const { data: asset, ok: completeOk } = await api(
-    `/api/im/media/uploads/${encodeURIComponent(String(intent.intent_id || ""))}/complete`,
-    { method: "POST", body: JSON.stringify({}), timeout: 120000 }
-  );
-  if (!completeOk || asset?.ok === false || !asset?.asset_id) {
-    const info = errorInfo(asset, "媒体校验失败");
-    throw new Error([info.title, info.detail].filter(Boolean).join(" · "));
-  }
-  onProgress?.(0.93);
-  return { ...asset, sha256: String(asset.sha256 || sha256) };
 }
 
 async function sendTimMediaFile(kind, file, meta = {}) {
@@ -15031,7 +14589,7 @@ function matchWaitingHtml(queue, message = "") {
   const expiresAt = String(queue?.expires_at || "").trim();
   const expiresLabel = expiresAt ? formatBottleTime(expiresAt) : "";
   const detail = [
-    String(message || "已进入本地匹配队列，请保持页面在线").trim(),
+    String(message || "匹配请求处理中，请保持页面在线").trim(),
     expiresLabel ? `等待有效期至 ${expiresLabel}` : "匹配完成后会自动显示对方资料",
   ]
     .filter(Boolean)
@@ -18234,14 +17792,6 @@ async function diagnoseTimConnectionFailure() {
 
 /** Fetch BFF UserSig and login TIM (idempotent when already connected). */
 async function ensureTimConnected({ force = false, background = false } = {}) {
-  if (webLocalDependencyMode()) {
-    S.imConnected = true;
-    S.imMode = "rest";
-    S.imLastError = "";
-    S.imNextReconnectAt = 0;
-    updateImConnectionStatus();
-    return true;
-  }
   const sessionGeneration = S.sessionGeneration;
   const policyGeneration = S.messagePolicyGeneration;
   const basePolicyIsCurrent = () =>
@@ -18564,7 +18114,6 @@ async function logout({ notifyServer = true } = {}) {
     await cleanupIM();
     await clearSensitiveBrowserStorage();
     revokeAllChatObjectUrls();
-    clearComposeDrafts();
     S.routeSeq += 1;
     S.profileSeq += 1;
     S.route = "nearby";
@@ -19953,7 +19502,7 @@ async function handleProductForm(form, submitter, submittedValues = null) {
           body: JSON.stringify({
             type: item.type,
             value: item.value,
-            operation_id: newComposeRequestId(`profile-${item.field}`),
+            operation_id: newProfileOperationId(item.field),
           }),
         });
         if (!ok || data?.ok === false) {
@@ -20293,10 +19842,6 @@ function scheduleFriendFilter(input) {
 }
 
 document.addEventListener("input", (event) => {
-  const momentComposeField = event.target.closest && event.target.closest('form[data-form="moment-publish"] input, form[data-form="moment-publish"] textarea, form[data-form="moment-publish"] select');
-  if (momentComposeField && !S.momentMediaUploading) {
-    S.momentPublishRequestId = "";
-  }
   const agentExecutionForm =
     event.target.closest &&
     event.target.closest('form[data-form="agent-action-review"], form[data-form="agent-reply-send-review"]');
@@ -20868,7 +20413,6 @@ window.addEventListener("pagehide", (event) => {
     stopMatchStatusPolling();
     closeMessageSyncChannel();
     revokeAllChatObjectUrls();
-    clearComposeDrafts();
     S.imMediaRetryState.clear();
     S.imAudioSourceRefreshes.clear();
     S.imVoiceTranscriptLoading.clear();

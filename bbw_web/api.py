@@ -48,6 +48,40 @@ SLOW_HTTP_REQUEST_MS = 1000.0
 LOGIN_START_PATHS = frozenset(
     {"/api/auth/login", "/api/auth/sms-login", "/api/auth/sms-send"}
 )
+APK_DISCOVERY_ROUTE_PATHS = frozenset(
+    {
+        "/api/match/status",
+        "/api/match/online",
+        "/api/match/local",
+        "/api/match/online-users",
+        "/api/match/nearby-users",
+    }
+)
+APK_SOCIAL_ROUTE_PATHS = frozenset(
+    {
+        "/api/profile/me",
+        "/api/profile/user",
+        "/api/profile/users",
+        "/api/profile/nick",
+        "/api/profile/reset",
+        "/api/profile/privacy",
+        "/api/social/follows",
+        "/api/social/fans",
+        "/api/social/friends",
+        "/api/social/friend-apply",
+        "/api/social/blacklist",
+        "/api/social/blacklist-me",
+        "/api/social/visitors",
+        "/api/social/follow",
+        "/api/social/unfollow",
+        "/api/social/add-friend",
+        "/api/social/agree-friend",
+        "/api/social/delete-friend",
+        "/api/social/blacklist-add",
+        "/api/social/blacklist-del",
+        "/api/social/visit",
+    }
+)
 LOCAL_PASSWORD_AUTH_RETRY_AFTER_SECONDS = 1
 _LOCAL_PASSWORD_AUTH_GATE_INIT_LOCK = threading.Lock()
 
@@ -104,6 +138,46 @@ def _local_password_auth_gate(request: Request) -> _LocalPasswordAuthGate:
             gate = _LocalPasswordAuthGate(capacity)
             state.local_password_auth_gate = gate
     return gate
+
+
+def _use_native_discovery_route(
+    path: str,
+    method: str,
+    native_paths: Iterable[str],
+) -> bool:
+    """Product discovery and matching are always dispatched to the APK BFF."""
+
+    del path, method, native_paths
+    return False
+
+
+def _native_profile_avatar_reset(
+    path: str,
+    request_data: Mapping[str, Any],
+) -> bool:
+    if path != "/api/profile/reset":
+        return False
+    if request_data.get("avatar_asset_id") in (None, ""):
+        return False
+    field = str(
+        request_data.get("field")
+        or request_data.get("type")
+        or request_data.get("type_")
+        or ""
+    ).strip()
+    return field in {"", "avatar", "头像", "头像设置"}
+
+
+def _use_native_social_route(
+    path: str,
+    method: str,
+    native_paths: Iterable[str],
+    request_data: Mapping[str, Any],
+) -> bool:
+    """Product profile and relationship routes never use local authority."""
+
+    del path, method, native_paths, request_data
+    return False
 
 
 class RequestBodyLimitMiddleware:
@@ -411,16 +485,10 @@ def _local_im_read_mode(
     upstream_auth_mode: str,
     sid: str | None,
 ) -> bool:
-    """Decide whether the main IM reads must stay entirely off-network."""
+    """Main IM reads are always served by TIM/APK, never by local archives."""
 
-    if str(upstream_auth_mode or "").strip().lower() == "local-only":
-        return True
-    if str(getattr(identity, "auth_source", "") or "").strip().lower() == "web-local":
-        return True
-    web_user = legacy.STORE.get(sid) if sid and legacy.STORE is not None else None
-    return str(
-        getattr(web_user, "authentication_source", "") or ""
-    ).strip().lower() in {"local", "web-local"}
+    del identity, upstream_auth_mode, sid
+    return False
 
 
 def _main_im_archive_payload(request: Request, path: str) -> dict[str, Any]:
@@ -948,6 +1016,40 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
                         set_session_sid=pending_sid,
                     )
 
+    revoke_non_provider_session = getattr(
+        persistence, "revoke_non_provider_session", None
+    )
+    legacy_local_session = bool(
+        sid
+        and callable(revoke_non_provider_session)
+        and revoke_non_provider_session(str(sid))
+    )
+    if legacy_local_session:
+        if legacy.STORE is not None:
+            legacy.STORE.drop(str(sid))
+        if path not in LOGIN_START_PATHS:
+            response = JSONResponse(
+                {
+                    "ok": False,
+                    "code": "PROVIDER_RELOGIN_REQUIRED",
+                    "error": "登录方式已恢复为原账号服务，请重新登录",
+                    "retryable": False,
+                },
+                status_code=401,
+            )
+            _clear_cookie(
+                response,
+                name=cookie_name,
+                secure=bool(request.app.state.settings.cookie_secure),
+            )
+            _clear_cookie(
+                response,
+                name=pending_cookie_name,
+                secure=bool(request.app.state.settings.cookie_secure),
+            )
+            return response
+        sid = None
+
     # Never trust an authenticated object that only remains in process memory.
     # PostgreSQL/Redis are the authority for idle/absolute expiry and revocation.
     identity = persistence.require_identity(str(sid or "")) if sid else None
@@ -1022,24 +1124,21 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
                     web_user.conversation_message_peers
                 )
 
-    upstream_auth_mode = str(
-        getattr(request.app.state.settings, "upstream_auth_mode", "provider-first")
-        or "provider-first"
+    configured_auth_mode = str(
+        getattr(request.app.state.settings, "upstream_auth_mode", "provider-only")
+        or "provider-only"
     ).strip().lower()
-    if (
-        request.method == "POST"
-        and upstream_auth_mode == "local-only"
-        and path in {"/api/auth/sms-send", "/api/auth/sms-login"}
-    ):
+    if configured_auth_mode not in {"provider-only", "provider-first"}:
         return JSONResponse(
             {
                 "ok": False,
-                "code": "UPSTREAM_AUTH_DISABLED",
-                "error": "当前为 Banghua 停用模式，仅支持已迁移账号使用密码登录",
+                "code": "UPSTREAM_AUTH_MODE_UNSUPPORTED",
+                "error": "当前配置禁用了原账号服务，Web 产品拒绝进入本地认证模式",
                 "retryable": False,
             },
             status_code=503,
         )
+    upstream_auth_mode = "provider-only"
 
     if request.method == "POST" and path == "/api/auth/sms-send":
         phone = str(request_json.get("phone") or "").strip()
@@ -1083,42 +1182,14 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
             )
 
     login_context: Any = None
-    defer_password_login_context = False
-    normalized_password_login_phone: str | None = None
     if request.method == "POST" and path in {"/api/auth/login", "/api/auth/sms-login"}:
         try:
-            precheck_values = {
-                "phone": str(request_json.get("phone") or "").strip(),
-                "client_ip": client_ip,
-                "turnstile_token": str(
-                    request_json.get("turnstile_token") or ""
-                ),
-            }
-            password_mode = (
-                str(request_json.get("mode") or "password").strip().lower()
-                == "password"
+            login_context = persistence.precheck_login_credentials(
+                phone=str(request_json.get("phone") or "").strip(),
+                client_ip=client_ip,
+                turnstile_token=str(request_json.get("turnstile_token") or ""),
             )
-            if path == "/api/auth/login" and (
-                upstream_auth_mode == "local-only"
-                or (upstream_auth_mode == "provider-first" and password_mode)
-            ):
-                normalized_password_login_phone = (
-                    persistence.precheck_local_password_credentials(**precheck_values)
-                )
-                defer_password_login_context = (
-                    upstream_auth_mode == "provider-first" and password_mode
-                )
-            else:
-                login_context = persistence.precheck_login_credentials(
-                    **precheck_values
-                )
         except PermissionError as exc:
-            if path == "/api/auth/login" and upstream_auth_mode == "local-only":
-                _record_local_login_failure(
-                    persistence,
-                    phone=str(request_json.get("phone") or "").strip(),
-                    client_ip=client_ip,
-                )
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=403)
         except ValueError:
             return JSONResponse(
@@ -1131,319 +1202,50 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
                 headers={"Retry-After": "900"},
             )
 
-    if request.method == "POST" and upstream_auth_mode == "local-only":
-        if path == "/api/auth/login":
-            mode = str(request_json.get("mode") or "password").strip().lower()
-            if mode != "password":
-                return JSONResponse(
-                    {
-                        "ok": False,
-                        "code": "LOCAL_PASSWORD_ONLY",
-                        "error": "当前仅支持账号密码登录",
-                        "retryable": False,
-                    },
-                    status_code=403,
-                )
-            if not str(request_json.get("password") or ""):
-                return JSONResponse(
-                    {"ok": False, "error": "请输入密码"}, status_code=400
-                )
-            return _local_password_login_response(
-                request,
-                persistence=persistence,
-                request_json=request_json,
-                sid=sid,
-                pending_sid=pending_sid,
-                cookie_name=cookie_name,
-                pending_cookie_name=pending_cookie_name,
-                client_ip=client_ip,
-                dependency_mode="web-local/local-only",
-                upstream_may_recover=False,
-            )
-
     if (
         identity is not None
         and request.method == "POST"
         and path == "/api/auth/password"
     ):
-        if upstream_auth_mode != "local-only":
-            return JSONResponse(
-                {
-                    "ok": False,
-                    "code": "LOCAL_PASSWORD_CHANGE_REQUIRES_LOCAL_ONLY",
-                    "error": (
-                        "当前仍由原认证服务校验登录密码。为避免 Web 密码与原账号密码分叉，"
-                        "请在正式切换到 Web 本地认证后再修改密码"
-                    ),
-                    "retryable": False,
-                },
-                status_code=409,
-            )
-        request_error = _auth_json_request_error(request)
-        if request_error is not None:
-            return request_error
-        if not persistence.rate_limit(
-            f"password-change:{identity.user_id}",
-            limit=5,
-            window_seconds=15 * 60,
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": "LOCAL_PASSWORD_DISABLED",
+                "error": "登录密码由原账号服务管理，Web 不再保存或修改本地密码",
+                "retryable": False,
+            },
+            status_code=409,
+        )
+
+    if request.method == "POST" and _native_profile_avatar_reset(path, request_json):
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": "APK_AVATAR_UPLOAD_REQUIRED",
+                "error": "Web 私有媒体头像已停用，请使用原账号服务支持的头像方式",
+                "retryable": False,
+            },
+            status_code=409,
+        )
+
+    if request.method == "POST" and path == "/api/moments/publish":
+        media_asset_ids = request_json.get("media_asset_ids")
+        if isinstance(media_asset_ids, (list, tuple, set)) and any(
+            str(value or "").strip() for value in media_asset_ids
         ):
             return JSONResponse(
                 {
                     "ok": False,
-                    "code": "PASSWORD_CHANGE_RATE_LIMIT",
-                    "error": "密码修改尝试过于频繁，请稍后重试",
-                    "retryable": True,
+                    "code": "APK_TEXT_MOMENT_ONLY",
+                    "error": "当前原 APK 发布接口仅支持文字动态，未发送所选本地媒体",
+                    "retryable": False,
                 },
-                status_code=429,
-                headers={"Retry-After": "900"},
+                status_code=409,
             )
 
-        from bbw_prod.services import (
-            AuthenticationFailed,
-            LocalAuthenticationUnavailable,
-            PasswordPolicyError,
-            PermissionDenied,
-        )
-
-        gate = _local_password_auth_gate(request)
-        with gate.claim() as admitted:
-            if not admitted:
-                return JSONResponse(
-                    {
-                        "ok": False,
-                        "code": "LOCAL_AUTH_BUSY",
-                        "error": "本地密码验证繁忙，请稍后重试",
-                        "retryable": True,
-                    },
-                    status_code=503,
-                    headers={
-                        "Retry-After": str(LOCAL_PASSWORD_AUTH_RETRY_AFTER_SECONDS)
-                    },
-                )
-            try:
-                revoked_sessions = persistence.change_local_password(
-                    identity=identity,
-                    current_password=str(request_json.get("current_password") or ""),
-                    new_password=str(request_json.get("new_password") or ""),
-                )
-            except PasswordPolicyError as exc:
-                return JSONResponse(
-                    {
-                        "ok": False,
-                        "code": "PASSWORD_POLICY_REJECTED",
-                        "error": str(exc),
-                        "retryable": False,
-                    },
-                    status_code=400,
-                )
-            except AuthenticationFailed:
-                return JSONResponse(
-                    {
-                        "ok": False,
-                        "code": "CURRENT_PASSWORD_REJECTED",
-                        "error": "当前密码验证失败",
-                        "retryable": False,
-                    },
-                    status_code=401,
-                )
-            except (LocalAuthenticationUnavailable, PermissionDenied):
-                return JSONResponse(
-                    {
-                        "ok": False,
-                        "code": "LOCAL_PASSWORD_UNAVAILABLE",
-                        "error": "当前账号无法修改本地密码",
-                        "retryable": False,
-                    },
-                    status_code=403,
-                )
-
-        if sid and legacy.STORE is not None:
-            legacy.STORE.drop(sid)
-        response = JSONResponse(
-            {
-                "ok": True,
-                "code": "LOCAL_PASSWORD_CHANGED",
-                "message": "密码已更新，请使用新密码重新登录",
-                "logged_out": True,
-                "revoked_sessions": int(revoked_sessions),
-                "auth_source": "web-local",
-                "compatibility_sync": "not_available",
-            }
-        )
-        _clear_cookie(
-            response,
-            name=cookie_name,
-            secure=bool(request.app.state.settings.cookie_secure),
-        )
-        _clear_cookie(
-            response,
-            name=pending_cookie_name,
-            secure=bool(request.app.state.settings.cookie_secure),
-        )
-        return response
-
-    # Migrated accounts use PostgreSQL as the canonical profile/relationship
-    # authority in every provider mode.  Banghua compatibility is represented
-    # by the transactional outbox written by the dispatcher, never by an
-    # inline network call whose failure could roll back the Web operation.
-    from bbw_web.native_social_api import (
-        HANDLED_PATHS as SOCIAL_NATIVE_PATHS,
-        PROFILE_RESET_FIELDS,
-        SOCIAL_NATIVE_WRITE_PATHS,
-        dispatch_social_native,
-    )
-
-    if path in SOCIAL_NATIVE_PATHS and request.method in {"GET", "POST"}:
-        if request.method == "POST" and path in SOCIAL_NATIVE_WRITE_PATHS:
-            request_error = _auth_json_request_error(request)
-            if request_error is not None:
-                return request_error
-        media_reference_scope: dict[str, str] = {}
-        raw_profile_field = (
-            str(
-                request_json.get("field")
-                or request_json.get("type")
-                or request_json.get("type_")
-                or ""
-            ).strip()
-            if isinstance(request_json, Mapping)
-            else ""
-        )
-        avatar_reset = bool(
-            path == "/api/profile/reset"
-            and isinstance(request_json, Mapping)
-            and request_json.get("avatar_asset_id") not in (None, "")
-            and (
-                PROFILE_RESET_FIELDS.get(raw_profile_field) == "avatar"
-                or not raw_profile_field
-            )
-        )
-        if avatar_reset:
-            try:
-                storage = persistence.get_r2_storage()
-                deployment = str(
-                    getattr(request.app.state.settings, "environment", "development")
-                    or "development"
-                ).strip().lower()
-                private_bucket = str(getattr(storage, "bucket", "") or "").strip()
-                if not deployment or not private_bucket:
-                    raise RuntimeError("native media storage scope is incomplete")
-                media_reference_scope = {
-                    "media_reference_deployment": deployment,
-                    "media_reference_bucket": private_bucket,
-                }
-            except Exception:
-                LOGGER.exception("native avatar storage scope unavailable")
-                return JSONResponse(
-                    {
-                        "ok": False,
-                        "code": "MEDIA_STORAGE_UNAVAILABLE",
-                        "error": "媒体存储暂时不可用，请稍后重试",
-                        "retryable": True,
-                    },
-                    status_code=503,
-                )
-        try:
-            native_social = dispatch_social_native(
-                identity,
-                request.method,
-                path,
-                _query_mapping(request),
-                request_json,
-                **media_reference_scope,
-            )
-        except Exception:
-            LOGGER.exception("native social dispatch failed")
-            return JSONResponse(
-                {
-                    "ok": False,
-                    "code": "SOCIAL_NATIVE_UNAVAILABLE",
-                    "error": "本地资料与关系服务暂时不可用，请稍后重试",
-                    "retryable": True,
-                },
-                status_code=503,
-            )
-        if native_social is not None:
-            legacy_read_fallback_allowed = (
-                getattr(native_social, "legacy_read_fallback_allowed", False)
-                is True
-            )
-            use_legacy_profile_read = bool(
-                request.method == "GET"
-                and path == "/api/profile/user"
-                and upstream_auth_mode == "provider-first"
-                and native_social.status == 404
-                and native_social.payload.get("code") == "SOCIAL_TARGET_UNAVAILABLE"
-                and legacy_read_fallback_allowed
-            )
-            if not use_legacy_profile_read:
-                return JSONResponse(
-                    native_social.payload,
-                    status_code=native_social.status,
-                )
-
-    # Discovery and text matching are canonical PostgreSQL operations.  The
-    # compatibility provider is not consulted in the request path and its
-    # failure therefore cannot disable Web-to-Web discovery or matching.
-    from bbw_web.native_discovery_api import (
-        DISCOVERY_NATIVE_PATHS,
-        DISCOVERY_NATIVE_WRITE_PATHS,
-        dispatch_discovery_native,
-    )
-
-    if path in DISCOVERY_NATIVE_PATHS and request.method in {"GET", "POST"}:
-        if request.method == "POST" and path in DISCOVERY_NATIVE_WRITE_PATHS:
-            request_error = _auth_json_request_error(request)
-            if request_error is not None:
-                return request_error
-        try:
-            native_discovery = dispatch_discovery_native(
-                identity,
-                request.method,
-                path,
-                _query_mapping(request),
-                request_json,
-            )
-        except Exception:
-            LOGGER.exception("native discovery dispatch failed")
-            return JSONResponse(
-                {
-                    "ok": False,
-                    "code": "DISCOVERY_NATIVE_UNAVAILABLE",
-                    "error": "本地发现与匹配服务暂时不可用，请稍后重试",
-                    "retryable": True,
-                },
-                status_code=503,
-            )
-        if native_discovery is not None:
-            if (
-                identity is not None
-                and request.method == "POST"
-                and path in {"/api/match/online", "/api/match/local"}
-                and native_discovery.status < 400
-                and native_discovery.payload.get("ok") is True
-            ):
-                try:
-                    persistence.remember_match_history_response(
-                        identity=identity,
-                        method="POST",
-                        path=path,
-                        response_data=native_discovery.payload,
-                        status=native_discovery.status,
-                        request_id=str(
-                            request_json.get("request_id")
-                            or request_json.get("operation_id")
-                            or uuid.uuid4().hex
-                        )[:160],
-                    )
-                except Exception:
-                    # MatchResult is already committed and remains canonical;
-                    # the legacy history projection is best effort only.
-                    LOGGER.exception("native match history projection failed")
-            return JSONResponse(
-                native_discovery.payload,
-                status_code=native_discovery.status,
-            )
+    # Profile, relationships, discovery, matching and moments all fall through
+    # to the APK-compatible BFF below. PostgreSQL remains a cache/archive and
+    # permission mirror only.
 
     message_policy_allowed_peers: tuple[str, ...] = ()
     message_policy_match_peers: tuple[str, ...] = ()
@@ -1888,16 +1690,16 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
             message_policy_allowed_peers=message_policy_allowed_peers,
             message_policy_match_peers=message_policy_match_peers,
             message_policy_blocked_peers=message_policy_blocked_peers,
-            local_password_change_enabled=upstream_auth_mode == "local-only",
+            local_password_change_enabled=False,
             message_block_snapshot_loader=message_block_snapshot_loader,
             message_block_snapshot_guard=message_block_snapshot_guard,
             message_block_snapshot_recorder=message_block_snapshot_recorder,
             match_history_loader=match_history_loader,
             match_history_recorder=match_history_recorder,
-            conversation_summary_loader=conversation_summary_loader,
-            local_text_sender=local_text_sender,
-            local_text_revoker=local_text_revoker,
-            local_read_marker=local_read_marker,
+            conversation_summary_loader=None,
+            local_text_sender=None,
+            local_text_revoker=None,
+            local_read_marker=None,
         )
         try:
             if request.method == "GET":
@@ -1915,107 +1717,15 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
         except Exception:
             LOGGER.exception("legacy route dispatch failed")
             handler.finish_capture()
-            if not main_im_read:
-                return JSONResponse(
-                    {"ok": False, "error": "服务暂时不可用，请稍后重试"},
-                    status_code=500,
-                )
-            status = 502
-            response_headers, response_body = _captured_json(
-                {
-                    "ok": False,
-                    "code": "UPSTREAM_IM_READ_UNAVAILABLE",
-                    "error": "外部聊天记录暂时不可用",
-                    "items": [],
-                    "list": [],
-                    "count": 0,
-                }
+            return JSONResponse(
+                {"ok": False, "error": "服务暂时不可用，请稍后重试"},
+                status_code=500,
             )
         else:
             status, response_headers, response_body = handler.finish_capture()
 
     response_data = _response_json(response_headers, response_body)
-    if main_im_read and not served_local_im_read and (
-        status < 400 or status >= 500
-    ):
-        try:
-            local_payload = _main_im_archive_payload(request, path)
-        except Exception:
-            LOGGER.exception("canonical IM fallback read failed")
-        else:
-            summary_only = request.query_params.get("summary", "0") == "1"
-            if status >= 500 or response_data.get("ok") is not True:
-                response_data = dict(local_payload)
-                response_data.update(
-                    ok=True,
-                    dependency_mode="web-local/degraded",
-                    upstream_unavailable=True,
-                )
-            else:
-                response_data = _merge_main_im_payload(
-                    path,
-                    response_data,
-                    local_payload,
-                    summary_only=summary_only,
-                )
-                response_data["dependency_mode"] = "provider-first/local-authority"
-            status = 200
-            response_headers, response_body = _captured_json(response_data)
     new_sid = _cookie_value(response_headers, cookie_name)
-
-    if (
-        request.method == "POST"
-        and path == "/api/auth/login"
-        and response_data.get("code") == "UPSTREAM_AUTH_UNAVAILABLE"
-        and str(request_json.get("mode") or "password").strip().lower()
-        == "password"
-    ):
-        # This is the only local-password fallback gate.  The legacy/provider
-        # layer emits the stable signal only for transport failures, negative
-        # statuses and 5xx responses.  Explicit password rejection, account
-        # suspension, 401/403/429 and unexpected adapter exceptions never
-        # reach this branch.
-        return _local_password_login_response(
-            request,
-            persistence=persistence,
-            request_json=request_json,
-            sid=sid,
-            pending_sid=pending_sid,
-            cookie_name=cookie_name,
-            pending_cookie_name=pending_cookie_name,
-            client_ip=client_ip,
-            dependency_mode="degraded",
-            upstream_may_recover=True,
-        )
-
-    if defer_password_login_context and response_data.get("ok"):
-        # Before upstream authentication succeeds, password login may perform
-        # only input and abuse checks.  Resolving the durable account state
-        # earlier would let a provider outage expose suspended Web accounts
-        # before the local real/dummy Argon2 path can return its uniform result.
-        try:
-            login_context = persistence.precheck_account(
-                phone=normalized_password_login_phone
-                or str(request_json.get("phone") or "").strip()
-            )
-        except PermissionError as exc:
-            if new_sid:
-                _discard_pending_runtime(new_sid)
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=403)
-        except ValueError:
-            if new_sid:
-                _discard_pending_runtime(new_sid)
-            return JSONResponse(
-                {"ok": False, "error": "手机号格式无效"}, status_code=400
-            )
-        except Exception:
-            LOGGER.exception("post-authentication account precheck failed")
-            if new_sid:
-                _discard_pending_runtime(new_sid)
-            return JSONResponse(
-                {"ok": False, "error": "登录状态保存失败，请稍后重试"},
-                status_code=503,
-            )
 
     message_policy_paths = {
         "/api/social/friends",
@@ -2900,7 +2610,6 @@ from bbw_agent.api import router as agent_router  # noqa: E402
 from bbw_web.archive_api import router as archive_router  # noqa: E402
 from bbw_web.media_api import router as media_router  # noqa: E402
 from bbw_web.native_media_api import router as native_media_router  # noqa: E402
-from bbw_web.native_moments_api import router as native_moments_router  # noqa: E402
 from bbw_web.moment_media_api import (  # noqa: E402
     MomentVideoServiceError,
     router as moment_media_router,
@@ -2946,7 +2655,6 @@ app.include_router(agent_router)
 app.include_router(archive_router)
 app.include_router(media_router)
 app.include_router(native_media_router)
-app.include_router(native_moments_router)
 app.include_router(moment_media_router)
 
 

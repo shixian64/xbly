@@ -507,7 +507,7 @@ class FrontendMessageDeduplicationContracts(unittest.TestCase):
         self.assertIn("keys.add(`canonical|${canonicalID}`)", source)
         self.assertIn("keys.add(`client-message|${clientMessageID}`)", source)
 
-    def test_web_local_canonical_revoke_state_wins_over_tim_compatibility(self) -> None:
+    def test_tim_revoke_state_wins_over_retired_web_local_compatibility(self) -> None:
         source = (ROOT / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8-sig")
         authority = source.split("function isWebLocalCanonicalMessage", 1)[1].split(
             "function numericMessageValue", 1
@@ -530,9 +530,15 @@ class FrontendMessageDeduplicationContracts(unittest.TestCase):
         self.assertIn("preferredCanonicalMessageAuthority(previous, entry)", merge)
         self.assertIn("const authorityOwnsRevocationState = Boolean(", merge)
         self.assertIn("revoked: mergedMessageRevoked(previous, entry)", merge)
-        self.assertIn("text: authorityOwnsRevocationState", merge)
-        self.assertIn("media: authorityOwnsRevocationState", merge)
+        self.assertIn("text: authority", merge)
+        self.assertIn("media: authority", merge)
         self.assertIn("canonicalAuthority: Boolean(authority)", merge)
+        self.assertIn("if (isTimAuthoritativeMessage(incoming)) return incoming;", authority)
+        self.assertIn("if (isTimAuthoritativeMessage(previous)) return previous;", authority)
+        self.assertIn(
+            "return !isTimAuthoritativeMessage(previous) || isTimAuthoritativeMessage(revoked);",
+            authority,
+        )
         self.assertGreaterEqual(
             pending_revoke.count("shouldApplyCompatibilityRevocation(previous, revoked)"),
             2,
@@ -559,18 +565,13 @@ class FrontendMessageDeduplicationContracts(unittest.TestCase):
             + authority
             + "\n"
             + r"""
-const canonicalActive = {
+const legacyActive = {
   canonicalMessageId: "canonical-1",
   provider: "web-local",
   source: "archive",
   revoked: false,
 };
-const canonicalRevoked = { ...canonicalActive, revoked: true };
-const localAckActive = {
-  canonicalMessageId: "canonical-1",
-  source: "web-local",
-  revoked: false,
-};
+const legacyRevoked = { ...legacyActive, revoked: true };
 const timRevoked = {
   canonicalMessageId: "canonical-1",
   provider: "tim",
@@ -578,20 +579,20 @@ const timRevoked = {
   revoked: true,
 };
 const timActive = { ...timRevoked, revoked: false };
-if (mergedMessageRevoked(canonicalActive, timRevoked) !== false) {
-  throw new Error("TIM revoked state overrode active canonical state");
+if (mergedMessageRevoked(legacyActive, timRevoked) !== true) {
+  throw new Error("TIM revoked state did not override retired local state");
 }
-if (mergedMessageRevoked(timRevoked, canonicalActive) !== false) {
-  throw new Error("canonical state depended on merge order");
+if (mergedMessageRevoked(timRevoked, legacyActive) !== true) {
+  throw new Error("TIM revoked state depended on merge order");
 }
-if (mergedMessageRevoked(canonicalRevoked, timActive) !== true) {
-  throw new Error("canonical revoked state was lost");
+if (mergedMessageRevoked(legacyRevoked, timActive) !== false) {
+  throw new Error("retired local revoke overrode active TIM state");
 }
-if (mergedMessageRevoked(localAckActive, timRevoked) !== false) {
-  throw new Error("local canonical acknowledgement was not authoritative");
+if (shouldApplyCompatibilityRevocation(legacyActive, timRevoked) !== true) {
+  throw new Error("TIM revoke event was blocked by retired local state");
 }
-if (shouldApplyCompatibilityRevocation(canonicalActive, timRevoked) !== false) {
-  throw new Error("TIM revoke event was allowed to overwrite canonical state");
+if (shouldApplyCompatibilityRevocation(timActive, legacyRevoked) !== false) {
+  throw new Error("retired local revoke was allowed to overwrite TIM state");
 }
 if (shouldApplyCompatibilityRevocation(timActive, timRevoked) !== true) {
   throw new Error("ordinary TIM revoke event was incorrectly ignored");
