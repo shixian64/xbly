@@ -20,23 +20,36 @@ class ByokAgentSchedulerSourceContractTests(unittest.TestCase):
             for node in tree.body
             if isinstance(node, ast.FunctionDef) and node.name == "_tick"
         )
+        agent_tick = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_agent_tick"
+        )
 
         self.assertEqual([arg.arg for arg in tick.args.args], ["queue"])
+        self.assertEqual(tick.args.kwonlyargs, [])
         self.assertEqual(
-            [arg.arg for arg in tick.args.kwonlyargs], ["agent_control_queue"]
+            [arg.arg for arg in agent_tick.args.args], ["agent_control_queue"]
         )
+        self.assertEqual(agent_tick.args.kwonlyargs, [])
         self.assertIn('AGENT_CONTROL_QUEUE = "agent-control"', source)
         self.assertIn(
             'AGENT_DISPATCH_JOB = "bbw_web.jobs.schedule_due_agent_runs"', source
         )
         self.assertIn('AGENT_DISPATCH_JOB_ID = "agent-dispatch-due-v1"', source)
+        self.assertIn("AGENT_DISPATCH_INTERVAL_SECONDS = 10", source)
+        self.assertIn("SCHEDULER_POLL_SECONDS = 1", source)
         self.assertIn('"BBW_AI_AGENT_BACKGROUND_ENABLED", False', source)
-        self.assertIn("job_timeout=60", source)
-        self.assertIn("result_ttl=30", source)
-        self.assertIn("failure_ttl=90", source)
+        self.assertIn("job_timeout=30", source)
+        self.assertIn("result_ttl=0", source)
+        self.assertIn("failure_ttl=30", source)
         self.assertIn("Queue(AGENT_CONTROL_QUEUE, connection=redis)", source)
         self.assertIn('lock_name = f"{redis_prefix}:scheduler:leader"', source)
-        self.assertIn("LOCK_TTL_SECONDS = 55", source)
+        self.assertIn("LOCK_TTL_SECONDS = 15", source)
+        self.assertIn(
+            "agent_slot = int(timestamp // AGENT_DISPATCH_INTERVAL_SECONDS)", source
+        )
+        self.assertIn("time.sleep(SCHEDULER_POLL_SECONDS)", source)
         self.assertNotIn("from bbw_web.jobs import", source)
 
     def test_settings_are_fail_closed_and_bounded(self) -> None:

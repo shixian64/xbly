@@ -258,6 +258,70 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         self.assertIn("tasks.has_open_task_type(", owner_scheduler)
         self.assertIn("limit=1", owner_scheduler)
 
+    def test_0020_migration_allows_ten_second_agent_cadence(self) -> None:
+        migration = self.read(
+            "migrations/versions/20260727_0020_ten_second_agent_cadence.py"
+        )
+        self.assertIn('revision: str = "20260727_0020"', migration)
+        self.assertIn(
+            'down_revision: Union[str, Sequence[str], None] = "20260727_0019"',
+            migration,
+        )
+        upgrade = self.fragment(
+            migration,
+            "def upgrade() -> None:",
+            "def downgrade() -> None:",
+        )
+        self.assertIn('server_default=sa.text("10")', upgrade)
+        self.assertIn("SET minimum_action_interval_seconds = 10", upgrade)
+        self.assertIn("WHERE minimum_action_interval_seconds = 300", upgrade)
+        self.assertIn(
+            "minimum_action_interval_seconds BETWEEN 10 AND 86400", upgrade
+        )
+        downgrade = migration.split("def downgrade() -> None:", 1)[1]
+        self.assertIn("SET minimum_action_interval_seconds = 60", downgrade)
+        self.assertIn('server_default=sa.text("300")', downgrade)
+        self.assertIn(
+            "minimum_action_interval_seconds BETWEEN 60 AND 86400", downgrade
+        )
+
+        models = self.read("bbw_prod/models.py")
+        self.assertIn(
+            'Integer, nullable=False, default=10, server_default="10"', models
+        )
+        self.assertIn(
+            "minimum_action_interval_seconds BETWEEN 10 AND 86400", models
+        )
+        api = self.read("bbw_agent/api.py")
+        self.assertIn(
+            "minimum_action_interval_seconds: int = Field(default=10, ge=10, le=86400)",
+            api,
+        )
+
+    def test_owner_scheduler_does_not_build_an_action_backlog(self) -> None:
+        owner_scheduler, _ = self.function_source(
+            "bbw_web/jobs.py", "_schedule_autonomy_owner"
+        )
+        self.assertIn(
+            "AUTONOMY_CONTROL_INTERVAL_SECONDS = 10",
+            self.read("bbw_web/jobs.py"),
+        )
+        self.assertIn(
+            "tasks.has_open_task(owner_user_id=owner_user_id)", owner_scheduler
+        )
+        self.assertIn("remaining = min(1, max(1, int(task_limit)))", owner_scheduler)
+        self.assertIn(
+            "seconds=AUTONOMY_CONTROL_INTERVAL_SECONDS", owner_scheduler
+        )
+
+        repository, _ = self.function_source(
+            "bbw_agent/repositories.py", "has_open_task"
+        )
+        self.assertIn(
+            "AiAgentAutonomyTask.owner_user_id == owner_user_id", repository
+        )
+        self.assertIn("AUTONOMY_TERMINAL_STATUSES", repository)
+
     def test_agent_run_type_constraints_use_alembic_complete_names(self) -> None:
         for migration in (
             "migrations/versions/20260725_0015_byok_account_actions.py",
@@ -542,9 +606,10 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
             'AGENT_DISPATCH_JOB = "bbw_web.jobs.schedule_due_agent_runs"', scheduler
         )
         self.assertIn('Queue(AGENT_CONTROL_QUEUE, connection=redis)', scheduler)
-        tick, _ = self.function_source("bbw_web/scheduler.py", "_tick")
-        self.assertIn('"BBW_AI_AGENT_BACKGROUND_ENABLED", False', tick)
-        self.assertIn("agent_control_queue,\n            AGENT_DISPATCH_JOB", tick)
+        agent_tick, _ = self.function_source("bbw_web/scheduler.py", "_agent_tick")
+        self.assertIn('"BBW_AI_AGENT_BACKGROUND_ENABLED", False', agent_tick)
+        self.assertIn("agent_control_queue,\n        AGENT_DISPATCH_JOB", agent_tick)
+        self.assertIn("result_ttl=0", agent_tick)
 
         schedule_source, schedule_node = self.function_source(
             "bbw_web/jobs.py", "schedule_due_agent_runs"

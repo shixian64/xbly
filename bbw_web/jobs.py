@@ -134,6 +134,7 @@ TIM_RECALL_LOOKUP_MAX_PAGES = 3
 WEB_NATIVE_MEDIA_CLEANUP_BATCH = 200
 WEB_NATIVE_UPLOAD_CLEANUP_GRACE_SECONDS = 60 * 60
 WEB_NATIVE_MEDIA_UNSENT_GRACE_SECONDS = 24 * 60 * 60
+AUTONOMY_CONTROL_INTERVAL_SECONDS = 10
 LOGGER = logging.getLogger(__name__)
 DEFAULT_MEDIA_HOSTS = (
     "oss.banghua.xin",
@@ -3277,7 +3278,17 @@ def _schedule_autonomy_owner(
             return {"eligible": False, "created": 0, "reused": 0}
 
         tasks = AgentAutonomyTaskRepository(db)
-        remaining = max(1, min(int(task_limit), 50))
+        if tasks.has_open_task(owner_user_id=owner_user_id):
+            setting.last_run_at = now
+            setting.next_run_at = now + timedelta(
+                seconds=AUTONOMY_CONTROL_INTERVAL_SECONDS
+            )
+            setting.updated_at = now
+            return {"eligible": True, "created": 0, "reused": 0}
+        # One owner may create at most one task per control scan.  The task is
+        # dispatched in the same scan when its action interval is due, instead
+        # of building a database backlog faster than the worker can consume it.
+        remaining = min(1, max(1, int(task_limit)))
         if (
             policy.auto_reply_enabled
             and remaining > 0
@@ -3586,7 +3597,9 @@ def _schedule_autonomy_owner(
                     break
 
         setting.last_run_at = now
-        setting.next_run_at = now + timedelta(seconds=60)
+        setting.next_run_at = now + timedelta(
+            seconds=AUTONOMY_CONTROL_INTERVAL_SECONDS
+        )
         setting.updated_at = now
     return {"eligible": True, "created": created, "reused": reused}
 

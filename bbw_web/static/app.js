@@ -2271,8 +2271,8 @@ function normalizedAiAgentAutonomyStatus(status) {
     active_end_minute: boundedInteger(source.active_end_minute, 0, 0, 1439),
     minimum_action_interval_seconds: boundedInteger(
       source.minimum_action_interval_seconds,
-      300,
-      60,
+      10,
+      10,
       86400
     ),
     daily_total_limit: boundedInteger(source.daily_total_limit, 20, 1, 200),
@@ -15876,6 +15876,9 @@ function agentAutonomySectionHtml(autonomy) {
           <div class="field"><label for="agent-autonomy-end">结束时间</label><input id="agent-autonomy-end" name="active_end_minute" type="time" value="${esc(
             aiAgentAutonomyTimeValue(autonomy.active_end_minute)
           )}" ${controlDisabled} required /><p class="field-help">开始与结束相同表示全天。</p></div>
+          <div class="field"><label for="agent-autonomy-action-interval">动作间隔（秒）</label><input id="agent-autonomy-action-interval" name="minimum_action_interval_seconds" type="number" min="10" max="86400" step="1" value="${esc(
+            autonomy.minimum_action_interval_seconds
+          )}" ${controlDisabled} required /><p class="field-help">同一账号两次实际操作之间至少间隔 10 秒。</p></div>
           <div class="field"><label for="agent-autonomy-discovery-interval">发现间隔（分钟）</label><input id="agent-autonomy-discovery-interval" name="discovery_interval_minutes" type="number" min="5" max="1440" step="1" value="${esc(
             autonomy.discovery_interval_minutes
           )}" ${controlDisabled} required /></div>
@@ -19175,6 +19178,13 @@ async function handleProductForm(form, submitter, submittedValues = null) {
       "每日开始时间"
     );
     const activeEndMinute = aiAgentAutonomyMinuteValue(values.active_end_minute, "每日结束时间");
+    const minimumActionIntervalSeconds = aiAgentAutonomyInteger(
+      values,
+      "minimum_action_interval_seconds",
+      "动作间隔",
+      10,
+      86400
+    );
     const discoveryIntervalMinutes = aiAgentAutonomyInteger(
       values,
       "discovery_interval_minutes",
@@ -19235,7 +19245,7 @@ async function handleProductForm(form, submitter, submittedValues = null) {
         timezone,
         active_start_minute: activeStartMinute,
         active_end_minute: activeEndMinute,
-        minimum_action_interval_seconds: autonomy.minimum_action_interval_seconds,
+        minimum_action_interval_seconds: minimumActionIntervalSeconds,
         daily_total_limit: autonomy.daily_total_limit,
         daily_reply_limit: Math.max(
           autoReplyEnabled || proactiveMessageEnabled ? 1 : 0,

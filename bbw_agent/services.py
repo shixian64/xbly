@@ -485,7 +485,7 @@ def autonomy_public(
         "timezone": "UTC",
         "active_start_minute": 0,
         "active_end_minute": 0,
-        "minimum_action_interval_seconds": 300,
+        "minimum_action_interval_seconds": 10,
         "daily_total_limit": 20,
         "daily_reply_limit": 10,
         "daily_post_limit": 1,

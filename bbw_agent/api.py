@@ -182,7 +182,7 @@ class AutonomySettingsBody(_StrictBody):
     timezone: str = Field(default="UTC", min_length=1, max_length=64)
     active_start_minute: int = Field(default=0, ge=0, le=1439)
     active_end_minute: int = Field(default=0, ge=0, le=1439)
-    minimum_action_interval_seconds: int = Field(default=300, ge=60, le=86400)
+    minimum_action_interval_seconds: int = Field(default=10, ge=10, le=86400)
     daily_total_limit: int = Field(default=20, ge=1, le=200)
     daily_reply_limit: int = Field(default=10, ge=0, le=200)
     daily_post_limit: int = Field(default=1, ge=0, le=20)

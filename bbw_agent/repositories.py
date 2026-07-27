@@ -1351,7 +1351,7 @@ class AgentAutonomySettingRepository:
             timezone="UTC",
             active_start_minute=0,
             active_end_minute=0,
-            minimum_action_interval_seconds=300,
+            minimum_action_interval_seconds=10,
             daily_total_limit=20,
             daily_reply_limit=10,
             daily_post_limit=1,
@@ -1425,7 +1425,7 @@ class AgentAutonomySettingRepository:
         failure_limit = int(consecutive_failure_limit)
         if not 0 <= start_minute < 1440 or not 0 <= end_minute < 1440:
             raise ValueError("autonomous active time is invalid")
-        if not 60 <= minimum_interval <= 86400:
+        if not 10 <= minimum_interval <= 86400:
             raise ValueError("autonomous minimum interval is invalid")
         if not 1 <= total_limit <= 200:
             raise ValueError("autonomous total daily limit is invalid")
@@ -1988,6 +1988,20 @@ class AgentAutonomyTaskRepository:
                 .where(AiAgentAutonomyTask.owner_user_id == owner_user_id)
                 .order_by(AiAgentAutonomyTask.created_at.desc())
                 .limit(min(max(1, int(limit)), 100))
+            )
+        )
+
+    def has_open_task(self, *, owner_user_id: uuid.UUID) -> bool:
+        return bool(
+            self.db.scalar(
+                select(AiAgentAutonomyTask.id)
+                .where(
+                    AiAgentAutonomyTask.owner_user_id == owner_user_id,
+                    ~AiAgentAutonomyTask.status.in_(
+                        tuple(AUTONOMY_TERMINAL_STATUSES)
+                    ),
+                )
+                .limit(1)
             )
         )
 

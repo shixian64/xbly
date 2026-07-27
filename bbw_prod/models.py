@@ -923,7 +923,7 @@ class AiAgentAutonomySetting(
             name="ai_agent_autonomy_active_minutes_valid",
         ),
         CheckConstraint(
-            "minimum_action_interval_seconds BETWEEN 60 AND 86400",
+            "minimum_action_interval_seconds BETWEEN 10 AND 86400",
             name="ai_agent_autonomy_minimum_interval_valid",
         ),
         CheckConstraint(
@@ -1070,7 +1070,7 @@ class AiAgentAutonomySetting(
         SmallInteger, nullable=False, default=0, server_default="0"
     )
     minimum_action_interval_seconds: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=300, server_default="300"
+        Integer, nullable=False, default=10, server_default="10"
     )
     daily_total_limit: Mapped[int] = mapped_column(
         SmallInteger, nullable=False, default=20, server_default="20"
