@@ -3022,8 +3022,9 @@ def _unanswered_autonomy_reply_candidates(
             .where(
                 Message.owner_user_id == owner_user_id,
                 Conversation.owner_user_id == owner_user_id,
-                Message.provider == "web-local",
-                Conversation.provider == "web-local",
+                Message.provider.in_(("web-local", CHAT_PROVIDER)),
+                Conversation.provider.in_(("web-local", CHAT_PROVIDER)),
+                Message.provider == Conversation.provider,
                 Message.direction == "incoming",
                 func.lower(Message.message_type).in_(("text", "timtextelem")),
                 func.length(func.btrim(func.coalesce(Message.body, ""))) > 0,
@@ -3066,6 +3067,86 @@ def _unanswered_autonomy_reply_candidates(
     return candidates
 
 
+def _agent_candidate_truthy(snapshot: Mapping[str, Any], *keys: str) -> bool:
+    for key in keys:
+        value = snapshot.get(key)
+        if value is True or str(value or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "active",
+            "pending",
+            "accepted",
+        }:
+            return True
+    return False
+
+
+def _agent_candidate_next_action(
+    *,
+    policy: Any,
+    candidate: Any,
+    tasks: Any,
+) -> tuple[Any, str] | None:
+    from bbw_agent.autonomous import (
+        FOLLOW_USER,
+        REQUEST_FRIEND,
+        SEND_PRIVATE_MESSAGE,
+        AutonomyTaskType,
+    )
+
+    snapshot = (
+        dict(candidate.profile_snapshot or {})
+        if isinstance(candidate.profile_snapshot, Mapping)
+        else {}
+    )
+    target = str(candidate.target_upstream_uid or "").strip()
+    last_action = str(candidate.last_action_type or "").strip()
+    following = _agent_candidate_truthy(
+        snapshot,
+        "is_following",
+        "is_follower",
+    ) or tasks.relationship_is_active(
+        owner_user_id=candidate.owner_user_id,
+        target_upstream_uid=target,
+    )
+    friendship_started = _agent_candidate_truthy(snapshot, "is_friend")
+    friend_request_pending = _agent_candidate_truthy(
+        snapshot,
+        "is_friend_apply",
+        "has_incoming_friend_apply",
+        "friend_apply_status",
+        "incoming_friend_apply_status",
+    )
+    if (
+        policy.follow_discovered_enabled
+        and FOLLOW_USER in policy.selected_actions
+        and not following
+        and last_action not in {FOLLOW_USER, REQUEST_FRIEND, SEND_PRIVATE_MESSAGE}
+    ):
+        return AutonomyTaskType.FOLLOW_DISCOVERED, FOLLOW_USER
+    if (
+        policy.friend_request_enabled
+        and REQUEST_FRIEND in policy.selected_actions
+        and not friendship_started
+        and not friend_request_pending
+        and last_action not in {REQUEST_FRIEND, SEND_PRIVATE_MESSAGE}
+    ):
+        return AutonomyTaskType.REQUEST_FRIEND, REQUEST_FRIEND
+    if (
+        policy.proactive_message_enabled
+        and SEND_PRIVATE_MESSAGE in policy.selected_actions
+        and last_action != SEND_PRIVATE_MESSAGE
+        and tasks.get_conversation_head(
+            owner_user_id=candidate.owner_user_id,
+            peer_upstream_uid=target,
+        )
+        is None
+    ):
+        return AutonomyTaskType.PROACTIVE_MESSAGE, SEND_PRIVATE_MESSAGE
+    return None
+
+
 def _schedule_autonomy_owner(
     owner_user_id: uuid.UUID,
     *,
@@ -3076,8 +3157,11 @@ def _schedule_autonomy_owner(
     """Create bounded, database-idempotent tasks for one authorized owner."""
 
     from bbw_agent.autonomous import (
+        BROWSE_ONLINE_USERS,
         FOLLOW_USER,
         PUBLISH_TEXT_POST,
+        REQUEST_FRIEND,
+        REQUEST_TEXT_MATCH,
         SEND_PRIVATE_MESSAGE,
         UNFOLLOW_USER,
         AutonomyTaskType,
@@ -3086,6 +3170,7 @@ def _schedule_autonomy_owner(
         quiet_window_end,
     )
     from bbw_agent.repositories import (
+        AgentDiscoveryCandidateRepository,
         AgentAutonomySettingRepository,
         AgentAutonomyTaskRepository,
     )
@@ -3193,6 +3278,92 @@ def _schedule_autonomy_owner(
                 if remaining <= 0:
                     break
 
+        discovery_interval_seconds = max(
+            300,
+            int(setting.discovery_interval_minutes) * 60,
+        )
+        browse_due = bool(
+            policy.discovery_enabled
+            and remaining > 0
+            and not tasks.has_open_task_type(
+                owner_user_id=owner_user_id,
+                task_type=AutonomyTaskType.BROWSE_ONLINE.value,
+            )
+            and (
+                setting.last_discovery_at is None
+                or setting.last_discovery_at
+                + timedelta(seconds=discovery_interval_seconds)
+                <= now
+            )
+        )
+        if browse_due:
+            slot = int(now.timestamp()) // discovery_interval_seconds
+            key = deterministic_task_key(
+                owner_user_id=owner_user_id,
+                task_type=AutonomyTaskType.BROWSE_ONLINE,
+                source_identity=f"browse:{policy.version}:{slot}",
+            )
+            _, was_created = tasks.enqueue(
+                owner_user_id=owner_user_id,
+                external_account_id=account.id,
+                task_type=AutonomyTaskType.BROWSE_ONLINE.value,
+                action_type=BROWSE_ONLINE_USERS,
+                idempotency_key=key,
+                policy_version=policy.version,
+                execution_setting_version=policy.execution_setting_version,
+                runner_setting_version=policy.runner_setting_version,
+                model_connection_id=policy.model_connection_id,
+                runner_configuration_fingerprint=(
+                    policy.runner_configuration_fingerprint
+                ),
+                schedule_slot=str(slot),
+                not_before=now,
+            )
+            created += int(was_created)
+            reused += int(not was_created)
+            remaining -= 1
+
+        match_due = bool(
+            policy.text_match_enabled
+            and remaining > 0
+            and not tasks.has_open_task_type(
+                owner_user_id=owner_user_id,
+                task_type=AutonomyTaskType.REQUEST_MATCH.value,
+            )
+            and (
+                setting.last_match_at is None
+                or setting.last_match_at
+                + timedelta(seconds=discovery_interval_seconds)
+                <= now
+            )
+        )
+        if match_due:
+            slot = int(now.timestamp()) // discovery_interval_seconds
+            key = deterministic_task_key(
+                owner_user_id=owner_user_id,
+                task_type=AutonomyTaskType.REQUEST_MATCH,
+                source_identity=f"match:{policy.version}:{slot}",
+            )
+            _, was_created = tasks.enqueue(
+                owner_user_id=owner_user_id,
+                external_account_id=account.id,
+                task_type=AutonomyTaskType.REQUEST_MATCH.value,
+                action_type=REQUEST_TEXT_MATCH,
+                idempotency_key=key,
+                policy_version=policy.version,
+                execution_setting_version=policy.execution_setting_version,
+                runner_setting_version=policy.runner_setting_version,
+                model_connection_id=policy.model_connection_id,
+                runner_configuration_fingerprint=(
+                    policy.runner_configuration_fingerprint
+                ),
+                schedule_slot=str(slot),
+                not_before=now,
+            )
+            created += int(was_created)
+            reused += int(not was_created)
+            remaining -= 1
+
         post_due = bool(
             policy.scheduled_posts_enabled
             and remaining > 0
@@ -3277,6 +3448,82 @@ def _schedule_autonomy_owner(
                     ),
                     schedule_slot=budget_day,
                     target_upstream_uid=target,
+                    not_before=now,
+                )
+                created += int(was_created)
+                reused += int(not was_created)
+                remaining -= 1
+                if remaining <= 0:
+                    break
+
+        if (
+            remaining > 0
+            and (
+                policy.follow_discovered_enabled
+                or policy.friend_request_enabled
+                or policy.proactive_message_enabled
+            )
+        ):
+            candidates = AgentDiscoveryCandidateRepository(db).list_recent_eligible(
+                owner_user_id,
+                seen_after=now - timedelta(days=7),
+                interaction_before=now - timedelta(minutes=15),
+                limit=50,
+            )
+            budget_day = policy_budget_day(policy, now=now).isoformat()
+            for candidate in candidates:
+                target = str(candidate.target_upstream_uid or "").strip()
+                if (
+                    not target
+                    or tasks.has_open_task_for_target(
+                        owner_user_id=owner_user_id,
+                        target_upstream_uid=target,
+                    )
+                    or tasks.target_is_blocked(
+                        owner_user_id=owner_user_id,
+                        target_upstream_uid=target,
+                    )
+                ):
+                    continue
+                planned = _agent_candidate_next_action(
+                    policy=policy,
+                    candidate=candidate,
+                    tasks=tasks,
+                )
+                if planned is None:
+                    continue
+                task_type, action = planned
+                key = deterministic_task_key(
+                    owner_user_id=owner_user_id,
+                    task_type=task_type,
+                    source_identity=(
+                        f"candidate:{task_type.value}:{target}:{budget_day}"
+                    ),
+                )
+                _, was_created = tasks.enqueue(
+                    owner_user_id=owner_user_id,
+                    external_account_id=account.id,
+                    task_type=task_type.value,
+                    action_type=action,
+                    idempotency_key=key,
+                    policy_version=policy.version,
+                    execution_setting_version=policy.execution_setting_version,
+                    runner_setting_version=policy.runner_setting_version,
+                    model_connection_id=policy.model_connection_id,
+                    runner_configuration_fingerprint=(
+                        policy.runner_configuration_fingerprint
+                    ),
+                    schedule_slot=budget_day,
+                    target_upstream_uid=target,
+                    generation_instruction=(
+                        str(setting.operation_brief or "")
+                        if task_type
+                        in {
+                            AutonomyTaskType.PROACTIVE_MESSAGE,
+                            AutonomyTaskType.REQUEST_FRIEND,
+                        }
+                        else ""
+                    ),
                     not_before=now,
                 )
                 created += int(was_created)
@@ -3397,7 +3644,7 @@ def schedule_due_agent_runs(
 
 
 def run_unattended_agent(task_id: str) -> dict[str, Any]:
-    """Execute one database-bound task without any browser/provider session."""
+    """Execute one authorized task with a short-lived provider session."""
 
     from bbw_agent.autonomous import AgentAutonomyOrchestrator
     from bbw_agent.runtime import (

@@ -248,11 +248,29 @@ class ByokAccountActionSchemaContractTests(unittest.TestCase):
             "ai_agent_action_executions": AiAgentActionExecution.__table__,
         }
         self.assertEqual(set(recorder.tables), set(expected_tables))
+        replaced_checks = {
+            "ai_agent_execution_settings": {
+                "ck_ai_agent_execution_settings_"
+                "ai_agent_execution_setting_allowed_actions_supported"
+            },
+            "ai_agent_action_executions": {
+                "ck_ai_agent_action_executions_"
+                "ai_agent_action_execution_type_valid"
+            },
+        }
         for name, expected in expected_tables.items():
             with self.subTest(table=name):
                 actual_spec = table_spec(recorder.tables[name])
                 actual_spec["indexes"] |= recorder.indexes.get(name, set())
-                self.assertEqual(actual_spec, table_spec(expected))
+                expected_spec = table_spec(expected)
+                mutable = replaced_checks.get(name, set())
+                actual_spec["checks"] = {
+                    item for item in actual_spec["checks"] if item[0] not in mutable
+                }
+                expected_spec["checks"] = {
+                    item for item in expected_spec["checks"] if item[0] not in mutable
+                }
+                self.assertEqual(actual_spec, expected_spec)
 
         added = {
             (table, column.name): column_spec(column)
@@ -554,6 +572,9 @@ class ByokAccountActionRepositoryTests(unittest.TestCase):
                 "publish_text_post",
                 "follow_user",
                 "unfollow_user",
+                "browse_online_users",
+                "request_text_match",
+                "request_friend",
             },
         )
         for value in ("send_reply", "like_content", "delete_account", ""):
@@ -672,6 +693,11 @@ class ByokAutonomySettingRepositoryTests(unittest.TestCase):
         "auto_reply_enabled": True,
         "scheduled_post_enabled": False,
         "managed_relationships_enabled": False,
+        "discovery_enabled": False,
+        "text_match_enabled": False,
+        "proactive_message_enabled": False,
+        "follow_discovered_enabled": False,
+        "friend_request_enabled": False,
         "allowed_actions": ["send_private_message"],
         "operation_brief": "维持既有联系",
         "managed_target_uids": [],
@@ -684,6 +710,7 @@ class ByokAutonomySettingRepositoryTests(unittest.TestCase):
         "daily_post_limit": 1,
         "daily_relationship_limit": 5,
         "post_interval_minutes": 1440,
+        "discovery_interval_minutes": 30,
         "consecutive_failure_limit": 3,
     }
 

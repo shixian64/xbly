@@ -26,12 +26,15 @@ const MINE_NAV = [
   ...(PRIMARY_NAV.find((item) => item.id === "me")?.children || []),
 ];
 
-const AI_AGENT_NAV = { id: "agent", name: "模型助手", desc: "配置个人模型并生成审核草稿" };
+const AI_AGENT_NAV = { id: "agent", name: "社交 Agent", desc: "授权后自动发现、匹配和维护聊天" };
 const AI_AGENT_EXECUTION_ACTIONS = Object.freeze({
   send_private_message: Object.freeze({ label: "发送私信", needsTarget: true, needsContent: true }),
   publish_text_post: Object.freeze({ label: "发布公开文字动态", needsTarget: false, needsContent: true }),
   follow_user: Object.freeze({ label: "关注用户", needsTarget: true, needsContent: false }),
   unfollow_user: Object.freeze({ label: "取消关注用户", needsTarget: true, needsContent: false }),
+  browse_online_users: Object.freeze({ label: "浏览在线用户", needsTarget: false, needsContent: false }),
+  request_text_match: Object.freeze({ label: "发起在线匹配", needsTarget: false, needsContent: false }),
+  request_friend: Object.freeze({ label: "发送好友申请", needsTarget: true, needsContent: true }),
 });
 const LAB_NAV = { id: "lab", name: "协议台", desc: "仅限已启用的调试环境" };
 const LEGACY_RELATION_ROUTES = { friends: "friends", visitors: "visitors" };
@@ -858,9 +861,8 @@ function ensureTimUploadPluginLoaded() {
 
 function imConnectionStatusText() {
   if (S.imConnecting) return "正在连接消息服务…";
-  if (webLocalDependencyMode()) return "Web 本地消息模式（文字和媒体可用，外部兼容同步不影响本地收发）";
   if (S.imConnected && S.imMode === "sdk") return "实时消息已连接";
-  if (S.imConnected && S.imMode === "rest") return "定时同步模式（约 8 秒，Web 本地文字和媒体可用）";
+  if (S.imConnected && S.imMode === "rest") return "文本备用通道（会话约每 8 秒同步）";
   return localizedUiText(S.imLastError || "消息服务尚未连接");
 }
 
@@ -1782,9 +1784,8 @@ function showLogin(show, clearSecrets = false) {
   }
 }
 
-function webLocalDependencyMode(value = S.dependencyMode) {
-  const mode = String(value || "").trim().toLowerCase();
-  return mode === "degraded" || mode === "local" || mode.includes("web-local");
+function webLocalDependencyMode() {
+  return false;
 }
 
 function applyDependencyMode(data) {
@@ -1794,21 +1795,9 @@ function applyDependencyMode(data) {
   if (!hasMode && !hasSource) return webLocalDependencyMode();
   const authenticationSource = String(data.auth_source || "").trim().toLowerCase();
   const dependencyMode = String(data.dependency_mode || "").trim().toLowerCase();
-  const local = webLocalDependencyMode(dependencyMode) || authenticationSource === "web-local";
   S.authenticationSource = authenticationSource;
-  S.dependencyMode = local ? "web-local/degraded" : dependencyMode || "provider";
-  if (local) {
-    S.directImCredentialsEnabled = false;
-    S.imComposerPanel = "";
-    S.imVoiceMode = false;
-    S.imConnected = true;
-    S.imMode = "rest";
-    S.imConnecting = false;
-    S.imNextReconnectAt = 0;
-    S.imLastError = "";
-    updateImConnectionStatus();
-  }
-  return local;
+  S.dependencyMode = dependencyMode || "provider";
+  return false;
 }
 
 function applyUser(user) {
@@ -1886,8 +1875,7 @@ function applyCapabilities(
     S.proactivePrivateMessageEnabled = capabilities.proactive_private_message === true;
   }
   if (Object.prototype.hasOwnProperty.call(capabilities, "direct_im_credentials")) {
-    S.directImCredentialsEnabled =
-      capabilities.direct_im_credentials === true && !webLocalDependencyMode();
+    S.directImCredentialsEnabled = capabilities.direct_im_credentials === true;
   }
   if (Object.prototype.hasOwnProperty.call(capabilities, "nearby_custom_city")) {
     S.nearbyCustomCityEnabled = capabilities.nearby_custom_city === true;
@@ -1979,25 +1967,30 @@ function syncAiAgentReadyControls(page, ready) {
 
 function aiAgentAutonomyPresentation(autonomy) {
   const title = autonomy.halted
-    ? "无人值守 Agent 已自动停机"
+    ? "自动社交 Agent 已安全暂停"
     : autonomy.effective_enabled
-      ? "无人值守 Agent 正在运行"
+      ? "自动社交 Agent 正在运行"
       : autonomy.user_enabled && !autonomy.background_enabled
-        ? "配置已保存，部署端后台调度未启用"
+        ? "已保存，后台服务尚未开启调度"
         : autonomy.user_enabled
-          ? "配置已保存，但当前门禁未全部满足"
-          : "无人值守 Agent 保持关闭";
-  const detail = `系统开关${autonomy.system_enabled ? "已开启" : "未开启"} · 管理授权${
-    autonomy.user_authorized ? "已授予" : "未授予"
-  } · 后台调度${autonomy.background_enabled ? "已启用" : "未启用"} · 运行条件${
-    autonomy.available ? "已满足" : "未满足"
-  }`;
+          ? "已开启，正在等待运行条件"
+          : "由你决定何时开始";
+  const missing = [];
+  if (!autonomy.system_enabled) missing.push("系统能力未开启");
+  if (!autonomy.user_authorized) missing.push("尚未获得管理授权");
+  if (!autonomy.background_enabled) missing.push("后台调度未开启");
+  if (!S.aiAgentModelReady) missing.push("模型连接未就绪");
+  const detail = autonomy.effective_enabled
+    ? "会按已授权能力自然推进，每次操作都会写入对应记录。"
+    : missing.length
+      ? missing.join("；")
+      : "开启后会在安全间隔内自动发现用户并处理互动。";
   const state = autonomy.halted
     ? "已自动停机"
     : autonomy.effective_enabled
       ? "正在运行"
       : autonomy.user_enabled
-        ? "等待条件满足"
+        ? "等待运行"
         : "未开启";
   return { title, detail, state, warning: autonomy.halted || !autonomy.effective_enabled };
 }
@@ -2064,8 +2057,8 @@ function markAiAgentConnectionReady(form) {
     page,
     "runner",
     ready ? "success" : "neutral",
-    ready ? "可以生成草稿" : "个人运行器未开启",
-    ready ? "连接与个人运行开关均已生效" : "连接已通过测试，可按需开启个人运行器"
+    ready ? "文字生成已就绪" : "个人运行器未开启",
+    ready ? "可用于上下文回复和自然开场白" : "连接已通过测试，可按需开启个人运行器"
   );
 }
 
@@ -2259,8 +2252,11 @@ function normalizedAiAgentAutonomyStatus(status) {
     ? Object.freeze({
         total_actions: boundedInteger(usageSource.total_actions, 0, 0, 1000000),
         reply_actions: boundedInteger(usageSource.reply_actions, 0, 0, 1000000),
+        outreach_actions: boundedInteger(usageSource.outreach_actions, 0, 0, 1000000),
         post_actions: boundedInteger(usageSource.post_actions, 0, 0, 1000000),
         relationship_actions: boundedInteger(usageSource.relationship_actions, 0, 0, 1000000),
+        browse_actions: boundedInteger(usageSource.browse_actions, 0, 0, 1000000),
+        match_actions: boundedInteger(usageSource.match_actions, 0, 0, 1000000),
         failed_actions: boundedInteger(usageSource.failed_actions, 0, 0, 1000000),
         outcome_unknown_actions: boundedInteger(usageSource.outcome_unknown_actions, 0, 0, 1000000),
       })
@@ -2278,6 +2274,11 @@ function normalizedAiAgentAutonomyStatus(status) {
     auto_reply_enabled: source.auto_reply_enabled === true,
     scheduled_post_enabled: source.scheduled_post_enabled === true,
     managed_relationships_enabled: source.managed_relationships_enabled === true,
+    discovery_enabled: source.discovery_enabled === true,
+    text_match_enabled: source.text_match_enabled === true,
+    proactive_message_enabled: source.proactive_message_enabled === true,
+    follow_discovered_enabled: source.follow_discovered_enabled === true,
+    friend_request_enabled: source.friend_request_enabled === true,
     allowed_actions: Object.freeze(allowedActions),
     operation_brief: String(source.operation_brief || "").slice(0, 4000),
     managed_target_uids: Object.freeze(managedTargets),
@@ -2295,7 +2296,11 @@ function normalizedAiAgentAutonomyStatus(status) {
     daily_post_limit: boundedInteger(source.daily_post_limit, 1, 0, 20),
     daily_relationship_limit: boundedInteger(source.daily_relationship_limit, 5, 0, 100),
     post_interval_minutes: boundedInteger(source.post_interval_minutes, 1440, 60, 10080),
+    discovery_interval_minutes: boundedInteger(source.discovery_interval_minutes, 30, 5, 1440),
     consecutive_failure_limit: boundedInteger(source.consecutive_failure_limit, 3, 1, 20),
+    last_discovery_at: String(source.last_discovery_at || ""),
+    last_match_at: String(source.last_match_at || ""),
+    last_outreach_at: String(source.last_outreach_at || ""),
     recent_tasks: Object.freeze(recentTasks),
     usage_today: usageToday,
   });
@@ -2400,14 +2405,14 @@ async function agentExecutionApi(path, options = {}) {
 }
 
 async function agentAutonomyApi(path, options = {}) {
-  if (!S.aiAgentAutonomyStatus?.visible) throw new Error("无人值守 Agent 当前不可用");
+  if (!S.aiAgentAutonomyStatus?.visible) throw new Error("自动社交 Agent 当前不可用");
   const result = await api(path, options);
   if (!result.ok || result.data?.ok === false) {
     if ([403, 404].includes(result.status)) {
       setAiAgentAutonomyStatus(null);
       void refreshAiAgentAccess({ redirect: false }).catch(() => {});
     }
-    const requestError = new Error(agentErrorMessage(result.data, "无人值守 Agent 设置未保存"));
+    const requestError = new Error(agentErrorMessage(result.data, "自动社交 Agent 设置未保存"));
     requestError.status = Number(result.status || 0);
     throw requestError;
   }
@@ -4877,14 +4882,11 @@ function conversationUnreadAuthoritative(item) {
 function normalizeConversationSummary(item, { authority = "live", observedAt = Date.now() } = {}) {
   const conversation = item && typeof item === "object" ? { ...item } : {};
   const source = String(conversation.source || authority || "").toLowerCase();
-  const provider = String(conversation.provider || "").toLowerCase();
   const preview = conversationPreview(conversation);
   const previewTimestamp = conversationPreviewTimestamp(conversation);
   const archive = authority === "archive" || source === "archive";
-  const localArchiveUnread =
-    archive && provider === "web-local" && conversation.unread_authoritative === true;
   const unreadAuthoritative = archive
-    ? localArchiveUnread
+    ? false
     : conversation.unread_authoritative == null
       ? true
       : conversation.unread_authoritative === true;
@@ -7276,25 +7278,44 @@ function canonicalMessageID(message, payload = messagePayload(message), cloud = 
 }
 
 function isWebLocalCanonicalMessage(entry) {
-  if (!canonicalMessageID(entry)) return false;
   const provider = String(entry?.provider || "").trim().toLowerCase();
   const source = String(entry?.source || "").trim().toLowerCase();
-  return entry?.canonicalAuthority === true || provider === "web-local" || source === "web-local";
+  return provider === "web-local" || source === "web-local";
+}
+
+function isTimAuthoritativeMessage(entry) {
+  if (!entry || isWebLocalCanonicalMessage(entry)) return false;
+  const provider = String(entry.provider || "").trim().toLowerCase();
+  const source = String(entry.source || "").trim().toLowerCase();
+  return (
+    ["tim", "tim-rest", "tim_rest", "rest", "http"].includes(provider) ||
+    ["tim", "tim-rest", "tim_rest", "rest", "http"].includes(source) ||
+    Boolean(entry.rawMessage) ||
+    Boolean(entry.msgKey)
+  );
 }
 
 function preferredCanonicalMessageAuthority(previous, incoming) {
+  if (isTimAuthoritativeMessage(incoming)) return incoming;
+  if (isTimAuthoritativeMessage(previous)) return previous;
   if (isWebLocalCanonicalMessage(incoming)) return incoming;
   if (isWebLocalCanonicalMessage(previous)) return previous;
   return null;
 }
 
 function mergedMessageRevoked(previous, incoming) {
+  if (isTimAuthoritativeMessage(previous) || isTimAuthoritativeMessage(incoming)) {
+    return Boolean(
+      (isTimAuthoritativeMessage(previous) && previous?.revoked) ||
+        (isTimAuthoritativeMessage(incoming) && incoming?.revoked)
+    );
+  }
   const authority = preferredCanonicalMessageAuthority(previous, incoming);
   return authority ? Boolean(authority.revoked) : Boolean(previous?.revoked || incoming?.revoked);
 }
 
 function shouldApplyCompatibilityRevocation(previous, revoked) {
-  return !isWebLocalCanonicalMessage(previous) || isWebLocalCanonicalMessage(revoked);
+  return !isTimAuthoritativeMessage(previous) || isTimAuthoritativeMessage(revoked);
 }
 
 function numericMessageValue(value, fallback = 0) {
@@ -9159,11 +9180,11 @@ function mergePeerMessages(peer, incoming) {
     const previousKey = matched?.[0] || "";
     const previous = matched?.[1];
     const canonicalID = canonicalMessageID(entry) || canonicalMessageID(previous);
-    const authority = previous
-      ? preferredCanonicalMessageAuthority(previous, entry)
-      : isWebLocalCanonicalMessage(entry)
-        ? entry
-        : null;
+    const authority = preferredCanonicalMessageAuthority(previous, entry);
+    const supplement = authority === entry ? previous : entry;
+    const authoritativeID = isTimAuthoritativeMessage(authority)
+      ? String(authority.id || authority.msgKey || "")
+      : "";
     const authorityOwnsRevocationState = Boolean(
       authority && Boolean(previous?.revoked) !== Boolean(entry?.revoked)
     );
@@ -9172,6 +9193,7 @@ function mergePeerMessages(peer, incoming) {
             ...previous,
             ...entry,
             id:
+              authoritativeID ||
               canonicalID ||
               (entry.messageRandom || timMessageRandom(entry) || !(previous.messageRandom || timMessageRandom(previous))
                 ? entry.id || previous.id || ""
@@ -9183,37 +9205,47 @@ function mergePeerMessages(peer, incoming) {
               previous.clientMessageId ||
               previous.client_message_id ||
               "",
-            rawMessage: entry.rawMessage || previous.rawMessage || null,
-            msgKey: entry.msgKey || previous.msgKey || "",
-            sequence: entry.sequence || previous.sequence || "",
-            messageRandom: entry.messageRandom || previous.messageRandom || "",
-            direction: timMessageDirection(entry) || timMessageDirection(previous),
+            rawMessage: authority?.rawMessage || entry.rawMessage || previous.rawMessage || null,
+            msgKey: authority?.msgKey || entry.msgKey || previous.msgKey || "",
+            sequence: authority?.sequence || entry.sequence || previous.sequence || "",
+            messageRandom: authority?.messageRandom || entry.messageRandom || previous.messageRandom || "",
+            direction: timMessageDirection(authority) || timMessageDirection(entry) || timMessageDirection(previous),
+            kind: authority?.kind || supplement?.kind || entry.kind || previous.kind,
+            objectName: authority?.objectName || supplement?.objectName || entry.objectName || previous.objectName,
+            timestamp: authority?.timestamp || entry.timestamp || previous.timestamp,
             source: authority
-              ? String(authority.source || "web-local")
+              ? String(authority.source || (isTimAuthoritativeMessage(authority) ? "tim" : "web-local"))
               : String(entry.source || previous.source || ""),
             provider: authority
-              ? String(authority.provider || "web-local")
+              ? String(authority.provider || (isTimAuthoritativeMessage(authority) ? "" : "web-local"))
               : String(entry.provider || previous.provider || ""),
             canonicalAuthority: Boolean(authority),
             revoked: mergedMessageRevoked(previous, entry),
-            text: authorityOwnsRevocationState
-              ? String(authority.text || "")
+            text: authority
+              ? String(authority.text ?? supplement?.text ?? "")
               : String(entry.text ?? previous.text ?? ""),
-            payload: authorityOwnsRevocationState
-              ? authority.payload || {}
+            payload: authority
+              ? authority.payload ?? supplement?.payload ?? {}
               : entry.payload ?? previous.payload ?? {},
-            media: authorityOwnsRevocationState
-              ? authority.media || {}
+            media: authority
+              ? { ...(supplement?.media || {}), ...(authority.media || {}) }
               : entry.media ?? previous.media ?? {},
-            flashId: authorityOwnsRevocationState
+            attachmentId: authority
+              ? String(authority.attachmentId || authority.media?.attachmentId || "")
+              : String(entry.attachmentId || previous.attachmentId || ""),
+            assetId: authority
+              ? String(authority.assetId || authority.media?.assetId || "")
+              : String(entry.assetId || previous.assetId || ""),
+            flashId: authority
               ? String(authority.flashId || "")
               : String(entry.flashId ?? previous.flashId ?? ""),
-            preview: authorityOwnsRevocationState
-              ? String(authority.preview || messagePreview(authority))
+            preview: authority
+              ? String(authority.preview ?? messagePreview(authority))
               : String(entry.preview ?? previous.preview ?? ""),
             recalledText: authorityOwnsRevocationState
               ? String(authority.recalledText || "")
-              : entry.recalledText ||
+              : authority?.recalledText ||
+                entry.recalledText ||
                 previous.recalledText ||
                 (previous.revoked && previous.kind === "text" ? String(previous.text || "") : "") ||
                 (entry.revoked && entry.kind === "text" ? String(entry.text || "") : ""),
@@ -9235,8 +9267,8 @@ function mergePeerMessages(peer, incoming) {
                 previous.timMirrorStatus ||
                 ""
             ),
-            quote: authorityOwnsRevocationState
-              ? normalizeMessageQuote(authority.quote)
+            quote: authority
+              ? normalizeMessageQuote(authority.quote) || normalizeMessageQuote(supplement?.quote)
               : normalizeMessageQuote(entry.quote) || normalizeMessageQuote(previous.quote),
             voiceText: entry.voiceText || previous.voiceText || "",
             voiceTextStatus:
@@ -11588,50 +11620,7 @@ function messageTimestampMs(entry) {
 }
 
 function revokeActionInfo(entry) {
-  const nativeAttachment = nativeMediaAttachmentId(entry);
-  const canonicalMessageId = String(
-    entry?.canonicalMessageId || entry?.canonical_message_id || entry?.id || ""
-  ).trim();
-  if (
-    entry?.canonicalMessageId ||
-    entry?.canonical_message_id ||
-    String(entry?.source || "").toLowerCase() === "web-local"
-  ) {
-    const eligible =
-      entry?.type === "mine" &&
-      canonicalMessageId &&
-      !entry?.revoked &&
-      entry?.delivery !== "sending" &&
-      entry?.delivery !== "failed";
-    if (!eligible) return null;
-    const timestamp = messageTimestampMs(entry);
-    const age = timestamp ? Math.max(0, Date.now() - timestamp) : 0;
-    const insideWindow = !timestamp || age <= MESSAGE_REVOKE_DEFAULT_WINDOW_MS;
-    if (
-      nativeAttachment &&
-      insideWindow
-    ) {
-      return {
-        label: "撤回",
-        title: "Web 本地媒体可在发送后 2 分钟内撤回",
-        mode: "native-media",
-        attachmentId: nativeAttachment,
-        outsideDefaultWindow: false,
-        hasRestKey: false,
-      };
-    }
-    if (entry?.kind === "text" && insideWindow) {
-      return {
-        label: "撤回",
-        title: "Web 本地文字可在发送后 2 分钟内撤回",
-        mode: "native-text",
-        canonicalMessageId,
-        outsideDefaultWindow: false,
-        hasRestKey: false,
-      };
-    }
-    return null;
-  }
+  if (isWebLocalCanonicalMessage(entry)) return null;
   const eligible =
     entry &&
     entry.type === "mine" &&
@@ -12017,6 +12006,7 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
   if (!(await ensurePrivateChatPermission(target))) {
     throw new Error("该私信入口仅向管理员授权的用户开放");
   }
+  const policyGeneration = S.messagePolicyGeneration;
   const previous = retryMessageId ? findChatMessage(retryMessageId, target) : null;
   const messageQuote = normalizeMessageQuote(quote || previous?.quote);
   const pendingID = previous?.id || localMessageID("text");
@@ -12052,95 +12042,71 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
   refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
 
   try {
-    const wasDisconnected = !S.imConnected;
-    const { data, ok } = await api("/api/im/rest/send", {
-      method: "POST",
-      body: JSON.stringify({
+    let sentEntry;
+    if (S.imConnected && S.imMode === "sdk" && S.chat && resolveTimApi()) {
+      if (!S.messagePolicyReady || S.messagePolicyGeneration !== policyGeneration) {
+        throw new Error("私聊安全策略已更新，请重试");
+      }
+      const TIM = resolveTimApi();
+      const cloudCustomData = messageQuoteCloudCustomData(messageQuote);
+      const options = {
         to: target,
+        conversationType: TIM.TYPES.CONV_C2C,
+        payload: { text: content },
+      };
+      if (cloudCustomData) options.cloudCustomData = cloudCustomData;
+      const message = S.chat.createTextMessage(options);
+      const result = await S.chat.sendMessage(message);
+      const sentMessage = result?.data?.message || result?.message || message;
+      sentEntry = timMessageEntry(sentMessage, target);
+      sentEntry.text = content;
+      sentEntry.type = "mine";
+      sentEntry.peerRead = timPeerReadState(sentMessage) ?? false;
+      sentEntry.delivery = "sent";
+    } else if (S.imMode === "rest" || !S.imConnected) {
+      const wasDisconnected = !S.imConnected;
+      const { data, ok } = await api("/api/im/rest/send", {
+        method: "POST",
+        body: JSON.stringify({
+          to: target,
+          text: content,
+          client_message_id: pendingID,
+          quote: messageQuote,
+        }),
+        timeout: 15000,
+      });
+      const response = data && typeof data === "object" ? data : {};
+      if (!ok || response.ok === false) {
+        const info = errorInfo(response, wasDisconnected ? "发送失败" : "文本备用通道发送失败");
+        throw new Error([info.title, info.detail || response.error_info].filter(Boolean).join(" · "));
+      }
+      if (wasDisconnected) {
+        S.imConnected = true;
+        S.imMode = "rest";
+        S.imLastError = "";
+        S.messageLastPeerSyncAt = 0;
+        updateImConnectionStatus();
+        toast("已通过文本备用通道发送");
+      }
+      sentEntry = {
+        id: String(response.message_id || response.msg_uid || pendingID),
+        clientMessageId: String(response.client_message_id || pendingID),
+        msgKey: String(response.msg_key || response.message_id || response.msg_uid || ""),
         text: content,
-        client_message_id: pendingID,
+        type: "mine",
+        direction: "out",
+        peer: target,
+        timestamp: timMessageTimestamp({ timestamp: response.timestamp || Date.now() }),
+        source: "rest",
+        provider: "tim-rest",
+        rawMessage: null,
+        peerRead: false,
+        delivery: "sent",
         quote: messageQuote,
-      }),
-      timeout: 15000,
-    });
-    const response = data && typeof data === "object" ? data : {};
-    if (!ok || response.ok === false) {
-      const info = errorInfo(response, wasDisconnected ? "发送失败" : "Web 消息发送失败");
-      throw new Error([info.title, info.detail || response.error_info].filter(Boolean).join(" · "));
+      };
+    } else {
+      throw new Error("消息通道尚未连接");
     }
-    if (wasDisconnected) {
-      S.imConnected = true;
-      S.imMode = "rest";
-      S.imLastError = "";
-      S.messageLastPeerSyncAt = 0;
-      updateImConnectionStatus();
-      toast("已通过 Web 消息通道发送");
-    }
-    const responseMessage =
-      response.message && typeof response.message === "object" && !Array.isArray(response.message)
-        ? response.message
-        : {};
-    const canonicalID = canonicalMessageID(response) || String(responseMessage.id || "").trim();
-    const responseMessageID = String(
-      canonicalID ||
-        response.message_id ||
-        response.msg_uid ||
-        responseMessage.message_id ||
-        responseMessage.msg_uid ||
-        responseMessage.ID ||
-        responseMessage.id ||
-        pendingID
-    );
-    const compatibilitySync = response.compatibility_sync ?? responseMessage.compatibility_sync ?? null;
-    const timMirrorStatus = String(
-      response.tim_mirror_status ||
-        responseMessage.tim_mirror_status ||
-        (compatibilitySync && typeof compatibilitySync === "object" ? compatibilitySync.status : "") ||
-        ""
-    );
-    const sentEntry = {
-      id: responseMessageID,
-      canonicalMessageId: canonicalID,
-      clientMessageId: String(
-        response.client_message_id || responseMessage.client_message_id || pendingID
-      ),
-      msgKey: String(
-        response.msg_key ||
-          responseMessage.msg_key ||
-          responseMessage.MsgKey ||
-          response.message_id ||
-          response.msg_uid ||
-          ""
-      ),
-      sequence: String(responseMessage.sequence || response.message_sequence || ""),
-      messageRandom: String(
-        responseMessage.messageRandom ||
-          responseMessage.message_random ||
-          response.message_random ||
-          ""
-      ),
-      text: content,
-      type: "mine",
-      direction: "out",
-      peer: target,
-      timestamp: timMessageTimestamp({
-        timestamp:
-          responseMessage.occurred_at ||
-          response.occurred_at ||
-          responseMessage.timestamp ||
-          response.timestamp ||
-          Date.now(),
-      }),
-      source: canonicalID ? "web-local" : "rest",
-      provider: canonicalID ? "web-local" : "",
-      canonicalAuthority: Boolean(canonicalID),
-      rawMessage: null,
-      peerRead: false,
-      delivery: "sent",
-      quote: messageQuote,
-      compatibility_sync: compatibilitySync,
-      tim_mirror_status: timMirrorStatus,
-    };
 
     const replacement = {
       ...pending,
@@ -12168,10 +12134,6 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
     });
     refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
     archiveMessageBestEffort(replacement, "outgoing");
-    if (canonicalID || webLocalDependencyMode()) {
-      void loadArchivedConversationSummary({ force: true });
-      void loadConversationMessages(target, { force: true, archiveOnly: true });
-    }
     return replacement;
   } catch (error) {
     updateLocalMessage(pendingID, {
@@ -12409,7 +12371,6 @@ async function sendTimMediaFile(kind, file, meta = {}) {
     height: Number(meta.height || localMedia.height || 0),
     poster: String(meta.poster || localMedia.poster || ""),
     localUrl: String(localMedia.url || meta.localUrl || ""),
-    assetId: String(meta.assetId || previous?.retryMeta?.assetId || ""),
   };
   const pending = {
     ...(previous || {}),
@@ -12441,83 +12402,52 @@ async function sendTimMediaFile(kind, file, meta = {}) {
   });
   refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
   try {
-    let asset = null;
-    const reusableAssetId = String(reusableMeta.assetId || "").trim();
-    if (reusableAssetId) {
-      asset = {
-        asset_id: reusableAssetId,
-        kind,
-        filename: file.name,
-        content_type: file.type || "application/octet-stream",
-        size_bytes: file.size,
-      };
-      updateLocalMessage(pendingID, (entry) => ({ ...entry, progress: 0.93 }));
-    } else {
-      asset = await createNativeMediaAsset(kind, file, (progress) =>
-        updateLocalMessage(pendingID, (entry) => ({ ...entry, progress }))
-      );
-      reusableMeta.assetId = String(asset.asset_id || "");
-      updateLocalMessage(pendingID, (entry) => ({
-        ...entry,
-        retryMeta: { ...(entry.retryMeta || reusableMeta), assetId: reusableMeta.assetId },
-        progress: 0.94,
-      }));
-    }
+    const { chat, TIM } = await ensureTimMediaReady();
     if (!S.messagePolicyReady || S.messagePolicyGeneration !== policyGeneration) {
       throw new Error("私聊安全策略已更新，请重试");
     }
-    const { data: response, ok } = await api("/api/im/media/messages", {
-      method: "POST",
-      body: JSON.stringify({
-        to: peer,
-        client_message_id: pendingID,
-        asset_id: asset.asset_id,
-        flash: false,
-      }),
-      timeout: 20000,
-    });
-    if (!ok || response?.ok === false) {
-      const info = errorInfo(response, "媒体发送失败");
-      throw new Error([info.title, info.detail].filter(Boolean).join(" · "));
-    }
-    const attachmentId = String(response.attachment_id || response.media?.attachment_id || "");
-    const canonicalID = String(response.canonical_message_id || response.message_id || "");
-    const mergedMedia = {
-      ...localMedia,
-      ...(response.media || {}),
-      url: localMedia.url,
-      thumbnail: kind === "image" ? localMedia.thumbnail || localMedia.url : localMedia.thumbnail,
-      attachmentId,
-      assetId: String(response.media?.asset_id || asset.asset_id || ""),
-      contentType: String(response.media?.content_type || asset.content_type || file.type || ""),
-      sha256: String(response.media?.sha256 || asset.sha256 || ""),
-      native: true,
+    if (!TIM?.TYPES?.CONV_C2C) throw new Error("实时消息类型不可用");
+    const options = {
+      to: peer,
+      conversationType: TIM.TYPES.CONV_C2C,
+      payload: { file },
+      onProgress: (event) =>
+        updateLocalMessage(pendingID, (entry) => ({ ...entry, progress: progressRatio(event) })),
     };
+    let message;
+    if (kind === "image") message = chat.createImageMessage(options);
+    else if (kind === "audio") message = chat.createAudioMessage(options);
+    else if (kind === "video") message = chat.createVideoMessage(options);
+    else message = chat.createFileMessage(options);
+    if (!message) throw new Error("未能创建媒体消息");
+    const sdkObjectUrls = collectBlobObjectUrls(message);
+    let result;
+    try {
+      result = await chat.sendMessage(message);
+    } finally {
+      revokeSdkTemporaryObjectUrls(sdkObjectUrls);
+    }
+    const sentMessage = result?.data?.message || result?.message || message;
+    const sent = timMessageEntry(sentMessage, peer);
+    const mergedMedia = replaceUploadedLocalMediaUrl(
+      localMedia.url,
+      mergeMediaResult(localMedia, sent.media),
+      sent.media
+    );
     const replacement = {
       ...pending,
-      id: canonicalID || pendingID,
-      canonicalMessageId: canonicalID,
-      clientMessageId: String(response.client_message_id || pendingID),
+      ...sent,
+      id: sent.id || pendingID,
       kind,
       media: mergedMedia,
-      attachmentId,
-      assetId: String(asset.asset_id || ""),
       type: "mine",
-      direction: "out",
       peer,
-      timestamp: timMessageTimestamp({ timestamp: response.occurred_at || Date.now() }),
-      source: "web-local",
-      provider: "web-local",
-      canonicalAuthority: true,
-      rawMessage: null,
-      peerRead: false,
+      peerRead: timPeerReadState(sentMessage) ?? false,
       delivery: "sent",
       progress: 1,
       retryFile: null,
       retryMeta: null,
       retryError: "",
-      compatibility_sync: response.compatibility_sync ?? null,
-      tim_mirror_status: String(response.tim_mirror_status || "pending"),
     };
     replacement.preview = messagePreview(replacement);
     updateLocalMessage(pendingID, replacement);
@@ -12528,15 +12458,13 @@ async function sendTimMediaFile(kind, file, meta = {}) {
       unreadCount: 0,
     });
     refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
-    void loadArchivedConversationSummary({ force: true });
-    void loadConversationMessages(peer, { force: true, archiveOnly: true });
+    archiveMessageBestEffort(replacement, "outgoing");
     return replacement;
   } catch (error) {
     updateLocalMessage(pendingID, {
       ...pending,
       delivery: "failed",
       progress: 0,
-      retryMeta: { ...reusableMeta },
       retryError: String(error?.message || error || "媒体发送失败"),
     });
     throw error;
@@ -12729,8 +12657,6 @@ async function sendFlashPhoto(file, { retryMessageId = "", peer: requestedPeer =
   if (!(await ensurePrivateChatPermission(peer))) throw new Error("该私信入口仅向管理员授权的用户开放");
   const previous = retryMessageId ? findChatMessage(retryMessageId, peer) : null;
   const pendingID = previous?.id || localMessageID("flash");
-  const localMedia = previous?.media || createLocalMedia(file, "image");
-  const reusableAssetId = String(previous?.retryMeta?.assetId || "");
   const pending = {
     ...(previous || {}),
     id: pendingID,
@@ -12738,7 +12664,7 @@ async function sendFlashPhoto(file, { retryMessageId = "", peer: requestedPeer =
     kind: "flash",
     objectName: "TIMTextElem",
     payload: { text: "点击查看5秒闪图" },
-    media: localMedia,
+    media: {},
     flashId: "",
     type: "mine",
     peer,
@@ -12749,88 +12675,50 @@ async function sendFlashPhoto(file, { retryMessageId = "", peer: requestedPeer =
     progress: 0,
     preview: "[闪图]",
     retryFile: file,
-    retryMeta: { peer, kind: "flash", assetId: reusableAssetId },
+    retryMeta: { peer, kind: "flash" },
     retryError: "",
   };
   if (previous) updateLocalMessage(pendingID, pending);
   else appendLocalMessage(pending);
   updateConversationActivity(peer, { name: S.activePeerName || `用户 ${peer}`, lastMessage: "[闪图]", unreadCount: 0 });
   refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
+  const form = new FormData();
+  form.append("peer", peer);
+  form.append("targetId", peer);
+  form.append("target_id", peer);
+  form.append("file", file, file.name || `flash-${Date.now()}.jpg`);
   try {
-    const asset = reusableAssetId
-      ? {
-          asset_id: reusableAssetId,
-          content_type: file.type,
-          size_bytes: file.size,
-          filename: file.name,
-        }
-      : await createNativeMediaAsset("image", file, (progress) =>
-          updateLocalMessage(pendingID, (entry) => ({ ...entry, progress }))
-        );
-    pending.retryMeta.assetId = String(asset.asset_id || "");
-    updateLocalMessage(pendingID, (entry) => ({
-      ...entry,
-      retryMeta: { ...(entry.retryMeta || {}), assetId: String(asset.asset_id || "") },
-      progress: 0.94,
-    }));
-    const { data, ok } = await api("/api/im/media/messages", {
-      method: "POST",
-      body: JSON.stringify({
-        to: peer,
-        client_message_id: pendingID,
-        asset_id: asset.asset_id,
-        flash: true,
-      }),
-      timeout: 20000,
-    });
-    if (!ok || !data?.ok) {
+    const { data } = await api("/api/im/flash/send", { method: "POST", body: form, timeout: 90000 });
+    if (!data?.ok) {
       const info = errorInfo(data, "闪图发送失败");
       throw new Error([info.title, info.detail].filter(Boolean).join(" · "));
     }
-    const flashId = String(data.attachment_id || data.flash_id || "");
-    const canonicalID = String(data.canonical_message_id || data.message_id || "");
+    const flashId = String(data.uniqueid || data.unique_id || data.flash_id || data.flashId || "");
     const archived = {
       ...pending,
-      id: canonicalID || pendingID,
-      canonicalMessageId: canonicalID,
-      clientMessageId: String(data.client_message_id || pendingID),
-      attachmentId: flashId,
-      assetId: String(data.media?.asset_id || asset.asset_id || ""),
+      id: String(data.message_id || data.msg_uid || pendingID),
       flashId,
       cloudCustomData: flashId,
       media: {
-        ...localMedia,
-        ...(data.media || {}),
-        url: localMedia.url,
-        thumbnail: localMedia.thumbnail || localMedia.url,
-        attachmentId: flashId,
-        assetId: String(data.media?.asset_id || asset.asset_id || ""),
-        native: true,
+        url: String(data.url || data.photo_url || ""),
+        name: String(file.name || "").slice(0, 255),
+        mime: String(data.content_type || file.type || "").slice(0, 128),
+        size: Math.max(0, Number(data.size || file.size || 0) || 0),
       },
-      source: "web-local",
-      provider: "web-local",
-      canonicalAuthority: true,
-      direction: "out",
-      timestamp: timMessageTimestamp({ timestamp: data.occurred_at || Date.now() }),
-      rawMessage: null,
       delivery: "sent",
       progress: 1,
       retryFile: null,
       retryMeta: null,
       retryError: "",
-      compatibility_sync: data.compatibility_sync ?? null,
-      tim_mirror_status: String(data.tim_mirror_status || "pending"),
     };
     updateLocalMessage(pendingID, archived);
-    void loadArchivedConversationSummary({ force: true });
-    void loadConversationMessages(peer, { force: true, archiveOnly: true });
+    archiveMessageBestEffort(archived, "outgoing");
     toast("闪图已发送");
   } catch (error) {
     updateLocalMessage(pendingID, {
       ...pending,
       delivery: "failed",
       progress: 0,
-      retryMeta: { ...pending.retryMeta },
       retryError: String(error?.message || error || "闪图发送失败"),
     });
     throw error;
@@ -15386,19 +15274,8 @@ async function pageMoments(signal, { force = false } = {}) {
   return `<div class="moments-page">
     <section class="moments-toolbar">
       <div><h2>动态</h2><p id="moment-page-subtitle">${esc(momentsTabDescription(view.tab, view.data))}</p></div>
-      <details class="moment-compose" ${S.momentMediaDraft.length ? "open" : ""}><summary class="btn primary">发布动态</summary><form data-form="moment-publish">
-        <textarea class="ui-scrollbar" name="text" rows="4" maxlength="2000" placeholder="分享此刻的想法，也可以只发布图片或视频"></textarea>
-        <div class="moment-compose-media"><input class="sr-only" id="moment-media-images" type="file" data-moment-media="image" accept=".jpg,.jpeg,.png,.gif,.webp,.avif,image/jpeg,image/png,image/gif,image/webp,image/avif" multiple /><input class="sr-only" id="moment-media-video" type="file" data-moment-media="video" accept=".mp4,.mov,.webm,video/mp4,video/quicktime,video/webm" /><div class="media-picker-actions"><label class="btn secondary small" for="moment-media-images">选择图片</label><label class="btn secondary small" for="moment-media-video">选择视频</label><button type="button" class="btn soft small" data-action="moment-media-clear" ${
-        S.momentMediaDraft.length ? 'data-locked="false"' : 'disabled data-locked="true"'
-        }>清除已选媒体</button></div><p class="media-upload-status" data-moment-media-status>${
-          S.momentMediaDraft.some((draft) => draft.kind === "video")
-            ? "已选择 1 个视频"
-            : S.momentMediaDraft.length
-              ? `已选择 ${S.momentMediaDraft.length} 张图片，最多 9 张`
-              : "可选择最多 9 张图片，或 1 个视频"
-        }</p><div class="moment-compose-preview-grid" data-moment-media-preview ${
-          S.momentMediaDraft.length ? "" : "hidden"
-        }>${momentMediaDraftHtml()}</div></div>
+      <details class="moment-compose"><summary class="btn primary">发布动态</summary><form data-form="moment-publish">
+        <textarea class="ui-scrollbar" name="text" rows="4" maxlength="2000" placeholder="分享此刻的想法" required></textarea>
         <div class="moment-compose-options"><label>可见范围<select name="visibility_scope"><option>公开</option><option>仅好友可见</option><option>好友及粉丝可见</option><option>仅自己可见</option></select></label><label>话题<input name="topic" maxlength="40" placeholder="可选" /></label></div>
         <div class="moment-compose-switches"><label><input type="checkbox" name="comment_forbid" value="1" />关闭评论</label><label><input type="checkbox" name="hide_comment" value="1" />评论仅双方可见</label></div>
         <button type="submit" class="btn primary full">发布</button>
@@ -15921,18 +15798,7 @@ async function pageMe(signal) {
       <button type="button" data-action="social-open-tab" data-tab="visitors" data-visitor-tab="seen_me"><strong data-me-stat="visitors">${esc(countAt("visitors"))}</strong><span>谁看过我</span></button>
     </div></section>
     <section class="section" id="profile-editor"><div class="form-grid">
-      <form class="surface-card profile-avatar-editor" data-form="profile-avatar"><div class="section-head"><div><h2>头像</h2><p>图片保存在 Web 私有媒体存储中，不会提交浏览器临时地址</p></div></div><div class="profile-avatar-preview" data-profile-avatar-preview ${profileAvatarPreviewHtml(user) ? "" : "hidden"}>${profileAvatarPreviewHtml(
-        user
-      )}</div><input class="sr-only" id="profile-avatar-file" type="file" data-profile-avatar accept=".jpg,.jpeg,.png,.gif,.webp,.avif,image/jpeg,image/png,image/gif,image/webp,image/avif" /><div class="media-picker-actions"><label class="btn secondary" for="profile-avatar-file">选择头像</label><button type="button" class="btn soft" data-action="profile-avatar-remove" ${
-        S.profileAvatarDraft ? 'data-locked="false"' : 'disabled data-locked="true"'
-      }>移除所选图片</button></div><p class="media-upload-status" data-profile-avatar-status>${esc(
-        profileAvatarDraftStatus()
-      )}</p><progress class="media-upload-track" data-profile-avatar-progress max="100" value="${Math.round(
-        Math.max(0, Math.min(1, Number(S.profileAvatarDraft?.progress || 0))) * 100
-      )}" ${S.profileAvatarDraft?.uploading ? "" : "hidden"}></progress><button type="submit" class="btn primary full mt-sm" data-profile-avatar-submit ${
-        S.profileAvatarDraft ? 'data-locked="false"' : 'disabled data-locked="true"'
-      }>上传并保存头像</button></form>
-      <form class="surface-card profile-details-editor" data-form="profile-details"><div class="section-head"><div><h2>基本资料</h2><p>资料以 Web 本地数据库为准，并异步兼容原有账号体系</p></div></div><div class="field"><label for="profile-nickname">昵称</label><input id="profile-nickname" name="nickname" value="${esc(
+      <form class="surface-card profile-details-editor" data-form="profile-details"><div class="section-head"><div><h2>基本资料</h2><p>资料以原账号服务为准，保存结果会直接提交到原 APK 接口</p></div></div><div class="field"><label for="profile-nickname">昵称</label><input id="profile-nickname" name="nickname" value="${esc(
         user.nickname || user.name || ""
       )}" minlength="2" maxlength="32" autocomplete="nickname" required /></div><div class="field"><label for="profile-signature">个性签名</label><textarea id="profile-signature" name="signature" rows="3" maxlength="280" placeholder="可选">${esc(
         user.signature || ""
@@ -15941,7 +15807,6 @@ async function pageMe(signal) {
       )}" maxlength="64" autocomplete="address-level2" placeholder="可选" /></div><div class="field"><label for="profile-gender">性别</label><select id="profile-gender" name="gender">${profileGenderOptions(
         user.gender || user.sex
       )}</select></div><button type="submit" class="btn primary full mt-sm">保存基本资料</button></form>
-      ${S.localPasswordChangeEnabled ? `<form class="surface-card" data-form="local-password-change"><div class="section-head"><div><h2>修改登录密码</h2><p>修改后所有设备需要使用新密码重新登录</p></div></div><div class="field"><label for="password-current">当前密码</label><input id="password-current" name="current_password" type="password" autocomplete="current-password" maxlength="4096" required /></div><div class="field"><label for="password-new">新密码</label><input id="password-new" name="new_password" type="password" autocomplete="new-password" minlength="8" maxlength="128" required /></div><div class="field"><label for="password-confirm">确认新密码</label><input id="password-confirm" name="confirm_password" type="password" autocomplete="new-password" minlength="8" maxlength="128" required /></div><button type="submit" class="btn primary full mt-sm">更新密码</button></form>` : ""}
       <div class="surface-card"><div class="section-head"><div><h2>账户信息</h2><p>仅展示必要的非敏感字段</p></div></div>${keyValueView({
         uid: user.uid || user.id,
         nickname: name,
@@ -16298,11 +16163,18 @@ function aiAgentAutonomyTaskTypeLabel(task) {
       scheduled_post: "定时文字动态",
       follow_target: "白名单关注",
       unfollow_target: "白名单取消关注",
+      browse_online: "浏览在线用户",
+      request_match: "在线匹配",
+      proactive_message: "主动私信",
+      follow_discovered: "关注候选用户",
+      request_friend: "好友申请",
       send_private_message: "自动回复",
       publish_text_post: "定时文字动态",
       follow_user: "白名单关注",
       unfollow_user: "白名单取消关注",
-    }[type] || "无人值守任务"
+      browse_online_users: "浏览在线用户",
+      request_text_match: "在线匹配",
+    }[type] || "Agent 任务"
   );
 }
 
@@ -16356,137 +16228,115 @@ function agentAutonomyRecentTasksHtml(tasks) {
 function syncAgentAutonomySettingsForm(form) {
   if (!form) return;
   const autonomy = S.aiAgentAutonomyStatus;
-  const configurable = autonomy?.user_authorized === true;
+  const configurable =
+    autonomy?.user_authorized === true && S.aiAgentExecutionStatus?.available === true;
   form.querySelectorAll("input, textarea, select, button").forEach((control) => {
     control.disabled = !configurable;
   });
-  if (!configurable) return;
-  const executionActions = new Set(S.aiAgentExecutionStatus?.selected_actions || []);
-  form.querySelectorAll('input[name="allowed_actions"]').forEach((input) => {
-    input.disabled = !executionActions.has(input.value);
-    if (input.disabled) input.checked = false;
-  });
-  const userEnabled = Boolean(form.elements.namedItem("user_enabled")?.checked);
-  const selectedActions = new Set(
-    [...form.querySelectorAll('input[name="allowed_actions"]:checked')].map((input) => input.value)
-  );
-  const featureRequirements = [
-    ["auto_reply_enabled", selectedActions.has("send_private_message")],
-    ["scheduled_post_enabled", selectedActions.has("publish_text_post")],
-    [
-      "managed_relationships_enabled",
-      selectedActions.has("follow_user") || selectedActions.has("unfollow_user"),
-    ],
-  ];
-  featureRequirements.forEach(([name, actionAllowed]) => {
-    const input = form.elements.namedItem(name);
-    if (!input) return;
-    input.disabled = !userEnabled || !actionAllowed;
-    if (input.disabled) input.checked = false;
-  });
+  const submit = form.querySelector('button[type="submit"]');
+  if (submit) {
+    const enabled = Boolean(form.elements.namedItem("user_enabled")?.checked);
+    submit.textContent = enabled
+      ? autonomy?.user_enabled
+        ? "保存运行设置"
+        : "开始运行"
+      : autonomy?.user_enabled
+        ? "暂停 Agent"
+        : "保存设置";
+  }
 }
 
 function agentAutonomySectionHtml(autonomy) {
   if (!autonomy?.visible) return "";
   const presentation = aiAgentAutonomyPresentation(autonomy);
-  const executionActions = new Set(S.aiAgentExecutionStatus?.selected_actions || []);
-  const selectedActions = new Set(
-    autonomy.allowed_actions.filter((action) => executionActions.has(action))
-  );
-  const configurable = autonomy.user_authorized === true;
+  const configurable =
+    autonomy.user_authorized === true && S.aiAgentExecutionStatus?.available === true;
   const controlDisabled = configurable ? "" : "disabled";
-  const actionOptions = Object.keys(AI_AGENT_EXECUTION_ACTIONS)
-    .map((action) => {
-      const executionAllowed = executionActions.has(action);
-      return `<label class="check-line"><input name="allowed_actions" type="checkbox" value="${esc(
-        action
-      )}" ${selectedActions.has(action) ? "checked" : ""} ${
-        configurable && executionAllowed ? "" : "disabled"
-      } /><span>${esc(aiAgentExecutionActionLabel(action))}${
-        executionAllowed ? "" : "（需先在上方授权）"
-      }</span></label>`;
-    })
-    .join("");
   const haltedReason = autonomy.halted_reason
-    ? `<div>停机原因：${esc(autonomy.halted_reason)}</div>`
+    ? `<div>暂停原因：${esc(autonomy.halted_reason)}</div>`
     : "";
-  const usage = autonomy.usage_today;
-  const usageLine = usage
-    ? `<div>今日预算用量：总量 ${usage.total_actions}/${autonomy.daily_total_limit} · 回复 ${usage.reply_actions}/${autonomy.daily_reply_limit} · 动态 ${usage.post_actions}/${autonomy.daily_post_limit} · 关系 ${usage.relationship_actions}/${autonomy.daily_relationship_limit}${
-        usage.failed_actions ? ` · 失败 ${usage.failed_actions}` : ""
-      }${usage.outcome_unknown_actions ? ` · 结果未知 ${usage.outcome_unknown_actions}` : ""}</div>`
-    : "";
-  return `<details class="agent-capability" id="agent-autonomy-section" ${
-    autonomy.user_enabled || autonomy.halted ? "open" : ""
-  }><summary class="agent-capability-summary"><span><strong>无人值守运行</strong><small>自动回复、定时文字动态与白名单关系维护</small></span><span class="agent-capability-state" data-agent-autonomy-state>${esc(
-    presentation.state
-  )}</span></summary><div class="agent-capability-body">
-    <div class="notice${presentation.warning ? " warn" : ""}" data-agent-autonomy-notice><strong data-agent-autonomy-title>${esc(
-      presentation.title
-    )}</strong><div data-agent-autonomy-detail>${esc(presentation.detail)}</div>${usageLine}${haltedReason}</div>
-    <div class="notice mt-sm"><strong>自动化边界</strong><div>自动回复只处理当前仍待回复的入站文字消息；如果你已经回复或会话最新消息发生变化，任务会失效。关系动作只对精确用户编号白名单生效，不支持通配符。无人值守动作只以 Web 本地权威事务成功为准，兼容镜像异步处理且失败不会回滚本地结果。任何结果未知的操作都不会自动重试，而会等待人工检查。</div></div>
-    <div class="agent-autonomy-grid mt-md">
-      <form class="surface-card" data-form="agent-autonomy-settings" autocomplete="off"><div class="section-head"><div><h2>后台策略</h2><p>默认全部关闭，可按动作和预算逐项启用</p></div></div>
-        <label class="check-line"><input name="user_enabled" type="checkbox" ${
+  const usage = autonomy.usage_today || {};
+  const stats = [
+    ["浏览", usage.browse_actions || 0],
+    ["匹配", usage.match_actions || 0],
+    ["上下文回复", usage.reply_actions || 0],
+    ["主动私信", usage.outreach_actions || 0],
+    ["关系操作", usage.relationship_actions || 0],
+  ]
+    .map(
+      ([label, value]) =>
+        `<div class="agent-social-stat"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`
+    )
+    .join("");
+  const capabilityOptions = [
+    ["discovery_enabled", "浏览在线用户", "定期查看当前在线列表并记录候选用户"],
+    ["text_match_enabled", "在线匹配", "按安全间隔发起文字匹配并保存匹配历史"],
+    ["follow_discovered_enabled", "关注合适用户", "从最近发现的候选中自然推进关注"],
+    ["friend_request_enabled", "发送好友申请", "关注后再发送简短、克制的好友申请"],
+    ["proactive_message_enabled", "主动发起私信", "只向没有未回复外发消息的候选发送一次开场白"],
+    ["auto_reply_enabled", "根据上下文回复", "只回复当前仍未处理的最新入站文字消息"],
+  ]
+    .map(
+      ([name, label, detail]) =>
+        `<label class="agent-social-capability"><input name="${name}" type="checkbox" ${
+          autonomy[name] ? "checked" : ""
+        } ${controlDisabled} /><span><strong>${esc(label)}</strong><small>${esc(detail)}</small></span></label>`
+    )
+    .join("");
+  const errorStats = [
+    usage.failed_actions ? `失败 ${usage.failed_actions}` : "",
+    usage.outcome_unknown_actions ? `待检查 ${usage.outcome_unknown_actions}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return `<section class="agent-social-shell" id="agent-autonomy-section">
+    <div class="agent-social-status${presentation.warning ? " is-warning" : ""}" data-agent-autonomy-notice>
+      <div><p class="eyebrow">自动社交 Agent</p><h2 data-agent-autonomy-title>${esc(
+        presentation.title
+      )}</h2><p data-agent-autonomy-detail>${esc(presentation.detail)}</p>${haltedReason}</div>
+      <span class="agent-capability-state" data-agent-autonomy-state>${esc(presentation.state)}</span>
+    </div>
+    <div class="agent-social-stats" aria-label="今日动作统计">${stats}</div>
+    ${errorStats ? `<div class="agent-social-stat-note">今日异常：${esc(errorStats)}</div>` : ""}
+    <div class="agent-autonomy-grid">
+      <form class="surface-card agent-social-form" data-form="agent-autonomy-settings" autocomplete="off">
+        <div class="section-head"><div><h2>自动操作</h2><p>选择允许 Agent 执行的能力，保存时会同步固定动作权限</p></div></div>
+        <label class="check-line agent-primary-toggle"><input name="user_enabled" type="checkbox" ${
           autonomy.user_enabled ? "checked" : ""
-        } ${controlDisabled} /><span>启用无人值守 Agent 总开关</span></label>
-        <div class="field"><label>无人值守动作白名单</label><div class="stack">${actionOptions}</div><p class="field-help">这里只能选择已在上方账号执行设置中授权的动作。</p></div>
-        <div class="stack">
-          <label class="check-line"><input name="auto_reply_enabled" type="checkbox" ${
-            autonomy.auto_reply_enabled ? "checked" : ""
-          } ${controlDisabled} /><span>自动回复待回复入站消息</span></label>
-          <label class="check-line"><input name="scheduled_post_enabled" type="checkbox" ${
-            autonomy.scheduled_post_enabled ? "checked" : ""
-          } ${controlDisabled} /><span>按间隔生成并发布公开文字动态</span></label>
-          <label class="check-line"><input name="managed_relationships_enabled" type="checkbox" ${
-            autonomy.managed_relationships_enabled ? "checked" : ""
-          } ${controlDisabled} /><span>管理白名单中的关注关系</span></label>
-        </div>
-        <div class="field"><label for="agent-autonomy-brief">运行目标与内容边界</label><textarea id="agent-autonomy-brief" name="operation_brief" rows="6" maxlength="4000" placeholder="说明允许回复或发布的主题、语气和禁止事项；不要填写密码、令牌或其他密钥" ${controlDisabled}>${esc(
+        } ${controlDisabled} /><span>运行自动社交 Agent</span></label>
+        <div class="agent-social-capability-grid">${capabilityOptions}</div>
+        <div class="field"><label for="agent-autonomy-brief">聊天目标与表达边界</label><textarea id="agent-autonomy-brief" name="operation_brief" rows="4" maxlength="4000" placeholder="例如：自然认识新朋友，语气真诚克制；不要索取联系方式，不讨论敏感话题" ${controlDisabled}>${esc(
           autonomy.operation_brief
-        )}</textarea></div>
-        <div class="field"><label for="agent-autonomy-targets">关系动作目标白名单</label><textarea id="agent-autonomy-targets" name="managed_target_uids" rows="5" maxlength="13000" placeholder="每行一个精确用户编号" ${controlDisabled}>${esc(
-          autonomy.managed_target_uids.join("\n")
-        )}</textarea><p class="field-help">仅用于关注和取消关注；自动回复仍只针对真实待回复会话。</p></div>
-        <div class="form-grid">
+        )}</textarea><p class="field-help">这里只影响文字生成，不会交给模型任何账号凭据或通用操作工具。</p></div>
+        <details class="agent-inline-details"><summary>运行时间与发现频率</summary><div class="agent-details-body"><div class="form-grid">
           <div class="field"><label for="agent-autonomy-timezone">时区</label><input id="agent-autonomy-timezone" name="timezone" maxlength="64" value="${esc(
             autonomy.timezone
           )}" ${controlDisabled} required /></div>
-          <div class="field"><label for="agent-autonomy-start">每日开始时间</label><input id="agent-autonomy-start" name="active_start_minute" type="time" value="${esc(
+          <div class="field"><label for="agent-autonomy-start">开始时间</label><input id="agent-autonomy-start" name="active_start_minute" type="time" value="${esc(
             aiAgentAutonomyTimeValue(autonomy.active_start_minute)
           )}" ${controlDisabled} required /></div>
-          <div class="field"><label for="agent-autonomy-end">每日结束时间</label><input id="agent-autonomy-end" name="active_end_minute" type="time" value="${esc(
+          <div class="field"><label for="agent-autonomy-end">结束时间</label><input id="agent-autonomy-end" name="active_end_minute" type="time" value="${esc(
             aiAgentAutonomyTimeValue(autonomy.active_end_minute)
           )}" ${controlDisabled} required /><p class="field-help">开始与结束相同表示全天。</p></div>
-          <div class="field"><label for="agent-autonomy-minimum-interval">动作最小间隔（秒）</label><input id="agent-autonomy-minimum-interval" name="minimum_action_interval_seconds" type="number" min="60" max="86400" step="1" value="${esc(
-            autonomy.minimum_action_interval_seconds
+          <div class="field"><label for="agent-autonomy-discovery-interval">发现间隔（分钟）</label><input id="agent-autonomy-discovery-interval" name="discovery_interval_minutes" type="number" min="5" max="1440" step="1" value="${esc(
+            autonomy.discovery_interval_minutes
           )}" ${controlDisabled} required /></div>
-          <div class="field"><label for="agent-autonomy-daily-total">每日总上限</label><input id="agent-autonomy-daily-total" name="daily_total_limit" type="number" min="1" max="200" step="1" value="${esc(
-            autonomy.daily_total_limit
-          )}" ${controlDisabled} required /></div>
-          <div class="field"><label for="agent-autonomy-daily-reply">每日自动回复上限</label><input id="agent-autonomy-daily-reply" name="daily_reply_limit" type="number" min="0" max="200" step="1" value="${esc(
-            autonomy.daily_reply_limit
-          )}" ${controlDisabled} required /></div>
-          <div class="field"><label for="agent-autonomy-daily-post">每日动态上限</label><input id="agent-autonomy-daily-post" name="daily_post_limit" type="number" min="0" max="20" step="1" value="${esc(
-            autonomy.daily_post_limit
-          )}" ${controlDisabled} required /></div>
-          <div class="field"><label for="agent-autonomy-daily-relationship">每日关系动作上限</label><input id="agent-autonomy-daily-relationship" name="daily_relationship_limit" type="number" min="0" max="100" step="1" value="${esc(
-            autonomy.daily_relationship_limit
-          )}" ${controlDisabled} required /></div>
-          <div class="field"><label for="agent-autonomy-post-interval">动态发布最小间隔（分钟）</label><input id="agent-autonomy-post-interval" name="post_interval_minutes" type="number" min="60" max="10080" step="1" value="${esc(
-            autonomy.post_interval_minutes
-          )}" ${controlDisabled} required /></div>
-          <div class="field"><label for="agent-autonomy-failure-limit">连续失败停机阈值</label><input id="agent-autonomy-failure-limit" name="consecutive_failure_limit" type="number" min="1" max="20" step="1" value="${esc(
-            autonomy.consecutive_failure_limit
-          )}" ${controlDisabled} required /></div>
-        </div>
-        <button type="submit" class="btn primary full mt-sm" ${controlDisabled}>保存无人值守策略</button>
+        </div></div></details>
+        <button type="submit" class="btn primary full mt-sm" ${controlDisabled}>${
+          autonomy.user_enabled ? "保存运行设置" : "开始运行"
+        }</button>
+        ${
+          configurable
+            ? ""
+            : `<p class="field-help">当前账号尚未获得完整的 Agent 与账号动作授权。</p>`
+        }
       </form>
-      <div class="surface-card"><div class="section-head"><div><h2>最近任务</h2><p>仅展示非敏感状态；结果未知的任务需要人工检查</p></div><button type="button" class="btn secondary small" data-action="agent-refresh-autonomy-tasks">刷新任务</button></div><div id="agent-autonomy-tasks">${agentAutonomyRecentTasksHtml(
+      <div class="surface-card agent-social-activity"><div class="section-head"><div><h2>最近动作</h2><p>消息、匹配和关系结果也会进入各自的正常记录</p></div><button type="button" class="btn secondary small" data-action="agent-refresh-autonomy-tasks">刷新</button></div><div id="agent-autonomy-tasks">${agentAutonomyRecentTasksHtml(
         autonomy.recent_tasks
       )}</div></div>
     </div>
-  </div></details>`;
+    <div class="notice agent-social-boundary"><strong>运行边界</strong><div>Agent 每次只执行预先授权的固定动作；不会获取 Cookie、Token 或任意网址访问能力。相同用户会按发现、关注、好友申请、私信的顺序逐步互动，存在未回复外发消息时不会重复触达。外部结果无法确认时会自动暂停并等待人工检查。</div></div>
+  </section>`;
 }
 
 function agentExecutionSectionHtml(execution) {
@@ -16523,7 +16373,7 @@ function agentExecutionSectionHtml(execution) {
   }><summary class="agent-capability-summary"><span><strong>账号执行</strong><small>手动发送、发布文字动态或变更关注关系</small></span><span class="agent-capability-state">${
     execution.user_enabled ? "已开启" : "未开启"
   }</span></summary><div class="agent-capability-body">
-    <div class="notice"><strong>本区域的每次实际执行都需要二次确认</strong><div>本区域开启后不会自动监听或接管账号，只处理你在本页发起、核对并再次确认的单次请求。无人值守运行必须在下方独立配置和开启。</div></div>
+    <div class="notice"><strong>本区域的每次实际执行都需要二次确认</strong><div>本区域开启后不会自动监听或接管账号，只处理你在本页发起、核对并再次确认的单次请求。自动社交需在上方单独配置和开启。</div></div>
     <div class="agent-action-grid mt-md">
       <form class="surface-card" data-form="agent-execution-settings"><div class="section-head"><div><h2>执行权限设置</h2><p>默认不选择任何动作，可随时关闭</p></div></div>
         <label class="check-line"><input name="user_enabled" type="checkbox" ${execution.user_enabled ? "checked" : ""} /><span>主动开启账号执行</span></label>
@@ -16532,7 +16382,7 @@ function agentExecutionSectionHtml(execution) {
           sendAllowed
             ? `<label class="check-line"><input name="auto_send_enabled" type="checkbox" ${
                 execution.auto_send_enabled ? "checked" : ""
-              } /><span>允许模型生成的私信直接发送</span></label><p class="field-help">手动直发仍需二次确认；后台自动回复还必须在无人值守区域独立开启。</p>`
+              } /><span>允许模型生成的私信直接发送</span></label><p class="field-help">手动直发仍需二次确认；自动回复还必须在自动社交设置中单独开启。</p>`
             : ""
         }
         <button type="submit" class="btn primary full mt-sm">保存执行权限</button>
@@ -16587,7 +16437,7 @@ async function pageAgent(signal, { data: prefetchedData = null } = {}) {
           ? { label: "测试失败", tone: "danger", detail: "更新密钥或连接信息后重新测试" }
           : { label: "等待测试", tone: "warning", detail: connection.model || "保存后完成一次连接测试" };
   const runnerState = ready
-    ? { label: "可以生成草稿", tone: "success", detail: "连接与个人运行开关均已生效" }
+    ? { label: "文字生成已就绪", tone: "success", detail: "可用于上下文回复和自然开场白" }
     : settings.user_enabled
       ? { label: "等待连接通过", tone: "warning", detail: "个人运行器已开启，但模型连接尚未就绪" }
       : { label: "个人运行器未开启", tone: "neutral", detail: "连接测试成功后再主动开启" };
@@ -16601,21 +16451,27 @@ async function pageAgent(signal, { data: prefetchedData = null } = {}) {
     : `<div class="agent-style-empty">尚未分析语言风格。该功能只读取本人已归档的历史文字消息。</div>`;
   const executionSection = agentExecutionSectionHtml(execution);
   const autonomySection = agentAutonomySectionHtml(autonomy);
-  const advancedSections = `${executionSection}${autonomySection}`;
+  const advancedSections = executionSection;
   return `<div class="agent-page">
     <section class="agent-overview">
-      <div class="agent-overview-copy"><p class="eyebrow">模型助手</p><h2>连接自己的模型，生成可审核草稿</h2><p>先完成连接测试，再开启个人运行器。基础功能只生成草稿，不会自动发送；账号执行和无人值守能力可在下方按需展开。</p></div>
-      <div class="agent-status-grid" aria-label="模型助手状态">
+      <div class="agent-overview-copy"><p class="eyebrow">社交 Agent</p><h2>授权后，自动完成发现、匹配与聊天维护</h2><p>Agent 会像正常用户一样逐步浏览在线列表、匹配、关注、申请好友和聊天；所有实际操作都会进入消息、匹配、关系或任务记录。</p></div>
+      <div class="agent-status-grid" aria-label="社交 Agent 状态">
         <div class="agent-status-item" data-agent-status="connection" data-tone="${connectionState.tone}"><span>模型连接</span><strong>${esc(
           connectionState.label
         )}</strong><small>${esc(connectionState.detail)}</small></div>
-        <div class="agent-status-item" data-agent-status="runner" data-tone="${runnerState.tone}"><span>运行状态</span><strong>${esc(
+        <div class="agent-status-item" data-agent-status="runner" data-tone="${runnerState.tone}"><span>文字生成</span><strong>${esc(
           runnerState.label
         )}</strong><small>${esc(runnerState.detail)}</small></div>
       </div>
     </section>
 
-    <section class="agent-primary-grid" aria-label="模型助手基础设置">
+    ${autonomySection}
+
+    <details class="agent-capability agent-tools" ${ready ? "" : "open"}>
+      <summary class="agent-capability-summary"><span><strong>模型与高级工具</strong><small>模型地址、API Key、生成参数、审核草稿和手动动作</small></span><span class="agent-capability-state">按需展开</span></summary>
+      <div class="agent-capability-body agent-tools-body">
+
+    <section class="agent-primary-grid" aria-label="模型与草稿设置">
       <div class="agent-setup-stack">
         <form class="surface-card agent-card" data-form="agent-connection" autocomplete="off">
           <div class="section-head"><div><h2>模型连接</h2><p>${esc(
@@ -16685,9 +16541,11 @@ async function pageAgent(signal, { data: prefetchedData = null } = {}) {
 
     ${
       advancedSections
-        ? `<section class="agent-advanced"><div class="section-head"><div><h2>高级能力</h2><p>仅在确实需要账号操作时展开；各项默认关闭并受独立权限控制</p></div></div>${advancedSections}</section>`
+        ? `<section class="agent-advanced"><div class="section-head"><div><h2>手动账号工具</h2><p>单次执行仍需二次确认，和自动社交设置相互独立</p></div></div>${advancedSections}</section>`
         : ""
     }
+      </div>
+    </details>
   </div>`;
 }
 
@@ -17883,10 +17741,10 @@ function mergeRevokedMessage(previous, revoked) {
     objectName: previous.objectName || revoked.objectName || "",
     timestamp: previous.timestamp || revoked.timestamp,
     source: authority
-      ? String(authority.source || "web-local")
+      ? String(authority.source || (isTimAuthoritativeMessage(authority) ? "tim" : "web-local"))
       : String(revoked.source || previous.source || ""),
     provider: authority
-      ? String(authority.provider || "web-local")
+      ? String(authority.provider || (isTimAuthoritativeMessage(authority) ? "" : "web-local"))
       : String(revoked.provider || previous.provider || ""),
     canonicalAuthority: Boolean(authority),
     rawMessage: revoked.rawMessage || previous.rawMessage || null,
@@ -18911,16 +18769,6 @@ async function handleAction(action, button) {
     S.momentsSearch = "";
     return switchMomentsTab(S.momentsTab, { force: true });
   }
-  if (action === "moment-media-remove") {
-    if (S.momentMediaUploading) throw new Error("媒体正在上传，暂时不能移除");
-    removeMomentMediaDraft(button.dataset.draftId);
-    return;
-  }
-  if (action === "moment-media-clear") {
-    if (S.momentMediaUploading) throw new Error("媒体正在上传，暂时不能清除");
-    clearMomentMediaDraft();
-    return;
-  }
   if (action === "play-moment-video") {
     const video = button.closest?.("[data-playback-wrap]")?.querySelector?.('video[data-moment-video="true"]');
     await startMomentVideoPlayback(video);
@@ -19555,11 +19403,6 @@ async function handleAction(action, button) {
     refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
     return;
   }
-  if (action === "profile-avatar-remove") {
-    if (S.profileAvatarDraft?.uploading) throw new Error("头像正在上传，暂时不能移除");
-    clearProfileAvatarDraft();
-    return;
-  }
   if (action === "focus-profile-editor") {
     const editor = $("profile-editor");
     if (editor) {
@@ -19743,77 +19586,39 @@ async function handleProductForm(form, submitter, submittedValues = null) {
   if (kind === "agent-autonomy-settings") {
     const autonomy = S.aiAgentAutonomyStatus;
     if (!autonomy?.visible || autonomy.user_authorized !== true) {
-      throw new Error("无人值守 Agent 尚未获得管理员授权");
+      throw new Error("自动社交 Agent 尚未获得管理员授权");
     }
-    const executionActions = new Set(S.aiAgentExecutionStatus?.selected_actions || []);
-    const requestedActions = [
-      ...form.querySelectorAll('input[name="allowed_actions"]:checked'),
-    ].map((input) => String(input.value || "").trim());
-    const allowedActions = [...new Set(requestedActions)].filter(
-      (action) =>
-        executionActions.has(action) &&
-        Object.prototype.hasOwnProperty.call(AI_AGENT_EXECUTION_ACTIONS, action)
-    );
-    if (allowedActions.length !== new Set(requestedActions).size) {
-      throw new Error("账号执行授权已变化，请刷新页面后重新选择无人值守动作");
-    }
-
+    const execution = S.aiAgentExecutionStatus;
+    if (!execution?.available) throw new Error("账号动作能力当前不可用");
     const userEnabled = Boolean(form.elements.namedItem("user_enabled")?.checked);
     const autoReplyEnabled =
       userEnabled && Boolean(form.elements.namedItem("auto_reply_enabled")?.checked);
-    const scheduledPostEnabled =
-      userEnabled && Boolean(form.elements.namedItem("scheduled_post_enabled")?.checked);
-    const managedRelationshipsEnabled =
-      userEnabled && Boolean(form.elements.namedItem("managed_relationships_enabled")?.checked);
+    const discoveryEnabled =
+      userEnabled && Boolean(form.elements.namedItem("discovery_enabled")?.checked);
+    const textMatchEnabled =
+      userEnabled && Boolean(form.elements.namedItem("text_match_enabled")?.checked);
+    const proactiveMessageEnabled =
+      userEnabled && Boolean(form.elements.namedItem("proactive_message_enabled")?.checked);
+    const followDiscoveredEnabled =
+      userEnabled && Boolean(form.elements.namedItem("follow_discovered_enabled")?.checked);
+    const friendRequestEnabled =
+      userEnabled && Boolean(form.elements.namedItem("friend_request_enabled")?.checked);
     if (
       userEnabled &&
       !autoReplyEnabled &&
-      !scheduledPostEnabled &&
-      !managedRelationshipsEnabled
+      !discoveryEnabled &&
+      !textMatchEnabled &&
+      !proactiveMessageEnabled &&
+      !followDiscoveredEnabled &&
+      !friendRequestEnabled
     ) {
-      throw new Error("开启无人值守总开关时，请至少启用一种自动化能力");
+      throw new Error("开始运行前，请至少选择一种自动社交能力");
     }
-    if (autoReplyEnabled && !allowedActions.includes("send_private_message")) {
-      throw new Error("开启自动回复前，请先选择发送私信动作");
+    if (userEnabled && !S.aiAgentModelReady) {
+      throw new Error("请先在高级设置中完成模型连接测试并开启个人运行器");
     }
-    if (scheduledPostEnabled && !allowedActions.includes("publish_text_post")) {
-      throw new Error("开启定时动态前，请先选择发布文字动态动作");
-    }
-    if (
-      managedRelationshipsEnabled &&
-      !allowedActions.some((action) => action === "follow_user" || action === "unfollow_user")
-    ) {
-      throw new Error("开启关系管理前，请先选择关注或取消关注动作");
-    }
-
-    const managedTargetUids = [
-      ...new Set(
-        String(values.managed_target_uids || "")
-          .split(/\r?\n/)
-          .map((uid) => uid.trim())
-          .filter(Boolean)
-      ),
-    ];
-    if (managedTargetUids.length > 100) throw new Error("关系动作目标最多填写 100 个用户编号");
-    if (
-      managedTargetUids.some(
-        (uid) =>
-          uid.length > 128 ||
-          [...uid].some((character) => character.codePointAt(0) < 33) ||
-          /[*?\[\]]/.test(uid)
-      )
-    ) {
-      throw new Error("关系动作目标必须是每行一个、不含空格或通配符的精确用户编号");
-    }
-    if (managedRelationshipsEnabled && !managedTargetUids.length) {
-      throw new Error("开启关系管理前，请至少填写一个精确用户编号");
-    }
-
     const operationBrief = String(values.operation_brief || "").trim();
-    if (operationBrief.length > 4000) throw new Error("运行目标与内容边界不能超过 4000 个字符");
-    if (scheduledPostEnabled && !operationBrief) {
-      throw new Error("开启定时动态前，请填写运行目标与内容边界");
-    }
+    if (operationBrief.length > 4000) throw new Error("聊天目标与表达边界不能超过 4000 个字符");
     const timezone = String(values.timezone || "").trim();
     if (!timezone || timezone.length > 64) throw new Error("时区不能为空且不能超过 64 个字符");
     const activeStartMinute = aiAgentAutonomyMinuteValue(
@@ -19821,96 +19626,84 @@ async function handleProductForm(form, submitter, submittedValues = null) {
       "每日开始时间"
     );
     const activeEndMinute = aiAgentAutonomyMinuteValue(values.active_end_minute, "每日结束时间");
-    const minimumActionIntervalSeconds = aiAgentAutonomyInteger(
+    const discoveryIntervalMinutes = aiAgentAutonomyInteger(
       values,
-      "minimum_action_interval_seconds",
-      "动作最小间隔",
-      60,
-      86400
+      "discovery_interval_minutes",
+      "发现间隔",
+      5,
+      1440
     );
-    const dailyTotalLimit = aiAgentAutonomyInteger(
-      values,
-      "daily_total_limit",
-      "每日总上限",
-      1,
-      200
+    const requiredActions = [];
+    if (discoveryEnabled) requiredActions.push("browse_online_users");
+    if (textMatchEnabled) requiredActions.push("request_text_match");
+    if (autoReplyEnabled || proactiveMessageEnabled) requiredActions.push("send_private_message");
+    if (followDiscoveredEnabled) requiredActions.push("follow_user");
+    if (friendRequestEnabled) requiredActions.push("request_friend");
+    const allowedActions = [...new Set(requiredActions)];
+    const unsupported = allowedActions.filter(
+      (action) => !execution.allowed_actions.includes(action)
     );
-    const dailyReplyLimit = aiAgentAutonomyInteger(
-      values,
-      "daily_reply_limit",
-      "每日自动回复上限",
-      0,
-      200
-    );
-    const dailyPostLimit = aiAgentAutonomyInteger(
-      values,
-      "daily_post_limit",
-      "每日动态上限",
-      0,
-      20
-    );
-    const dailyRelationshipLimit = aiAgentAutonomyInteger(
-      values,
-      "daily_relationship_limit",
-      "每日关系动作上限",
-      0,
-      100
-    );
-    if (
-      dailyReplyLimit > dailyTotalLimit ||
-      dailyPostLimit > dailyTotalLimit ||
-      dailyRelationshipLimit > dailyTotalLimit
-    ) {
-      throw new Error("各类每日动作上限不能超过每日总上限");
+    if (unsupported.length) {
+      throw new Error("管理员尚未开放所选能力需要的账号动作");
     }
-    if (autoReplyEnabled && dailyReplyLimit < 1) {
-      throw new Error("开启自动回复时，每日自动回复上限至少为 1");
+    const selectedExecutionActions = [
+      ...new Set([...(execution.selected_actions || []), ...allowedActions]),
+    ];
+    const nextExecutionEnabled = userEnabled || execution.user_enabled;
+    const nextAutoSend =
+      execution.auto_send_enabled || (userEnabled && (autoReplyEnabled || proactiveMessageEnabled));
+    const executionChanged =
+      nextExecutionEnabled !== execution.user_enabled ||
+      nextAutoSend !== execution.auto_send_enabled ||
+      selectedExecutionActions.join("\u0000") !== execution.selected_actions.join("\u0000");
+    if (executionChanged) {
+      await agentExecutionApi("/api/agent/execution-settings", {
+        method: "PUT",
+        body: JSON.stringify({
+          user_enabled: nextExecutionEnabled,
+          auto_send_enabled: nextAutoSend,
+          selected_actions: selectedExecutionActions,
+        }),
+        timeout: 30000,
+      });
     }
-    if (scheduledPostEnabled && dailyPostLimit < 1) {
-      throw new Error("开启定时动态时，每日动态上限至少为 1");
-    }
-    if (managedRelationshipsEnabled && dailyRelationshipLimit < 1) {
-      throw new Error("开启关系管理时，每日关系动作上限至少为 1");
-    }
-    const postIntervalMinutes = aiAgentAutonomyInteger(
-      values,
-      "post_interval_minutes",
-      "动态发布最小间隔",
-      60,
-      10080
-    );
-    const consecutiveFailureLimit = aiAgentAutonomyInteger(
-      values,
-      "consecutive_failure_limit",
-      "连续失败停机阈值",
-      1,
-      20
-    );
 
     await agentAutonomyApi("/api/agent/autonomy-settings", {
       method: "PUT",
       body: JSON.stringify({
         user_enabled: userEnabled,
         auto_reply_enabled: autoReplyEnabled,
-        scheduled_post_enabled: scheduledPostEnabled,
-        managed_relationships_enabled: managedRelationshipsEnabled,
+        scheduled_post_enabled: false,
+        managed_relationships_enabled: false,
+        discovery_enabled: discoveryEnabled,
+        text_match_enabled: textMatchEnabled,
+        proactive_message_enabled: proactiveMessageEnabled,
+        follow_discovered_enabled: followDiscoveredEnabled,
+        friend_request_enabled: friendRequestEnabled,
         allowed_actions: allowedActions,
         operation_brief: operationBrief,
-        managed_target_uids: managedTargetUids,
+        managed_target_uids: [],
         timezone,
         active_start_minute: activeStartMinute,
         active_end_minute: activeEndMinute,
-        minimum_action_interval_seconds: minimumActionIntervalSeconds,
-        daily_total_limit: dailyTotalLimit,
-        daily_reply_limit: dailyReplyLimit,
-        daily_post_limit: dailyPostLimit,
-        daily_relationship_limit: dailyRelationshipLimit,
-        post_interval_minutes: postIntervalMinutes,
-        consecutive_failure_limit: consecutiveFailureLimit,
+        minimum_action_interval_seconds: autonomy.minimum_action_interval_seconds,
+        daily_total_limit: autonomy.daily_total_limit,
+        daily_reply_limit: Math.max(
+          autoReplyEnabled || proactiveMessageEnabled ? 1 : 0,
+          autonomy.daily_reply_limit
+        ),
+        daily_post_limit: autonomy.daily_post_limit,
+        daily_relationship_limit: Math.max(
+          followDiscoveredEnabled || friendRequestEnabled ? 1 : 0,
+          autonomy.daily_relationship_limit
+        ),
+        post_interval_minutes: autonomy.post_interval_minutes,
+        discovery_interval_minutes: discoveryIntervalMinutes,
+        consecutive_failure_limit: autonomy.consecutive_failure_limit,
       }),
       timeout: 30000,
     });
-    toast("无人值守策略已保存");
+    toast(userEnabled ? "自动社交 Agent 设置已保存" : "自动社交 Agent 已暂停");
     clearViewCacheKey("agent");
     return switchMineTab("agent", { force: true });
   }
@@ -19975,42 +19768,29 @@ async function handleProductForm(form, submitter, submittedValues = null) {
   }
   if (kind === "moment-publish") {
     const text = String(values.text || "").trim();
-    if (!text && !S.momentMediaDraft.length) throw new Error("请输入动态内容，或选择图片、视频");
-    const imageCount = S.momentMediaDraft.filter((draft) => draft.kind === "image").length;
-    const videoCount = S.momentMediaDraft.filter((draft) => draft.kind === "video").length;
-    if (imageCount > 9) throw new Error("动态图片最多选择 9 张");
-    if (videoCount > 1 || (imageCount && videoCount)) throw new Error("图片和视频不能同时发布");
-    setMomentComposeLocked(form, true);
-    try {
-      const mediaAssetIds = await ensureMomentMediaAssets();
-      S.momentPublishRequestId ||= newComposeRequestId("moment-publish");
-      const { data, ok } = await api("/api/moments/publish", {
-        method: "POST",
-        body: JSON.stringify({
-          text,
-          media_asset_ids: mediaAssetIds,
-          visibility_scope: values.visibility_scope || "公开",
-          topic: String(values.topic || "").trim(),
-          plate: "动态",
-          comment_forbid: values.comment_forbid === "1",
-          hide_comment: values.hide_comment === "1",
-          client_request_id: S.momentPublishRequestId,
-        }),
-        timeout: 20000,
-      });
-      if (!ok || data?.ok === false) {
-        toastEnv(data, "动态发布失败");
-        return;
-      }
-      toastEnv(data, "动态已发布");
+    if (!text) throw new Error("请输入动态内容");
+    const { data, ok } = await api("/api/moments/publish", {
+      method: "POST",
+      body: JSON.stringify({
+        text,
+        visibility_scope: values.visibility_scope || "公开",
+        topic: String(values.topic || "").trim(),
+        plate: "动态",
+        comment_forbid: values.comment_forbid === "1",
+        hide_comment: values.hide_comment === "1",
+      }),
+      timeout: 20000,
+    });
+    if (!ok || data?.ok === false) {
+      toastEnv(data, "动态发布失败");
+      return;
+    }
+    if (toastEnv(data, "动态已发布")) {
       form.reset();
       form.closest("details")?.removeAttribute("open");
-      clearMomentMediaDraft();
       clearMomentCache();
       S.momentsSearch = "";
       await switchMomentsTab("我的", { force: true });
-    } finally {
-      setMomentComposeLocked(form, false);
     }
     return;
   }
@@ -20132,52 +19912,6 @@ async function handleProductForm(form, submitter, submittedValues = null) {
     setPanel("wallet-result", operationView(data, "提现请求结果"));
     return;
   }
-  if (kind === "profile-avatar") {
-    const draft = S.profileAvatarDraft;
-    if (!draft?.file) throw new Error("请先选择头像图片");
-    draft.uploading = true;
-    draft.error = "";
-    renderProfileAvatarDraft();
-    try {
-      if (!draft.assetId) {
-        const asset = await createNativeMediaAsset("image", draft.file, (progress) => {
-          draft.progress = progress;
-          renderProfileAvatarDraft({ refreshPreview: false });
-        });
-        draft.assetId = String(asset.asset_id || "");
-        draft.progress = 1;
-      }
-      if (!draft.assetId) throw new Error("头像上传完成但未返回可用资产编号");
-      draft.operationId ||= newComposeRequestId("profile-avatar");
-      const { data, ok } = await api("/api/profile/reset", {
-        method: "POST",
-        body: JSON.stringify({
-          type: "头像设置",
-          avatar_asset_id: draft.assetId,
-          operation_id: draft.operationId,
-        }),
-        timeout: 20000,
-      });
-      if (!ok || data?.ok === false) {
-        const info = errorInfo(data, "头像保存失败");
-        throw new Error([info.title, info.detail].filter(Boolean).join(" · "));
-      }
-      if (data.user) applyUser({ ...(S.user || {}), ...data.user });
-      toastEnv(data, "头像已更新");
-      clearProfileAvatarDraft();
-      clearMomentCache();
-      go("me", { force: true });
-    } catch (error) {
-      draft.error = String(error?.message || error || "头像保存失败");
-      throw error;
-    } finally {
-      if (S.profileAvatarDraft === draft) {
-        draft.uploading = false;
-        renderProfileAvatarDraft();
-      }
-    }
-    return;
-  }
   if (kind === "profile-details") {
     const current = S.user || {};
     const requested = [
@@ -20237,31 +19971,6 @@ async function handleProductForm(form, submitter, submittedValues = null) {
     clearMomentCache();
     toast("基本资料已保存");
     go("me", { force: true });
-    return;
-  }
-  if (kind === "local-password-change") {
-    const currentPassword = String(values.current_password || "");
-    const newPassword = String(values.new_password || "");
-    const confirmPassword = String(values.confirm_password || "");
-    if (!currentPassword) throw new Error("请输入当前密码");
-    if (newPassword.length < 8 || newPassword.length > 128) {
-      throw new Error("新密码长度必须为 8 至 128 个字符");
-    }
-    if (newPassword !== confirmPassword) throw new Error("两次输入的新密码不一致");
-    const { data, ok } = await api("/api/auth/password", {
-      method: "POST",
-      body: JSON.stringify({
-        current_password: currentPassword,
-        new_password: newPassword,
-      }),
-      authOptional: true,
-    });
-    if (!ok || data?.ok === false) {
-      toastEnv(data, "密码修改失败");
-      return;
-    }
-    toast("密码已更新，请重新登录");
-    await logout({ notifyServer: false });
     return;
   }
   if (kind === "referral-set") {
@@ -20673,29 +20382,6 @@ document.addEventListener("focusout", (event) => {
 });
 
 document.addEventListener("change", (event) => {
-  const profileAvatarInput = event.target.closest && event.target.closest("input[data-profile-avatar]");
-  if (profileAvatarInput) {
-    try {
-      const file = profileAvatarInput.files?.[0];
-      if (file) selectProfileAvatarFile(file);
-    } catch (error) {
-      toast(error?.message || "头像图片不可用", "error", 4200);
-    } finally {
-      profileAvatarInput.value = "";
-    }
-    return;
-  }
-  const momentMediaInput = event.target.closest && event.target.closest("input[data-moment-media]");
-  if (momentMediaInput) {
-    try {
-      selectMomentMediaFiles(String(momentMediaInput.dataset.momentMedia || "image"), momentMediaInput.files);
-    } catch (error) {
-      toast(error?.message || "动态媒体不可用", "error", 4200);
-    } finally {
-      momentMediaInput.value = "";
-    }
-    return;
-  }
   const agentAutonomySetting =
     event.target.closest &&
     event.target.closest('form[data-form="agent-autonomy-settings"] input[type="checkbox"]');

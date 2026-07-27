@@ -8,6 +8,7 @@ PostgreSQL and remains available without Banghua.
 from __future__ import annotations
 
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Mapping, Sequence
@@ -778,6 +779,8 @@ def dispatch_discovery_native(
     path: object,
     query: Mapping[str, Any] | None,
     body: Mapping[str, Any] | None,
+    *,
+    db: Any | None = None,
 ) -> NativeDiscoveryResponse | None:
     """Handle Web-local discovery routes; return ``None`` for other paths.
 
@@ -808,8 +811,8 @@ def dispatch_discovery_native(
         )
     try:
         principal = _principal(identity)
-        with session_scope() as db:
-            store = SqlAlchemyDiscoveryStore(db)
+        with (nullcontext(db) if db is not None else session_scope()) as action_db:
+            store = SqlAlchemyDiscoveryStore(action_db)
             service = DiscoveryNativeService(store)
             if normalized_method == "GET":
                 return _dispatch_get(

@@ -185,7 +185,7 @@ class NativeMediaApiContracts(unittest.TestCase):
         self.assertNotIn("create_legacy_tim_rest_transport", source)
         self.assertNotIn("TimRestClient", source)
 
-    def test_all_request_paths_use_only_local_service(self) -> None:
+    def test_writes_are_gone_while_historical_access_and_flash_claim_remain(self) -> None:
         headers = {"Origin": "http://testserver"}
         cookies = {"bbw_sid": "valid-session"}
         attachment_id = str(self.service.attachment_id)
@@ -228,32 +228,26 @@ class NativeMediaApiContracts(unittest.TestCase):
                     kwargs["json"] = body
                 responses.append(getattr(client, method)(path, **kwargs))
 
-        self.assertTrue(all(response.status_code == 200 for response in responses))
+        self.assertEqual(
+            [response.status_code for response in responses],
+            [410, 410, 410, 200, 410, 200],
+        )
+        for response in (responses[0], responses[1], responses[2], responses[4]):
+            self.assertEqual(
+                response.json()["detail"]["code"],
+                "WEB_LOCAL_MEDIA_DISABLED",
+            )
         self.assertEqual(
             [name for name, _values in self.service.calls],
             [
-                "create_upload_intent",
-                "complete_upload",
-                "send_attachment",
                 "request_access",
-                "revoke_attachment",
                 "claim_flash",
                 "request_access",
             ],
         )
-        send_payload = responses[2].json()
-        self.assertEqual(send_payload["source"], "web-local")
-        self.assertEqual(send_payload["provider"], "web-local")
-        self.assertFalse(send_payload["compatibility_sync"]["required"])
-        self.assertEqual(send_payload["compatibility_sync"]["status"], "pending")
-        self.assertEqual(
-            self.persistence.message_policy_calls,
-            [(self.identity, "9")],
-        )
-        revoke_payload = responses[4].json()
-        self.assertFalse(revoke_payload["compatibility_sync"]["required"])
+        self.assertEqual(self.persistence.message_policy_calls, [])
 
-    def test_media_send_requires_the_same_private_message_authorization(self) -> None:
+    def test_media_send_is_disabled_before_private_message_authorization(self) -> None:
         self.persistence.message_allowed = False
         with patch.object(api, "_service_context", self.service_context), TestClient(
             self.app
@@ -269,25 +263,35 @@ class NativeMediaApiContracts(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.status_code, 410)
         self.assertEqual(
-            response.json(),
-            {"detail": "当前账号无权向该用户发送私聊媒体"},
+            response.json()["detail"]["code"],
+            "WEB_LOCAL_MEDIA_DISABLED",
         )
+        self.assertEqual(self.persistence.message_policy_calls, [])
         self.assertEqual(self.service.calls, [])
 
-    def test_cross_site_write_is_rejected_before_auth_rate_limit_and_service(self) -> None:
+    def test_disabled_upload_is_stable_and_retained_claim_still_checks_origin(self) -> None:
         with patch.object(api, "_service_context", self.service_context), TestClient(
             self.app
         ) as client:
-            response = client.post(
+            disabled = client.post(
                 "/api/im/media/uploads",
                 headers={"Origin": "https://attacker.invalid"},
                 cookies={"bbw_sid": "valid-session"},
                 json={},
             )
-        self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()["detail"], "跨站请求已拒绝")
+            claim = client.post(
+                f"/api/im/media/attachments/{self.service.attachment_id}/claim",
+                headers={"Origin": "https://attacker.invalid"},
+                cookies={"bbw_sid": "valid-session"},
+            )
+        self.assertEqual(disabled.status_code, 410)
+        self.assertEqual(
+            disabled.json()["detail"]["code"], "WEB_LOCAL_MEDIA_DISABLED"
+        )
+        self.assertEqual(claim.status_code, 403)
+        self.assertEqual(claim.json()["detail"], "跨站请求已拒绝")
         self.assertEqual(self.persistence.rate_calls, [])
         self.assertEqual(self.service.calls, [])
 
@@ -309,7 +313,7 @@ class NativeMediaApiContracts(unittest.TestCase):
         self.assertEqual(limited.json(), {"detail": "媒体操作过于频繁"})
         self.assertEqual(self.service.calls, [])
 
-    def test_domain_and_path_validation_errors_keep_fastapi_detail_shape(self) -> None:
+    def test_disabled_write_and_path_validation_keep_fastapi_detail_shape(self) -> None:
         def reject_upload(**_values):
             raise MediaTooLarge("图片最大 20 MiB")
 
@@ -329,17 +333,18 @@ class NativeMediaApiContracts(unittest.TestCase):
                 cookies={"bbw_sid": "valid-session"},
             )
 
-        self.assertEqual(domain_error.status_code, 400)
+        self.assertEqual(domain_error.status_code, 410)
         self.assertEqual(
             domain_error.json()["detail"],
             {
-                "code": "media_too_large",
-                "message": "图片最大 20 MiB",
+                "code": "WEB_LOCAL_MEDIA_DISABLED",
+                "message": "Web 本地消息媒体写入已停用，请使用 TIM SDK 或原 APK 闪图接口",
                 "retryable": False,
             },
         )
         self.assertEqual(path_error.status_code, 422)
         self.assertIsInstance(path_error.json()["detail"], list)
+        self.assertEqual(self.service.calls, [])
 
 
 if __name__ == "__main__":

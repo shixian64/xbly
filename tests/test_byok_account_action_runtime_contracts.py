@@ -91,6 +91,9 @@ class ByokAccountActionSourceSafetyTests(unittest.TestCase):
             "PUBLISH_TEXT_POST",
             "FOLLOW_USER",
             "UNFOLLOW_USER",
+            "BROWSE_ONLINE_USERS",
+            "REQUEST_TEXT_MATCH",
+            "REQUEST_FRIEND",
         ):
             self.assertIn(action, constants)
         for forbidden in ("delete", "like", "http", "browser"):
@@ -135,8 +138,11 @@ try:
     from fastapi import HTTPException
 
     from bbw_agent.action_executor import (
+        BROWSE_ONLINE_USERS,
         FOLLOW_USER,
         PUBLISH_TEXT_POST,
+        REQUEST_FRIEND,
+        REQUEST_TEXT_MATCH,
         SEND_PRIVATE_MESSAGE,
         SUPPORTED_ACCOUNT_ACTIONS,
         UNFOLLOW_USER,
@@ -292,7 +298,7 @@ class ByokAccountActionRuntimeSafetyTests(unittest.TestCase):
         self.assertTrue(identity.match_pool_online_list_enabled)
         self.assertTrue(_identity_view(context).match_pool_online_list_enabled)
 
-    def test_only_four_actions_and_two_thousand_characters_are_accepted(self) -> None:
+    def test_only_fixed_social_actions_and_bounded_text_are_accepted(self) -> None:
         self.assertEqual(
             SUPPORTED_ACCOUNT_ACTIONS,
             (
@@ -300,6 +306,9 @@ class ByokAccountActionRuntimeSafetyTests(unittest.TestCase):
                 PUBLISH_TEXT_POST,
                 FOLLOW_USER,
                 UNFOLLOW_USER,
+                BROWSE_ONLINE_USERS,
+                REQUEST_TEXT_MATCH,
+                REQUEST_FRIEND,
             ),
         )
         context = _context()

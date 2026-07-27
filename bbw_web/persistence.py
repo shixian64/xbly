@@ -79,10 +79,9 @@ def _default_local_runtime_provider(
 
 
 def _default_runtime_provider(settings: Settings | None = None) -> RuntimeProvider:
-    """Resolve a provider without importing the protocol core in local-only mode."""
+    """Return the original APK-compatible provider for every product runtime."""
 
-    if str(getattr(settings, "upstream_auth_mode", "") or "").lower() == "local-only":
-        return _default_local_runtime_provider()
+    del settings
     from bbw_web.providers import LegacyBanghuaProvider
 
     return LegacyBanghuaProvider()
@@ -1779,28 +1778,14 @@ return 1
             stored_auth_source = str(
                 getattr(state, "auth_source", "provider") or "provider"
             ).strip().lower()
-            use_local_runtime = (
-                stored_auth_source == "web-local"
-                or str(
-                    getattr(self.settings, "upstream_auth_mode", "provider-first")
-                    or "provider-first"
-                ).strip().lower()
-                == "local-only"
+            if stored_auth_source != "provider":
+                sessions.revoke(sid, reason="provider_relogin_required")
+                return None
+            login, _password, token = self._decrypt_account(
+                account, include_password=False
             )
-            if use_local_runtime:
-                # Local sessions do not need an APK token or reversible login
-                # field.  A missing, expired or undecryptable legacy token must
-                # not prevent Web session recovery after provider retirement.
-                login = ""
-                token = ""
-                runtime_provider = self.local_runtime_provider
-            else:
-                login, _password, token = self._decrypt_account(
-                    account, include_password=False
-                )
-                runtime_provider = self.runtime_provider
             data = dict(account.device_data or {})
-            runtime = runtime_provider.create_runtime_from_state(
+            runtime = self.runtime_provider.create_runtime_from_state(
                 ProviderSessionState(
                     uid=str(account.upstream_uid or "0"),
                     token=token,
@@ -1827,11 +1812,7 @@ return 1
                 last_seen=state.last_seen_at.timestamp(),
                 persist_sessions=False,
             )
-            setattr(
-                web_user,
-                "authentication_source",
-                "local" if use_local_runtime else "provider",
-            )
+            setattr(web_user, "authentication_source", "provider")
             identity = UserIdentity(
                 user_id=user.id,
                 external_account_id=account.id,
@@ -1840,9 +1821,84 @@ return 1
                     user.match_pool_online_list_enabled
                 ),
                 nearby_custom_city_enabled=bool(user.nearby_custom_city_enabled),
-                auth_source=stored_auth_source,
+                auth_source="provider",
             )
         self._attach_runtime(web_user, identity)
+        return web_user
+
+    def restore_agent_web_user(
+        self,
+        owner_user_id: uuid.UUID,
+        external_account_id: uuid.UUID,
+        *,
+        expected_upstream_uid: str,
+    ) -> Optional[WebUser]:
+        """Create a short-lived provider runtime for one fully authorized Agent action.
+
+        The runtime is never exposed to the model and never restores a browser
+        cookie.  It uses the currently stored provider token, disables password
+        reauthentication and is closed immediately after the fixed action.
+        """
+
+        expected_uid = str(expected_upstream_uid or "").strip()
+        if not expected_uid:
+            return None
+        with session_scope() as db:
+            binding = ExternalAccountRepository(db).get_user_binding(
+                owner_user_id,
+                external_account_id=external_account_id,
+            )
+            if binding is None or binding[0].status != "active":
+                return None
+            user, account = binding
+            if str(account.provider or "") != str(self.runtime_provider.provider_id):
+                return None
+            if str(account.upstream_uid or "").strip() != expected_uid:
+                return None
+            login, _password, token = self._decrypt_account(
+                account, include_password=False
+            )
+            data = dict(account.device_data or {})
+            runtime = self.runtime_provider.create_runtime_from_state(
+                ProviderSessionState(
+                    uid=str(account.upstream_uid or "0"),
+                    token=token,
+                    phone=login,
+                    nickname=str(user.display_name or ""),
+                    user_role=str(data.get("user_role") or ""),
+                    rp_verify_time=str(data.get("rp_verify_time") or "0"),
+                    vip=str(data.get("vip") or "0"),
+                    svip=str(data.get("svip") or "0"),
+                    money=str(data.get("money") or "0"),
+                    portrait=str(data.get("portrait") or ""),
+                    user_sign=str(data.get("user_sign") or ""),
+                    login_id=str(data.get("login_id") or ""),
+                    raw_user=dict(user.profile or {}),
+                    device_data=data,
+                )
+            )
+            web_user = WebUser(
+                web_sid=f"agent-{owner_user_id}",
+                app=runtime.app,
+                native=runtime.native,
+                label=str(user.display_name or account.upstream_uid or ""),
+                created_at=time.time(),
+                last_seen=time.time(),
+                persist_sessions=False,
+            )
+            setattr(web_user, "authentication_source", "provider")
+            identity = UserIdentity(
+                user_id=user.id,
+                external_account_id=account.id,
+                upstream_uid=str(account.upstream_uid or ""),
+                match_pool_online_list_enabled=bool(
+                    user.match_pool_online_list_enabled
+                ),
+                nearby_custom_city_enabled=bool(user.nearby_custom_city_enabled),
+                auth_source="provider",
+            )
+        self._attach_runtime(web_user, identity)
+        web_user.app.client.reauth_callback = None
         return web_user
 
     def _attach_runtime(self, web_user: WebUser, identity: UserIdentity) -> None:
@@ -1905,10 +1961,14 @@ return 1
         if not sid:
             return None
         with session_scope() as db:
-            state = UserSessionService(
+            sessions = UserSessionService(
                 db, self.redis, self.settings, self.session_hmac_key
-            ).touch(sid)
+            )
+            state = sessions.touch(sid)
             if state is None:
+                return None
+            if str(getattr(state, "auth_source", "provider") or "").strip().lower() != "provider":
+                sessions.revoke(sid, reason="provider_relogin_required")
                 return None
             binding = ExternalAccountRepository(db).get_user_binding(
                 state.user_id,
@@ -1925,9 +1985,7 @@ return 1
                     user.match_pool_online_list_enabled
                 ),
                 nearby_custom_city_enabled=bool(user.nearby_custom_city_enabled),
-                auth_source=str(
-                    getattr(state, "auth_source", "provider") or "provider"
-                ),
+                auth_source="provider",
             )
 
     def revoke_session(self, sid: str, *, reason: str = "logout") -> bool:
@@ -1937,6 +1995,28 @@ return 1
             return UserSessionService(
                 db, self.redis, self.settings, self.session_hmac_key
             ).revoke(sid, reason=reason)
+
+    def revoke_non_provider_session(self, sid: str) -> bool:
+        """Revoke one historical Web-local session before product dispatch."""
+
+        if not sid:
+            return False
+        with session_scope() as db:
+            sessions = UserSessionService(
+                db, self.redis, self.settings, self.session_hmac_key
+            )
+            state = sessions.recover(sid)
+            if state is None:
+                return False
+            if (
+                str(getattr(state, "auth_source", "provider") or "")
+                .strip()
+                .lower()
+                == "provider"
+            ):
+                return False
+            sessions.revoke(sid, reason="provider_relogin_required")
+            return True
 
     def change_local_password(
         self,
@@ -1978,10 +2058,14 @@ return 1
         if not sid:
             return None
         with session_scope() as db:
-            state = UserSessionService(
+            sessions = UserSessionService(
                 db, self.redis, self.settings, self.session_hmac_key
-            ).touch(sid)
+            )
+            state = sessions.touch(sid)
             if state is None:
+                return None
+            if str(getattr(state, "auth_source", "provider") or "").strip().lower() != "provider":
+                sessions.revoke(sid, reason="provider_relogin_required")
                 return None
             binding = ExternalAccountRepository(db).get_user_binding(
                 state.user_id,
@@ -1998,9 +2082,7 @@ return 1
                     user.match_pool_online_list_enabled
                 ),
                 nearby_custom_city_enabled=bool(user.nearby_custom_city_enabled),
-                auth_source=str(
-                    getattr(state, "auth_source", "provider") or "provider"
-                ),
+                auth_source="provider",
             )
 
     def grant_message_peers(
@@ -2519,6 +2601,126 @@ return 1
                         result.tim_mirror.delivery_id,
                     )
         return result
+
+    def remember_agent_external_text_message(
+        self,
+        *,
+        identity: UserIdentity,
+        peer_upstream_uid: Any,
+        text_value: Any,
+        client_message_id: Any,
+        upstream_message_id: Any = "",
+        db: Any | None = None,
+    ) -> str:
+        """Persist an already accepted provider message in normal chat history."""
+
+        from bbw_web.jobs import _ingest_message, _load_owner_binding
+
+        peer = _message_peer_uid(peer_upstream_uid)
+        text_body = str(text_value or "").strip()
+        client_key = str(client_message_id or "").strip()
+        upstream_key = str(upstream_message_id or "").strip() or client_key
+        if not peer or not text_body or not client_key or not upstream_key:
+            raise ValueError("agent external message archive parameters are invalid")
+        now = utcnow()
+        report = {
+            "schema_version": 1,
+            "source": "agent",
+            "peer_uid": peer,
+            "direction": "outgoing",
+            "text": text_body,
+            "message_type": "text",
+            "object_name": "TIMTextElem",
+            "sent_at": now.isoformat(),
+            "observed_at": now.isoformat(),
+            "upstream_message_id": upstream_key,
+            "client_message_id": client_key,
+            "client_message_key": client_key,
+            "idempotency_key": client_key,
+        }
+        owns_transaction = db is None
+        with (session_scope() if owns_transaction else nullcontext(db)) as action_db:
+            user, account = _load_owner_binding(
+                action_db,
+                identity.user_id,
+                identity.external_account_id,
+            )
+            message, _created, _outbox_id = _ingest_message(
+                action_db,
+                settings=self.settings,
+                user=user,
+                account=account,
+                report=report,
+            )
+            return str(message.id)
+
+    def remember_agent_external_social_action(
+        self,
+        *,
+        identity: UserIdentity,
+        target_upstream_uid: Any,
+        action_type: str,
+        db: Any | None = None,
+    ) -> str:
+        """Persist one successful provider relationship action in normal state."""
+
+        target = _message_peer_uid(target_upstream_uid)
+        action = str(action_type or "").strip().lower()
+        if not target or target == _message_peer_uid(identity.upstream_uid):
+            raise ValueError("agent external social target is invalid")
+        mapping = {
+            "follow_user": ("follow", "active", None, "api.social.follow"),
+            "unfollow_user": ("follow", "inactive", "ended", "api.social.unfollow"),
+            "request_friend": (
+                "friend_request",
+                "active",
+                None,
+                "api.social.add-friend",
+            ),
+        }
+        if action not in mapping:
+            raise ValueError("agent external social action is unsupported")
+        kind, status, ended_marker, event_type = mapping[action]
+        now = utcnow()
+        with (session_scope() if db is None else nullcontext(db)) as action_db:
+            existing = action_db.scalar(
+                select(Relationship).where(
+                    Relationship.owner_user_id == identity.user_id,
+                    Relationship.provider == SOCIAL_RELATIONSHIP_PROVIDER,
+                    Relationship.subject_upstream_uid == target,
+                    Relationship.kind == kind,
+                )
+            )
+            metadata = dict(existing.extra_data or {}) if existing else {}
+            metadata.update(
+                {
+                    "server_owned": True,
+                    "source_path": (
+                        "/api/social/add-friend"
+                        if action == "request_friend"
+                        else "/api/social/follow"
+                        if action == "follow_user"
+                        else "/api/social/unfollow"
+                    ),
+                    "last_event_type": event_type,
+                    "agent_managed": True,
+                }
+            )
+            row = RelationshipRepository(action_db).upsert(
+                owner_user_id=identity.user_id,
+                provider=SOCIAL_RELATIONSHIP_PROVIDER,
+                subject_upstream_uid=target,
+                kind=kind,
+                status=status,
+                started_at=(
+                    existing.started_at
+                    if existing is not None
+                    else now
+                ),
+                ended_at=now if ended_marker else None,
+                extra_data=metadata,
+            )
+            return str(row.id)
 
     def mark_local_conversation_read(
         self,
@@ -3099,6 +3301,7 @@ return 1
         response_data: Mapping[str, Any],
         status: int,
         request_id: str,
+        db: Any | None = None,
     ) -> list[str]:
         return record_match_history_response(
             owner_user_id=identity.user_id,
@@ -3108,6 +3311,7 @@ return 1
             response_data=response_data,
             status=status,
             request_id=request_id,
+            db=db,
         )
 
     def match_history(

@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, aliased
 from bbw_prod.models import (
     AiAgentActionExecution,
     AiAgentAutonomyDailyUsage,
+    AiAgentDiscoveryCandidate,
     AiAgentAutonomySetting,
     AiAgentAutonomyTask,
     AiAgentExecutionSetting,
@@ -39,6 +40,9 @@ SUPPORTED_ACCOUNT_ACTION_TYPES = frozenset(
         "publish_text_post",
         "follow_user",
         "unfollow_user",
+        "browse_online_users",
+        "request_text_match",
+        "request_friend",
     }
 )
 SUPPORTED_ACTION_APPROVAL_SOURCES = frozenset(
@@ -53,6 +57,11 @@ AUTONOMY_TASK_TYPES = frozenset(
         "scheduled_post",
         "follow_target",
         "unfollow_target",
+        "browse_online",
+        "request_match",
+        "proactive_message",
+        "follow_discovered",
+        "request_friend",
     }
 )
 AUTONOMY_NOT_STARTED_STATUSES = frozenset(
@@ -66,8 +75,19 @@ AUTONOMY_TASK_ACTIONS = {
     "scheduled_post": "publish_text_post",
     "follow_target": "follow_user",
     "unfollow_target": "unfollow_user",
+    "browse_online": "browse_online_users",
+    "request_match": "request_text_match",
+    "proactive_message": "send_private_message",
+    "follow_discovered": "follow_user",
+    "request_friend": "request_friend",
 }
-AUTONOMY_MESSAGE_PROVIDER = "web-local"
+AUTONOMY_MESSAGE_PROVIDERS = frozenset({"web-local", "tim"})
+AUTONOMY_BROWSE_DAILY_LIMIT = 8
+AUTONOMY_MATCH_DAILY_LIMIT = 6
+AUTONOMY_OUTREACH_DAILY_LIMIT = 6
+AUTONOMY_DYNAMIC_CANDIDATE_TASKS = frozenset(
+    {"proactive_message", "follow_discovered", "request_friend"}
+)
 AGENT_RUNNING_TIMEOUT = timedelta(minutes=15)
 MODEL_RUN_TIMEOUT_FAILURE_CODE = "model_run_timeout"
 ACTION_EXECUTION_TIMEOUT_FAILURE_CODE = "execution_timeout_unknown"
@@ -108,6 +128,70 @@ def _normalize_stable_error_code(value: str, *, fallback: str) -> str:
     ):
         raise ValueError("invalid stable error code")
     return normalized
+
+
+def _autonomy_usage_category(task_type: str, action_type: str) -> str:
+    normalized_task = str(task_type or "").strip()
+    normalized_action = str(action_type or "").strip()
+    if normalized_task == "reply_to_message":
+        return "reply"
+    if normalized_task == "proactive_message":
+        return "outreach"
+    if normalized_task == "browse_online":
+        return "browse"
+    if normalized_task == "request_match":
+        return "match"
+    if normalized_action == "publish_text_post":
+        return "post"
+    return "relationship"
+
+
+def _autonomy_usage_count(usage: Any | None, category: str) -> int:
+    if usage is None:
+        return 0
+    field = {
+        "reply": "reply_actions",
+        "outreach": "outreach_actions",
+        "post": "post_actions",
+        "relationship": "relationship_actions",
+        "browse": "browse_actions",
+        "match": "match_actions",
+    }[category]
+    return int(getattr(usage, field, 0) or 0)
+
+
+def _increment_autonomy_usage(usage: Any, category: str) -> None:
+    field = {
+        "reply": "reply_actions",
+        "outreach": "outreach_actions",
+        "post": "post_actions",
+        "relationship": "relationship_actions",
+        "browse": "browse_actions",
+        "match": "match_actions",
+    }[category]
+    setattr(usage, field, int(getattr(usage, field, 0) or 0) + 1)
+
+
+def _setting_category_limit(setting: Any, category: str) -> int:
+    total = max(1, int(getattr(setting, "daily_total_limit", 1) or 1))
+    if category == "reply":
+        return min(total, int(getattr(setting, "daily_reply_limit", 0) or 0))
+    if category == "outreach":
+        return min(
+            total,
+            int(getattr(setting, "daily_reply_limit", 0) or 0),
+            AUTONOMY_OUTREACH_DAILY_LIMIT,
+        )
+    if category == "post":
+        return min(total, int(getattr(setting, "daily_post_limit", 0) or 0))
+    if category == "relationship":
+        return min(
+            total,
+            int(getattr(setting, "daily_relationship_limit", 0) or 0),
+        )
+    if category == "browse":
+        return min(total, AUTONOMY_BROWSE_DAILY_LIMIT)
+    return min(total, AUTONOMY_MATCH_DAILY_LIMIT)
 
 
 class ModelRunnerSystemSettingRepository:
@@ -1035,6 +1119,186 @@ class AgentAutonomyPreparedExecution:
     should_execute: bool
 
 
+class AgentDiscoveryCandidateRepository:
+    """Durable, owner-scoped results from Agent discovery scans."""
+
+    PROFILE_FIELDS = frozenset(
+        {
+            "uid",
+            "id",
+            "nickname",
+            "name",
+            "city",
+            "gender",
+            "sex",
+            "property",
+            "age",
+            "signature",
+            "online",
+            "is_online",
+            "is_following",
+            "is_friend",
+            "is_friend_apply",
+            "has_incoming_friend_apply",
+            "friend_apply_status",
+            "incoming_friend_apply_status",
+            "is_follower",
+            "is_fans",
+        }
+    )
+
+    def __init__(self, db: Session) -> None:
+        self.db = db
+
+    @staticmethod
+    def _target(value: object) -> str:
+        target = str(value or "").strip()
+        if (
+            not target
+            or len(target) > 128
+            or any(ord(character) < 33 for character in target)
+        ):
+            raise ValueError("invalid discovery candidate target")
+        return target
+
+    @classmethod
+    def _snapshot(cls, candidate: Mapping[str, Any], target: str) -> dict[str, Any]:
+        result: dict[str, Any] = {"uid": target, "id": target}
+        for field in cls.PROFILE_FIELDS:
+            value = candidate.get(field)
+            if value is None or isinstance(value, (bool, int, float)):
+                if field in candidate:
+                    result[field] = value
+            elif isinstance(value, str):
+                result[field] = value[:1000]
+        return result
+
+    def remember_many(
+        self,
+        *,
+        owner_user_id: uuid.UUID,
+        candidates: Sequence[Mapping[str, Any]],
+        source: str,
+        seen_at: datetime | None = None,
+    ) -> int:
+        normalized_source = str(source or "online").strip().lower()
+        if normalized_source not in {"online", "match"}:
+            raise ValueError("invalid discovery candidate source")
+        now = seen_at or utcnow()
+        remembered = 0
+        seen: set[str] = set()
+        for candidate in list(candidates)[:50]:
+            if not isinstance(candidate, Mapping):
+                continue
+            try:
+                target = self._target(
+                    candidate.get("uid")
+                    or candidate.get("user_id")
+                    or candidate.get("id")
+                )
+            except ValueError:
+                continue
+            if target in seen:
+                continue
+            seen.add(target)
+            display_name = str(
+                candidate.get("nickname") or candidate.get("name") or ""
+            ).strip()[:160]
+            statement = insert(AiAgentDiscoveryCandidate).values(
+                id=uuid.uuid4(),
+                owner_user_id=owner_user_id,
+                target_upstream_uid=target,
+                source=normalized_source,
+                display_name=display_name or None,
+                profile_snapshot=self._snapshot(candidate, target),
+                first_seen_at=now,
+                last_seen_at=now,
+                updated_at=now,
+            )
+            excluded = statement.excluded
+            self.db.execute(
+                statement.on_conflict_do_update(
+                    constraint="uq_ai_agent_discovery_candidates_owner_target",
+                    set_={
+                        "source": excluded.source,
+                        "display_name": excluded.display_name,
+                        "profile_snapshot": excluded.profile_snapshot,
+                        "last_seen_at": excluded.last_seen_at,
+                        "updated_at": excluded.updated_at,
+                    },
+                )
+            )
+            remembered += 1
+        return remembered
+
+    def get(
+        self,
+        *,
+        owner_user_id: uuid.UUID,
+        target_upstream_uid: str,
+        for_update: bool = False,
+    ) -> AiAgentDiscoveryCandidate | None:
+        stmt = select(AiAgentDiscoveryCandidate).where(
+            AiAgentDiscoveryCandidate.owner_user_id == owner_user_id,
+            AiAgentDiscoveryCandidate.target_upstream_uid
+            == self._target(target_upstream_uid),
+        )
+        if for_update:
+            stmt = stmt.with_for_update()
+        return self.db.scalar(stmt)
+
+    def list_recent_eligible(
+        self,
+        owner_user_id: uuid.UUID,
+        *,
+        seen_after: datetime,
+        interaction_before: datetime,
+        limit: int = 20,
+    ) -> list[AiAgentDiscoveryCandidate]:
+        return list(
+            self.db.scalars(
+                select(AiAgentDiscoveryCandidate)
+                .where(
+                    AiAgentDiscoveryCandidate.owner_user_id == owner_user_id,
+                    AiAgentDiscoveryCandidate.last_seen_at >= seen_after,
+                    or_(
+                        AiAgentDiscoveryCandidate.last_interaction_at.is_(None),
+                        AiAgentDiscoveryCandidate.last_interaction_at
+                        <= interaction_before,
+                    ),
+                )
+                .order_by(
+                    AiAgentDiscoveryCandidate.last_seen_at.desc(),
+                    AiAgentDiscoveryCandidate.id,
+                )
+                .limit(min(max(1, int(limit)), 50))
+            )
+        )
+
+    def mark_interaction(
+        self,
+        *,
+        owner_user_id: uuid.UUID,
+        target_upstream_uid: str,
+        action_type: str,
+        at: datetime,
+    ) -> bool:
+        result = self.db.execute(
+            update(AiAgentDiscoveryCandidate)
+            .where(
+                AiAgentDiscoveryCandidate.owner_user_id == owner_user_id,
+                AiAgentDiscoveryCandidate.target_upstream_uid
+                == self._target(target_upstream_uid),
+            )
+            .values(
+                last_interaction_at=at,
+                last_action_type=_normalize_action_type(action_type),
+                updated_at=at,
+            )
+        )
+        return bool(result.rowcount)
+
+
 class AgentAutonomySettingRepository:
     """Owner-scoped autonomous policy persistence; every default is disabled."""
 
@@ -1070,6 +1334,11 @@ class AgentAutonomySettingRepository:
             auto_reply_enabled=False,
             scheduled_post_enabled=False,
             managed_relationships_enabled=False,
+            discovery_enabled=False,
+            text_match_enabled=False,
+            proactive_message_enabled=False,
+            follow_discovered_enabled=False,
+            friend_request_enabled=False,
             allowed_actions=[],
             operation_brief="",
             managed_target_uids=[],
@@ -1082,6 +1351,7 @@ class AgentAutonomySettingRepository:
             daily_post_limit=1,
             daily_relationship_limit=5,
             post_interval_minutes=1440,
+            discovery_interval_minutes=30,
             consecutive_failure_limit=3,
             consecutive_failures=0,
             version=1,
@@ -1100,6 +1370,11 @@ class AgentAutonomySettingRepository:
         auto_reply_enabled: bool,
         scheduled_post_enabled: bool,
         managed_relationships_enabled: bool,
+        discovery_enabled: bool,
+        text_match_enabled: bool,
+        proactive_message_enabled: bool,
+        follow_discovered_enabled: bool,
+        friend_request_enabled: bool,
         allowed_actions: Sequence[str],
         operation_brief: str,
         managed_target_uids: Sequence[str],
@@ -1112,12 +1387,18 @@ class AgentAutonomySettingRepository:
         daily_post_limit: int,
         daily_relationship_limit: int,
         post_interval_minutes: int,
+        discovery_interval_minutes: int,
         consecutive_failure_limit: int,
     ) -> AiAgentAutonomySetting:
         enabled = bool(user_enabled)
         reply = bool(auto_reply_enabled) if enabled else False
         posts = bool(scheduled_post_enabled) if enabled else False
         relationships = bool(managed_relationships_enabled) if enabled else False
+        discovery = bool(discovery_enabled) if enabled else False
+        matching = bool(text_match_enabled) if enabled else False
+        outreach = bool(proactive_message_enabled) if enabled else False
+        discovered_follow = bool(follow_discovered_enabled) if enabled else False
+        friend_requests = bool(friend_request_enabled) if enabled else False
         actions = _normalize_allowed_actions(tuple(allowed_actions))
         targets = _normalize_autonomy_targets(tuple(managed_target_uids))
         brief = str(operation_brief or "").strip()
@@ -1134,6 +1415,7 @@ class AgentAutonomySettingRepository:
         post_limit = int(daily_post_limit)
         relationship_limit = int(daily_relationship_limit)
         post_interval = int(post_interval_minutes)
+        discovery_interval = int(discovery_interval_minutes)
         failure_limit = int(consecutive_failure_limit)
         if not 0 <= start_minute < 1440 or not 0 <= end_minute < 1440:
             raise ValueError("autonomous active time is invalid")
@@ -1149,9 +1431,20 @@ class AgentAutonomySettingRepository:
             raise ValueError("autonomous relationship daily limit is invalid")
         if not 60 <= post_interval <= 10080:
             raise ValueError("autonomous post interval is invalid")
+        if not 5 <= discovery_interval <= 1440:
+            raise ValueError("autonomous discovery interval is invalid")
         if not 1 <= failure_limit <= 20:
             raise ValueError("autonomous failure threshold is invalid")
-        if enabled and not (reply or posts or relationships):
+        if enabled and not (
+            reply
+            or posts
+            or relationships
+            or discovery
+            or matching
+            or outreach
+            or discovered_follow
+            or friend_requests
+        ):
             raise ValueError("enabled autonomy requires one capability")
         if reply and "send_private_message" not in actions:
             raise ValueError("auto reply requires send_private_message")
@@ -1171,6 +1464,22 @@ class AgentAutonomySettingRepository:
             raise ValueError("relationship automation requires exact targets")
         if relationships and relationship_limit < 1:
             raise ValueError("relationship automation requires a positive daily budget")
+        if discovery and "browse_online_users" not in actions:
+            raise ValueError("discovery automation requires browse_online_users")
+        if matching and "request_text_match" not in actions:
+            raise ValueError("matching automation requires request_text_match")
+        if outreach and "send_private_message" not in actions:
+            raise ValueError("proactive messaging requires send_private_message")
+        if outreach and reply_limit < 1:
+            raise ValueError("proactive messaging requires a positive daily budget")
+        if discovered_follow and "follow_user" not in actions:
+            raise ValueError("discovered follow requires follow_user")
+        if discovered_follow and relationship_limit < 1:
+            raise ValueError("discovered follow requires a positive daily budget")
+        if friend_requests and "request_friend" not in actions:
+            raise ValueError("friend requests require request_friend")
+        if friend_requests and relationship_limit < 1:
+            raise ValueError("friend requests require a positive daily budget")
 
         row = self.get_or_create(owner_user_id, for_update=True)
         values = {
@@ -1178,6 +1487,11 @@ class AgentAutonomySettingRepository:
             "auto_reply_enabled": reply,
             "scheduled_post_enabled": posts,
             "managed_relationships_enabled": relationships,
+            "discovery_enabled": discovery,
+            "text_match_enabled": matching,
+            "proactive_message_enabled": outreach,
+            "follow_discovered_enabled": discovered_follow,
+            "friend_request_enabled": friend_requests,
             "allowed_actions": actions,
             "operation_brief": brief,
             "managed_target_uids": targets,
@@ -1190,6 +1504,7 @@ class AgentAutonomySettingRepository:
             "daily_post_limit": post_limit,
             "daily_relationship_limit": relationship_limit,
             "post_interval_minutes": post_interval,
+            "discovery_interval_minutes": discovery_interval,
             "consecutive_failure_limit": failure_limit,
         }
         changed = any(getattr(row, name) != value for name, value in values.items())
@@ -1224,6 +1539,11 @@ class AgentAutonomySettingRepository:
             or row.auto_reply_enabled
             or row.scheduled_post_enabled
             or row.managed_relationships_enabled
+            or row.discovery_enabled
+            or row.text_match_enabled
+            or row.proactive_message_enabled
+            or row.follow_discovered_enabled
+            or row.friend_request_enabled
         )
         if not changed:
             return False
@@ -1232,6 +1552,11 @@ class AgentAutonomySettingRepository:
         row.auto_reply_enabled = False
         row.scheduled_post_enabled = False
         row.managed_relationships_enabled = False
+        row.discovery_enabled = False
+        row.text_match_enabled = False
+        row.proactive_message_enabled = False
+        row.follow_discovered_enabled = False
+        row.friend_request_enabled = False
         row.next_run_at = None
         row.halted_at = now
         row.halted_reason = _normalize_stable_error_code(
@@ -1258,6 +1583,11 @@ class AgentAutonomySettingRepository:
                     AiAgentAutonomySetting.auto_reply_enabled.is_(True),
                     AiAgentAutonomySetting.scheduled_post_enabled.is_(True),
                     AiAgentAutonomySetting.managed_relationships_enabled.is_(True),
+                    AiAgentAutonomySetting.discovery_enabled.is_(True),
+                    AiAgentAutonomySetting.text_match_enabled.is_(True),
+                    AiAgentAutonomySetting.proactive_message_enabled.is_(True),
+                    AiAgentAutonomySetting.follow_discovered_enabled.is_(True),
+                    AiAgentAutonomySetting.friend_request_enabled.is_(True),
                 )
             )
             .values(
@@ -1265,6 +1595,11 @@ class AgentAutonomySettingRepository:
                 auto_reply_enabled=False,
                 scheduled_post_enabled=False,
                 managed_relationships_enabled=False,
+                discovery_enabled=False,
+                text_match_enabled=False,
+                proactive_message_enabled=False,
+                follow_discovered_enabled=False,
+                friend_request_enabled=False,
                 next_run_at=None,
                 halted_at=now,
                 halted_reason=_normalize_stable_error_code(
@@ -1491,8 +1826,11 @@ class AgentAutonomyDailyUsageRepository:
                 usage_date=usage_date,
                 total_actions=0,
                 reply_actions=0,
+                outreach_actions=0,
                 post_actions=0,
                 relationship_actions=0,
+                browse_actions=0,
+                match_actions=0,
                 failed_actions=0,
                 outcome_unknown_actions=0,
             )
@@ -1635,6 +1973,71 @@ class AgentAutonomyTaskRepository:
                 .where(AiAgentAutonomyTask.owner_user_id == owner_user_id)
                 .order_by(AiAgentAutonomyTask.created_at.desc())
                 .limit(min(max(1, int(limit)), 100))
+            )
+        )
+
+    def has_open_task_for_target(
+        self,
+        *,
+        owner_user_id: uuid.UUID,
+        target_upstream_uid: str,
+    ) -> bool:
+        target = _normalize_autonomy_targets((target_upstream_uid,))[0]
+        return bool(
+            self.db.scalar(
+                select(AiAgentAutonomyTask.id)
+                .where(
+                    AiAgentAutonomyTask.owner_user_id == owner_user_id,
+                    AiAgentAutonomyTask.target_upstream_uid == target,
+                    ~AiAgentAutonomyTask.status.in_(
+                        tuple(AUTONOMY_TERMINAL_STATUSES)
+                    ),
+                )
+                .limit(1)
+            )
+        )
+
+    def has_open_task_type(
+        self,
+        *,
+        owner_user_id: uuid.UUID,
+        task_type: str,
+    ) -> bool:
+        normalized_type = str(task_type or "").strip()
+        if normalized_type not in AUTONOMY_TASK_TYPES:
+            raise ValueError("unsupported autonomous task type")
+        return bool(
+            self.db.scalar(
+                select(AiAgentAutonomyTask.id)
+                .where(
+                    AiAgentAutonomyTask.owner_user_id == owner_user_id,
+                    AiAgentAutonomyTask.task_type == normalized_type,
+                    ~AiAgentAutonomyTask.status.in_(
+                        tuple(AUTONOMY_TERMINAL_STATUSES)
+                    ),
+                )
+                .limit(1)
+            )
+        )
+
+    def target_is_blocked(
+        self,
+        *,
+        owner_user_id: uuid.UUID,
+        target_upstream_uid: str,
+    ) -> bool:
+        target = _normalize_autonomy_targets((target_upstream_uid,))[0]
+        return bool(
+            self.db.scalar(
+                select(Relationship.id)
+                .where(
+                    Relationship.owner_user_id == owner_user_id,
+                    Relationship.subject_upstream_uid == target,
+                    Relationship.kind.in_(("blacklist", "blacklisted_by")),
+                    Relationship.status == "active",
+                    Relationship.ended_at.is_(None),
+                )
+                .limit(1)
             )
         )
 
@@ -1817,15 +2220,12 @@ class AgentAutonomyTaskRepository:
             total_count = int(usage.total_actions or 0) if usage is not None else 0
             if total_count >= int(setting.daily_total_limit):
                 continue
-            if task.action_type == "send_private_message":
-                action_count = int(usage.reply_actions or 0) if usage else 0
-                action_limit = int(setting.daily_reply_limit)
-            elif task.action_type == "publish_text_post":
-                action_count = int(usage.post_actions or 0) if usage else 0
-                action_limit = int(setting.daily_post_limit)
-            else:
-                action_count = int(usage.relationship_actions or 0) if usage else 0
-                action_limit = int(setting.daily_relationship_limit)
+            category = _autonomy_usage_category(
+                str(task.task_type or ""),
+                str(task.action_type or ""),
+            )
+            action_count = _autonomy_usage_count(usage, category)
+            action_limit = _setting_category_limit(setting, category)
             if action_count >= action_limit:
                 continue
             selected.append(task.id)
@@ -1921,8 +2321,9 @@ class AgentAutonomyTaskRepository:
             .where(
                 Message.owner_user_id == owner_user_id,
                 Conversation.owner_user_id == owner_user_id,
-                Message.provider == AUTONOMY_MESSAGE_PROVIDER,
-                Conversation.provider == AUTONOMY_MESSAGE_PROVIDER,
+                Message.provider.in_(tuple(AUTONOMY_MESSAGE_PROVIDERS)),
+                Conversation.provider.in_(tuple(AUTONOMY_MESSAGE_PROVIDERS)),
+                Message.provider == Conversation.provider,
                 Conversation.peer_upstream_uid == str(peer_upstream_uid or "").strip(),
             )
             .order_by(Message.occurred_at.desc(), Message.id.desc())
@@ -1974,8 +2375,9 @@ class AgentAutonomyTaskRepository:
             func.coalesce(Message.extra_data.op("->>")("revoked"), "false")
         )
         conditions: list[Any] = [
-            Message.provider == AUTONOMY_MESSAGE_PROVIDER,
-            Conversation.provider == AUTONOMY_MESSAGE_PROVIDER,
+            Message.provider.in_(tuple(AUTONOMY_MESSAGE_PROVIDERS)),
+            Conversation.provider.in_(tuple(AUTONOMY_MESSAGE_PROVIDERS)),
+            Message.provider == Conversation.provider,
             Message.direction == "incoming",
             func.lower(Message.message_type).in_(("text", "timtextelem")),
             func.length(func.btrim(func.coalesce(Message.body, ""))) > 0,
@@ -2096,13 +2498,8 @@ class AgentAutonomyTaskRepository:
             return DispatchReservationDecision(
                 DispatchDecisionCode.DAILY_BUDGET_EXHAUSTED
             )
-        category_count = (
-            int(usage.reply_actions or 0)
-            if request.action_type == "send_private_message"
-            else int(usage.post_actions or 0)
-            if request.action_type == "publish_text_post"
-            else int(usage.relationship_actions or 0)
-        )
+        category = _autonomy_usage_category(task.task_type, task.action_type)
+        category_count = _autonomy_usage_count(usage, category)
         if category_count >= int(request.daily_action_limit):
             return DispatchReservationDecision(
                 DispatchDecisionCode.DAILY_BUDGET_EXHAUSTED
@@ -2119,12 +2516,7 @@ class AgentAutonomyTaskRepository:
                 )
 
         usage.total_actions = int(usage.total_actions or 0) + 1
-        if request.action_type == "send_private_message":
-            usage.reply_actions = int(usage.reply_actions or 0) + 1
-        elif request.action_type == "publish_text_post":
-            usage.post_actions = int(usage.post_actions or 0) + 1
-        else:
-            usage.relationship_actions = int(usage.relationship_actions or 0) + 1
+        _increment_autonomy_usage(usage, category)
         usage.last_action_at = request.now
         usage.updated_at = request.now
         setting.last_action_at = request.now
@@ -2207,15 +2599,6 @@ class AgentAutonomyTaskRepository:
             != str(request.expected_runner_configuration_fingerprint or "")
         ):
             return DispatchDecisionCode.POLICY_CHANGED
-        if request.action_type in {
-            "send_private_message",
-            "follow_user",
-            "unfollow_user",
-        } and (
-            not bool(snapshot.get("target_mapping_current", False))
-            or snapshot.get("target_external_account") is None
-        ):
-            return DispatchDecisionCode.ACTION_NOT_ALLOWED
         if setting.halted_at is not None or int(setting.consecutive_failures or 0) >= int(
             setting.consecutive_failure_limit
         ):
@@ -2225,9 +2608,36 @@ class AgentAutonomyTaskRepository:
             or request.action_type not in set(execution.allowed_actions or [])
         ):
             return DispatchDecisionCode.ACTION_NOT_ALLOWED
-        if request.action_type in {"follow_user", "unfollow_user"} and str(
-            request.target_upstream_uid or ""
-        ) not in set(setting.managed_target_uids or []):
+        feature_enabled = {
+            "reply_to_message": bool(setting.auto_reply_enabled),
+            "scheduled_post": bool(setting.scheduled_post_enabled),
+            "follow_target": bool(setting.managed_relationships_enabled),
+            "unfollow_target": bool(setting.managed_relationships_enabled),
+            "browse_online": bool(setting.discovery_enabled),
+            "request_match": bool(setting.text_match_enabled),
+            "proactive_message": bool(setting.proactive_message_enabled),
+            "follow_discovered": bool(setting.follow_discovered_enabled),
+            "request_friend": bool(setting.friend_request_enabled),
+        }.get(str(task.task_type or ""), False)
+        if not feature_enabled:
+            return DispatchDecisionCode.ACTION_NOT_ALLOWED
+        target = str(request.target_upstream_uid or "").strip()
+        if task.task_type in {"follow_target", "unfollow_target"} and target not in set(
+            setting.managed_target_uids or []
+        ):
+            return DispatchDecisionCode.ACTION_NOT_ALLOWED
+        if task.task_type in AUTONOMY_DYNAMIC_CANDIDATE_TASKS:
+            if not target or AgentDiscoveryCandidateRepository(self.db).get(
+                owner_user_id=task.owner_user_id,
+                target_upstream_uid=target,
+            ) is None:
+                return DispatchDecisionCode.ACTION_NOT_ALLOWED
+        if task.action_type in {
+            "send_private_message",
+            "follow_user",
+            "unfollow_user",
+            "request_friend",
+        } and not target:
             return DispatchDecisionCode.ACTION_NOT_ALLOWED
         return None
 
@@ -2421,6 +2831,26 @@ class AgentAutonomyTaskRepository:
         )()
         if self._dispatch_gate_code(task=task, request=request, snapshot=snapshot) is not None:
             return None
+        if task.task_type == "reply_to_message":
+            head = self.get_conversation_head(
+                owner_user_id=task.owner_user_id,
+                peer_upstream_uid=str(task.target_upstream_uid or ""),
+            )
+            if (
+                head is None
+                or head.message_identity != str(task.source_message_identity or "")
+                or head.direction != "incoming"
+                or head.revoked
+                or str(head.message_type or "").strip().lower()
+                not in {"text", "timtextelem"}
+                or not str(head.body or "").strip()
+            ):
+                return None
+        elif task.task_type == "proactive_message" and self.get_conversation_head(
+            owner_user_id=task.owner_user_id,
+            peer_upstream_uid=str(task.target_upstream_uid or ""),
+        ) is not None:
+            return None
         assert snapshot is not None
         setting = snapshot["autonomy_setting"]
         try:
@@ -2498,6 +2928,32 @@ class AgentAutonomyTaskRepository:
             .values(model_run_id=model_run_id, updated_at=utcnow())
         )
         return bool(result.rowcount)
+
+    def _record_success_state(
+        self,
+        *,
+        task: AiAgentAutonomyTask,
+        setting: AiAgentAutonomySetting | None,
+        now: datetime,
+    ) -> None:
+        if setting is not None:
+            if task.action_type == "publish_text_post":
+                setting.last_post_at = now
+            if task.task_type == "browse_online":
+                setting.last_discovery_at = now
+            elif task.task_type == "request_match":
+                setting.last_match_at = now
+            elif task.task_type == "proactive_message":
+                setting.last_outreach_at = now
+        if task.task_type in AUTONOMY_DYNAMIC_CANDIDATE_TASKS and str(
+            task.target_upstream_uid or ""
+        ).strip():
+            AgentDiscoveryCandidateRepository(self.db).mark_interaction(
+                owner_user_id=task.owner_user_id,
+                target_upstream_uid=str(task.target_upstream_uid or ""),
+                action_type=str(task.action_type or ""),
+                at=now,
+            )
 
     def finish_task(
         self,
@@ -2811,8 +3267,8 @@ class AgentAutonomyTaskRepository:
             setting.last_run_at = now
             if reset_failures:
                 setting.consecutive_failures = 0
-                if task.action_type == "publish_text_post":
-                    setting.last_post_at = now
+            if status == "succeeded":
+                self._record_success_state(task=task, setting=setting, now=now)
             if count_failure:
                 setting.consecutive_failures = int(setting.consecutive_failures or 0) + 1
             if force_halt or int(
@@ -3084,8 +3540,12 @@ class AgentAutonomyTaskRepository:
                 setting.last_run_at = now
                 if reset_failures:
                     setting.consecutive_failures = 0
-                    if task.action_type == "publish_text_post":
-                        setting.last_post_at = now
+                if task.status == "succeeded":
+                    self._record_success_state(
+                        task=task,
+                        setting=setting,
+                        now=now,
+                    )
                 if count_failure:
                     setting.consecutive_failures = int(
                         setting.consecutive_failures or 0

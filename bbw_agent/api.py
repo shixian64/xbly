@@ -149,7 +149,7 @@ class ReplyDraftBody(IdempotentRunBody):
 class ExecutionSettingsBody(_StrictBody):
     user_enabled: StrictBool = False
     auto_send_enabled: StrictBool = False
-    selected_actions: list[str] = Field(default_factory=list, max_length=4)
+    selected_actions: list[str] = Field(default_factory=list, max_length=7)
 
     @field_validator("selected_actions", mode="before")
     @classmethod
@@ -171,7 +171,12 @@ class AutonomySettingsBody(_StrictBody):
     auto_reply_enabled: StrictBool = False
     scheduled_post_enabled: StrictBool = False
     managed_relationships_enabled: StrictBool = False
-    allowed_actions: list[str] = Field(default_factory=list, max_length=4)
+    discovery_enabled: StrictBool = False
+    text_match_enabled: StrictBool = False
+    proactive_message_enabled: StrictBool = False
+    follow_discovered_enabled: StrictBool = False
+    friend_request_enabled: StrictBool = False
+    allowed_actions: list[str] = Field(default_factory=list, max_length=7)
     operation_brief: str = Field(default="", max_length=4000)
     managed_target_uids: list[str] = Field(default_factory=list, max_length=100)
     timezone: str = Field(default="UTC", min_length=1, max_length=64)
@@ -183,6 +188,7 @@ class AutonomySettingsBody(_StrictBody):
     daily_post_limit: int = Field(default=1, ge=0, le=20)
     daily_relationship_limit: int = Field(default=5, ge=0, le=100)
     post_interval_minutes: int = Field(default=1440, ge=60, le=10080)
+    discovery_interval_minutes: int = Field(default=30, ge=5, le=1440)
     consecutive_failure_limit: int = Field(default=3, ge=1, le=20)
 
     @field_validator("allowed_actions", mode="before")
@@ -1130,6 +1136,11 @@ def update_autonomy_settings(
                 auto_reply_enabled=body.auto_reply_enabled,
                 scheduled_post_enabled=body.scheduled_post_enabled,
                 managed_relationships_enabled=body.managed_relationships_enabled,
+                discovery_enabled=body.discovery_enabled,
+                text_match_enabled=body.text_match_enabled,
+                proactive_message_enabled=body.proactive_message_enabled,
+                follow_discovered_enabled=body.follow_discovered_enabled,
+                friend_request_enabled=body.friend_request_enabled,
                 allowed_actions=body.allowed_actions,
                 operation_brief=body.operation_brief,
                 managed_target_uids=body.managed_target_uids,
@@ -1142,6 +1153,7 @@ def update_autonomy_settings(
                 daily_post_limit=body.daily_post_limit,
                 daily_relationship_limit=body.daily_relationship_limit,
                 post_interval_minutes=body.post_interval_minutes,
+                discovery_interval_minutes=body.discovery_interval_minutes,
                 consecutive_failure_limit=body.consecutive_failure_limit,
             )
             changed = int(row.version) != previous_version
@@ -1214,6 +1226,15 @@ def update_autonomy_settings(
                     "managed_relationships_enabled": bool(
                         row.managed_relationships_enabled
                     ),
+                    "discovery_enabled": bool(row.discovery_enabled),
+                    "text_match_enabled": bool(row.text_match_enabled),
+                    "proactive_message_enabled": bool(
+                        row.proactive_message_enabled
+                    ),
+                    "follow_discovered_enabled": bool(
+                        row.follow_discovered_enabled
+                    ),
+                    "friend_request_enabled": bool(row.friend_request_enabled),
                     "allowed_actions": list(row.allowed_actions or []),
                     "managed_target_count": len(row.managed_target_uids or []),
                     "timezone": row.timezone,
@@ -1242,7 +1263,7 @@ def list_autonomy_tasks(
             if not access.visible:
                 raise AgentServiceError(
                     "autonomous_agent_not_available",
-                    "无人值守账号运营功能当前不可用",
+                    "自动社交 Agent 当前不可用",
                     status_code=404,
                 )
             tasks = AgentAutonomyTaskRepository(db).list_recent(

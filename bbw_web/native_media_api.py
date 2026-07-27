@@ -53,6 +53,17 @@ router = APIRouter(prefix="/api/im/media", tags=["media-native"])
 DEFAULT_COOKIE_NAME = "bbw_sid"
 
 
+def _reject_native_media_write() -> None:
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "WEB_LOCAL_MEDIA_DISABLED",
+            "message": "Web 本地消息媒体写入已停用，请使用 TIM SDK 或原 APK 闪图接口",
+            "retryable": False,
+        },
+    )
+
+
 def _cookie_name(request: Request) -> str:
     settings = getattr(request.app.state, "settings", None)
     return str(getattr(settings, "user_cookie_name", "") or DEFAULT_COOKIE_NAME)
@@ -309,6 +320,7 @@ def create_upload_intent(
     response: Response,
     body: dict[str, Any] = Body(default_factory=dict),
 ) -> dict[str, Any]:
+    _reject_native_media_write()
     _require_same_origin(request)
     identity = _identity(request)
     _rate_limit(request, identity, "upload-create", limit=30)
@@ -344,6 +356,7 @@ def complete_upload_intent(
     request: Request,
     response: Response,
 ) -> dict[str, Any]:
+    _reject_native_media_write()
     _require_same_origin(request)
     identity = _identity(request)
     _rate_limit(request, identity, "upload-complete", limit=30)
@@ -378,6 +391,7 @@ def send_media_message(
     response: Response,
     body: dict[str, Any] = Body(default_factory=dict),
 ) -> dict[str, Any]:
+    _reject_native_media_write()
     _require_same_origin(request)
     identity = _identity(request)
     _rate_limit(request, identity, "send", limit=60)
@@ -468,6 +482,7 @@ def revoke_media_attachment(
     request: Request,
     response: Response,
 ) -> dict[str, Any]:
+    _reject_native_media_write()
     _require_same_origin(request)
     identity = _identity(request)
     _rate_limit(request, identity, "revoke", limit=30)

@@ -371,6 +371,38 @@ class MatchHistoryPersistenceContractTests(unittest.TestCase):
         self.assertEqual(inserted[0]["subject_upstream_uid"], "9")
         self.assertNotIn("token", inserted[0]["details"]["profile"])
 
+    def test_agent_match_history_can_join_the_callers_transaction(self) -> None:
+        caller_db = object()
+        repositories: list[object] = []
+
+        class FakeRepository:
+            def __init__(self, db):
+                repositories.append(db)
+
+            def insert_idempotent(self, **_values):
+                return SimpleNamespace(id=uuid.uuid4())
+
+        with (
+            patch(
+                "bbw_web.match_history.session_scope",
+                side_effect=AssertionError("must use caller transaction"),
+            ),
+            patch("bbw_web.match_history.ActivityEventRepository", FakeRepository),
+        ):
+            peers = record_match_history_response(
+                owner_user_id=self.owner_user_id,
+                upstream_uid="42",
+                method="POST",
+                path="/api/match/online",
+                response_data={"ok": True, "items": [{"id": "9"}]},
+                status=200,
+                request_id="agent-match-1",
+                db=caller_db,
+            )
+
+        self.assertEqual(peers, ["9"])
+        self.assertEqual(repositories, [caller_db])
+
     def test_history_query_returns_owner_scoped_page_metadata(self) -> None:
         row = SimpleNamespace(
             id=uuid.uuid4(),
@@ -460,7 +492,8 @@ class MatchHistoryFrontendContractTests(unittest.TestCase):
             "def record_match_history_response(",
             "def load_match_history(",
             "ActivityEvent.owner_user_id == owner_user_id",
-            "repo = ActivityEventRepository(db)",
+            "repo = ActivityEventRepository(action_db)",
+            "nullcontext(db)",
             "repo.insert_idempotent(",
         ):
             self.assertIn(marker, history_module)

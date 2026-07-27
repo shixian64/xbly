@@ -171,6 +171,55 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
             downgrade,
         )
 
+    def test_0018_migration_adds_fixed_social_operations_and_candidate_state(self) -> None:
+        source = self.read(
+            "migrations/versions/20260727_0018_social_agent_operations.py"
+        )
+        self.assertIn('revision: str = "20260727_0018"', source)
+        self.assertIn(
+            'down_revision: Union[str, Sequence[str], None] = "20260725_0017"',
+            source,
+        )
+        upgrade = self.fragment(source, "def upgrade() -> None:", "def downgrade() -> None:")
+        for action in (
+            "browse_online_users",
+            "request_text_match",
+            "request_friend",
+        ):
+            self.assertIn(action, source)
+        for task_type in (
+            "browse_online",
+            "request_match",
+            "proactive_message",
+            "follow_discovered",
+            "request_friend",
+        ):
+            self.assertIn(task_type, source)
+        for field in (
+            "discovery_enabled",
+            "text_match_enabled",
+            "proactive_message_enabled",
+            "follow_discovered_enabled",
+            "friend_request_enabled",
+            "discovery_interval_minutes",
+            "last_discovery_at",
+            "last_match_at",
+            "last_outreach_at",
+            "browse_actions",
+            "match_actions",
+            "outreach_actions",
+        ):
+            self.assertIn(f'"{field}"', upgrade)
+        self.assertIn('"ai_agent_discovery_candidates"', upgrade)
+        self.assertIn(
+            'name="uq_ai_agent_discovery_candidates_owner_target"', upgrade
+        )
+        downgrade = source.split("def downgrade() -> None:", 1)[1]
+        self.assertIn('op.drop_table("ai_agent_discovery_candidates")', downgrade)
+        self.assertIn(
+            "reply_actions + post_actions + relationship_actions", downgrade
+        )
+
     def test_agent_run_type_constraints_use_alembic_complete_names(self) -> None:
         for migration in (
             "migrations/versions/20260725_0015_byok_account_actions.py",
@@ -505,43 +554,48 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         self.assertIsNone(run_node.args.kwarg)
         self.assertIn('parsed_task_id = _uuid(task_id, field="task_id")', run_source)
 
-    def test_unattended_executor_cannot_fall_back_to_external_channels(self) -> None:
+    def test_unattended_executor_uses_only_short_lived_provider_sessions(self) -> None:
         send, _ = self.function_source("bbw_agent/action_executor.py", "_send_private_message")
         publish, _ = self.function_source("bbw_agent/action_executor.py", "_publish_text_post")
         follow, _ = self.function_source("bbw_agent/action_executor.py", "_follow_action")
-        self.assertGreaterEqual(send.count("if not allow_external_fallback:"), 2)
-        self.assertGreaterEqual(follow.count("if not allow_external_fallback:"), 1)
-        self.assertIn('"external_channel_disabled"', send)
-        self.assertIn('"external_channel_disabled"', follow)
-        self.assertLess(
-            send.rfind("if not allow_external_fallback:"),
-            send.index("web_user = _provider_web_user"),
+        browse, _ = self.function_source("bbw_agent/action_executor.py", "_browse_online_users")
+        match, _ = self.function_source("bbw_agent/action_executor.py", "_request_text_match")
+        friend, _ = self.function_source("bbw_agent/action_executor.py", "_request_friend")
+        for operation in (send, publish, follow, browse, match, friend):
+            self.assertIn("_provider_web_user", operation)
+            self.assertIn("_close_restored_web_user", operation)
+
+        provider, _ = self.function_source(
+            "bbw_agent/action_executor.py", "_provider_web_user"
         )
-        self.assertLess(
-            follow.rfind("if not allow_external_fallback:"),
-            follow.index("web_user = _provider_web_user"),
-        )
-        self.assertNotIn("_provider_web_user", publish)
+        self.assertIn("restore_agent_web_user", provider)
+        self.assertIn("reauth_callback = None", provider)
+        self.assertIn('"external_session_unavailable"', provider)
+        self.assertIn('"external_channel_disabled"', provider)
 
         dispatcher, _ = self.function_source(
             "bbw_agent/runtime.py",
             "execute_fixed_action",
-            containing="allow_external_fallback=False",
+            containing="allow_external_fallback=True",
         )
-        self.assertIn("allow_external_fallback=False", dispatcher)
+        self.assertGreaterEqual(dispatcher.count("allow_external_fallback=True"), 2)
         context = self.fragment(
             self.read("bbw_agent/runtime.py"),
             "class AgentAutonomyDispatchContext:",
             "class AgentAutonomyDispatchGate(",
         )
         self.assertIn('return ""', context)
-        self.assertIn("Workers never restore or use a browser/provider session", context)
+        self.assertIn("never restore a browser cookie session", context)
+
+        worker, _ = self.function_source("bbw_web/jobs.py", "run_unattended_agent")
+        self.assertIn("short-lived provider session", worker)
+        self.assertNotIn("cookie", worker.lower())
 
     def test_side_effect_unknown_and_execution_updates_are_fail_closed(self) -> None:
         dispatcher, _ = self.function_source(
             "bbw_agent/runtime.py",
             "execute_fixed_action",
-            containing="allow_external_fallback=False",
+            containing="allow_external_fallback=True",
         )
         self.assertIn("invoked = False", dispatcher)
         self.assertGreaterEqual(dispatcher.count("invoked = True"), 2)
@@ -675,8 +729,8 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
             "request.expected_model_connection_id",
             "request.expected_runner_configuration_fingerprint",
             "runner_configuration_fingerprint(agent, connection)",
-            'snapshot.get("target_mapping_current", False)',
-            'snapshot.get("target_external_account") is None',
+            "task.task_type in AUTONOMY_DYNAMIC_CANDIDATE_TASKS",
+            "AgentDiscoveryCandidateRepository(self.db).get(",
         ):
             self.assertIn(binding, gate)
 
@@ -692,28 +746,37 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         ):
             self.assertIn(binding, permit)
 
-        send, _ = self.function_source(
-            "bbw_agent/action_executor.py",
-            "_send_private_message",
-        )
+        self.assertIn('if task.task_type == "reply_to_message":', permit)
         self.assertIn(
-            "expected_source_message_identity=expected_source_message_identity",
-            send,
+            'head.message_identity != str(task.source_message_identity or "")',
+            permit,
         )
+        self.assertIn('elif task.task_type == "proactive_message"', permit)
+
+        send, _ = self.function_source(
+            "bbw_agent/action_executor.py", "_send_private_message"
+        )
+        self.assertIn("web_user.native.tim_rest.send_text", send)
+        self.assertIn('cloud_custom_data={"origin": "agent"}', send)
+        self.assertIn("remember_agent_external_text_message", send)
         self.assertIn("db=db", send)
-        persistence, _ = self.function_source(
-            "bbw_web/persistence.py",
-            "send_local_text_message",
+
+        archive, _ = self.function_source(
+            "bbw_web/persistence.py", "remember_agent_external_text_message"
         )
-        self.assertIn("nullcontext(db)", persistence)
-        self.assertIn("if not owns_transaction:", persistence)
+        self.assertIn('"direction": "outgoing"', archive)
+        self.assertIn('"source": "agent"', archive)
+        self.assertIn("_ingest_message(", archive)
+        self.assertIn("nullcontext(db)", archive)
 
         head, _ = self.function_source(
             "bbw_agent/repositories.py",
             "get_conversation_head",
         )
-        self.assertIn("Message.provider == AUTONOMY_MESSAGE_PROVIDER", head)
-        self.assertIn("Conversation.provider == AUTONOMY_MESSAGE_PROVIDER", head)
+        self.assertIn("Message.provider.in_(tuple(AUTONOMY_MESSAGE_PROVIDERS))", head)
+        self.assertIn(
+            "Conversation.provider.in_(tuple(AUTONOMY_MESSAGE_PROVIDERS))", head
+        )
 
         execution_load, _ = self.function_source(
             "bbw_agent/services.py",
@@ -821,13 +884,33 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         self.assertIn("source.visible !== true", normalized)
         self.assertIn("background_enabled: source.background_enabled === true", normalized)
         self.assertIn('if (!autonomy?.visible) return "";', section)
-        self.assertIn("后台调度", presentation)
+        self.assertIn("自动社交 Agent 正在运行", presentation)
         self.assertIn('? "已自动停机"', presentation)
         self.assertLess(
             presentation.index('? "已自动停机"'),
             presentation.index('? "正在运行"'),
         )
         self.assertIn("agentAutonomySectionHtml(autonomy)", page)
+        for field in (
+            "discovery_enabled",
+            "text_match_enabled",
+            "follow_discovered_enabled",
+            "friend_request_enabled",
+            "proactive_message_enabled",
+            "auto_reply_enabled",
+        ):
+            self.assertIn(f'"{field}"', section)
+        self.assertIn('name="${name}"', section)
+        for hidden_budget in (
+            "daily_total_limit",
+            "daily_reply_limit",
+            "daily_post_limit",
+            "daily_relationship_limit",
+        ):
+            self.assertNotIn(f'name="{hidden_budget}"', section)
+        for statistic in ("浏览", "匹配", "上下文回复", "主动私信", "关系操作"):
+            self.assertIn(statistic, section)
+        self.assertNotIn("无人值守", page)
         self.assertIn('data-action="agent-refresh-autonomy-tasks"', section)
         self.assertIn('id="agent-autonomy-tasks"', section)
         self.assertIn('"/api/agent/autonomy/tasks?limit=50"', app)
@@ -854,6 +937,52 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
             (ROOT / "bbw_web/static/app.js").read_bytes()
         ).hexdigest()[:16]
         self.assertEqual(match.group(1), expected)
+
+        css_match = re.search(r'/static/app\.css\?v=([0-9a-f]{16})', index)
+        self.assertIsNotNone(css_match)
+        css_expected = hashlib.sha256(
+            (ROOT / "bbw_web/static/app.css").read_bytes()
+        ).hexdigest()[:16]
+        self.assertEqual(css_match.group(1), css_expected)
+
+    def test_external_social_results_are_archived_in_normal_domain_records(self) -> None:
+        match, _ = self.function_source(
+            "bbw_agent/action_executor.py", "_request_text_match"
+        )
+        for call in (
+            "_remember_discovery_candidates(",
+            "persistence.grant_message_peers(",
+            "persistence.remember_match_history_response(",
+        ):
+            self.assertIn(call, match)
+        self.assertIn("db=db", match)
+
+        follow, _ = self.function_source("bbw_agent/action_executor.py", "_follow_action")
+        friend, _ = self.function_source("bbw_agent/action_executor.py", "_request_friend")
+        self.assertIn("remember_agent_external_social_action", follow)
+        self.assertIn("remember_agent_external_social_action", friend)
+
+        persistence = self.read("bbw_web/persistence.py")
+        social_archive, _ = self.function_source(
+            "bbw_web/persistence.py", "remember_agent_external_social_action"
+        )
+        for relationship_kind in ('"follow"', '"friend_request"'):
+            self.assertIn(relationship_kind, social_archive)
+        self.assertIn("RelationshipRepository(action_db).upsert(", social_archive)
+        self.assertIn('"agent_managed": True', social_archive)
+        self.assertIn("remember_agent_external_text_message", persistence)
+
+        candidates = self.fragment(
+            self.read("bbw_agent/repositories.py"),
+            "class AgentDiscoveryCandidateRepository:",
+            "class AgentAutonomySettingRepository:",
+        )
+        self.assertIn(
+            'constraint="uq_ai_agent_discovery_candidates_owner_target"',
+            candidates,
+        )
+        self.assertIn("statement.on_conflict_do_update(", candidates)
+        self.assertIn("seen: set[str] = set()", candidates)
 
     def test_style_profile_uses_an_existing_timestamp_formatter(self) -> None:
         app = self.read("bbw_web/static/app.js")

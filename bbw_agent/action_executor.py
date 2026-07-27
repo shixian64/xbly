@@ -17,24 +17,37 @@ from typing import Any, Mapping, Protocol
 from sqlalchemy import select
 
 from bbw_prod.db import session_scope
-from bbw_prod.models import Relationship, User
-from bbw_prod.repositories import OperationOutboxRepository
+from bbw_prod.models import Relationship
 
 
 SEND_PRIVATE_MESSAGE = "send_private_message"
 PUBLISH_TEXT_POST = "publish_text_post"
 FOLLOW_USER = "follow_user"
 UNFOLLOW_USER = "unfollow_user"
+BROWSE_ONLINE_USERS = "browse_online_users"
+REQUEST_TEXT_MATCH = "request_text_match"
+REQUEST_FRIEND = "request_friend"
 
 SUPPORTED_ACCOUNT_ACTIONS = (
     SEND_PRIVATE_MESSAGE,
     PUBLISH_TEXT_POST,
     FOLLOW_USER,
     UNFOLLOW_USER,
+    BROWSE_ONLINE_USERS,
+    REQUEST_TEXT_MATCH,
+    REQUEST_FRIEND,
 )
 SUPPORTED_ACCOUNT_ACTION_SET = frozenset(SUPPORTED_ACCOUNT_ACTIONS)
 SUPPORTED_POST_VISIBILITIES = frozenset({"public", "followers", "private"})
 MAX_ACTION_TEXT_LENGTH = 2_000
+MAX_FRIEND_REQUEST_TEXT_LENGTH = 200
+DEFAULT_FRIEND_REQUEST_TEXT = "你好，想和你认识一下"
+TARGET_ACCOUNT_ACTIONS = frozenset(
+    {SEND_PRIVATE_MESSAGE, FOLLOW_USER, UNFOLLOW_USER, REQUEST_FRIEND}
+)
+CONTENT_ACCOUNT_ACTIONS = frozenset(
+    {SEND_PRIVATE_MESSAGE, PUBLISH_TEXT_POST, REQUEST_FRIEND}
+)
 
 
 class ActionIdentity(Protocol):
@@ -193,7 +206,7 @@ def normalize_account_action(
     target = ""
     normalized_content = ""
     normalized_visibility = "public"
-    if normalized_action in {SEND_PRIVATE_MESSAGE, FOLLOW_USER, UNFOLLOW_USER}:
+    if normalized_action in TARGET_ACCOUNT_ACTIONS:
         target = normalize_target(
             target_upstream_uid, actor_upstream_uid=identity.upstream_uid
         )
@@ -201,8 +214,23 @@ def normalize_account_action(
         raise AccountActionError(
             "action_parameters_invalid", "发布动态不接受目标用户编号"
         )
-    if normalized_action in {SEND_PRIVATE_MESSAGE, PUBLISH_TEXT_POST}:
-        normalized_content = normalize_content(content)
+    if normalized_action in CONTENT_ACCOUNT_ACTIONS:
+        if normalized_action == REQUEST_FRIEND:
+            normalized_content = str(content or "").strip() or DEFAULT_FRIEND_REQUEST_TEXT
+            if len(normalized_content) > MAX_FRIEND_REQUEST_TEXT_LENGTH:
+                raise AccountActionError(
+                    "friend_request_text_too_long",
+                    "好友申请内容不能超过两百字",
+                )
+            if any(
+                ord(character) < 32 and character not in {"\n", "\t"}
+                for character in normalized_content
+            ):
+                raise AccountActionError(
+                    "friend_request_text_invalid", "好友申请内容包含不允许的字符"
+                )
+        else:
+            normalized_content = normalize_content(content)
     elif str(content or "").strip():
         raise AccountActionError(
             "action_parameters_invalid", "该账号操作不接受文字内容"
@@ -252,7 +280,19 @@ def _close_restored_web_user(web_user: Any) -> None:
 
 def _provider_web_user(identity: ActionIdentity, persistence: Any) -> Any:
     try:
-        web_user = persistence.restore_web_user(identity.sid)
+        if str(getattr(identity, "sid", "") or ""):
+            web_user = persistence.restore_web_user(identity.sid)
+        else:
+            restore_agent = getattr(persistence, "restore_agent_web_user", None)
+            web_user = (
+                restore_agent(
+                    identity.owner_user_id,
+                    identity.external_account_id,
+                    expected_upstream_uid=str(identity.upstream_uid or ""),
+                )
+                if callable(restore_agent)
+                else None
+            )
     except Exception as exc:
         raise AccountActionError(
             "external_session_unavailable",
@@ -263,6 +303,8 @@ def _provider_web_user(identity: ActionIdentity, persistence: Any) -> Any:
         web_user is None
         or str(getattr(web_user, "internal_user_id", "") or "")
         != str(identity.owner_user_id)
+        or str(getattr(web_user, "external_account_id", "") or "")
+        != str(identity.external_account_id)
         or str(getattr(web_user.app.session, "uid", "") or "").strip()
         != str(identity.upstream_uid or "").strip()
     ):
@@ -297,6 +339,27 @@ def _provider_result_id(result: Any, *keys: str) -> str:
             if value:
                 return value[:256]
     return ""
+
+
+def _provider_outcome_unknown(result: Any) -> bool:
+    """Return whether a mutating provider call lacks a reliable outcome."""
+
+    try:
+        status = int(getattr(result, "status", 0) or 0)
+    except (TypeError, ValueError):
+        status = 0
+    try:
+        error_code = int(getattr(result, "error_code", 0) or 0)
+    except (TypeError, ValueError):
+        error_code = 0
+    code = str(getattr(result, "code", "") or "").strip().upper()
+    kind = str(getattr(result, "kind", "") or "").strip().lower()
+    return (
+        status < 0
+        or error_code < 0
+        or code in {"EMPTY_RESPONSE", "NULL_RESPONSE"}
+        or kind in {"empty", "unknown"}
+    )
 
 
 def _ensure_not_blocked(owner_user_id: uuid.UUID, target: str) -> None:
@@ -345,7 +408,7 @@ def preflight_account_action(
                 "当前账号没有向该用户主动发送私信的权限",
                 status_code=403,
             )
-    elif command.action_type in {FOLLOW_USER, UNFOLLOW_USER}:
+    elif command.action_type in {FOLLOW_USER, UNFOLLOW_USER, REQUEST_FRIEND}:
         _ensure_not_blocked(
             identity.owner_user_id, command.target_upstream_uid
         )
@@ -362,15 +425,7 @@ def _send_private_message(
     db: Any | None = None,
     allow_external_fallback: bool = True,
 ) -> AccountActionResult:
-    from bbw_web.messaging import (
-        InvalidLocalMessage,
-        LocalIdentityUnavailable,
-        LocalMessageBlocked,
-        LocalMessageForbidden,
-        LocalMessageIdempotencyConflict,
-        PeerNotMigrated,
-    )
-
+    del expected_source_message_identity, allow_external_fallback
     web_identity = _identity_view(identity)
     preflight_account_action(
         identity=identity,
@@ -385,58 +440,6 @@ def _send_private_message(
     )
 
     client_message_id = domain_idempotency_key(idempotency_key)
-    try:
-        result = persistence.send_local_text_message(
-            identity=web_identity,
-            peer=target,
-            client_message_id=client_message_id,
-            text_value=content,
-            quote={},
-            expected_source_message_identity=expected_source_message_identity,
-            db=db,
-        )
-        return AccountActionResult(
-            action_type=SEND_PRIVATE_MESSAGE,
-            result_id=str(result.message.id),
-            channel="web-local",
-            compatibility_sync=str(result.tim_mirror.status or "pending"),
-            created=bool(result.created),
-            idempotent_replay=not bool(result.created),
-        )
-    except PeerNotMigrated as exc:
-        if not allow_external_fallback:
-            raise AccountActionError(
-                "external_channel_disabled",
-                "无人值守任务只允许使用 Web 本地权威消息通道",
-                status_code=409,
-            ) from exc
-    except LocalMessageBlocked as exc:
-        raise AccountActionError(
-            "message_target_blocked", str(exc), status_code=403
-        ) from exc
-    except LocalMessageForbidden as exc:
-        raise AccountActionError(
-            "message_target_forbidden", str(exc), status_code=403
-        ) from exc
-    except (InvalidLocalMessage, LocalMessageIdempotencyConflict) as exc:
-        raise AccountActionError(
-            getattr(exc, "code", "message_invalid"), str(exc), status_code=409
-        ) from exc
-    except LocalIdentityUnavailable as exc:
-        if not allow_external_fallback:
-            raise AccountActionError(
-                "external_channel_disabled",
-                "无人值守任务只允许使用 Web 本地权威消息通道",
-                status_code=409,
-            ) from exc
-        # A provider-backed interactive request may still use the TIM server edge.
-    except Exception as exc:
-        raise AccountActionError(
-            "local_message_unavailable",
-            "Web 本地消息服务暂时不可用",
-            status_code=503,
-        ) from exc
-
     web_user = _provider_web_user(identity, persistence)
     try:
         try:
@@ -455,6 +458,13 @@ def _send_private_message(
                 outcome_unknown=True,
             ) from exc
         if not bool(getattr(result, "ok", False)):
+            if _provider_outcome_unknown(result):
+                raise AccountActionError(
+                    "external_message_outcome_unknown",
+                    "外部消息通道未返回明确结果，请先检查会话后再决定是否重试",
+                    status_code=502,
+                    outcome_unknown=True,
+                )
             raise AccountActionError(
                 "external_message_failed",
                 "外部消息通道发送失败",
@@ -463,9 +473,33 @@ def _send_private_message(
         result_id = _provider_result_id(
             result, "MsgKey", "msg_key", "MsgUID", "msg_uid"
         )
+        archived_result_id = ""
+        remember_outgoing = getattr(
+            persistence, "remember_agent_external_text_message", None
+        )
+        if callable(remember_outgoing):
+            try:
+                archived_result_id = str(
+                    remember_outgoing(
+                        identity=web_identity,
+                        peer_upstream_uid=target,
+                        text_value=content,
+                        client_message_id=client_message_id,
+                        upstream_message_id=result_id,
+                        db=db,
+                    )
+                    or ""
+                )
+            except Exception as exc:
+                raise AccountActionError(
+                    "external_message_archive_failed",
+                    "消息已发送，但消息记录未能安全保存，请先检查会话",
+                    status_code=500,
+                    outcome_unknown=True,
+                ) from exc
         return AccountActionResult(
             action_type=SEND_PRIVATE_MESSAGE,
-            result_id=result_id,
+            result_id=archived_result_id or result_id or client_message_id,
             channel="tim-rest",
             compatibility_sync="not_required",
             created=True,
@@ -484,49 +518,9 @@ def _follow_action(
     db: Any | None = None,
     allow_external_fallback: bool = True,
 ) -> AccountActionResult:
-    from bbw_web.native_social_api import dispatch_social_native
-
+    del idempotency_key, allow_external_fallback
     action_type = FOLLOW_USER if active else UNFOLLOW_USER
-    path = "/api/social/follow" if active else "/api/social/unfollow"
     _ensure_not_blocked(identity.owner_user_id, target)
-    response = dispatch_social_native(
-        _identity_view(identity),
-        "POST",
-        path,
-        {},
-        {"uid": target, "operation_id": domain_idempotency_key(idempotency_key)},
-        db=db,
-    )
-    if response is not None and response.status < 400 and response.payload.get("ok"):
-        return AccountActionResult(
-            action_type=action_type,
-            result_id=target,
-            channel="web-local",
-            compatibility_sync=str(
-                response.payload.get("compatibility_sync") or "pending"
-            ),
-            changed=bool(response.payload.get("changed")),
-            idempotent_replay=bool(response.payload.get("idempotent_replay")),
-        )
-    code = str((response.payload if response else {}).get("code") or "")
-    if code != "SOCIAL_TARGET_UNAVAILABLE":
-        status = int(response.status if response is not None else 500)
-        public_message = str(
-            (response.payload if response else {}).get("error")
-            or "社交关系操作失败"
-        )
-        raise AccountActionError(
-            code.lower() or "social_action_failed",
-            public_message,
-            status_code=status,
-        )
-    if not allow_external_fallback:
-        raise AccountActionError(
-            "external_channel_disabled",
-            "无人值守任务只允许使用 Web 本地权威社交关系通道",
-            status_code=409,
-        )
-
     web_user = _provider_web_user(identity, persistence)
     try:
         try:
@@ -543,14 +537,308 @@ def _follow_action(
                 outcome_unknown=True,
             ) from exc
         if not bool(getattr(result, "ok", False)):
+            if _provider_outcome_unknown(result):
+                raise AccountActionError(
+                    "external_social_outcome_unknown",
+                    "外部社交服务未返回明确结果，请先检查账号状态后再决定是否重试",
+                    status_code=502,
+                    outcome_unknown=True,
+                )
             raise AccountActionError(
                 "external_social_action_failed",
                 "外部社交关系操作失败",
                 status_code=502,
             )
+        archived_result_id = ""
+        remember_social = getattr(
+            persistence, "remember_agent_external_social_action", None
+        )
+        if callable(remember_social):
+            try:
+                archived_result_id = str(
+                    remember_social(
+                        identity=_identity_view(identity),
+                        target_upstream_uid=target,
+                        action_type=action_type,
+                        db=db,
+                    )
+                    or ""
+                )
+            except Exception as exc:
+                raise AccountActionError(
+                    "external_social_archive_failed",
+                    "关系操作已执行，但本地关系记录未能安全保存，请先检查关系状态",
+                    status_code=500,
+                    outcome_unknown=True,
+                ) from exc
         return AccountActionResult(
             action_type=action_type,
-            result_id=target,
+            result_id=archived_result_id or target,
+            channel="external-provider",
+            compatibility_sync="not_required",
+            changed=True,
+        )
+    finally:
+        _close_restored_web_user(web_user)
+
+
+def _candidate_items(value: object, *, actor_upstream_uid: str) -> list[dict[str, Any]]:
+    items = value if isinstance(value, list) else []
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in items:
+        if not isinstance(raw, Mapping):
+            continue
+        item = dict(raw)
+        target = str(
+            item.get("uid")
+            or item.get("user_id")
+            or item.get("id")
+            or ""
+        ).strip()
+        if (
+            not target
+            or target == str(actor_upstream_uid or "").strip()
+            or target in seen
+            or len(target) > 128
+            or any(ord(character) < 33 for character in target)
+        ):
+            continue
+        item["uid"] = target
+        item["id"] = target
+        seen.add(target)
+        normalized.append(item)
+    return normalized[:50]
+
+
+def _remember_discovery_candidates(
+    *,
+    identity: ActionIdentity,
+    items: list[dict[str, Any]],
+    source: str,
+    db: Any | None,
+) -> None:
+    from bbw_agent.repositories import AgentDiscoveryCandidateRepository
+
+    with (nullcontext(db) if db is not None else session_scope()) as action_db:
+        AgentDiscoveryCandidateRepository(action_db).remember_many(
+            owner_user_id=identity.owner_user_id,
+            candidates=items,
+            source=source,
+        )
+
+
+def _browse_online_users(
+    *,
+    identity: ActionIdentity,
+    persistence: Any,
+    db: Any | None,
+    allow_external_fallback: bool,
+) -> AccountActionResult:
+    del allow_external_fallback
+    from bbw_web.normalize import normalize_match_filters, normalize_users
+
+    web_user = _provider_web_user(identity, persistence)
+    try:
+        raw_user = getattr(web_user.app.session, "raw_user", {}) or {}
+        filters = normalize_match_filters(
+            raw_user if isinstance(raw_user, dict) else {}
+        )
+        try:
+            result = web_user.app.match.online_users(
+                id=web_user.app.session.uid,
+                gender=filters["gender"],
+                property=filters["property"],
+                pageIndex="1",
+            )
+        except Exception as exc:
+            raise AccountActionError(
+                "external_discovery_unavailable",
+                "在线列表暂时不可用",
+                status_code=502,
+            ) from exc
+        if not bool(getattr(result, "ok", False)):
+            raise AccountActionError(
+                "external_discovery_failed",
+                "原账号服务没有返回可用的在线列表",
+                status_code=502,
+            )
+        items = _candidate_items(
+            normalize_users(getattr(result, "data", None)),
+            actor_upstream_uid=str(identity.upstream_uid),
+        )
+    finally:
+        _close_restored_web_user(web_user)
+
+    _remember_discovery_candidates(
+        identity=identity,
+        items=items,
+        source="online",
+        db=db,
+    )
+    digest = hashlib.sha256(
+        "\n".join(str(item.get("uid") or "") for item in items).encode("utf-8")
+    ).hexdigest()[:24]
+    return AccountActionResult(
+        action_type=BROWSE_ONLINE_USERS,
+        result_id=f"browse:{len(items)}:{digest}",
+        channel="external-provider",
+        compatibility_sync="not_required",
+        created=True,
+    )
+
+
+def _request_text_match(
+    *,
+    identity: ActionIdentity,
+    persistence: Any,
+    idempotency_key: str,
+    db: Any | None,
+    allow_external_fallback: bool,
+) -> AccountActionResult:
+    del allow_external_fallback
+    request_id = domain_idempotency_key(idempotency_key)
+    web_user = _provider_web_user(identity, persistence)
+    try:
+        from bbw_web.normalize import normalize_match_filters, normalize_match_result
+
+        raw_user = getattr(web_user.app.session, "raw_user", {}) or {}
+        raw_user = raw_user if isinstance(raw_user, dict) else {}
+        filters = normalize_match_filters(raw_user)
+        try:
+            result = web_user.app.match.online_one(
+                id=web_user.app.session.uid,
+                gender=str(raw_user.get("sex") or ""),
+                property=str(raw_user.get("property") or ""),
+            )
+        except Exception as exc:
+            raise AccountActionError(
+                "external_match_outcome_unknown",
+                "在线匹配结果无法确认，请先检查匹配记录",
+                status_code=502,
+                outcome_unknown=True,
+            ) from exc
+        payload = normalize_match_result(result)
+        payload["filters"] = {
+            "gender": filters["gender"],
+            "property": filters["property"],
+            "properties": [filters["property"]],
+        }
+        if not payload.get("ok"):
+            if _provider_outcome_unknown(result):
+                raise AccountActionError(
+                    "external_match_outcome_unknown",
+                    "在线匹配结果无法确认，请先检查匹配记录",
+                    status_code=502,
+                    outcome_unknown=True,
+                )
+            raise AccountActionError(
+                "external_match_failed",
+                "在线匹配没有返回成功结果",
+                status_code=502,
+            )
+        items = _candidate_items(
+            list(payload.get("items") or []),
+            actor_upstream_uid=str(identity.upstream_uid),
+        )
+        payload["items"] = items
+        payload["list"] = items
+        payload["message_peers"] = [str(item.get("uid") or "") for item in items]
+        _remember_discovery_candidates(
+            identity=identity,
+            items=items,
+            source="match",
+            db=db,
+        )
+        if items:
+            persistence.grant_message_peers(
+                identity=_identity_view(identity),
+                peers=[str(item.get("uid") or "") for item in items],
+                kind="match",
+                evidence={"source": "agent", "request_id": request_id},
+            )
+        persistence.remember_match_history_response(
+            identity=_identity_view(identity),
+            method="POST",
+            path="/api/match/online",
+            response_data=payload,
+            status=200,
+            request_id=request_id,
+            db=db,
+        )
+        result_id = str(items[0].get("uid") or "") if items else request_id
+        return AccountActionResult(
+            action_type=REQUEST_TEXT_MATCH,
+            result_id=result_id,
+            channel="external-provider",
+            compatibility_sync="not_required",
+            created=True,
+        )
+    finally:
+        _close_restored_web_user(web_user)
+
+
+def _request_friend(
+    *,
+    identity: ActionIdentity,
+    persistence: Any,
+    target: str,
+    content: str,
+    idempotency_key: str,
+    db: Any | None,
+    allow_external_fallback: bool,
+) -> AccountActionResult:
+    del idempotency_key, allow_external_fallback
+    _ensure_not_blocked(identity.owner_user_id, target)
+    web_user = _provider_web_user(identity, persistence)
+    try:
+        try:
+            result = web_user.app.social.add_friend(target, content)
+        except Exception as exc:
+            raise AccountActionError(
+                "external_friend_request_outcome_unknown",
+                "好友申请结果无法确认，请先检查好友申请记录",
+                status_code=502,
+                outcome_unknown=True,
+            ) from exc
+        if not bool(getattr(result, "ok", False)):
+            if _provider_outcome_unknown(result):
+                raise AccountActionError(
+                    "external_friend_request_outcome_unknown",
+                    "好友申请结果无法确认，请先检查好友申请记录",
+                    status_code=502,
+                    outcome_unknown=True,
+                )
+            raise AccountActionError(
+                "external_friend_request_failed",
+                "原账号服务未接受好友申请",
+                status_code=502,
+            )
+        archived_result_id = ""
+        remember_social = getattr(
+            persistence, "remember_agent_external_social_action", None
+        )
+        if callable(remember_social):
+            try:
+                archived_result_id = str(
+                    remember_social(
+                        identity=_identity_view(identity),
+                        target_upstream_uid=target,
+                        action_type=REQUEST_FRIEND,
+                        db=db,
+                    )
+                    or ""
+                )
+            except Exception as exc:
+                raise AccountActionError(
+                    "external_friend_request_archive_failed",
+                    "好友申请已发送，但本地申请记录未能安全保存，请先检查关系状态",
+                    status_code=500,
+                    outcome_unknown=True,
+                ) from exc
+        return AccountActionResult(
+            action_type=REQUEST_FRIEND,
+            result_id=archived_result_id or target,
             channel="external-provider",
             compatibility_sync="not_required",
             changed=True,
@@ -562,88 +850,55 @@ def _follow_action(
 def _publish_text_post(
     *,
     identity: ActionIdentity,
+    persistence: Any,
     content: str,
     visibility: str,
     idempotency_key: str,
     db: Any | None = None,
 ) -> AccountActionResult:
-    from bbw_web.moments_native import (
-        LocalMomentsService,
-        SocialContentError,
-        SocialPrincipal,
-        SqlAlchemyCanonicalSocialStore,
-        SqlAlchemySocialPermissionPolicy,
-    )
-
+    del db
+    visibility_scope = {
+        "public": "公开",
+        "followers": "好友及粉丝可见",
+        "private": "仅自己可见",
+    }[visibility]
+    web_user = _provider_web_user(identity, persistence)
     try:
-        with (nullcontext(db) if db is not None else session_scope()) as action_db:
-            user = action_db.scalar(
-                select(User).where(
-                    User.id == identity.owner_user_id,
-                    User.status == "active",
-                    User.disabled_at.is_(None),
-                )
+        try:
+            result = web_user.app.social.publish_post(
+                content,
+                visibility_scope=visibility_scope,
             )
-            if user is None:
+        except Exception as exc:
+            raise AccountActionError(
+                "external_post_outcome_unknown",
+                "动态发布结果无法确认，请先检查原账号动态后再决定是否重试",
+                status_code=502,
+                outcome_unknown=True,
+            ) from exc
+        if not bool(getattr(result, "ok", False)):
+            if _provider_outcome_unknown(result):
                 raise AccountActionError(
-                    "account_unavailable", "当前账号已不可用", status_code=401
+                    "external_post_outcome_unknown",
+                    "动态发布结果无法确认，请先检查原账号动态后再决定是否重试",
+                    status_code=502,
+                    outcome_unknown=True,
                 )
-            principal = SocialPrincipal(
-                user_id=identity.owner_user_id,
-                upstream_uid=str(identity.upstream_uid),
-                display_name=str(user.display_name or ""),
+            raise AccountActionError(
+                "external_post_failed",
+                "原账号服务未接受动态发布请求",
+                status_code=502,
             )
-            result = LocalMomentsService(
-                SqlAlchemyCanonicalSocialStore(action_db),
-                SqlAlchemySocialPermissionPolicy(action_db),
-            ).publish(
-                principal=principal,
-                client_request_id=domain_idempotency_key(idempotency_key),
-                title="",
-                body=content,
-                media={},
-                visibility=visibility,
-                comment_policy="open",
-                hide_comments=False,
-                topics=(),
-            )
-            mirror = result.mirror
-            compatibility_sync = "not_required"
-            if mirror is not None:
-                outbox, _outbox_created = OperationOutboxRepository(
-                    action_db
-                ).enqueue(
-                    owner_user_id=principal.user_id,
-                    operation_type=f"compatibility.{mirror.operation_type}"[:96],
-                    aggregate_type=mirror.aggregate_type[:80],
-                    aggregate_id=mirror.aggregate_public_id[:128],
-                    idempotency_key=mirror.idempotency_key[:160],
-                    payload={
-                        "authority": "web-local",
-                        "aggregate_public_id": mirror.aggregate_public_id,
-                        "operation": mirror.operation_type,
-                        "payload": mirror.payload,
-                        "schema": 1,
-                    },
-                    status="pending",
-                )
-                compatibility_sync = str(outbox.status or "pending")
-            return AccountActionResult(
-                action_type=PUBLISH_TEXT_POST,
-                result_id=result.post.public_id,
-                channel="web-local",
-                compatibility_sync=compatibility_sync,
-                created=bool(result.created),
-                idempotent_replay=not bool(result.created),
-            )
-    except AccountActionError:
-        raise
-    except SocialContentError as exc:
-        raise AccountActionError(
-            getattr(exc, "code", "social_content_invalid"),
-            str(exc),
-            status_code=409 if "conflict" in getattr(exc, "code", "") else 400,
-        ) from exc
+        return AccountActionResult(
+            action_type=PUBLISH_TEXT_POST,
+            result_id=_provider_result_id(result, "postid", "post_id", "id")
+            or domain_idempotency_key(idempotency_key),
+            channel="external-provider",
+            compatibility_sync="not_required",
+            created=True,
+        )
+    finally:
+        _close_restored_web_user(web_user)
 
 
 def execute_account_action(
@@ -683,10 +938,36 @@ def execute_account_action(
     if command.action_type == PUBLISH_TEXT_POST:
         return _publish_text_post(
             identity=identity,
+            persistence=persistence,
             content=command.content,
             visibility=command.visibility,
             idempotency_key=command.idempotency_key,
             db=db,
+        )
+    if command.action_type == BROWSE_ONLINE_USERS:
+        return _browse_online_users(
+            identity=identity,
+            persistence=persistence,
+            db=db,
+            allow_external_fallback=allow_external_fallback,
+        )
+    if command.action_type == REQUEST_TEXT_MATCH:
+        return _request_text_match(
+            identity=identity,
+            persistence=persistence,
+            idempotency_key=command.idempotency_key,
+            db=db,
+            allow_external_fallback=allow_external_fallback,
+        )
+    if command.action_type == REQUEST_FRIEND:
+        return _request_friend(
+            identity=identity,
+            persistence=persistence,
+            target=command.target_upstream_uid,
+            content=command.content,
+            idempotency_key=command.idempotency_key,
+            db=db,
+            allow_external_fallback=allow_external_fallback,
         )
     return _follow_action(
         identity=identity,

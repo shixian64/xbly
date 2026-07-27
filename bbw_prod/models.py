@@ -856,7 +856,8 @@ class AiAgentExecutionSetting(
         CheckConstraint(
             "allowed_actions <@ "
             "'[\"send_private_message\", \"publish_text_post\", "
-            "\"follow_user\", \"unfollow_user\"]'::jsonb",
+            "\"follow_user\", \"unfollow_user\", \"browse_online_users\", "
+            "\"request_text_match\", \"request_friend\"]'::jsonb",
             name="ai_agent_execution_setting_allowed_actions_supported",
         ),
         CheckConstraint(
@@ -900,7 +901,8 @@ class AiAgentAutonomySetting(
         CheckConstraint(
             "allowed_actions <@ "
             "'[\"send_private_message\", \"publish_text_post\", "
-            "\"follow_user\", \"unfollow_user\"]'::jsonb",
+            "\"follow_user\", \"unfollow_user\", \"browse_online_users\", "
+            "\"request_text_match\", \"request_friend\"]'::jsonb",
             name="ai_agent_autonomy_allowed_actions_supported",
         ),
         CheckConstraint(
@@ -936,6 +938,10 @@ class AiAgentAutonomySetting(
             name="ai_agent_autonomy_post_interval_valid",
         ),
         CheckConstraint(
+            "discovery_interval_minutes BETWEEN 5 AND 1440",
+            name="ai_agent_autonomy_discovery_interval_valid",
+        ),
+        CheckConstraint(
             "consecutive_failure_limit BETWEEN 1 AND 20 "
             "AND consecutive_failures >= 0",
             name="ai_agent_autonomy_failure_limits_valid",
@@ -964,8 +970,35 @@ class AiAgentAutonomySetting(
             name="ai_agent_autonomy_relationship_requires_targets",
         ),
         CheckConstraint(
+            "NOT discovery_enabled OR "
+            "(user_enabled AND allowed_actions ? 'browse_online_users')",
+            name="ai_agent_autonomy_discovery_requires_action",
+        ),
+        CheckConstraint(
+            "NOT text_match_enabled OR "
+            "(user_enabled AND allowed_actions ? 'request_text_match')",
+            name="ai_agent_autonomy_match_requires_action",
+        ),
+        CheckConstraint(
+            "NOT proactive_message_enabled OR "
+            "(user_enabled AND allowed_actions ? 'send_private_message')",
+            name="ai_agent_autonomy_outreach_requires_action",
+        ),
+        CheckConstraint(
+            "NOT follow_discovered_enabled OR "
+            "(user_enabled AND allowed_actions ? 'follow_user')",
+            name="ai_agent_autonomy_discovered_follow_requires_action",
+        ),
+        CheckConstraint(
+            "NOT friend_request_enabled OR "
+            "(user_enabled AND allowed_actions ? 'request_friend')",
+            name="ai_agent_autonomy_friend_request_requires_action",
+        ),
+        CheckConstraint(
             "NOT user_enabled OR auto_reply_enabled OR scheduled_post_enabled "
-            "OR managed_relationships_enabled",
+            "OR managed_relationships_enabled OR discovery_enabled OR "
+            "text_match_enabled OR proactive_message_enabled OR "
+            "follow_discovered_enabled OR friend_request_enabled",
             name="ai_agent_autonomy_enabled_has_capability",
         ),
         Index(
@@ -994,6 +1027,21 @@ class AiAgentAutonomySetting(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
     managed_relationships_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    discovery_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    text_match_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    proactive_message_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    follow_discovered_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    friend_request_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
     allowed_actions: Mapped[list[str]] = mapped_column(
@@ -1032,6 +1080,9 @@ class AiAgentAutonomySetting(
     post_interval_minutes: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1440, server_default="1440"
     )
+    discovery_interval_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=30, server_default="30"
+    )
     consecutive_failure_limit: Mapped[int] = mapped_column(
         SmallInteger, nullable=False, default=3, server_default="3"
     )
@@ -1044,6 +1095,9 @@ class AiAgentAutonomySetting(
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_action_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_post_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_discovery_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_match_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_outreach_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     halted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     halted_reason: Mapped[str | None] = mapped_column(String(160))
     version: Mapped[int] = mapped_column(
@@ -1106,7 +1160,8 @@ class AiAgentRun(UUIDPrimaryKeyMixin, TimestampMixin, SerializableMixin, Base):
         CheckConstraint(
             "run_type IN "
             "('connection_test', 'style_analysis', 'reply_draft', 'reply_send', "
-            "'autonomous_reply', 'autonomous_post', 'autonomous_plan')",
+            "'autonomous_reply', 'autonomous_post', 'autonomous_plan', "
+            "'autonomous_outreach')",
             name="ai_agent_run_type_valid",
         ),
         CheckConstraint(
@@ -1194,7 +1249,8 @@ class AiAgentActionExecution(
         CheckConstraint(
             "action_type IN "
             "('send_private_message', 'publish_text_post', "
-            "'follow_user', 'unfollow_user')",
+            "'follow_user', 'unfollow_user', 'browse_online_users', "
+            "'request_text_match', 'request_friend')",
             name="ai_agent_action_execution_type_valid",
         ),
         CheckConstraint(
@@ -1327,19 +1383,27 @@ class AiAgentAutonomyTask(
         ),
         CheckConstraint(
             "task_type IN ('reply_to_message', 'scheduled_post', "
-            "'follow_target', 'unfollow_target')",
+            "'follow_target', 'unfollow_target', 'browse_online', "
+            "'request_match', 'proactive_message', 'follow_discovered', "
+            "'request_friend')",
             name="ai_agent_autonomy_task_type_valid",
         ),
         CheckConstraint(
             "action_type IN ('send_private_message', 'publish_text_post', "
-            "'follow_user', 'unfollow_user')",
+            "'follow_user', 'unfollow_user', 'browse_online_users', "
+            "'request_text_match', 'request_friend')",
             name="ai_agent_autonomy_task_action_valid",
         ),
         CheckConstraint(
             "(task_type = 'reply_to_message' AND action_type = 'send_private_message') OR "
             "(task_type = 'scheduled_post' AND action_type = 'publish_text_post') OR "
             "(task_type = 'follow_target' AND action_type = 'follow_user') OR "
-            "(task_type = 'unfollow_target' AND action_type = 'unfollow_user')",
+            "(task_type = 'unfollow_target' AND action_type = 'unfollow_user') OR "
+            "(task_type = 'browse_online' AND action_type = 'browse_online_users') OR "
+            "(task_type = 'request_match' AND action_type = 'request_text_match') OR "
+            "(task_type = 'proactive_message' AND action_type = 'send_private_message') OR "
+            "(task_type = 'follow_discovered' AND action_type = 'follow_user') OR "
+            "(task_type = 'request_friend' AND action_type = 'request_friend')",
             name="ai_agent_autonomy_task_action_matches_type",
         ),
         CheckConstraint(
@@ -1473,6 +1537,66 @@ class AiAgentAutonomyTask(
     )
 
 
+class AiAgentDiscoveryCandidate(
+    UUIDPrimaryKeyMixin, TimestampMixin, SerializableMixin, Base
+):
+    """Agent 最近浏览到的候选用户，用于受控后续互动。"""
+
+    __tablename__ = "ai_agent_discovery_candidates"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_user_id",
+            "target_upstream_uid",
+            name="uq_ai_agent_discovery_candidates_owner_target",
+        ),
+        CheckConstraint(
+            "source IN ('online', 'match')",
+            name="ai_agent_discovery_candidate_source_valid",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(profile_snapshot) = 'object'",
+            name="ai_agent_discovery_candidate_profile_object",
+        ),
+        Index(
+            "ix_ai_agent_discovery_candidates_owner_seen",
+            "owner_user_id",
+            "last_seen_at",
+        ),
+        Index(
+            "ix_ai_agent_discovery_candidates_owner_interaction",
+            "owner_user_id",
+            "last_interaction_at",
+        ),
+    )
+    __sensitive_fields__ = frozenset(
+        {"target_upstream_uid", "display_name", "profile_snapshot"}
+    )
+
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    target_upstream_uid: Mapped[str] = mapped_column(String(128), nullable=False)
+    source: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="online", server_default="online"
+    )
+    display_name: Mapped[str | None] = mapped_column(String(160))
+    profile_snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=JSON_EMPTY_OBJECT
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
+    )
+    last_interaction_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    last_action_type: Mapped[str | None] = mapped_column(String(64))
+
+
 class AiAgentAutonomyDailyUsage(
     UUIDPrimaryKeyMixin, TimestampMixin, SerializableMixin, Base
 ):
@@ -1487,12 +1611,14 @@ class AiAgentAutonomyDailyUsage(
         ),
         CheckConstraint(
             "total_actions >= 0 AND reply_actions >= 0 AND post_actions >= 0 "
-            "AND relationship_actions >= 0 AND failed_actions >= 0 "
-            "AND outcome_unknown_actions >= 0",
+            "AND relationship_actions >= 0 AND browse_actions >= 0 "
+            "AND match_actions >= 0 AND outreach_actions >= 0 "
+            "AND failed_actions >= 0 AND outcome_unknown_actions >= 0",
             name="ai_agent_autonomy_daily_usage_nonnegative",
         ),
         CheckConstraint(
-            "total_actions = reply_actions + post_actions + relationship_actions",
+            "total_actions = reply_actions + outreach_actions + post_actions + "
+            "relationship_actions + browse_actions + match_actions",
             name="ai_agent_autonomy_daily_usage_total_consistent",
         ),
         Index(
@@ -1514,10 +1640,19 @@ class AiAgentAutonomyDailyUsage(
     reply_actions: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
+    outreach_actions: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     post_actions: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
     relationship_actions: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    browse_actions: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    match_actions: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
     failed_actions: Mapped[int] = mapped_column(

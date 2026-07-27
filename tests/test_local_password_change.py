@@ -143,49 +143,24 @@ class LocalPasswordChangeServiceTests(unittest.TestCase):
 
 
 class LocalPasswordChangeApiContractTests(unittest.TestCase):
-    def test_authenticated_endpoint_uses_argon_gate_and_revokes_sessions(self) -> None:
+    def test_authenticated_endpoint_is_disabled_for_provider_owned_passwords(self) -> None:
         api_source = (ROOT / "bbw_web" / "api.py").read_text(encoding="utf-8-sig")
-        persistence_source = (ROOT / "bbw_web" / "persistence.py").read_text(
-            encoding="utf-8-sig"
-        )
         block = api_source.split('path == "/api/auth/password"', 1)[1].split(
             "message_policy_allowed_peers", 1
         )[0]
 
-        self.assertIn("_auth_json_request_error(request)", block)
-        self.assertIn("_local_password_auth_gate(request)", block)
-        self.assertIn('upstream_auth_mode != "local-only"', block)
-        self.assertIn('"LOCAL_PASSWORD_CHANGE_REQUIRES_LOCAL_ONLY"', block)
-        self.assertIn("persistence.change_local_password(", block)
-        self.assertIn('"CURRENT_PASSWORD_REJECTED"', block)
-        self.assertIn('"PASSWORD_POLICY_REJECTED"', block)
-        self.assertIn('"compatibility_sync": "not_available"', block)
-        self.assertIn("legacy.STORE.drop(sid)", block)
-        self.assertIn("revoke_all_for_user", persistence_source)
-        self.assertNotIn("password_encrypted =", persistence_source.split(
-            "def change_local_password", 1
-        )[1].split("def require_identity", 1)[0])
+        self.assertIn('"LOCAL_PASSWORD_DISABLED"', block)
+        self.assertIn("登录密码由原账号服务管理", block)
+        self.assertNotIn("persistence.change_local_password(", block)
 
-    def test_profile_page_exposes_password_change_without_persisting_secrets(self) -> None:
+    def test_profile_page_does_not_expose_local_password_change(self) -> None:
         source = (ROOT / "bbw_web" / "static" / "app.js").read_text(
             encoding="utf-8-sig"
         )
-        form = source.split('data-form="local-password-change"', 1)[1].split(
-            "</form>", 1
-        )[0]
-        handler = source.split('if (kind === "local-password-change")', 1)[1].split(
-            'if (kind === "referral-set")', 1
-        )[0]
 
-        self.assertIn('autocomplete="current-password"', form)
-        self.assertEqual(form.count('autocomplete="new-password"'), 2)
-        self.assertIn('api("/api/auth/password"', handler)
-        self.assertIn("S.localPasswordChangeEnabled", source)
-        self.assertIn('"local_password_change"', source)
-        self.assertIn("newPassword !== confirmPassword", handler)
-        self.assertIn("logout({ notifyServer: false })", handler)
-        self.assertNotIn("localStorage", handler)
-        self.assertNotIn("sessionStorage", handler)
+        self.assertNotIn('data-form="local-password-change"', source)
+        self.assertNotIn('if (kind === "local-password-change")', source)
+        self.assertNotIn('api("/api/auth/password"', source)
 
 
 if __name__ == "__main__":

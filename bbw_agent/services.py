@@ -31,7 +31,10 @@ from bbw_prod.models import (
 
 from .model_gateway import ModelGatewayError, validate_api_key, validate_model_base_url
 from .action_executor import (
+    BROWSE_ONLINE_USERS,
     FOLLOW_USER,
+    REQUEST_FRIEND,
+    REQUEST_TEXT_MATCH,
     SEND_PRIVATE_MESSAGE,
     SUPPORTED_ACCOUNT_ACTIONS,
     UNFOLLOW_USER,
@@ -321,7 +324,7 @@ def require_autonomy_access(
     if not access.visible:
         raise AgentServiceError(
             "autonomous_agent_not_available",
-            "无人值守账号运营功能当前不可用",
+            "自动社交 Agent 当前不可用",
             status_code=404,
         )
     return access
@@ -462,6 +465,11 @@ def autonomy_public(
         "auto_reply_enabled": False,
         "scheduled_post_enabled": False,
         "managed_relationships_enabled": False,
+        "discovery_enabled": False,
+        "text_match_enabled": False,
+        "proactive_message_enabled": False,
+        "follow_discovered_enabled": False,
+        "friend_request_enabled": False,
         "allowed_actions": [],
         "operation_brief": "",
         "managed_target_uids": [],
@@ -474,6 +482,7 @@ def autonomy_public(
         "daily_post_limit": 1,
         "daily_relationship_limit": 5,
         "post_interval_minutes": 1440,
+        "discovery_interval_minutes": 30,
         "consecutive_failure_limit": 3,
         "consecutive_failures": 0,
         "halted": False,
@@ -482,6 +491,9 @@ def autonomy_public(
         "last_run_at": None,
         "last_action_at": None,
         "last_post_at": None,
+        "last_discovery_at": None,
+        "last_match_at": None,
+        "last_outreach_at": None,
         "recent_tasks": [],
         "usage_today": None,
     }
@@ -503,6 +515,15 @@ def autonomy_public(
                 "managed_relationships_enabled": bool(
                     row.managed_relationships_enabled
                 ),
+                "discovery_enabled": bool(row.discovery_enabled),
+                "text_match_enabled": bool(row.text_match_enabled),
+                "proactive_message_enabled": bool(
+                    row.proactive_message_enabled
+                ),
+                "follow_discovered_enabled": bool(
+                    row.follow_discovered_enabled
+                ),
+                "friend_request_enabled": bool(row.friend_request_enabled),
                 "allowed_actions": [
                     action
                     for action in SUPPORTED_ACCOUNT_ACTIONS
@@ -522,6 +543,9 @@ def autonomy_public(
                 "daily_post_limit": int(row.daily_post_limit),
                 "daily_relationship_limit": int(row.daily_relationship_limit),
                 "post_interval_minutes": int(row.post_interval_minutes),
+                "discovery_interval_minutes": int(
+                    row.discovery_interval_minutes
+                ),
                 "consecutive_failure_limit": int(row.consecutive_failure_limit),
                 "consecutive_failures": int(row.consecutive_failures),
                 "halted": row.halted_at is not None,
@@ -532,6 +556,19 @@ def autonomy_public(
                     row.last_action_at.isoformat() if row.last_action_at else None
                 ),
                 "last_post_at": row.last_post_at.isoformat() if row.last_post_at else None,
+                "last_discovery_at": (
+                    row.last_discovery_at.isoformat()
+                    if row.last_discovery_at
+                    else None
+                ),
+                "last_match_at": (
+                    row.last_match_at.isoformat() if row.last_match_at else None
+                ),
+                "last_outreach_at": (
+                    row.last_outreach_at.isoformat()
+                    if row.last_outreach_at
+                    else None
+                ),
                 "updated_at": row.updated_at.isoformat(),
             }
         )
@@ -549,8 +586,11 @@ def autonomy_public(
             "usage_date": usage_today.usage_date.isoformat(),
             "total_actions": int(usage_today.total_actions),
             "reply_actions": int(usage_today.reply_actions),
+            "outreach_actions": int(usage_today.outreach_actions),
             "post_actions": int(usage_today.post_actions),
             "relationship_actions": int(usage_today.relationship_actions),
+            "browse_actions": int(usage_today.browse_actions),
+            "match_actions": int(usage_today.match_actions),
             "failed_actions": int(usage_today.failed_actions),
             "outcome_unknown_actions": int(usage_today.outcome_unknown_actions),
         }
@@ -887,6 +927,11 @@ def save_autonomy_settings(
     auto_reply_enabled: bool,
     scheduled_post_enabled: bool,
     managed_relationships_enabled: bool,
+    discovery_enabled: bool,
+    text_match_enabled: bool,
+    proactive_message_enabled: bool,
+    follow_discovered_enabled: bool,
+    friend_request_enabled: bool,
     allowed_actions: Sequence[str],
     operation_brief: str,
     managed_target_uids: Sequence[str],
@@ -899,6 +944,7 @@ def save_autonomy_settings(
     daily_post_limit: int,
     daily_relationship_limit: int,
     post_interval_minutes: int,
+    discovery_interval_minutes: int,
     consecutive_failure_limit: int,
 ) -> AiAgentAutonomySetting:
     require_autonomy_access(db, owner_user_id, for_update=True)
@@ -947,19 +993,21 @@ def save_autonomy_settings(
     if unknown:
         raise AgentServiceError(
             "autonomy_action_not_supported",
-            "无人值守配置包含不受支持的账号操作",
+            "自动社交设置包含不受支持的账号操作",
         )
     execution_actions = set(execution.allowed_actions or []) if execution else set()
     if enabled and not selected_set <= execution_actions:
         raise AgentServiceError(
             "autonomy_action_not_authorized",
-            "无人值守操作必须先在个人账号动作白名单中授权",
+            "自动社交操作必须先在个人账号动作白名单中授权",
             status_code=409,
         )
-    if enabled and auto_reply_enabled and not bool(execution.auto_send_enabled):
+    if enabled and (
+        auto_reply_enabled or proactive_message_enabled
+    ) and not bool(execution.auto_send_enabled):
         raise AgentServiceError(
             "autonomy_auto_send_required",
-            "自动回复要求先打开私信自动发送授权",
+            "自动回复和主动私信要求先打开私信自动发送授权",
             status_code=409,
         )
     if enabled and auto_reply_enabled and int(daily_reply_limit) < 1:
@@ -972,6 +1020,11 @@ def save_autonomy_settings(
             "autonomy_post_budget_required",
             "开启自动动态时，每日动态上限至少为一",
         )
+    if enabled and proactive_message_enabled and int(daily_reply_limit) < 1:
+        raise AgentServiceError(
+            "autonomy_outreach_budget_required",
+            "开启主动私信时，私信安全上限必须大于零",
+        )
     if (
         enabled
         and managed_relationships_enabled
@@ -980,6 +1033,15 @@ def save_autonomy_settings(
         raise AgentServiceError(
             "autonomy_relationship_budget_required",
             "开启关系管理时，每日关系动作上限至少为一",
+        )
+    if (
+        enabled
+        and (follow_discovered_enabled or friend_request_enabled)
+        and int(daily_relationship_limit) < 1
+    ):
+        raise AgentServiceError(
+            "autonomy_social_budget_required",
+            "开启自动关系操作时，关系安全上限必须大于零",
         )
     if (
         enabled
@@ -998,13 +1060,27 @@ def save_autonomy_settings(
             "自动发布动态前请填写运营目标和内容边界",
             status_code=409,
         )
+    feature_requirements = (
+        (discovery_enabled, BROWSE_ONLINE_USERS, "浏览在线用户"),
+        (text_match_enabled, REQUEST_TEXT_MATCH, "在线匹配"),
+        (proactive_message_enabled, SEND_PRIVATE_MESSAGE, "主动私信"),
+        (follow_discovered_enabled, FOLLOW_USER, "关注候选用户"),
+        (friend_request_enabled, REQUEST_FRIEND, "发送好友申请"),
+    )
+    for feature_enabled, action, label in feature_requirements:
+        if enabled and feature_enabled and action not in selected_set:
+            raise AgentServiceError(
+                "autonomy_action_required",
+                f"开启{label}前需要授权对应账号动作",
+                status_code=409,
+            )
     zone = str(timezone or "UTC").strip()
     try:
         ZoneInfo(zone)
     except ZoneInfoNotFoundError as exc:
         raise AgentServiceError(
             "autonomy_timezone_invalid",
-            "无人值守运行时区无效",
+            "自动社交运行时区无效",
         ) from exc
     own_uid = str(account.upstream_uid or "").strip() if account else ""
     targets = [str(value or "").strip() for value in managed_target_uids]
@@ -1041,6 +1117,11 @@ def save_autonomy_settings(
             auto_reply_enabled=bool(auto_reply_enabled),
             scheduled_post_enabled=bool(scheduled_post_enabled),
             managed_relationships_enabled=bool(managed_relationships_enabled),
+            discovery_enabled=bool(discovery_enabled),
+            text_match_enabled=bool(text_match_enabled),
+            proactive_message_enabled=bool(proactive_message_enabled),
+            follow_discovered_enabled=bool(follow_discovered_enabled),
+            friend_request_enabled=bool(friend_request_enabled),
             allowed_actions=normalized_actions,
             operation_brief=brief,
             managed_target_uids=targets,
@@ -1053,12 +1134,13 @@ def save_autonomy_settings(
             daily_post_limit=int(daily_post_limit),
             daily_relationship_limit=int(daily_relationship_limit),
             post_interval_minutes=int(post_interval_minutes),
+            discovery_interval_minutes=int(discovery_interval_minutes),
             consecutive_failure_limit=int(consecutive_failure_limit),
         )
     except (TypeError, ValueError) as exc:
         raise AgentServiceError(
             "autonomy_settings_invalid",
-            "无人值守账号运营设置无效",
+            "自动社交 Agent 设置无效",
         ) from exc
 
 

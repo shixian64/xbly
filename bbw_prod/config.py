@@ -72,6 +72,23 @@ def _env_choice(name: str, default: str, *, choices: tuple[str, ...]) -> str:
     return value
 
 
+def _upstream_auth_mode_from_env() -> str:
+    """Keep the original APK provider as the only product authentication authority.
+
+    ``provider-first`` was the previously documented default.  Accept it as a
+    deployment-compatible alias so existing environments do not fail during a
+    rolling update, but normalize the runtime value to ``provider-only``.  The
+    retired ``local-only`` mode is deliberately rejected by ``_env_choice``.
+    """
+
+    _env_choice(
+        "BBW_UPSTREAM_AUTH_MODE",
+        "provider-only",
+        choices=("provider-only", "provider-first"),
+    )
+    return "provider-only"
+
+
 def _read_secret_source(value: str | None, file_path: str | None, *, name: str) -> bytes:
     if value and file_path:
         raise ConfigurationError(f"configure only one of {name} and {name}_FILE")
@@ -307,11 +324,7 @@ class Settings:
             turnstile_site_key=os.getenv("BBW_TURNSTILE_SITE_KEY"),
             turnstile_secret_key_file=os.getenv("BBW_TURNSTILE_SECRET_KEY_FILE"),
             invite_required=_env_bool("BBW_INVITE_REQUIRED", True),
-            upstream_auth_mode=_env_choice(
-                "BBW_UPSTREAM_AUTH_MODE",
-                "provider-first",
-                choices=("provider-first", "local-only"),
-            ),
+            upstream_auth_mode=_upstream_auth_mode_from_env(),
             compatibility_mode=_env_choice(
                 "BBW_COMPATIBILITY_MODE",
                 "enabled",
@@ -510,6 +523,13 @@ class Settings:
         return token
 
     def validate(self) -> None:
+        if str(self.upstream_auth_mode or "").strip().lower() not in {
+            "provider-only",
+            "provider-first",
+        }:
+            raise ConfigurationError(
+                "BBW_UPSTREAM_AUTH_MODE must keep the original APK provider enabled"
+            )
         if not self.database_url.startswith(("postgresql://", "postgresql+")):
             raise ConfigurationError("BBW_DATABASE_URL must use PostgreSQL")
         if self.environment.strip().lower() in {"prod", "production"}:

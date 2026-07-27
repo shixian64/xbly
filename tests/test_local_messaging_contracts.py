@@ -833,7 +833,7 @@ class CanonicalMessagingSchemaTests(unittest.TestCase):
         self.assertIn('projection.body = None', source)
         self.assertIn('projection_metadata["recalled_text"] = recalled_text', source)
 
-    def test_revoke_is_exposed_through_persistence_and_canonical_route(self) -> None:
+    def test_local_revoke_service_is_retained_but_not_wired_to_product_route(self) -> None:
         persistence = (ROOT / "bbw_web" / "persistence.py").read_text(
             encoding="utf-8"
         )
@@ -844,7 +844,9 @@ class CanonicalMessagingSchemaTests(unittest.TestCase):
         self.assertIn("def revoke_local_text_message(", persistence)
         self.assertIn(").revoke_text(", persistence)
         self.assertIn('"bbw_web.jobs.mirror_tim_message_delivery"', persistence)
-        self.assertIn("local_text_revoker=local_text_revoker", api)
+        self.assertIn("local_text_sender=None", api)
+        self.assertIn("local_text_revoker=None", api)
+        self.assertIn("local_read_marker=None", api)
         for field in (
             '"provider": "web-local"',
             '"canonical_message_id": message_id',

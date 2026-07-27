@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from contextlib import nullcontext
 from typing import Any, Mapping
 
 from sqlalchemy import func, select
@@ -110,6 +111,7 @@ def record_match_history_response(
     response_data: Mapping[str, Any],
     status: int,
     request_id: str,
+    db: Any | None = None,
 ) -> list[str]:
     """Persist every valid peer in one successful server match response."""
 
@@ -148,8 +150,8 @@ def record_match_history_response(
         if isinstance(filters, Mapping)
         else {}
     )
-    with session_scope() as db:
-        repo = ActivityEventRepository(db)
+    with (nullcontext(db) if db is not None else session_scope()) as action_db:
+        repo = ActivityEventRepository(action_db)
         for index, (peer, item) in enumerate(matched_items):
             repo.insert_idempotent(
                 owner_user_id=owner_user_id,

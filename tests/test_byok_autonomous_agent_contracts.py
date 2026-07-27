@@ -16,10 +16,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bbw_agent.autonomous import (  # noqa: E402
+    BROWSE_ONLINE_USERS,
     FIXED_ACCOUNT_ACTIONS,
     FOLLOW_USER,
+    MAX_AUTONOMOUS_FRIEND_REQUEST_LENGTH,
     MAX_AUTONOMOUS_TEXT_LENGTH,
     PUBLISH_TEXT_POST,
+    REQUEST_FRIEND,
+    REQUEST_TEXT_MATCH,
     SEND_PRIVATE_MESSAGE,
     UNFOLLOW_USER,
     AgentAutonomyAccess,
@@ -99,6 +103,11 @@ def policy(**changes: object) -> AgentAutonomyPolicy:
         "auto_reply_enabled": True,
         "scheduled_posts_enabled": True,
         "relationship_actions_enabled": True,
+        "discovery_enabled": True,
+        "text_match_enabled": True,
+        "proactive_message_enabled": True,
+        "follow_discovered_enabled": True,
+        "friend_request_enabled": True,
         "selected_actions": frozenset(FIXED_ACCOUNT_ACTIONS),
         "target_allowlist": frozenset({"allowed-peer"}),
         "daily_total_limit": 8,
@@ -107,6 +116,9 @@ def policy(**changes: object) -> AgentAutonomyPolicy:
             (PUBLISH_TEXT_POST, 2),
             (FOLLOW_USER, 1),
             (UNFOLLOW_USER, 1),
+            (BROWSE_ONLINE_USERS, 8),
+            (REQUEST_TEXT_MATCH, 6),
+            (REQUEST_FRIEND, 1),
         ),
         "minimum_interval_seconds": 120,
         "quiet_timezone": "UTC",
@@ -128,6 +140,11 @@ def task(
         AutonomyTaskType.SCHEDULED_POST: PUBLISH_TEXT_POST,
         AutonomyTaskType.FOLLOW_TARGET: FOLLOW_USER,
         AutonomyTaskType.UNFOLLOW_TARGET: UNFOLLOW_USER,
+        AutonomyTaskType.BROWSE_ONLINE: BROWSE_ONLINE_USERS,
+        AutonomyTaskType.REQUEST_MATCH: REQUEST_TEXT_MATCH,
+        AutonomyTaskType.PROACTIVE_MESSAGE: SEND_PRIVATE_MESSAGE,
+        AutonomyTaskType.FOLLOW_DISCOVERED: FOLLOW_USER,
+        AutonomyTaskType.REQUEST_FRIEND: REQUEST_FRIEND,
     }[task_type]
     values: dict[str, object] = {
         "id": TASK_ID,
@@ -162,10 +179,32 @@ def task(
     elif task_type in {
         AutonomyTaskType.FOLLOW_TARGET,
         AutonomyTaskType.UNFOLLOW_TARGET,
+        AutonomyTaskType.FOLLOW_DISCOVERED,
     }:
         values.update(
             {
                 "target_upstream_uid": "allowed-peer",
+                "source_message_identity": "",
+            }
+        )
+    elif task_type in {
+        AutonomyTaskType.PROACTIVE_MESSAGE,
+        AutonomyTaskType.REQUEST_FRIEND,
+    }:
+        values.update(
+            {
+                "target_upstream_uid": "peer-uid",
+                "source_message_identity": "",
+                "generation_instruction": "自然认识新朋友",
+            }
+        )
+    elif task_type in {
+        AutonomyTaskType.BROWSE_ONLINE,
+        AutonomyTaskType.REQUEST_MATCH,
+    }:
+        values.update(
+            {
+                "target_upstream_uid": "",
                 "source_message_identity": "",
             }
         )
@@ -309,6 +348,8 @@ class FakeModel(AgentAutonomyModelRunner):
         self.text = text
         self.reply_calls = 0
         self.post_calls = 0
+        self.proactive_calls = 0
+        self.friend_request_calls = 0
         self.error: Exception | None = None
 
     def generate_reply(
@@ -323,6 +364,39 @@ class FakeModel(AgentAutonomyModelRunner):
         if self.error is not None:
             raise self.error
         return GeneratedText(self.text)
+
+    def generate_proactive_message(
+        self,
+        *,
+        task: AgentAutonomyTask,
+        policy: AgentAutonomyPolicy,
+    ) -> GeneratedText:
+        del task, policy
+        self.proactive_calls += 1
+        if self.error is not None:
+            raise self.error
+        return GeneratedText(self.text)
+
+    def generate_friend_request(
+        self,
+        *,
+        task: AgentAutonomyTask,
+        policy: AgentAutonomyPolicy,
+    ) -> GeneratedText:
+        del task, policy
+        self.friend_request_calls += 1
+        if self.error is not None:
+            raise self.error
+        return GeneratedText(self.text)
+
+    @property
+    def total_calls(self) -> int:
+        return (
+            self.reply_calls
+            + self.post_calls
+            + self.proactive_calls
+            + self.friend_request_calls
+        )
 
     def generate_scheduled_post(
         self,
@@ -388,6 +462,9 @@ class AgentAutonomyPolicyContractTests(unittest.TestCase):
                 PUBLISH_TEXT_POST,
                 FOLLOW_USER,
                 UNFOLLOW_USER,
+                BROWSE_ONLINE_USERS,
+                REQUEST_TEXT_MATCH,
+                REQUEST_FRIEND,
             ),
         )
         forbidden_fields = {
@@ -572,6 +649,82 @@ class AgentAutonomyOrchestratorTests(unittest.TestCase):
         self.assertEqual(command.visibility, "public")
         self.assertLessEqual(len(command.content), MAX_AUTONOMOUS_TEXT_LENGTH)
 
+    def test_browse_and_match_dispatch_without_calling_the_model(self) -> None:
+        for task_type, expected_action in (
+            (AutonomyTaskType.BROWSE_ONLINE, BROWSE_ONLINE_USERS),
+            (AutonomyTaskType.REQUEST_MATCH, REQUEST_TEXT_MATCH),
+        ):
+            with self.subTest(task_type=task_type.value):
+                store = FakeStore(task(task_type), policy())
+                runner, model, dispatcher = orchestrator(store)
+
+                result = runner.run_once(worker_id="worker-001")
+
+                self.assertEqual(result.status, AutonomyTaskStatus.SUCCEEDED.value)
+                self.assertEqual(model.total_calls, 0)
+                self.assertEqual(dispatcher.commands[0][0].action_type, expected_action)
+
+    def test_proactive_message_is_sent_once_only_when_no_conversation_exists(self) -> None:
+        clean_store = FakeStore(
+            task(AutonomyTaskType.PROACTIVE_MESSAGE),
+            policy(),
+            heads=[None, None],
+        )
+        clean_runner, clean_model, clean_dispatcher = orchestrator(clean_store)
+
+        sent = clean_runner.run_once(worker_id="worker-001")
+
+        self.assertEqual(sent.status, AutonomyTaskStatus.SUCCEEDED.value)
+        self.assertEqual(clean_model.proactive_calls, 1)
+        self.assertEqual(clean_dispatcher.commands[0][0].action_type, SEND_PRIVATE_MESSAGE)
+        self.assertEqual(clean_dispatcher.commands[0][0].content, clean_model.text)
+
+        for head, code in (
+            (inbound_head(), "inbound_message_requires_reply"),
+            (
+                replace(inbound_head(), direction=MessageDirection.OUTGOING),
+                "proactive_message_already_sent",
+            ),
+        ):
+            with self.subTest(code=code):
+                store = FakeStore(
+                    task(AutonomyTaskType.PROACTIVE_MESSAGE),
+                    policy(),
+                    heads=[head],
+                )
+                runner, model, dispatcher = orchestrator(store)
+
+                result = runner.run_once(worker_id="worker-001")
+
+                self.assertEqual(result.status, AutonomyTaskStatus.STALE.value)
+                self.assertEqual(result.code, code)
+                self.assertEqual(model.total_calls, 0)
+                self.assertEqual(dispatcher.commands, [])
+
+    def test_friend_request_uses_bounded_model_text(self) -> None:
+        allowed_text = "很高兴认识你"
+        store = FakeStore(task(AutonomyTaskType.REQUEST_FRIEND), policy())
+        runner, model, dispatcher = orchestrator(store, model=FakeModel(allowed_text))
+
+        result = runner.run_once(worker_id="worker-001")
+
+        self.assertEqual(result.status, AutonomyTaskStatus.SUCCEEDED.value)
+        self.assertEqual(model.friend_request_calls, 1)
+        self.assertEqual(dispatcher.commands[0][0].action_type, REQUEST_FRIEND)
+        self.assertEqual(dispatcher.commands[0][0].content, allowed_text)
+
+        oversized_store = FakeStore(task(AutonomyTaskType.REQUEST_FRIEND), policy())
+        oversized_runner, _model, oversized_dispatcher = orchestrator(
+            oversized_store,
+            model=FakeModel("x" * (MAX_AUTONOMOUS_FRIEND_REQUEST_LENGTH + 1)),
+        )
+
+        oversized = oversized_runner.run_once(worker_id="worker-001")
+
+        self.assertEqual(oversized.status, AutonomyTaskStatus.FAILED.value)
+        self.assertEqual(oversized.code, "friend_request_text_too_long")
+        self.assertEqual(oversized_dispatcher.commands, [])
+
     def test_relationship_action_requires_exact_configured_target(self) -> None:
         denied_task = task(
             AutonomyTaskType.FOLLOW_TARGET,
@@ -752,7 +905,7 @@ class AgentAutonomyOrchestratorTests(unittest.TestCase):
             result,
             AgentAutonomyRunResult(status="idle", code="no_due_task"),
         )
-        self.assertEqual(model.reply_calls + model.post_calls, 0)
+        self.assertEqual(model.total_calls, 0)
         self.assertEqual(dispatcher.commands, [])
 
 
@@ -776,6 +929,11 @@ class AgentAutonomyRuntimeAdapterTests(unittest.TestCase):
             auto_reply_enabled=True,
             scheduled_post_enabled=True,
             managed_relationships_enabled=True,
+            discovery_enabled=True,
+            text_match_enabled=True,
+            proactive_message_enabled=True,
+            follow_discovered_enabled=True,
+            friend_request_enabled=True,
             allowed_actions=list(FIXED_ACCOUNT_ACTIONS),
             managed_target_uids=["allowed-peer"],
             active_start_minute=7 * 60,
@@ -834,6 +992,11 @@ class AgentAutonomyRuntimeAdapterTests(unittest.TestCase):
         self.assertTrue(mapped.auto_reply_enabled)
         self.assertFalse(mapped.scheduled_posts_enabled)
         self.assertTrue(mapped.relationship_actions_enabled)
+        self.assertFalse(mapped.discovery_enabled)
+        self.assertFalse(mapped.text_match_enabled)
+        self.assertTrue(mapped.proactive_message_enabled)
+        self.assertTrue(mapped.follow_discovered_enabled)
+        self.assertFalse(mapped.friend_request_enabled)
         self.assertEqual(mapped.quiet_start_minute, 22 * 60)
         self.assertEqual(mapped.quiet_end_minute, 7 * 60)
         self.assertTrue(mapped.access.available)
@@ -925,7 +1088,7 @@ class AgentAutonomyRuntimeAdapterTests(unittest.TestCase):
         self.assertIn("不可信数据", messages[0]["content"])
         self.assertIn("<untrusted_autonomy_context>", messages[1]["content"])
 
-    def test_worker_dispatch_forces_local_fixed_action_without_browser_session(self) -> None:
+    def test_worker_dispatch_uses_guarded_external_provider_runtime(self) -> None:
         calls: list[dict[str, object]] = []
         fake_module = ModuleType("bbw_agent.action_executor")
 
@@ -969,7 +1132,7 @@ class AgentAutonomyRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIs(calls[0]["identity"], dispatch_context)
         self.assertEqual(calls[0]["db"], "locked-db")
-        self.assertIs(calls[0]["allow_external_fallback"], False)
+        self.assertIs(calls[0]["allow_external_fallback"], True)
 
     def test_dispatch_commit_failure_after_invocation_is_outcome_unknown(self) -> None:
         fake_module = ModuleType("bbw_agent.action_executor")

@@ -28,20 +28,31 @@ SEND_PRIVATE_MESSAGE = "send_private_message"
 PUBLISH_TEXT_POST = "publish_text_post"
 FOLLOW_USER = "follow_user"
 UNFOLLOW_USER = "unfollow_user"
+BROWSE_ONLINE_USERS = "browse_online_users"
+REQUEST_TEXT_MATCH = "request_text_match"
+REQUEST_FRIEND = "request_friend"
 
 FIXED_ACCOUNT_ACTIONS = (
     SEND_PRIVATE_MESSAGE,
     PUBLISH_TEXT_POST,
     FOLLOW_USER,
     UNFOLLOW_USER,
+    BROWSE_ONLINE_USERS,
+    REQUEST_TEXT_MATCH,
+    REQUEST_FRIEND,
 )
 FIXED_ACCOUNT_ACTION_SET = frozenset(FIXED_ACCOUNT_ACTIONS)
-RELATIONSHIP_ACTIONS = frozenset({FOLLOW_USER, UNFOLLOW_USER})
+RELATIONSHIP_ACTIONS = frozenset({FOLLOW_USER, UNFOLLOW_USER, REQUEST_FRIEND})
+STATIC_RELATIONSHIP_ACTIONS = frozenset({FOLLOW_USER, UNFOLLOW_USER})
 MAX_AUTONOMOUS_TEXT_LENGTH = 2_000
+MAX_AUTONOMOUS_FRIEND_REQUEST_LENGTH = 200
 MAX_AUTONOMY_TASK_ATTEMPTS = 3
 MAX_TARGET_LENGTH = 128
 MAX_INSTRUCTION_LENGTH = 4_000
 MAX_IDEMPOTENCY_LENGTH = 160
+AUTONOMOUS_BROWSE_DAILY_LIMIT = 8
+AUTONOMOUS_MATCH_DAILY_LIMIT = 6
+AUTONOMOUS_OUTREACH_DAILY_LIMIT = 6
 _STABLE_CODE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 _AUTONOMOUS_LINK = re.compile(r"(?i)(?:https?://|www\.)\S+")
 _AUTONOMOUS_CREDENTIAL = re.compile(
@@ -64,7 +75,7 @@ class AgentAutonomyError(RuntimeError):
         super().__init__(message)
         normalized = str(code or "autonomy_error").strip().lower()
         self.code = normalized if _STABLE_CODE.fullmatch(normalized) else "autonomy_error"
-        self.public_message = str(message or "无人值守任务失败")[:240]
+        self.public_message = str(message or "自动社交 Agent 任务失败")[:240]
 
 
 class AgentAutonomyModelError(AgentAutonomyError):
@@ -76,6 +87,11 @@ class AutonomyTaskType(str, Enum):
     SCHEDULED_POST = "scheduled_post"
     FOLLOW_TARGET = "follow_target"
     UNFOLLOW_TARGET = "unfollow_target"
+    BROWSE_ONLINE = "browse_online"
+    REQUEST_MATCH = "request_match"
+    PROACTIVE_MESSAGE = "proactive_message"
+    FOLLOW_DISCOVERED = "follow_discovered"
+    REQUEST_FRIEND = "request_friend"
 
 
 class AutonomyTaskStatus(str, Enum):
@@ -224,6 +240,11 @@ class AgentAutonomyPolicy:
     auto_reply_enabled: bool
     scheduled_posts_enabled: bool
     relationship_actions_enabled: bool
+    discovery_enabled: bool = False
+    text_match_enabled: bool = False
+    proactive_message_enabled: bool = False
+    follow_discovered_enabled: bool = False
+    friend_request_enabled: bool = False
     selected_actions: frozenset[str] = field(default_factory=frozenset)
     target_allowlist: frozenset[str] = field(default_factory=frozenset)
     daily_total_limit: int = 10
@@ -285,10 +306,22 @@ class AgentAutonomyPolicy:
             raise ValueError("auto reply requires the private-message action")
         if self.scheduled_posts_enabled and PUBLISH_TEXT_POST not in actions:
             raise ValueError("scheduled posts require the publish action")
-        if self.relationship_actions_enabled and not (actions & RELATIONSHIP_ACTIONS):
+        if self.relationship_actions_enabled and not (
+            actions & STATIC_RELATIONSHIP_ACTIONS
+        ):
             raise ValueError("relationship automation requires a relationship action")
         if self.relationship_actions_enabled and not targets:
             raise ValueError("relationship automation requires an exact target allowlist")
+        if self.discovery_enabled and BROWSE_ONLINE_USERS not in actions:
+            raise ValueError("online discovery requires the browse action")
+        if self.text_match_enabled and REQUEST_TEXT_MATCH not in actions:
+            raise ValueError("text matching requires the match action")
+        if self.proactive_message_enabled and SEND_PRIVATE_MESSAGE not in actions:
+            raise ValueError("proactive messaging requires the private-message action")
+        if self.follow_discovered_enabled and FOLLOW_USER not in actions:
+            raise ValueError("discovered follows require the follow action")
+        if self.friend_request_enabled and REQUEST_FRIEND not in actions:
+            raise ValueError("friend requests require the friend-request action")
         object.__setattr__(self, "selected_actions", actions)
         object.__setattr__(self, "target_allowlist", targets)
         object.__setattr__(self, "daily_total_limit", total_limit)
@@ -308,9 +341,17 @@ class AgentAutonomyPolicy:
             and self.consecutive_failures < self.max_consecutive_failures
         )
 
-    def action_daily_limit(self, action_type: str) -> int:
+    def action_daily_limit(
+        self,
+        action_type: str,
+        *,
+        task_type: AutonomyTaskType | None = None,
+    ) -> int:
         configured = dict(self.daily_action_limits)
-        return int(configured.get(action_type, self.daily_total_limit))
+        limit = int(configured.get(action_type, self.daily_total_limit))
+        if task_type == AutonomyTaskType.PROACTIVE_MESSAGE:
+            limit = min(limit, AUTONOMOUS_OUTREACH_DAILY_LIMIT)
+        return limit
 
 
 @dataclass(frozen=True, slots=True)
@@ -373,6 +414,11 @@ class AgentAutonomyTask:
             AutonomyTaskType.SCHEDULED_POST: PUBLISH_TEXT_POST,
             AutonomyTaskType.FOLLOW_TARGET: FOLLOW_USER,
             AutonomyTaskType.UNFOLLOW_TARGET: UNFOLLOW_USER,
+            AutonomyTaskType.BROWSE_ONLINE: BROWSE_ONLINE_USERS,
+            AutonomyTaskType.REQUEST_MATCH: REQUEST_TEXT_MATCH,
+            AutonomyTaskType.PROACTIVE_MESSAGE: SEND_PRIVATE_MESSAGE,
+            AutonomyTaskType.FOLLOW_DISCOVERED: FOLLOW_USER,
+            AutonomyTaskType.REQUEST_FRIEND: REQUEST_FRIEND,
         }[self.task_type]
         if action != expected_action:
             raise ValueError("autonomy task type and action do not match")
@@ -383,10 +429,24 @@ class AgentAutonomyTask:
         elif self.task_type == AutonomyTaskType.SCHEDULED_POST:
             if target or source or self.scheduled_for is None:
                 raise ValueError("scheduled post task parameters are invalid")
-        else:
+        elif self.task_type in {
+            AutonomyTaskType.FOLLOW_TARGET,
+            AutonomyTaskType.UNFOLLOW_TARGET,
+            AutonomyTaskType.FOLLOW_DISCOVERED,
+        }:
             target = _normalize_target(target)
             if source or instruction:
                 raise ValueError("relationship task parameters are invalid")
+        elif self.task_type in {
+            AutonomyTaskType.PROACTIVE_MESSAGE,
+            AutonomyTaskType.REQUEST_FRIEND,
+        }:
+            target = _normalize_target(target)
+            if source or self.scheduled_for is not None:
+                raise ValueError("outreach task parameters are invalid")
+        else:
+            if target or source or instruction or self.scheduled_for is not None:
+                raise ValueError("discovery task parameters are invalid")
         object.__setattr__(self, "action_type", action)
         object.__setattr__(self, "idempotency_key", key)
         object.__setattr__(self, "target_upstream_uid", target)
@@ -448,13 +508,23 @@ class FixedActionCommand:
         target = str(self.target_upstream_uid or "").strip()
         content = str(self.content or "").strip()
         visibility = str(self.visibility or "public").strip().lower()
-        if action in {SEND_PRIVATE_MESSAGE, FOLLOW_USER, UNFOLLOW_USER}:
+        if action in {
+            SEND_PRIVATE_MESSAGE,
+            FOLLOW_USER,
+            UNFOLLOW_USER,
+            REQUEST_FRIEND,
+        }:
             target = _normalize_target(target)
         elif target:
-            raise ValueError("publish action does not accept a target")
-        if action in {SEND_PRIVATE_MESSAGE, PUBLISH_TEXT_POST}:
+            raise ValueError("this fixed action does not accept a target")
+        if action in {SEND_PRIVATE_MESSAGE, PUBLISH_TEXT_POST, REQUEST_FRIEND}:
             if not content or len(content) > MAX_AUTONOMOUS_TEXT_LENGTH:
                 raise ValueError("fixed action content is invalid")
+            if (
+                action == REQUEST_FRIEND
+                and len(content) > MAX_AUTONOMOUS_FRIEND_REQUEST_LENGTH
+            ):
+                raise ValueError("friend request content is too long")
         elif content:
             raise ValueError("relationship action does not accept content")
         if action == PUBLISH_TEXT_POST:
@@ -648,6 +718,20 @@ class AgentAutonomyModelRunner(Protocol):
         policy: AgentAutonomyPolicy,
     ) -> GeneratedText: ...
 
+    def generate_proactive_message(
+        self,
+        *,
+        task: AgentAutonomyTask,
+        policy: AgentAutonomyPolicy,
+    ) -> GeneratedText: ...
+
+    def generate_friend_request(
+        self,
+        *,
+        task: AgentAutonomyTask,
+        policy: AgentAutonomyPolicy,
+    ) -> GeneratedText: ...
+
 
 class AgentAutonomyFixedActionDispatcher(Protocol):
     """Adapter to the fixed account-action execution layer only."""
@@ -759,7 +843,7 @@ def _safe_generated_text(value: GeneratedText, *, action_type: str) -> str:
     if _AUTONOMOUS_LINK.search(text_value):
         raise AgentAutonomyModelError(
             "generated_content_link_rejected",
-            "无人值守内容不能自动发送外部链接，本次未执行",
+            "自动社交内容不能发送外部链接，本次未执行",
         )
     if _AUTONOMOUS_CREDENTIAL.search(text_value):
         raise AgentAutonomyModelError(
@@ -773,6 +857,11 @@ def _safe_generated_text(value: GeneratedText, *, action_type: str) -> str:
         raise AgentAutonomyModelError(
             "generated_content_privacy_rejected",
             "公开动态可能包含联系方式，本次未自动发布",
+        )
+    if action_type == REQUEST_FRIEND and len(text_value) > MAX_AUTONOMOUS_FRIEND_REQUEST_LENGTH:
+        raise AgentAutonomyModelError(
+            "friend_request_text_too_long",
+            "好友申请内容超过两百字，本次未发送",
         )
     return text_value
 
@@ -856,11 +945,31 @@ class AgentAutonomyOrchestrator:
                     ),
                     now=now,
                 )
+        elif task.task_type == AutonomyTaskType.PROACTIVE_MESSAGE:
+            head = self.store.load_conversation_head(
+                owner_user_id=task.owner_user_id,
+                peer_upstream_uid=task.target_upstream_uid,
+            )
+            if head is not None:
+                return self._finish(
+                    task,
+                    TaskCompletion(
+                        status=AutonomyTaskStatus.STALE,
+                        stable_error_code=(
+                            "inbound_message_requires_reply"
+                            if head.direction == MessageDirection.INCOMING
+                            else "proactive_message_already_sent"
+                        ),
+                    ),
+                    now=now,
+                )
 
         content = ""
         if task.task_type in {
             AutonomyTaskType.REPLY_TO_MESSAGE,
             AutonomyTaskType.SCHEDULED_POST,
+            AutonomyTaskType.PROACTIVE_MESSAGE,
+            AutonomyTaskType.REQUEST_FRIEND,
         }:
             if not self.store.begin_generation(
                 task_id=task.id,
@@ -874,18 +983,28 @@ class AgentAutonomyOrchestrator:
                     task_id=task.id,
                 )
             try:
-                generated = (
-                    self.model_runner.generate_reply(
+                if task.task_type == AutonomyTaskType.REPLY_TO_MESSAGE:
+                    assert head is not None
+                    generated = self.model_runner.generate_reply(
                         task=task,
                         head=head,
                         policy=policy,
                     )
-                    if task.task_type == AutonomyTaskType.REPLY_TO_MESSAGE
-                    else self.model_runner.generate_scheduled_post(
+                elif task.task_type == AutonomyTaskType.SCHEDULED_POST:
+                    generated = self.model_runner.generate_scheduled_post(
                         task=task,
                         policy=policy,
                     )
-                )
+                elif task.task_type == AutonomyTaskType.PROACTIVE_MESSAGE:
+                    generated = self.model_runner.generate_proactive_message(
+                        task=task,
+                        policy=policy,
+                    )
+                else:
+                    generated = self.model_runner.generate_friend_request(
+                        task=task,
+                        policy=policy,
+                    )
                 content = _safe_generated_text(
                     generated,
                     action_type=task.action_type,
@@ -938,8 +1057,28 @@ class AgentAutonomyOrchestrator:
                         ),
                         now=now,
                     )
-            elif now - _aware_utc(task.scheduled_for) > timedelta(
-                seconds=policy.scheduled_post_max_lateness_seconds
+            elif task.task_type == AutonomyTaskType.PROACTIVE_MESSAGE:
+                head = self.store.load_conversation_head(
+                    owner_user_id=task.owner_user_id,
+                    peer_upstream_uid=task.target_upstream_uid,
+                )
+                if head is not None:
+                    return self._finish(
+                        task,
+                        TaskCompletion(
+                            status=AutonomyTaskStatus.STALE,
+                            stable_error_code=(
+                                "inbound_message_requires_reply"
+                                if head.direction == MessageDirection.INCOMING
+                                else "proactive_message_changed_during_generation"
+                            ),
+                        ),
+                        now=now,
+                    )
+            elif (
+                task.task_type == AutonomyTaskType.SCHEDULED_POST
+                and now - _aware_utc(task.scheduled_for)
+                > timedelta(seconds=policy.scheduled_post_max_lateness_seconds)
             ):
                 return self._finish(
                     task,
@@ -976,7 +1115,10 @@ class AgentAutonomyOrchestrator:
                 target_upstream_uid=task.target_upstream_uid,
                 budget_day=policy_budget_day(policy, now=now),
                 daily_total_limit=policy.daily_total_limit,
-                daily_action_limit=policy.action_daily_limit(task.action_type),
+                daily_action_limit=policy.action_daily_limit(
+                    task.action_type,
+                    task_type=task.task_type,
+                ),
                 minimum_interval_seconds=policy.minimum_interval_seconds,
                 now=now,
             )
@@ -1097,12 +1239,17 @@ class AgentAutonomyOrchestrator:
                 ),
                 now=now,
             )
-        if task.task_type == AutonomyTaskType.REPLY_TO_MESSAGE:
-            feature_enabled = policy.auto_reply_enabled
-        elif task.task_type == AutonomyTaskType.SCHEDULED_POST:
-            feature_enabled = policy.scheduled_posts_enabled
-        else:
-            feature_enabled = policy.relationship_actions_enabled
+        feature_enabled = {
+            AutonomyTaskType.REPLY_TO_MESSAGE: policy.auto_reply_enabled,
+            AutonomyTaskType.SCHEDULED_POST: policy.scheduled_posts_enabled,
+            AutonomyTaskType.FOLLOW_TARGET: policy.relationship_actions_enabled,
+            AutonomyTaskType.UNFOLLOW_TARGET: policy.relationship_actions_enabled,
+            AutonomyTaskType.BROWSE_ONLINE: policy.discovery_enabled,
+            AutonomyTaskType.REQUEST_MATCH: policy.text_match_enabled,
+            AutonomyTaskType.PROACTIVE_MESSAGE: policy.proactive_message_enabled,
+            AutonomyTaskType.FOLLOW_DISCOVERED: policy.follow_discovered_enabled,
+            AutonomyTaskType.REQUEST_FRIEND: policy.friend_request_enabled,
+        }[task.task_type]
         if not feature_enabled:
             return self._finish(
                 task,
@@ -1113,7 +1260,10 @@ class AgentAutonomyOrchestrator:
                 now=now,
             )
         if (
-            task.task_type == AutonomyTaskType.REPLY_TO_MESSAGE
+            task.task_type in {
+                AutonomyTaskType.REPLY_TO_MESSAGE,
+                AutonomyTaskType.PROACTIVE_MESSAGE,
+            }
             and not policy.access.private_message_auto_send_enabled
         ):
             return self._finish(
