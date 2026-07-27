@@ -1070,7 +1070,7 @@ class AiAgentAutonomySetting(
         SmallInteger, nullable=False, default=0, server_default="0"
     )
     minimum_action_interval_seconds: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=10, server_default="10"
+        Integer, nullable=False, default=30, server_default="30"
     )
     daily_total_limit: Mapped[int] = mapped_column(
         SmallInteger, nullable=False, default=20, server_default="20"

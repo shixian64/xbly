@@ -62,6 +62,7 @@ from bbw_agent.runtime import (  # noqa: E402
     ByokAgentAutonomyModelRunner,
     FixedLayerAgentAutonomyDispatcher,
     SqlAgentAutonomyStore,
+    generated_text_unverified_outreach_context,
     _post_generation_messages,
     conversation_head_from_row,
     policy_from_rows,
@@ -669,6 +670,35 @@ class AgentAutonomyPolicyContractTests(unittest.TestCase):
         self.assertEqual(completion.input_tokens, 22)
         self.assertEqual(completion.output_tokens, 9)
         self.assertEqual(completion.latency_ms, 180)
+
+    def test_context_free_outreach_rejects_unverified_profile_claims(self) -> None:
+        unsafe = (
+            "你好，看到你的主页觉得挺有意思，想认识一下交个朋友。",
+            "看了你的动态，感觉我们有共同兴趣。",
+            "发现我们同城，认识一下？",
+        )
+        for value in unsafe:
+            with self.subTest(value=value):
+                self.assertTrue(generated_text_unverified_outreach_context(value))
+                with self.assertRaises(AgentAutonomyModelError) as raised:
+                    ByokAgentAutonomyModelRunner._validated_reply_text(
+                        value,
+                        allow_laughter=False,
+                        forbid_unverified_outreach_context=True,
+                    )
+                self.assertEqual(
+                    raised.exception.code,
+                    "generated_text_unverified_context",
+                )
+
+        self.assertEqual(
+            ByokAgentAutonomyModelRunner._validated_reply_text(
+                "你好，最近在忙什么？",
+                allow_laughter=False,
+                forbid_unverified_outreach_context=True,
+            ),
+            "你好，最近在忙什么？",
+        )
 
     def test_address_terms_require_repeated_use_with_the_same_peer(self) -> None:
         self.assertEqual(

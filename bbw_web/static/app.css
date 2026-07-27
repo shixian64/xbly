@@ -6891,9 +6891,117 @@ html.flash-viewing body {
 .agent-page {
   display: grid;
   width: 100%;
-  max-width: 1040px;
+  max-width: 1160px;
   gap: 1rem;
   margin: 0 auto;
+}
+
+.agent-menu-layout {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(190px, 220px) minmax(0, 1fr);
+  align-items: start;
+  gap: 1rem;
+}
+
+.agent-menu {
+  display: grid;
+  min-width: 0;
+  gap: 0.48rem;
+  position: sticky;
+  top: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  padding: 0.55rem;
+}
+
+.agent-menu-item {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  gap: 0.16rem;
+  cursor: pointer;
+  border: 1px solid transparent;
+  border-radius: 13px;
+  background: transparent;
+  color: var(--ink);
+  padding: 0.72rem 0.76rem;
+  text-align: left;
+}
+
+.agent-menu-item:hover {
+  border-color: var(--line);
+  background: var(--surface-soft);
+}
+
+.agent-menu-item.on {
+  border-color: rgba(115, 87, 217, 0.25);
+  background: var(--brand-soft);
+  color: var(--brand-dark);
+}
+
+.agent-menu-item:focus-visible {
+  outline: 3px solid rgba(115, 87, 217, 0.35);
+  outline-offset: 2px;
+}
+
+.agent-menu-item strong,
+.agent-menu-item small {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.agent-menu-item strong {
+  font-size: 0.83rem;
+}
+
+.agent-menu-item small {
+  color: var(--muted);
+  font-size: 0.67rem;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.agent-menu-content,
+.agent-tab-panel {
+  min-width: 0;
+}
+
+.agent-tab-panel {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.agent-tab-panel[hidden] {
+  display: none !important;
+}
+
+.agent-panel-heading {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid var(--line);
+  padding: 0 0 0.82rem;
+}
+
+.agent-panel-heading h2,
+.agent-panel-heading p {
+  margin: 0;
+}
+
+.agent-panel-heading h2 {
+  font-size: 1.08rem;
+}
+
+.agent-panel-heading p:not(.eyebrow) {
+  margin-top: 0.22rem;
+  color: var(--muted);
+  font-size: 0.74rem;
+  line-height: 1.5;
 }
 
 .agent-page .notice,
@@ -7019,6 +7127,14 @@ html.flash-viewing body {
   display: grid;
   min-width: 0;
   grid-template-columns: minmax(0, 1.3fr) minmax(300px, 0.7fr);
+  align-items: start;
+  gap: 0.8rem;
+}
+
+.agent-social-overview-grid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(260px, 0.72fr) minmax(0, 1.28fr);
   align-items: start;
   gap: 0.8rem;
 }
@@ -7229,7 +7345,50 @@ html.flash-viewing body {
 }
 
 .agent-communication-field {
-  margin-top: 0.82rem;
+  margin-top: 0;
+}
+
+.agent-form-section,
+.agent-cadence-group {
+  min-width: 0;
+  margin: 0.82rem 0 0;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: rgba(251, 250, 255, 0.72);
+  padding: 0.82rem;
+}
+
+.agent-form-section .section-head {
+  margin-bottom: 0.62rem;
+}
+
+.agent-form-section .section-head h3,
+.agent-form-section .section-head p {
+  margin: 0;
+}
+
+.agent-form-section .section-head h3 {
+  font-size: 0.86rem;
+}
+
+.agent-form-section .section-head p {
+  margin-top: 0.16rem;
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.agent-cadence-group legend {
+  color: var(--ink);
+  padding: 0 0.28rem;
+  font-size: 0.86rem;
+  font-weight: 800;
+}
+
+.agent-cadence-group > p {
+  margin: 0 0 0.72rem;
+  color: var(--muted);
+  font-size: 0.7rem;
+  line-height: 1.5;
 }
 
 .agent-autonomy-task-list {
@@ -7514,8 +7673,20 @@ html.flash-viewing body {
   .agent-primary-grid,
   .agent-autonomy-grid,
   .agent-social-workspace,
+  .agent-social-overview-grid,
   .agent-settings-grid {
     grid-template-columns: 1fr;
+  }
+
+  .agent-menu-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .agent-menu {
+    grid-template-columns: repeat(3, minmax(170px, 1fr));
+    position: static;
+    overflow-x: auto;
+    scrollbar-width: thin;
   }
 
   .agent-social-stats {
@@ -7568,6 +7739,7 @@ html.flash-viewing body {
 
   .agent-style-head,
   .agent-social-status,
+  .agent-panel-heading,
   .agent-capability-summary {
     align-items: stretch;
     flex-direction: column;

@@ -258,7 +258,7 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         self.assertIn("tasks.has_open_task_type(", owner_scheduler)
         self.assertIn("limit=1", owner_scheduler)
 
-    def test_0020_migration_allows_ten_second_agent_cadence(self) -> None:
+    def test_agent_cadence_keeps_safe_lower_bounds_and_uses_natural_defaults(self) -> None:
         migration = self.read(
             "migrations/versions/20260727_0020_ten_second_agent_cadence.py"
         )
@@ -285,16 +285,35 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
             "minimum_action_interval_seconds BETWEEN 60 AND 86400", downgrade
         )
 
+        natural = self.read(
+            "migrations/versions/20260727_0021_natural_agent_cadence.py"
+        )
+        self.assertIn('revision: str = "20260727_0021"', natural)
+        self.assertIn(
+            'down_revision: Union[str, Sequence[str], None] = "20260727_0020"',
+            natural,
+        )
+        natural_upgrade = self.fragment(
+            natural,
+            "def upgrade() -> None:",
+            "def downgrade() -> None:",
+        )
+        self.assertIn('server_default=sa.text("30")', natural_upgrade)
+        self.assertIn("SET minimum_action_interval_seconds = 30", natural_upgrade)
+        self.assertIn("WHERE minimum_action_interval_seconds < 30", natural_upgrade)
+        self.assertIn("SET discovery_interval_minutes = 30", natural_upgrade)
+        self.assertIn("WHERE discovery_interval_minutes < 30", natural_upgrade)
+
         models = self.read("bbw_prod/models.py")
         self.assertIn(
-            'Integer, nullable=False, default=10, server_default="10"', models
+            'Integer, nullable=False, default=30, server_default="30"', models
         )
         self.assertIn(
             "minimum_action_interval_seconds BETWEEN 10 AND 86400", models
         )
         api = self.read("bbw_agent/api.py")
         self.assertIn(
-            "minimum_action_interval_seconds: int = Field(default=10, ge=10, le=86400)",
+            "minimum_action_interval_seconds: int = Field(default=30, ge=10, le=86400)",
             api,
         )
 
@@ -862,6 +881,8 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         )
         self.assertIn("generated_text_filler_violations(", validate)
         self.assertIn('"generated_text_filler_overuse"', validate)
+        self.assertIn("generated_text_unverified_outreach_context(", validate)
+        self.assertIn('"generated_text_unverified_context"', validate)
 
         complete, _ = self.function_source(
             "bbw_agent/runtime.py", "_complete_social_text"
@@ -876,6 +897,16 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         )
         self.assertIn("AUTONOMY_GENERATED_TEXT_STYLE_RULES", outreach)
         self.assertIn("首次私信和好友申请完全不要使用", outreach)
+        self.assertIn("你没有获得对方的主页", outreach)
+        self.assertIn("不得提及或暗示看过对方主页", outreach)
+
+        generate_outreach, _ = self.function_source(
+            "bbw_agent/runtime.py", "_generate_outreach"
+        )
+        self.assertEqual(
+            generate_outreach.count("forbid_unverified_outreach_context=True"),
+            2,
+        )
 
         style, _ = self.function_source(
             "bbw_agent/services.py", "build_style_analysis_plan"
@@ -1074,7 +1105,17 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         self.assertIn("模型与表达设置", page)
         self.assertIn("个人运行器", page)
         self.assertIn("语言风格", page)
+        self.assertIn("aiAgentTabsHtml(", page)
+        self.assertIn('data-agent-tab-panel="model"', page)
+        self.assertIn('data-agent-tab-panel="overview"', section)
+        self.assertIn('data-agent-tab-panel="capabilities"', section)
+        self.assertIn("推荐至少 30 秒", section)
+        self.assertIn("推荐 30 分钟", section)
         for selector in (
+            ".agent-menu-layout",
+            ".agent-menu-item",
+            ".agent-tab-panel[hidden]",
+            ".agent-social-overview-grid",
             ".agent-social-workspace",
             ".agent-capability-groups",
             ".agent-capability-group",

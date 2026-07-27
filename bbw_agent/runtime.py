@@ -60,6 +60,40 @@ _AUTONOMY_FILLER_REWRITE_INSTRUCTION = (
     "不要解释原因，不要复述上一版。"
 )
 
+_UNVERIFIED_OUTREACH_CONTEXT_MARKERS = (
+    "主页",
+    "个人资料",
+    "你的资料",
+    "动态",
+    "照片",
+    "相册",
+    "签名",
+    "简介",
+    "帖子",
+    "共同兴趣",
+    "共同爱好",
+    "同城",
+    "你也喜欢",
+    "我们都喜欢",
+    "看到你的",
+    "看了你的",
+    "刷到你的",
+    "翻到你的",
+    "觉得你挺",
+    "感觉你挺",
+)
+
+
+def generated_text_unverified_outreach_context(value: object) -> tuple[str, ...]:
+    """Return unsupported profile claims made by context-free outreach text."""
+
+    compact = "".join(str(value or "").lower().split())
+    if not compact:
+        return ()
+    return tuple(
+        marker for marker in _UNVERIFIED_OUTREACH_CONTEXT_MARKERS if marker in compact
+    )
+
 
 @dataclass(frozen=True, slots=True)
 class _AuditedModelCompletion:
@@ -726,11 +760,20 @@ def _outreach_generation_messages(
         "你是自动社交账号的首次私信生成器。你只能输出一条自然、礼貌、不过度热情的开场白，"
         "不得调用工具、不得声称已经执行发送、不得索取或输出密钥、Cookie、Token、账号或密码。"
         "不得编造双方已经认识、见过或拥有共同经历，不得诱导转移到其他平台或索取联系方式。"
+        "你没有获得对方的主页、动态、照片、签名、简介、兴趣、城市或经历资料。"
+        "不得提及或暗示看过对方主页、资料、动态、照片、签名、简介或帖子，"
+        "不得声称双方同城、拥有共同兴趣，或根据不存在的资料评价对方。"
+        "开场只能使用不依赖任何个人资料的中性表达，例如询问对方最近在忙什么。"
         "不得使用宝宝、宝贝、哥哥、姐姐、狗狗等昵称、亲昵称呼或关系称呼。"
         "只返回私信正文，不加标题、引号、Markdown或解释，正文保持简短。"
     )
     if friend_request:
         system += "不得使用宝宝、宝贝、哥哥、姐姐、狗狗等昵称、亲昵称呼或关系称呼。"
+        system += (
+            "你没有获得对方的主页、动态、照片、签名、简介、兴趣、城市或经历资料。"
+            "不得提及或暗示看过这些资料，不得声称双方同城、拥有共同兴趣，"
+            "或根据不存在的资料评价对方。"
+        )
     system += AUTONOMY_GENERATED_TEXT_STYLE_RULES
     system += "首次私信和好友申请完全不要使用哈哈、嘿嘿、嘻嘻、呵呵等笑声。"
     payload = {
@@ -798,6 +841,7 @@ class ByokAgentAutonomyModelRunner(AgentAutonomyModelRunner):
         *,
         allowed_address_terms: Sequence[str] = (),
         allow_laughter: bool = True,
+        forbid_unverified_outreach_context: bool = False,
     ) -> str:
         text = cls._validated_completion_text(value)
         if AUTONOMY_NO_REPLY_SENTINEL in text.strip("` \t\r\n"):
@@ -821,6 +865,13 @@ class ByokAgentAutonomyModelRunner(AgentAutonomyModelRunner):
                 "generated_text_filler_overuse",
                 "模型生成内容的语气词或笑声过多，本次未执行账号操作",
             )
+        if forbid_unverified_outreach_context and generated_text_unverified_outreach_context(
+            text
+        ):
+            raise AgentAutonomyModelError(
+                "generated_text_unverified_context",
+                "模型生成内容引用了未经验证的对方资料，本次未执行账号操作",
+            )
         return text
 
     def _complete_social_text(
@@ -832,6 +883,7 @@ class ByokAgentAutonomyModelRunner(AgentAutonomyModelRunner):
         max_output_tokens: int,
         allowed_address_terms: Sequence[str] = (),
         allow_laughter: bool = True,
+        forbid_unverified_outreach_context: bool = False,
     ) -> tuple[str, Any]:
         gateway = self.gateway_factory(self.settings)
         completion = gateway.complete(
@@ -847,6 +899,7 @@ class ByokAgentAutonomyModelRunner(AgentAutonomyModelRunner):
                 completion.text,
                 allowed_address_terms=allowed_address_terms,
                 allow_laughter=allow_laughter,
+                forbid_unverified_outreach_context=forbid_unverified_outreach_context,
             )
         except AgentAutonomyModelError as exc:
             if exc.code != "generated_text_filler_overuse":
@@ -866,6 +919,7 @@ class ByokAgentAutonomyModelRunner(AgentAutonomyModelRunner):
                 retry.text,
                 allowed_address_terms=allowed_address_terms,
                 allow_laughter=allow_laughter,
+                forbid_unverified_outreach_context=forbid_unverified_outreach_context,
             )
             completion = _combined_model_completion(completion, retry)
         return text, completion
@@ -1245,6 +1299,7 @@ class ByokAgentAutonomyModelRunner(AgentAutonomyModelRunner):
                     self._validated_reply_text(
                         cached.text,
                         allow_laughter=False,
+                        forbid_unverified_outreach_context=True,
                     ),
                     input_tokens=cached.input_tokens,
                     output_tokens=cached.output_tokens,
@@ -1256,6 +1311,7 @@ class ByokAgentAutonomyModelRunner(AgentAutonomyModelRunner):
                 temperature=min(runtime.temperature, 0.3),
                 max_output_tokens=min(runtime.max_output_tokens, 300),
                 allow_laughter=False,
+                forbid_unverified_outreach_context=True,
             )
             self._ensure_runtime_current(runtime)
             self._succeed_model_run(

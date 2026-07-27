@@ -140,6 +140,11 @@ const MATCH_GENDERS = ["不限", "男", "女"];
 const MATCH_PROPERTIES = ["双", "Z", "B"];
 const DISCOVERY_TABS = ["online", "nearby"];
 const DISCOVERY_AGES = ["不限", "18-24", "25-34", "35-44", "45+"];
+const AI_AGENT_TABS = Object.freeze([
+  Object.freeze({ id: "overview", label: "运行概览", detail: "状态、统计与最近动作" }),
+  Object.freeze({ id: "capabilities", label: "能力与节奏", detail: "探索、互动与运行频率" }),
+  Object.freeze({ id: "model", label: "模型与表达", detail: "模型连接与语言风格" }),
+]);
 
 const S = {
   user: null,
@@ -158,6 +163,7 @@ const S = {
   aiAgentExecutionAccessEnabled: false,
   aiAgentExecutionStatus: null,
   aiAgentAutonomyStatus: null,
+  aiAgentTab: "overview",
   aiAgentPendingExecution: null,
   aiAgentExecutionGeneration: 0,
   proactivePrivateMessageEnabled: false,
@@ -1990,7 +1996,7 @@ function syncAiAgentAutonomyStatusUi(page, autonomy = S.aiAgentAutonomyStatus) {
   if (state) state.textContent = presentation.state;
   if (title) title.textContent = presentation.title;
   if (detail) detail.textContent = presentation.detail;
-  notice?.classList.toggle("warn", presentation.warning);
+  notice?.classList.toggle("is-warning", presentation.warning);
 }
 
 function syncAiAgentAutonomyModelReadiness(page, ready) {
@@ -2271,7 +2277,7 @@ function normalizedAiAgentAutonomyStatus(status) {
     active_end_minute: boundedInteger(source.active_end_minute, 0, 0, 1439),
     minimum_action_interval_seconds: boundedInteger(
       source.minimum_action_interval_seconds,
-      10,
+      30,
       10,
       86400
     ),
@@ -15783,6 +15789,43 @@ function agentAutonomyRecentTasksHtml(tasks) {
     .join("")}</div>`;
 }
 
+function normalizeAiAgentTab(value) {
+  const normalized = String(value || "").trim();
+  return AI_AGENT_TABS.some((item) => item.id === normalized) ? normalized : "overview";
+}
+
+function aiAgentTabsHtml(activeTab) {
+  return AI_AGENT_TABS.map(
+    (item) => `<button type="button" id="agent-menu-${item.id}" class="agent-menu-item${
+      item.id === activeTab ? " on" : ""
+    }" role="tab" aria-selected="${String(item.id === activeTab)}" tabindex="${
+      item.id === activeTab ? "0" : "-1"
+    }" aria-controls="agent-tab-panel-${
+      item.id
+    }" data-action="agent-tab" data-tab="${item.id}"><strong>${esc(
+      item.label
+    )}</strong><small>${esc(item.detail)}</small></button>`
+  ).join("");
+}
+
+function aiAgentPanelHidden(tab) {
+  return normalizeAiAgentTab(S.aiAgentTab) === tab ? "" : "hidden";
+}
+
+function switchAiAgentTab(tab) {
+  const activeTab = normalizeAiAgentTab(tab);
+  S.aiAgentTab = activeTab;
+  root().querySelectorAll('[data-action="agent-tab"]').forEach((button) => {
+    const active = button.dataset.tab === activeTab;
+    button.classList.toggle("on", active);
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
+  });
+  root().querySelectorAll("[data-agent-tab-panel]").forEach((panel) => {
+    panel.hidden = panel.dataset.agentTabPanel !== activeTab;
+  });
+}
+
 function syncAgentAutonomySettingsForm(form) {
   if (!form) return;
   const autonomy = S.aiAgentAutonomyStatus;
@@ -15872,23 +15915,40 @@ function agentAutonomySectionHtml(autonomy) {
     .filter(Boolean)
     .join(" · ");
   return `<section class="agent-social-shell" id="agent-autonomy-section">
-    <div class="agent-social-status${presentation.warning ? " is-warning" : ""}" data-agent-autonomy-notice>
-      <div><p class="eyebrow">自动社交 Agent</p><h2 data-agent-autonomy-title>${esc(
-        presentation.title
-      )}</h2><p data-agent-autonomy-detail>${esc(presentation.detail)}</p>${haltedReason}</div>
-      <span class="agent-capability-state" data-agent-autonomy-state>${esc(presentation.state)}</span>
+    <div id="agent-tab-panel-overview" class="agent-tab-panel" data-agent-tab-panel="overview" role="tabpanel" aria-labelledby="agent-menu-overview" ${aiAgentPanelHidden(
+      "overview"
+    )}>
+      <div class="agent-social-status${presentation.warning ? " is-warning" : ""}" data-agent-autonomy-notice>
+        <div><p class="eyebrow">自动社交 Agent</p><h2 data-agent-autonomy-title>${esc(
+          presentation.title
+        )}</h2><p data-agent-autonomy-detail>${esc(presentation.detail)}</p>${haltedReason}</div>
+        <span class="agent-capability-state" data-agent-autonomy-state>${esc(
+          presentation.state
+        )}</span>
+      </div>
+      <div class="agent-social-overview-grid">
+        <section class="surface-card agent-social-summary"><div class="section-head"><div><p class="eyebrow">运行概览</p><h2>今日统计</h2><p>仅展示已完成动作，不提供预算设置</p></div></div><div class="agent-social-stats" aria-label="今日动作统计">${stats}</div>${
+          errorStats ? `<div class="agent-social-stat-note">今日异常：${esc(errorStats)}</div>` : ""
+        }</section>
+        <section class="surface-card agent-social-activity"><div class="section-head"><div><h2>最近动作</h2><p>消息、匹配和关系变化会同时进入对应记录</p></div><button type="button" class="btn secondary small" data-action="agent-refresh-autonomy-tasks">刷新</button></div><div id="agent-autonomy-tasks">${agentAutonomyRecentTasksHtml(
+          autonomy.recent_tasks
+        )}</div></section>
+      </div>
+      <div class="notice agent-social-boundary"><strong>运行边界</strong><div>Agent 每次只执行已授权的固定动作，不会获取 Cookie、Token 或任意网址访问能力。相同用户会按发现、关注、好友申请、私信的顺序逐步互动；存在未回复外发消息时不会重复触达。外部结果无法确认时会自动停止重试并保留记录。</div></div>
     </div>
-    <div class="agent-social-workspace">
+    <div id="agent-tab-panel-capabilities" class="agent-tab-panel" data-agent-tab-panel="capabilities" role="tabpanel" aria-labelledby="agent-menu-capabilities" ${aiAgentPanelHidden(
+      "capabilities"
+    )}>
       <form class="surface-card agent-social-form" data-form="agent-autonomy-settings" autocomplete="off">
-        <div class="section-head"><div><p class="eyebrow">主要设置</p><h2>自动社交</h2><p>开启需要的能力，Agent 会按发现、关系推进、对话维护的顺序运行</p></div></div>
+        <div class="section-head"><div><p class="eyebrow">能力与节奏</p><h2>自动社交能力</h2><p>按发现、关系推进、对话维护分组配置，运行频率在本页下方统一控制</p></div></div>
         <label class="check-line agent-primary-toggle"><input name="user_enabled" type="checkbox" ${
           autonomy.user_enabled ? "checked" : ""
         } ${controlDisabled} /><span>运行自动社交 Agent</span></label>
         <div class="agent-capability-groups">${capabilityGroups}</div>
-        <div class="field agent-communication-field"><label for="agent-autonomy-brief">交流原则</label><textarea id="agent-autonomy-brief" name="operation_brief" rows="4" maxlength="4000" placeholder="例如：表达自然直接，少用语气词，不连续使用哈哈，不乱用称呼；不要索取联系方式" ${controlDisabled}>${esc(
+        <div class="agent-form-section agent-communication-section"><div class="section-head"><div><h3>交流原则</h3><p>只控制聊天目标和表达边界，不会替代发送前安全检查</p></div></div><div class="field agent-communication-field"><label for="agent-autonomy-brief">表达要求</label><textarea id="agent-autonomy-brief" name="operation_brief" rows="4" maxlength="4000" placeholder="例如：表达自然直接，少用语气词，不连续使用哈哈，不乱用称呼；不要索取联系方式" ${controlDisabled}>${esc(
           autonomy.operation_brief
-        )}</textarea><p class="field-help">这里控制聊天目标和表达方式。发送前仍会检查重复笑声、语气词和未经上下文允许的称呼。</p></div>
-        <details class="agent-inline-details"><summary>时间与运行节奏</summary><div class="agent-details-body"><div class="form-grid">
+        )}</textarea><p class="field-help">首次触达不得声称看过对方主页、动态或资料；上下文不足时只能使用中性开场。</p></div></div>
+        <fieldset class="agent-cadence-group"><legend>运行时间与节奏</legend><p>推荐采用更自然的低频探索。技术下限仅用于特殊场景，不代表推荐值。</p><div class="form-grid">
           <div class="field"><label for="agent-autonomy-timezone">时区</label><input id="agent-autonomy-timezone" name="timezone" maxlength="64" value="${esc(
             autonomy.timezone
           )}" ${controlDisabled} required /></div>
@@ -15900,11 +15960,11 @@ function agentAutonomySectionHtml(autonomy) {
           )}" ${controlDisabled} required /><p class="field-help">开始与结束相同表示全天。</p></div>
           <div class="field"><label for="agent-autonomy-action-interval">动作间隔（秒）</label><input id="agent-autonomy-action-interval" name="minimum_action_interval_seconds" type="number" min="10" max="86400" step="1" value="${esc(
             autonomy.minimum_action_interval_seconds
-          )}" ${controlDisabled} required /><p class="field-help">同一账号两次实际操作之间至少间隔 10 秒。</p></div>
+          )}" ${controlDisabled} required /><p class="field-help">推荐至少 30 秒；10 秒只是技术下限，持续使用会显得机械。</p></div>
           <div class="field"><label for="agent-autonomy-discovery-interval">发现间隔（分钟）</label><input id="agent-autonomy-discovery-interval" name="discovery_interval_minutes" type="number" min="5" max="1440" step="1" value="${esc(
             autonomy.discovery_interval_minutes
-          )}" ${controlDisabled} required /><p class="field-help">重新浏览在线列表和寻找新候选的间隔，不表示每次都会发消息。</p></div>
-        </div></div></details>
+          )}" ${controlDisabled} required /><p class="field-help">推荐 30 分钟；5 分钟只是技术下限，发现后也不会必然发消息。</p></div>
+        </div></fieldset>
         <button type="submit" class="btn primary full mt-sm" ${controlDisabled}>${
           autonomy.user_enabled ? "保存运行设置" : "开始运行"
         }</button>
@@ -15914,16 +15974,7 @@ function agentAutonomySectionHtml(autonomy) {
             : `<p class="field-help">当前账号尚未获得完整的 Agent 与账号动作授权。</p>`
         }
       </form>
-      <div class="agent-social-side">
-        <section class="surface-card agent-social-summary"><div class="section-head"><div><p class="eyebrow">运行概览</p><h2>今日统计</h2><p>仅展示已完成动作，不提供预算设置</p></div></div><div class="agent-social-stats" aria-label="今日动作统计">${stats}</div>${
-          errorStats ? `<div class="agent-social-stat-note">今日异常：${esc(errorStats)}</div>` : ""
-        }</section>
-        <section class="surface-card agent-social-activity"><div class="section-head"><div><h2>最近动作</h2><p>消息、匹配和关系变化会同时进入对应记录</p></div><button type="button" class="btn secondary small" data-action="agent-refresh-autonomy-tasks">刷新</button></div><div id="agent-autonomy-tasks">${agentAutonomyRecentTasksHtml(
-          autonomy.recent_tasks
-        )}</div></section>
-      </div>
     </div>
-    <div class="notice agent-social-boundary"><strong>运行边界</strong><div>Agent 每次只执行已授权的固定动作，不会获取 Cookie、Token 或任意网址访问能力。相同用户会按发现、关注、好友申请、私信的顺序逐步互动；存在未回复外发消息时不会重复触达。外部结果无法确认时会自动停止重试并保留记录。</div></div>
   </section>`;
 }
 
@@ -16036,6 +16087,8 @@ async function pageAgent(signal, { data: prefetchedData = null } = {}) {
         data.style_profile
       )}</div></details>`
     : `<div class="agent-style-empty">尚未分析语言风格。该功能只读取本人已归档的历史文字消息。</div>`;
+  const activeTab = normalizeAiAgentTab(S.aiAgentTab);
+  S.aiAgentTab = activeTab;
   const autonomySection = agentAutonomySectionHtml(autonomy);
   return `<div class="agent-page">
     <section class="agent-overview">
@@ -16050,13 +16103,19 @@ async function pageAgent(signal, { data: prefetchedData = null } = {}) {
       </div>
     </section>
 
-    ${autonomySection}
-
-    <details class="agent-capability agent-tools" ${ready ? "" : "open"}>
-      <summary class="agent-capability-summary"><span><strong>模型与表达设置</strong><small>模型连接、个人运行器和语言风格，通常配置一次即可</small></span><span class="agent-capability-state">${
-        ready ? "已就绪" : "需要设置"
-      }</span></summary>
-      <div class="agent-capability-body agent-tools-body">
+    <div class="agent-menu-layout">
+      <nav class="agent-menu" role="tablist" aria-label="Agent 功能菜单">${aiAgentTabsHtml(
+        activeTab
+      )}</nav>
+      <div class="agent-menu-content">
+        ${autonomySection}
+        <section id="agent-tab-panel-model" class="agent-tab-panel agent-tools" data-agent-tab-panel="model" role="tabpanel" aria-labelledby="agent-menu-model" ${aiAgentPanelHidden(
+          "model"
+        )}>
+          <div class="agent-panel-heading"><div><p class="eyebrow">模型与表达</p><h2>模型连接与语言风格</h2><p>这些设置通常只需配置一次，自动社交能力和运行节奏在单独菜单中管理。</p></div><span class="agent-capability-state">${
+            ready ? "已就绪" : "需要设置"
+          }</span></div>
+          <div class="agent-tools-body">
     <section class="agent-settings-grid" aria-label="模型与表达设置">
         <form class="surface-card agent-card" data-form="agent-connection" autocomplete="off">
           <div class="section-head"><div><h2>模型连接</h2><p>${esc(
@@ -16115,8 +16174,10 @@ async function pageAgent(signal, { data: prefetchedData = null } = {}) {
           </section>
         </div>
     </section>
+          </div>
+        </section>
       </div>
-    </details>
+    </div>
   </div>`;
 }
 
@@ -18247,6 +18308,7 @@ async function handleAction(action, button) {
     return isMineRoute(S.route) ? switchMineTab(S.route, { force: true }) : go(S.route, { force: true });
   }
   if (action === "mine-tab") return switchMineTab(button.dataset.tab);
+  if (action === "agent-tab") return switchAiAgentTab(button.dataset.tab);
   if (action === "logout") return logout();
   if (action === "agent-test-connection") {
     const data = await agentApi("/api/agent/connection/test", {
@@ -19177,7 +19239,7 @@ async function handleProductForm(form, submitter, submittedValues = null) {
       throw new Error("开始运行前，请至少选择一种自动社交能力");
     }
     if (userEnabled && !S.aiAgentModelReady) {
-      throw new Error("请先在高级设置中完成模型连接测试并开启个人运行器");
+      throw new Error("请先在“模型与表达”菜单完成模型连接测试并开启个人运行器");
     }
     const operationBrief = String(values.operation_brief || "").trim();
     if (operationBrief.length > 4000) throw new Error("聊天目标与表达边界不能超过 4000 个字符");
