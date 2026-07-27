@@ -58,6 +58,11 @@ AUTONOMY_REPLY_MAX_AGE_SECONDS = 2 * 60 * 60
 AUTONOMY_REPLY_CLOCK_SKEW_SECONDS = 5 * 60
 AUTONOMY_REPLY_SESSION_GAP_SECONDS = 6 * 60 * 60
 AUTONOMY_NO_REPLY_SENTINEL = "[[NO_REPLY]]"
+AUTONOMY_GENERATED_TEXT_STYLE_RULES = (
+    "控制口头语：每条最多使用一个语气词，不得以‘哈哈’‘嗯’‘啊’‘哦’等"
+    "笑声或语气词开头；不得使用‘哈哈哈’或更长的连续笑声，也不得在一条内容中"
+    "反复插入笑声。笑声只有在当前上下文确实需要时才可使用一次‘哈哈’。"
+)
 _STABLE_CODE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 _AUTONOMOUS_LINK = re.compile(r"(?i)(?:https?://|www\.)\S+")
 _AUTONOMOUS_CREDENTIAL = re.compile(
@@ -174,6 +179,41 @@ _AUTONOMY_STYLE_RELATIONSHIP_MARKERS = (
     "亲昵",
     *AUTONOMY_RELATIONSHIP_ADDRESS_TERMS,
 )
+_AUTONOMY_STYLE_FILLER_MARKERS = (
+    "语气词",
+    "口头禅",
+    "笑声",
+    "哈哈",
+    "嘿嘿",
+    "嘻嘻",
+    "呵呵",
+    "嗯嗯",
+    "啊啊",
+    "哦哦",
+    "呀呀",
+    "啦啦",
+)
+_AUTONOMY_LAUGHTER_FRAGMENT = re.compile(r"(?:哈{2,}|嘿{2,}|嘻{2,}|呵{2,})")
+_AUTONOMY_LONG_LAUGHTER = re.compile(
+    r"(?:[哈嘿嘻呵][\s，,。.!！？?；;：:…~～]*){3,}"
+)
+_AUTONOMY_LEADING_FILLER = re.compile(
+    r"^[\s，,。.!！？?；;：:…~～‘’“”\"']*"
+    r"(?:哈{2,}|嘿{2,}|嘻{2,}|呵{2,}|嗯+|呃+|额+|啊+|哦+|噢+|欸+|诶+|哎+|唉+)"
+)
+_AUTONOMY_REPEATED_FILLER = re.compile(
+    r"(?:嗯{2,}|呃{2,}|额{2,}|啊{2,}|哦{2,}|噢{2,}|欸{2,}|诶{2,}|"
+    r"呀{2,}|啦{2,}|嘛{2,}|哎{2,}|唉{2,})"
+)
+_AUTONOMY_STANDALONE_FILLER = re.compile(
+    r"(?:^|[\s，,。.!！？?；;：:…~～])"
+    r"(嗯+|呃+|额+|啊+|哦+|噢+|欸+|诶+|哎+|唉+)"
+    r"(?=$|[\s，,。.!！？?；;：:…~～])"
+)
+_AUTONOMY_SENTENCE_FINAL_PARTICLE = re.compile(
+    r"[啊呀呢啦哦噢嘛吗吧呗哒嘞咯喽哈欸诶耶]"
+    r"(?=\s*(?:[，,。.!！？?；;：:…~～\n]|$))"
+)
 
 
 def _normalized_autonomy_message_text(value: object) -> str:
@@ -271,6 +311,40 @@ def unapproved_relationship_address_terms(
     )
 
 
+def generated_text_filler_violations(
+    value: object,
+    *,
+    allow_laughter: bool = True,
+) -> tuple[str, ...]:
+    """Return stable reasons why generated social text sounds mechanically chatty."""
+
+    text = _normalized_autonomy_message_text(value)
+    if not text:
+        return ()
+    violations: list[str] = []
+    laughter = tuple(_AUTONOMY_LAUGHTER_FRAGMENT.finditer(text))
+    if laughter and not allow_laughter:
+        violations.append("laughter_not_allowed")
+    if _AUTONOMY_LONG_LAUGHTER.search(text):
+        violations.append("long_laughter")
+    if len(laughter) > 1:
+        violations.append("repeated_laughter")
+    if _AUTONOMY_LEADING_FILLER.search(text):
+        violations.append("leading_filler")
+    if _AUTONOMY_REPEATED_FILLER.search(text):
+        violations.append("repeated_filler")
+
+    filler_spans = {
+        match.span(1) for match in _AUTONOMY_STANDALONE_FILLER.finditer(text)
+    }
+    filler_spans.update(
+        match.span() for match in _AUTONOMY_SENTENCE_FINAL_PARTICLE.finditer(text)
+    )
+    if len(filler_spans) > 1:
+        violations.append("too_many_fillers")
+    return tuple(dict.fromkeys(violations))
+
+
 def _sanitize_style_text(value: object) -> str:
     text = _normalized_autonomy_message_text(value)
     if not text:
@@ -282,7 +356,10 @@ def _sanitize_style_text(value: object) -> str:
         if fragment.strip()
         and not any(
             marker.casefold() in fragment.casefold()
-            for marker in _AUTONOMY_STYLE_RELATIONSHIP_MARKERS
+            for marker in (
+                *_AUTONOMY_STYLE_RELATIONSHIP_MARKERS,
+                *_AUTONOMY_STYLE_FILLER_MARKERS,
+            )
         )
     ]
     return "，".join(safe)
@@ -315,11 +392,16 @@ def sanitize_social_style_profile(
         ]
         if items:
             safe_traits[key] = items
-    avoid = list(safe_traits.get("avoid") or [])
-    boundary = "不要跨联系人复用昵称或关系型称呼"
-    if boundary not in avoid:
-        avoid.append(boundary)
-    safe_traits["avoid"] = avoid[:10]
+    enforced_boundaries = (
+        "不要跨联系人复用昵称或关系型称呼",
+        "减少语气词，不连续或反复使用哈哈等笑声",
+    )
+    avoid = [
+        item
+        for item in list(safe_traits.get("avoid") or [])
+        if item not in enforced_boundaries
+    ]
+    safe_traits["avoid"] = [*avoid[:8], *enforced_boundaries]
     return safe_summary[:1000], safe_traits
 
 

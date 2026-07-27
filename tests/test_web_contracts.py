@@ -6790,6 +6790,11 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
             "function agentExecutionSectionHtml",
             "async function pageAgent",
         )
+        page = self._app_fragment(
+            app_js,
+            "async function pageAgent",
+            "async function pageLab",
+        )
         forms = self._app_fragment(
             app_js,
             "async function handleProductForm",
@@ -6822,6 +6827,11 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
         self.assertIn("默认不选择任何动作", section)
         self.assertIn("开启后不会自动监听或接管账号", section)
         self.assertIn("selected.has(action) ? \"checked\" : \"\"", section)
+        self.assertNotIn("agentExecutionSectionHtml(", page)
+        for removed_surface in ("回复草稿", "手动账号工具", "二次确认"):
+            self.assertNotIn(removed_surface, page)
+        self.assertIn("模型与表达设置", page)
+        self.assertIn("语言风格", page)
         self.assertIn('agentExecutionApi("/api/agent/execution-settings"', forms)
         self.assertIn("user_enabled: userEnabled", forms)
         self.assertIn("auto_send_enabled: autoSendEnabled", forms)

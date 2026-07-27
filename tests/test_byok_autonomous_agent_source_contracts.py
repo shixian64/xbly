@@ -788,17 +788,31 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         self.assertIn('"model_run_cancelled"', succeed)
         self.assertIn("AgentRunRepository(db).fail(", fail)
 
-        for generator in ("generate_reply", "generate_scheduled_post"):
-            generation, _ = self.function_source("bbw_agent/runtime.py", generator)
-            self.assertLess(
-                generation.index("self._begin_model_run("),
-                generation.index("self.gateway_factory(self.settings).complete("),
-            )
-            self.assertLess(
-                generation.index("self.gateway_factory(self.settings).complete("),
-                generation.index("self._succeed_model_run("),
-            )
-            self.assertIn("self._fail_model_run(", generation)
+        reply_generation, _ = self.function_source(
+            "bbw_agent/runtime.py", "generate_reply"
+        )
+        self.assertLess(
+            reply_generation.index("self._begin_model_run("),
+            reply_generation.index("self._complete_social_text("),
+        )
+        self.assertLess(
+            reply_generation.index("self._complete_social_text("),
+            reply_generation.index("self._succeed_model_run("),
+        )
+        self.assertIn("self._fail_model_run(", reply_generation)
+
+        post_generation, _ = self.function_source(
+            "bbw_agent/runtime.py", "generate_scheduled_post"
+        )
+        self.assertLess(
+            post_generation.index("self._begin_model_run("),
+            post_generation.index("self.gateway_factory(self.settings).complete("),
+        )
+        self.assertLess(
+            post_generation.index("self.gateway_factory(self.settings).complete("),
+            post_generation.index("self._succeed_model_run("),
+        )
+        self.assertIn("self._fail_model_run(", post_generation)
 
         run_succeed, _ = self.function_source(
             "bbw_agent/repositories.py",
@@ -834,13 +848,34 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
             "AUTONOMY_NO_REPLY_SENTINEL",
             "不得续接已经中断的旧话题",
             "列表为空时完全不要称呼对方",
+            "AUTONOMY_GENERATED_TEXT_STYLE_RULES",
         ):
             self.assertIn(binding, draft)
 
         reply, _ = self.function_source("bbw_agent/runtime.py", "generate_reply")
         self.assertIn("autonomous=True", reply)
         self.assertIn("temperature=min(runtime.temperature, 0.3)", reply)
-        self.assertIn("self._validated_reply_text(", reply)
+        self.assertIn("self._complete_social_text(", reply)
+
+        validate, _ = self.function_source(
+            "bbw_agent/runtime.py", "_validated_reply_text"
+        )
+        self.assertIn("generated_text_filler_violations(", validate)
+        self.assertIn('"generated_text_filler_overuse"', validate)
+
+        complete, _ = self.function_source(
+            "bbw_agent/runtime.py", "_complete_social_text"
+        )
+        self.assertIn('exc.code != "generated_text_filler_overuse"', complete)
+        self.assertEqual(complete.count("gateway.complete("), 2)
+        self.assertIn("temperature=min(float(temperature), 0.1)", complete)
+        self.assertIn("_combined_model_completion(completion, retry)", complete)
+
+        outreach, _ = self.function_source(
+            "bbw_agent/runtime.py", "_outreach_generation_messages"
+        )
+        self.assertIn("AUTONOMY_GENERATED_TEXT_STYLE_RULES", outreach)
+        self.assertIn("首次私信和好友申请完全不要使用", outreach)
 
         style, _ = self.function_source(
             "bbw_agent/services.py", "build_style_analysis_plan"
@@ -1011,6 +1046,7 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
             "function agentExecutionSectionHtml(execution)",
         )
         page = self.fragment(app, "async function pageAgent(signal,", "async function pageLab()")
+        css = self.read("bbw_web/static/app.css")
         self.assertIn("source.visible !== true", normalized)
         self.assertIn("background_enabled: source.background_enabled === true", normalized)
         self.assertIn('if (!autonomy?.visible) return "";', section)
@@ -1021,6 +1057,30 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
             presentation.index('? "正在运行"'),
         )
         self.assertIn("agentAutonomySectionHtml(autonomy)", page)
+        self.assertNotIn("agentExecutionSectionHtml(", page)
+        for removed_surface in ("回复草稿", "手动账号工具", "二次确认"):
+            self.assertNotIn(removed_surface, page)
+        for hierarchy in (
+            "发现新用户",
+            "推进关系",
+            "维护对话",
+            "交流原则",
+            "今日统计",
+            "最近动作",
+        ):
+            self.assertIn(hierarchy, section)
+        self.assertIn("模型与表达设置", page)
+        self.assertIn("个人运行器", page)
+        self.assertIn("语言风格", page)
+        for selector in (
+            ".agent-social-workspace",
+            ".agent-capability-groups",
+            ".agent-capability-group",
+            ".agent-social-side",
+            ".agent-settings-grid",
+            ".agent-settings-side",
+        ):
+            self.assertIn(selector, css)
         for field in (
             "discovery_enabled",
             "text_match_enabled",
@@ -1041,6 +1101,9 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         for statistic in ("浏览", "匹配", "上下文回复", "主动私信", "关系操作"):
             self.assertIn(statistic, section)
         self.assertNotIn("无人值守", page)
+        self.assertNotIn("等待人工检查", section)
+        self.assertNotIn("等待人工检查", page)
+        self.assertIn("自动停止重试并保留记录", section)
         self.assertIn('data-action="agent-refresh-autonomy-tasks"', section)
         self.assertIn('id="agent-autonomy-tasks"', section)
         self.assertIn('"/api/agent/autonomy/tasks?limit=50"', app)

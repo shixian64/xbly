@@ -7015,6 +7015,20 @@ html.flash-viewing body {
   gap: 0.8rem;
 }
 
+.agent-social-workspace {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1.3fr) minmax(300px, 0.7fr);
+  align-items: start;
+  gap: 0.8rem;
+}
+
+.agent-social-side {
+  display: grid;
+  min-width: 0;
+  gap: 0.8rem;
+}
+
 .agent-social-status {
   display: flex;
   min-width: 0;
@@ -7053,8 +7067,12 @@ html.flash-viewing body {
 .agent-social-stats {
   display: grid;
   min-width: 0;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.55rem;
+}
+
+.agent-social-stat:last-child:nth-child(odd) {
+  grid-column: 1 / -1;
 }
 
 .agent-social-stat {
@@ -7063,8 +7081,7 @@ html.flash-viewing body {
   gap: 0.16rem;
   border: 1px solid var(--line);
   border-radius: 14px;
-  background: var(--surface);
-  box-shadow: var(--shadow-sm);
+  background: var(--surface-soft);
   padding: 0.68rem 0.72rem;
 }
 
@@ -7086,8 +7103,50 @@ html.flash-viewing body {
 }
 
 .agent-social-form,
+.agent-social-summary,
 .agent-social-activity {
   min-width: 0;
+}
+
+.agent-social-summary .section-head,
+.agent-social-activity .section-head,
+.agent-social-form .section-head {
+  align-items: flex-start;
+}
+
+.agent-social-summary .eyebrow,
+.agent-social-form .eyebrow {
+  margin-bottom: 0.12rem;
+}
+
+.agent-capability-groups {
+  display: grid;
+  min-width: 0;
+  gap: 0.65rem;
+  margin-top: 0.78rem;
+}
+
+.agent-capability-group {
+  min-width: 0;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: rgba(251, 250, 255, 0.72);
+  padding: 0.72rem;
+}
+
+.agent-capability-group legend {
+  color: var(--ink);
+  padding: 0 0.28rem;
+  font-size: 0.84rem;
+  font-weight: 800;
+}
+
+.agent-capability-group > p {
+  margin: 0 0.62rem 0.62rem;
+  color: var(--muted);
+  font-size: 0.7rem;
+  line-height: 1.5;
 }
 
 .agent-social-capability-grid {
@@ -7095,7 +7154,7 @@ html.flash-viewing body {
   min-width: 0;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.55rem;
-  margin: 0.75rem 0;
+  margin: 0;
 }
 
 .agent-social-capability {
@@ -7169,6 +7228,17 @@ html.flash-viewing body {
   margin: 0;
 }
 
+.agent-communication-field {
+  margin-top: 0.82rem;
+}
+
+.agent-autonomy-task-list {
+  max-height: 32rem;
+  overflow: auto;
+  padding-right: 0.12rem;
+  scrollbar-width: thin;
+}
+
 .agent-tools-body {
   display: grid;
   gap: 1rem;
@@ -7179,6 +7249,20 @@ html.flash-viewing body {
   min-width: 0;
   grid-template-columns: minmax(300px, 0.88fr) minmax(0, 1.12fr);
   align-items: start;
+  gap: 1rem;
+}
+
+.agent-settings-grid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1.08fr) minmax(320px, 0.92fr);
+  align-items: start;
+  gap: 1rem;
+}
+
+.agent-settings-side {
+  display: grid;
+  min-width: 0;
   gap: 1rem;
 }
 
@@ -7287,11 +7371,13 @@ html.flash-viewing body {
 }
 
 .agent-style-head h3,
+.agent-style-head h2,
 .agent-style-head p {
   margin: 0;
 }
 
-.agent-style-head h3 {
+.agent-style-head h3,
+.agent-style-head h2 {
   font-size: 0.9rem;
 }
 
@@ -7426,12 +7512,18 @@ html.flash-viewing body {
 @media (max-width: 820px) {
   .agent-overview,
   .agent-primary-grid,
-  .agent-autonomy-grid {
+  .agent-autonomy-grid,
+  .agent-social-workspace,
+  .agent-settings-grid {
     grid-template-columns: 1fr;
   }
 
   .agent-social-stats {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
+
+  .agent-social-stat:last-child:nth-child(odd) {
+    grid-column: auto;
   }
 
   .agent-overview {
@@ -7451,7 +7543,6 @@ html.flash-viewing body {
   }
 
   .agent-status-grid,
-  .agent-social-stats,
   .agent-social-capability-grid,
   .agent-form-actions,
   .agent-parameter-grid,
@@ -7463,7 +7554,14 @@ html.flash-viewing body {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .agent-social-stat:last-child:nth-child(odd) {
+    grid-column: 1 / -1;
+  }
+
   .agent-card,
+  .agent-social-form,
+  .agent-social-summary,
+  .agent-social-activity,
   .agent-capability-body {
     padding: 0.88rem;
   }

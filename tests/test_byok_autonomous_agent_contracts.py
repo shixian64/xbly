@@ -51,6 +51,7 @@ from bbw_agent.autonomous import (  # noqa: E402
     autonomy_reply_message_is_eligible,
     deterministic_action_key,
     deterministic_task_key,
+    generated_text_filler_violations,
     quiet_window_end,
     sanitize_social_style_profile,
     task_is_reclaimable,
@@ -58,6 +59,7 @@ from bbw_agent.autonomous import (  # noqa: E402
 )
 from bbw_agent.runtime import (  # noqa: E402
     AgentAutonomyDispatchContext,
+    ByokAgentAutonomyModelRunner,
     FixedLayerAgentAutonomyDispatcher,
     SqlAgentAutonomyStore,
     _post_generation_messages,
@@ -560,18 +562,113 @@ class AgentAutonomyPolicyContractTests(unittest.TestCase):
 
     def test_global_style_drops_contact_specific_address_terms(self) -> None:
         summary, traits = sanitize_social_style_profile(
-            "轻松亲昵，常用宠物式昵称，短句自然",
+            "轻松亲昵，常用宠物式昵称，喜欢哈哈哈，短句自然",
             {
-                "vocabulary": "贱狗、小傻狗、日常简单词",
-                "do": ["用亲昵调侃称呼如狗狗/傻狗", "多用短句"],
+                "vocabulary": "贱狗、小傻狗、嗯嗯、日常简单词",
+                "do": [
+                    "用亲昵调侃称呼如狗狗/傻狗",
+                    "多用哈哈和语气词",
+                    "多用短句",
+                ],
             },
         )
 
         serialized = f"{summary}{traits}"
         self.assertNotIn("小傻狗", serialized)
         self.assertNotIn("狗狗", serialized)
+        self.assertNotIn("哈哈哈", serialized)
+        self.assertNotIn("嗯嗯", serialized)
         self.assertIn("短句", serialized)
         self.assertIn("不要跨联系人复用昵称或关系型称呼", serialized)
+        self.assertIn("减少语气词，不连续或反复使用哈哈等笑声", serialized)
+
+    def test_generated_social_text_rejects_filler_and_laughter_overuse(self) -> None:
+        for value in (
+            "哈哈哈，认识一下",
+            "哈 哈 哈，认识一下",
+            "哈哈，确实挺有意思",
+            "嗯，好的呀，回头聊呢",
+            "好的呀，回头聊呢",
+            "你呢？今天忙吗？",
+            "这也太好笑了，哈哈，真的哈哈",
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(generated_text_filler_violations(value))
+                with self.assertRaises(AgentAutonomyModelError) as raised:
+                    ByokAgentAutonomyModelRunner._validated_reply_text(value)
+                self.assertEqual(
+                    raised.exception.code,
+                    "generated_text_filler_overuse",
+                )
+
+        for value in ("最近在忙什么？", "这个确实挺有意思", "晚点再聊呀"):
+            with self.subTest(value=value):
+                self.assertEqual(generated_text_filler_violations(value), ())
+                self.assertEqual(
+                    ByokAgentAutonomyModelRunner._validated_reply_text(value),
+                    value,
+                )
+
+        with self.assertRaises(AgentAutonomyModelError) as raised:
+            ByokAgentAutonomyModelRunner._validated_reply_text(
+                "这个确实挺好笑，哈哈",
+                allow_laughter=False,
+            )
+        self.assertEqual(raised.exception.code, "generated_text_filler_overuse")
+
+    def test_filler_overuse_is_rewritten_once_at_low_temperature(self) -> None:
+        completions = [
+            SimpleNamespace(
+                text="哈哈哈，认识一下",
+                input_tokens=10,
+                output_tokens=5,
+                latency_ms=100,
+            ),
+            SimpleNamespace(
+                text="最近在忙什么？",
+                input_tokens=12,
+                output_tokens=4,
+                latency_ms=80,
+            ),
+        ]
+        calls: list[dict[str, object]] = []
+
+        class Gateway:
+            def complete(self, **kwargs: object) -> SimpleNamespace:
+                calls.append(dict(kwargs))
+                return completions.pop(0)
+
+        gateway = Gateway()
+        runner = ByokAgentAutonomyModelRunner(
+            settings=object(),
+            cipher=object(),
+            gateway_factory=lambda _settings: gateway,
+        )
+        text, completion = runner._complete_social_text(
+            runtime=SimpleNamespace(
+                base_url="https://model.example/v1",
+                api_key="secret",
+                model="model",
+            ),
+            messages=(
+                {"role": "system", "content": "生成自然回复。"},
+                {"role": "user", "content": "最近怎么样？"},
+            ),
+            temperature=0.3,
+            max_output_tokens=200,
+        )
+
+        self.assertEqual(text, "最近在忙什么？")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["temperature"], 0.3)
+        self.assertEqual(calls[1]["temperature"], 0.1)
+        self.assertIn(
+            "上一版因为语气词或笑声过多",
+            calls[1]["messages"][0]["content"],
+        )
+        self.assertEqual(completion.input_tokens, 22)
+        self.assertEqual(completion.output_tokens, 9)
+        self.assertEqual(completion.latency_ms, 180)
 
     def test_address_terms_require_repeated_use_with_the_same_peer(self) -> None:
         self.assertEqual(

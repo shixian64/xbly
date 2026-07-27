@@ -15749,7 +15749,7 @@ function aiAgentAutonomyTaskStatusLabel(task) {
       failed: "执行失败",
       cancelled: "已取消",
       stale: "已失效",
-      manual_review: "等待人工检查",
+      manual_review: "结果待核对",
     }[status] || status || "状态未知"
   );
 }
@@ -15758,7 +15758,7 @@ function agentAutonomyRecentTasksHtml(tasks) {
   if (!tasks.length) {
     return `<div class="notice"><strong>暂无最近任务</strong><div>只有满足全部门禁并进入队列的任务才会显示在这里。</div></div>`;
   }
-  return `<div class="stack">${tasks
+  return `<div class="stack agent-autonomy-task-list">${tasks
     .map((task) => {
       const status = String(task.status || "").trim();
       const outcomeUnknown = task.outcome_unknown === true || status === "manual_review";
@@ -15776,7 +15776,7 @@ function agentAutonomyRecentTasksHtml(tasks) {
         detail ? `<div>${esc(detail)}</div>` : ""
       }${
         outcomeUnknown
-          ? `<div>本次外部结果不能安全确认，系统不会自动重试，请先人工检查账号状态。</div>`
+          ? `<div>结果暂无法确认，系统已停止重试并保留记录。</div>`
           : ""
       }</div>`;
     })
@@ -15826,24 +15826,48 @@ function agentAutonomySectionHtml(autonomy) {
         `<div class="agent-social-stat"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`
     )
     .join("");
-  const capabilityOptions = [
-    ["discovery_enabled", "浏览在线用户", "定期查看当前在线列表并记录候选用户"],
-    ["text_match_enabled", "在线匹配", "按安全间隔发起文字匹配并保存匹配历史"],
-    ["follow_discovered_enabled", "关注合适用户", "从最近发现的候选中自然推进关注"],
-    ["friend_request_enabled", "发送好友申请", "关注后再发送简短、克制的好友申请"],
-    ["proactive_message_enabled", "主动发起私信", "只向没有未回复外发消息的候选发送一次开场白"],
-    ["auto_reply_enabled", "根据上下文回复", "只回复当前仍未处理的最新入站文字消息"],
+  const capabilityControl = ([name, label, detail]) =>
+    `<label class="agent-social-capability"><input name="${name}" type="checkbox" ${
+      autonomy[name] ? "checked" : ""
+    } ${controlDisabled} /><span><strong>${esc(label)}</strong><small>${esc(detail)}</small></span></label>`;
+  const capabilityGroups = [
+    [
+      "发现新用户",
+      "从在线列表和文字匹配中寻找新的聊天对象",
+      [
+        ["discovery_enabled", "浏览在线用户", "定期查看在线列表并保存可继续了解的用户"],
+        ["text_match_enabled", "在线匹配", "按设定节奏发起文字匹配并保留匹配结果"],
+      ],
+    ],
+    [
+      "推进关系",
+      "只对已发现且符合条件的用户逐步建立关系",
+      [
+        ["follow_discovered_enabled", "关注合适用户", "从最近发现的候选中选择合适用户关注"],
+        ["friend_request_enabled", "发送好友申请", "在关系自然推进后发送简短、克制的申请"],
+      ],
+    ],
+    [
+      "维护对话",
+      "消息会像正常聊天一样进入会话记录",
+      [
+        ["proactive_message_enabled", "主动发起私信", "没有未回复外发消息时才发送一次自然开场"],
+        ["auto_reply_enabled", "根据上下文回复", "只处理当前连续会话中仍未回复的最新消息"],
+      ],
+    ],
   ]
     .map(
-      ([name, label, detail]) =>
-        `<label class="agent-social-capability"><input name="${name}" type="checkbox" ${
-          autonomy[name] ? "checked" : ""
-        } ${controlDisabled} /><span><strong>${esc(label)}</strong><small>${esc(detail)}</small></span></label>`
+      ([title, detail, options]) =>
+        `<fieldset class="agent-capability-group"><legend>${esc(title)}</legend><p>${esc(
+          detail
+        )}</p><div class="agent-social-capability-grid">${options
+          .map(capabilityControl)
+          .join("")}</div></fieldset>`
     )
     .join("");
   const errorStats = [
     usage.failed_actions ? `失败 ${usage.failed_actions}` : "",
-    usage.outcome_unknown_actions ? `待检查 ${usage.outcome_unknown_actions}` : "",
+    usage.outcome_unknown_actions ? `待核对 ${usage.outcome_unknown_actions}` : "",
   ]
     .filter(Boolean)
     .join(" · ");
@@ -15854,19 +15878,17 @@ function agentAutonomySectionHtml(autonomy) {
       )}</h2><p data-agent-autonomy-detail>${esc(presentation.detail)}</p>${haltedReason}</div>
       <span class="agent-capability-state" data-agent-autonomy-state>${esc(presentation.state)}</span>
     </div>
-    <div class="agent-social-stats" aria-label="今日动作统计">${stats}</div>
-    ${errorStats ? `<div class="agent-social-stat-note">今日异常：${esc(errorStats)}</div>` : ""}
-    <div class="agent-autonomy-grid">
+    <div class="agent-social-workspace">
       <form class="surface-card agent-social-form" data-form="agent-autonomy-settings" autocomplete="off">
-        <div class="section-head"><div><h2>自动操作</h2><p>选择允许 Agent 执行的能力，保存时会同步固定动作权限</p></div></div>
+        <div class="section-head"><div><p class="eyebrow">主要设置</p><h2>自动社交</h2><p>开启需要的能力，Agent 会按发现、关系推进、对话维护的顺序运行</p></div></div>
         <label class="check-line agent-primary-toggle"><input name="user_enabled" type="checkbox" ${
           autonomy.user_enabled ? "checked" : ""
         } ${controlDisabled} /><span>运行自动社交 Agent</span></label>
-        <div class="agent-social-capability-grid">${capabilityOptions}</div>
-        <div class="field"><label for="agent-autonomy-brief">聊天目标与表达边界</label><textarea id="agent-autonomy-brief" name="operation_brief" rows="4" maxlength="4000" placeholder="例如：自然认识新朋友，语气真诚克制；不要索取联系方式，不讨论敏感话题" ${controlDisabled}>${esc(
+        <div class="agent-capability-groups">${capabilityGroups}</div>
+        <div class="field agent-communication-field"><label for="agent-autonomy-brief">交流原则</label><textarea id="agent-autonomy-brief" name="operation_brief" rows="4" maxlength="4000" placeholder="例如：表达自然直接，少用语气词，不连续使用哈哈，不乱用称呼；不要索取联系方式" ${controlDisabled}>${esc(
           autonomy.operation_brief
-        )}</textarea><p class="field-help">这里只影响文字生成，不会交给模型任何账号凭据或通用操作工具。</p></div>
-        <details class="agent-inline-details"><summary>运行时间与发现频率</summary><div class="agent-details-body"><div class="form-grid">
+        )}</textarea><p class="field-help">这里控制聊天目标和表达方式。发送前仍会检查重复笑声、语气词和未经上下文允许的称呼。</p></div>
+        <details class="agent-inline-details"><summary>时间与运行节奏</summary><div class="agent-details-body"><div class="form-grid">
           <div class="field"><label for="agent-autonomy-timezone">时区</label><input id="agent-autonomy-timezone" name="timezone" maxlength="64" value="${esc(
             autonomy.timezone
           )}" ${controlDisabled} required /></div>
@@ -15881,7 +15903,7 @@ function agentAutonomySectionHtml(autonomy) {
           )}" ${controlDisabled} required /><p class="field-help">同一账号两次实际操作之间至少间隔 10 秒。</p></div>
           <div class="field"><label for="agent-autonomy-discovery-interval">发现间隔（分钟）</label><input id="agent-autonomy-discovery-interval" name="discovery_interval_minutes" type="number" min="5" max="1440" step="1" value="${esc(
             autonomy.discovery_interval_minutes
-          )}" ${controlDisabled} required /></div>
+          )}" ${controlDisabled} required /><p class="field-help">重新浏览在线列表和寻找新候选的间隔，不表示每次都会发消息。</p></div>
         </div></div></details>
         <button type="submit" class="btn primary full mt-sm" ${controlDisabled}>${
           autonomy.user_enabled ? "保存运行设置" : "开始运行"
@@ -15892,11 +15914,16 @@ function agentAutonomySectionHtml(autonomy) {
             : `<p class="field-help">当前账号尚未获得完整的 Agent 与账号动作授权。</p>`
         }
       </form>
-      <div class="surface-card agent-social-activity"><div class="section-head"><div><h2>最近动作</h2><p>消息、匹配和关系结果也会进入各自的正常记录</p></div><button type="button" class="btn secondary small" data-action="agent-refresh-autonomy-tasks">刷新</button></div><div id="agent-autonomy-tasks">${agentAutonomyRecentTasksHtml(
-        autonomy.recent_tasks
-      )}</div></div>
+      <div class="agent-social-side">
+        <section class="surface-card agent-social-summary"><div class="section-head"><div><p class="eyebrow">运行概览</p><h2>今日统计</h2><p>只做统计，不限制每日预算</p></div></div><div class="agent-social-stats" aria-label="今日动作统计">${stats}</div>${
+          errorStats ? `<div class="agent-social-stat-note">今日异常：${esc(errorStats)}</div>` : ""
+        }</section>
+        <section class="surface-card agent-social-activity"><div class="section-head"><div><h2>最近动作</h2><p>消息、匹配和关系变化会同时进入对应记录</p></div><button type="button" class="btn secondary small" data-action="agent-refresh-autonomy-tasks">刷新</button></div><div id="agent-autonomy-tasks">${agentAutonomyRecentTasksHtml(
+          autonomy.recent_tasks
+        )}</div></section>
+      </div>
     </div>
-    <div class="notice agent-social-boundary"><strong>运行边界</strong><div>Agent 每次只执行预先授权的固定动作；不会获取 Cookie、Token 或任意网址访问能力。相同用户会按发现、关注、好友申请、私信的顺序逐步互动，存在未回复外发消息时不会重复触达。外部结果无法确认时会自动暂停并等待人工检查。</div></div>
+    <div class="notice agent-social-boundary"><strong>运行边界</strong><div>Agent 每次只执行已授权的固定动作，不会获取 Cookie、Token 或任意网址访问能力。相同用户会按发现、关注、好友申请、私信的顺序逐步互动；存在未回复外发消息时不会重复触达。外部结果无法确认时会自动停止重试并保留记录。</div></div>
   </section>`;
 }
 
@@ -15986,7 +16013,6 @@ async function pageAgent(signal, { data: prefetchedData = null } = {}) {
   const connection = data.connection || null;
   const settings = data.settings || {};
   const ready = settings.ready === true;
-  const execution = S.aiAgentExecutionStatus;
   const autonomy = S.aiAgentAutonomyStatus;
   const connectionState = !connection
     ? { label: "尚未配置", tone: "neutral", detail: "填写模型服务地址、模型名称和 API Key" }
@@ -16010,12 +16036,10 @@ async function pageAgent(signal, { data: prefetchedData = null } = {}) {
         data.style_profile
       )}</div></details>`
     : `<div class="agent-style-empty">尚未分析语言风格。该功能只读取本人已归档的历史文字消息。</div>`;
-  const executionSection = agentExecutionSectionHtml(execution);
   const autonomySection = agentAutonomySectionHtml(autonomy);
-  const advancedSections = executionSection;
   return `<div class="agent-page">
     <section class="agent-overview">
-      <div class="agent-overview-copy"><p class="eyebrow">社交 Agent</p><h2>授权后，自动完成发现、匹配与聊天维护</h2><p>Agent 会像正常用户一样逐步浏览在线列表、匹配、关注、申请好友和聊天；所有实际操作都会进入消息、匹配、关系或任务记录。</p></div>
+      <div class="agent-overview-copy"><p class="eyebrow">社交 Agent</p><h2>自动探索新用户，持续维护真实对话</h2><p>授权后，Agent 会逐步浏览在线列表、匹配、关注、申请好友和聊天。每次实际操作都会进入消息、匹配、关系或任务记录。</p></div>
       <div class="agent-status-grid" aria-label="社交 Agent 状态">
         <div class="agent-status-item" data-agent-status="connection" data-tone="${connectionState.tone}"><span>模型连接</span><strong>${esc(
           connectionState.label
@@ -16029,11 +16053,11 @@ async function pageAgent(signal, { data: prefetchedData = null } = {}) {
     ${autonomySection}
 
     <details class="agent-capability agent-tools" ${ready ? "" : "open"}>
-      <summary class="agent-capability-summary"><span><strong>模型与高级工具</strong><small>模型地址、API Key、生成参数、审核草稿和手动动作</small></span><span class="agent-capability-state">按需展开</span></summary>
+      <summary class="agent-capability-summary"><span><strong>模型与表达设置</strong><small>模型连接、个人运行器和语言风格，通常配置一次即可</small></span><span class="agent-capability-state">${
+        ready ? "已就绪" : "需要设置"
+      }</span></summary>
       <div class="agent-capability-body agent-tools-body">
-
-    <section class="agent-primary-grid" aria-label="模型与草稿设置">
-      <div class="agent-setup-stack">
+    <section class="agent-settings-grid" aria-label="模型与表达设置">
         <form class="surface-card agent-card" data-form="agent-connection" autocomplete="off">
           <div class="section-head"><div><h2>模型连接</h2><p>${esc(
             agentConnectionStatusText(connection)
@@ -16059,52 +16083,38 @@ async function pageAgent(signal, { data: prefetchedData = null } = {}) {
           <div class="agent-form-actions"><button type="submit" class="btn primary" name="intent" value="save_test">保存并测试</button><button type="submit" class="btn secondary" name="intent" value="save">仅保存</button></div>
         </form>
 
-        <form class="surface-card agent-card agent-runner-card" data-form="agent-settings">
-          <div class="section-head"><div><h2>个人运行器</h2><p>连接测试通过后，主动开启才会调用模型</p></div></div>
-          <label class="check-line agent-primary-toggle"><input name="user_enabled" type="checkbox" ${
-            settings.user_enabled ? "checked" : ""
-          } /><span>启用个人模型运行器</span></label>
-          <details class="agent-inline-details"><summary>写作偏好与生成参数</summary><div class="agent-details-body">
-            <div class="field"><label for="agent-custom-instructions">个人写作要求</label><textarea id="agent-custom-instructions" name="custom_instructions" rows="4" maxlength="4000" placeholder="例如语气自然、避免过度热情；不要填写账号密码或其他密钥">${esc(
-              settings.custom_instructions || ""
-            )}</textarea></div>
-            <div class="agent-parameter-grid">
-              <div class="field"><label for="agent-temperature">随机度</label><input id="agent-temperature" name="temperature" type="number" min="0" max="2" step="0.1" value="${esc(
-                settings.temperature ?? 0.7
-              )}" required /></div>
-              <div class="field"><label for="agent-context-limit">上下文条数</label><input id="agent-context-limit" name="context_message_limit" type="number" min="1" max="100" step="1" value="${esc(
-                settings.context_message_limit ?? 30
-              )}" required /></div>
-              <div class="field"><label for="agent-output-tokens">最大输出长度</label><input id="agent-output-tokens" name="max_output_tokens" type="number" min="64" max="4096" step="1" value="${esc(
-                settings.max_output_tokens ?? 512
-              )}" required /></div>
-            </div>
-          </div></details>
-          <button type="submit" class="btn primary full">保存运行设置</button>
-        </form>
-      </div>
+        <div class="agent-settings-side">
+          <form class="surface-card agent-card agent-runner-card" data-form="agent-settings">
+            <div class="section-head"><div><h2>个人运行器</h2><p>连接测试通过后，主动开启才会调用模型</p></div></div>
+            <label class="check-line agent-primary-toggle"><input name="user_enabled" type="checkbox" ${
+              settings.user_enabled ? "checked" : ""
+            } /><span>启用个人模型运行器</span></label>
+            <details class="agent-inline-details"><summary>写作偏好与生成参数</summary><div class="agent-details-body">
+              <div class="field"><label for="agent-custom-instructions">个人写作要求</label><textarea id="agent-custom-instructions" name="custom_instructions" rows="4" maxlength="4000" placeholder="例如表达自然直接，少用语气词，不连续使用哈哈；不要填写账号密码或其他密钥">${esc(
+                settings.custom_instructions || ""
+              )}</textarea></div>
+              <div class="agent-parameter-grid">
+                <div class="field"><label for="agent-temperature">随机度</label><input id="agent-temperature" name="temperature" type="number" min="0" max="2" step="0.1" value="${esc(
+                  settings.temperature ?? 0.7
+                )}" required /></div>
+                <div class="field"><label for="agent-context-limit">上下文条数</label><input id="agent-context-limit" name="context_message_limit" type="number" min="1" max="100" step="1" value="${esc(
+                  settings.context_message_limit ?? 30
+                )}" required /></div>
+                <div class="field"><label for="agent-output-tokens">最大输出长度</label><input id="agent-output-tokens" name="max_output_tokens" type="number" min="64" max="4096" step="1" value="${esc(
+                  settings.max_output_tokens ?? 512
+                )}" required /></div>
+              </div>
+            </div></details>
+            <button type="submit" class="btn primary full">保存运行设置</button>
+          </form>
 
-      <section class="surface-card agent-card agent-compose-card">
-        <div class="section-head"><div><h2>回复草稿</h2><p>读取指定联系人的已归档会话，生成后不会自动发送</p></div></div>
-        ${
-          ready
-            ? ""
-            : `<div class="notice warn agent-inline-notice"><strong>草稿功能尚未就绪</strong><div>请先完成模型连接测试，并开启个人模型运行器。</div></div>`
-        }
-        <form class="agent-draft-form" data-form="agent-draft"><div class="field"><label for="agent-peer-uid">对方用户编号</label><input id="agent-peer-uid" name="peer_upstream_uid" maxlength="128" placeholder="输入已有会话中的对方用户编号" required /></div><div class="field"><label for="agent-objective">本次回复意图</label><textarea id="agent-objective" name="objective" rows="4" maxlength="2000" placeholder="可选，例如礼貌回应并继续了解对方"></textarea></div><button type="submit" class="btn primary full" ${
-          ready ? "" : "disabled"
-        } data-agent-ready-control>生成审核草稿</button></form><div id="agent-result" class="result-panel" aria-live="polite"></div>
-        <div class="agent-style-panel"><div class="agent-style-head"><div><h3>个人语言风格</h3><p>可选；仅分析本人发出的历史文字消息</p></div><button type="button" class="btn secondary small" data-action="agent-analyze-style" ${
-          ready ? "" : "disabled"
-        } data-agent-ready-control>${data.style_profile ? "重新分析" : "开始分析"}</button></div>${styleContent}</div>
-      </section>
+          <section class="surface-card agent-card agent-style-card">
+            <div class="agent-style-head"><div><h2>语言风格</h2><p>仅分析本人发出的历史文字，并过滤重复笑声、语气词和联系人专属称呼</p></div><button type="button" class="btn secondary small" data-action="agent-analyze-style" ${
+              ready ? "" : "disabled"
+            } data-agent-ready-control>${data.style_profile ? "重新分析" : "开始分析"}</button></div>${styleContent}
+          </section>
+        </div>
     </section>
-
-    ${
-      advancedSections
-        ? `<section class="agent-advanced"><div class="section-head"><div><h2>手动账号工具</h2><p>单次执行仍需二次确认，和自动社交设置相互独立</p></div></div>${advancedSections}</section>`
-        : ""
-    }
       </div>
     </details>
   </div>`;

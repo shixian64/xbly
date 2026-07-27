@@ -31,6 +31,7 @@ from bbw_prod.models import (
 
 from .model_gateway import ModelGatewayError, validate_api_key, validate_model_base_url
 from .autonomous import (
+    AUTONOMY_GENERATED_TEXT_STYLE_RULES,
     AUTONOMY_NO_REPLY_SENTINEL,
     AUTONOMY_REPLY_SESSION_GAP_SECONDS,
     allowed_relationship_address_terms,
@@ -1457,6 +1458,8 @@ def build_style_analysis_plan(
                 "vocabulary、punctuation、expressions、do、avoid 这些键；do 与 avoid 为字符串数组。"
                 "不同联系人之间的昵称、亲昵称呼、侮辱式调侃、姓名和关系表达不属于全局语言风格，"
                 "不得写入 summary、vocabulary、expressions 或 do；应在 avoid 中明确禁止跨联系人复用。"
+                "高频语气词、口头禅和哈哈等笑声也不得作为应模仿的全局风格；"
+                "应在 avoid 中明确要求减少语气词和重复笑声。"
             ),
         },
         {
@@ -1678,6 +1681,7 @@ def build_reply_draft_plan(
         "全局风格画像只控制句长、语气和标点，不代表与当前联系人的关系。"
         "除 allowed_address_terms 明确列出的词外，不得使用昵称、亲昵称呼、侮辱式调侃或关系称呼；"
         "列表为空时完全不要称呼对方。conversation_title 只能用于识别会话，不能直接作为称呼。"
+        f"{AUTONOMY_GENERATED_TEXT_STYLE_RULES}"
         "保持自然简洁，只返回草稿正文，不要解释过程、不要加标题或引号。"
     )
     if autonomous:
