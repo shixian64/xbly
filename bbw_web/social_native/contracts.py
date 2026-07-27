@@ -57,6 +57,10 @@ class SocialAccount:
     profile: Mapping[str, object] = field(default_factory=dict)
     updated_at: datetime | None = None
     account_provider: str = LEGACY_ACCOUNT_PROVIDER
+    account_display_data: Mapping[str, object] = field(
+        default_factory=dict,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)

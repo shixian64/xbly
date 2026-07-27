@@ -162,10 +162,67 @@ class NativeSocialDispatchContractTests(unittest.TestCase):
         ):
             self.assertIn(key, user)
         self.assertEqual(user["source"], "web-local")
+        for private_key in (
+            "money",
+            "vip",
+            "svip",
+            "user_role",
+            "rp_verify_time",
+            "is_realname",
+            "logged_in",
+        ):
+            self.assertNotIn(private_key, user)
         service.get_user.assert_called_once()
         self.assertEqual(
             service.get_user.call_args.kwargs["upstream_uid"], "用户-乙_7"
         )
+
+    def test_me_profile_includes_private_state_and_derives_realname(self) -> None:
+        identity = _identity("账号-A_9")
+        profile = _profile(identity.upstream_uid, nickname="当前用户")
+        account = SocialAccount(
+            identity.user_id,
+            identity.external_account_id,
+            identity.upstream_uid,
+            "当前用户",
+            {"money": "88"},
+            NOW,
+            account_display_data={
+                "rp_verify_time": "1715268133",
+                "portrait": "/media/account-avatar.jpg",
+                "vip": "1",
+                "svip": "2",
+                "user_sign": "账号签名",
+                "user_role": "member",
+            },
+        )
+        service = Mock()
+        service.get_me_with_account.return_value = (profile, account)
+        db = object()
+        with (
+            patch.object(API, "session_scope", side_effect=lambda: _scope(db)),
+            patch.object(API, "SqlAlchemyCanonicalSocialStore", return_value=Mock()),
+            patch.object(API, "LocalSocialService", return_value=service),
+        ):
+            response = API.dispatch_social_native(
+                identity,
+                "GET",
+                "/api/profile/me",
+                {},
+                {},
+            )
+
+        self.assertEqual(response.status, 200)
+        user = response.payload["user"]
+        self.assertTrue(user["is_realname"])
+        self.assertEqual(user["rp_verify_time"], "1715268133")
+        self.assertEqual(user["money"], "88")
+        self.assertEqual(user["vip"], "1")
+        self.assertEqual(user["svip"], "2")
+        self.assertEqual(user["user_role"], "member")
+        self.assertTrue(user["logged_in"])
+        self.assertEqual(response.payload["items"], [user])
+        self.assertEqual(response.payload["list"], [user])
 
     def test_profile_users_preserves_order_and_envelope(self) -> None:
         service = Mock()

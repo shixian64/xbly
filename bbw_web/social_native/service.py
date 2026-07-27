@@ -199,21 +199,33 @@ class LocalSocialService:
     @staticmethod
     def _profile(account: SocialAccount, flags: RelationshipFlags) -> SocialProfileView:
         profile = dict(account.profile or {})
+        account_display = dict(account.account_display_data or {})
         return SocialProfileView(
             user_id=account.user_id,
             upstream_uid=account.upstream_uid,
             nickname=str(account.display_name or profile.get("nickname") or ""),
-            avatar=projected_profile_avatar(profile),
-            signature=str(profile.get("signature") or ""),
+            avatar=(
+                projected_profile_avatar(profile)
+                or str(account_display.get("portrait") or "")
+            ),
+            signature=str(
+                profile.get("signature") or account_display.get("user_sign") or ""
+            ),
             city=str(profile.get("city") or ""),
             gender=str(profile.get("gender") or "unspecified"),
             relationship=flags,
             updated_at=account.updated_at,
         )
 
-    def get_me(self, *, principal: SocialPrincipal) -> SocialProfileView:
+    def get_me_with_account(
+        self, *, principal: SocialPrincipal
+    ) -> tuple[SocialProfileView, SocialAccount]:
         actor = self._actor(principal)
-        return self._profile(actor, RelationshipFlags())
+        return self._profile(actor, RelationshipFlags()), actor
+
+    def get_me(self, *, principal: SocialPrincipal) -> SocialProfileView:
+        profile, _actor = self.get_me_with_account(principal=principal)
+        return profile
 
     def get_user(
         self, *, principal: SocialPrincipal, upstream_uid: object

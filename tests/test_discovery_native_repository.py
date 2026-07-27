@@ -11,9 +11,11 @@ from sqlalchemy.dialects import postgresql
 
 from bbw_prod.models import (
     ActivityEvent,
+    MatchPreference as MatchPreferenceModel,
     MatchQueueEntry as MatchQueueEntryModel,
     MatchResult as MatchResultModel,
     Relationship,
+    UserDiscoveryProfile,
 )
 from bbw_web.discovery_native import (
     MATCH_STATUS_ACTIVE,
@@ -49,6 +51,9 @@ class _Rows:
 
     def one(self):
         return self.rows[0]
+
+    def one_or_none(self):
+        return self.rows[0] if self.rows else None
 
     def scalar_one(self):
         return self.rows[0] if self.rows else None
@@ -110,6 +115,104 @@ class DiscoveryRepositoryContractTests(unittest.TestCase):
 
         self.assertEqual(values["city_code"], normalized_city_code("福州"))
         self.assertFalse(values["discoverable"])
+
+    def test_canonical_user_display_derives_realname_from_account_state(self) -> None:
+        principal = DiscoveryPrincipal(uuid.uuid4(), uuid.uuid4(), "账号-A")
+        user = SimpleNamespace(
+            id=principal.user_id,
+            profile={
+                "signature": "本地签名",
+                "is_realname": False,
+                "money": "12",
+            },
+        )
+        account = SimpleNamespace(
+            id=principal.external_account_id,
+            provider="beibeiwu",
+            upstream_uid=principal.upstream_uid,
+            device_data={
+                "rp_verify_time": "1715268133",
+                "vip": "1",
+                "svip": "0",
+                "user_role": "member",
+            },
+        )
+        db = SimpleNamespace(execute=lambda _statement: _Rows([(user, account)]))
+
+        display = SqlAlchemyDiscoveryStore(db).canonical_user_display(principal)
+
+        self.assertTrue(display["is_realname"])
+        self.assertEqual(display["rp_verify_time"], "1715268133")
+        self.assertEqual(display["money"], "12")
+        self.assertEqual(display["vip"], "1")
+        self.assertEqual(display["svip"], "0")
+        self.assertEqual(display["user_role"], "member")
+        self.assertTrue(display["logged_in"])
+
+    def test_new_rows_are_query_visible_when_autoflush_is_disabled(self) -> None:
+        class AutoflushDisabledDB:
+            autoflush = False
+
+            def __init__(self) -> None:
+                self.pending = []
+                self.persisted = {
+                    UserDiscoveryProfile: [],
+                    MatchPreferenceModel: [],
+                    MatchQueueEntryModel: [],
+                }
+                self.flush_count = 0
+
+            def scalar(self, statement):
+                entity = statement.column_descriptions[0].get("entity")
+                rows = self.persisted.get(entity, [])
+                return rows[0] if rows else None
+
+            def add(self, value):
+                self.pending.append(value)
+
+            def flush(self):
+                self.flush_count += 1
+                while self.pending:
+                    value = self.pending.pop(0)
+                    self.persisted[type(value)].append(value)
+
+        owner = DiscoveryAccount(uuid.uuid4(), uuid.uuid4(), "owner", "Owner")
+        profile = DiscoveryProfile(
+            owner.user_id,
+            "CN-500000",
+            "重庆市",
+            "male",
+            "Z",
+            30,
+            True,
+            NOW,
+        )
+        preference = MatchPreference(
+            owner.user_id, "same-city", "female", "Z", 18, 120, True, 1
+        )
+        db = AutoflushDisabledDB()
+        store = SqlAlchemyDiscoveryStore(db)
+
+        store.save_discovery_profile(profile)
+        self.assertEqual(store.get_discovery_profile(owner.user_id), profile)
+        store.save_match_preference(preference, expected_version=0)
+        self.assertEqual(store.get_match_preference(owner.user_id), preference)
+        store.enqueue_text_match(
+            account=owner,
+            profile=profile,
+            preference=preference,
+            request_id="request-one",
+            enqueued_at=NOW,
+            expires_at=NOW + timedelta(seconds=120),
+        )
+        outcome = store.get_text_match_outcome(
+            user_id=owner.user_id,
+            request_id="request-one",
+        )
+
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.status, QUEUE_STATUS_WAITING)
+        self.assertEqual(db.flush_count, 3)
 
     def test_waiting_candidate_query_locks_only_queue_rows_and_skips_claimed(self) -> None:
         class Capture:
@@ -233,7 +336,7 @@ class DiscoveryRepositoryContractTests(unittest.TestCase):
         self.assertEqual(created.status, QUEUE_STATUS_WAITING)
         self.assertEqual(created.request_id, "new-request")
         self.assertEqual(len(db.added), 1)
-        self.assertEqual(db.flush_count, 1)
+        self.assertEqual(db.flush_count, 2)
 
     def test_commit_plan_consumes_both_queues_and_requests_two_grants(self) -> None:
         left = DiscoveryAccount(uuid.uuid4(), uuid.uuid4(), "left", "Left")

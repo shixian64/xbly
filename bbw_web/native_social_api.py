@@ -20,6 +20,7 @@ from sqlalchemy.dialects.postgresql import insert
 from bbw_prod.db import session_scope
 from bbw_prod.models import ActivityEvent, ExternalAccount, Relationship
 from bbw_prod.repositories import OperationOutboxRepository
+from bbw_web.account_display import canonical_self_account_display
 from bbw_web.social_native import (
     InvalidSocialInput,
     LocalSocialService,
@@ -290,6 +291,20 @@ def _profile_dict(profile: SocialProfileView) -> dict[str, Any]:
         "blocked_by": flags.blocked_by,
         "source": SOCIAL_NATIVE_PROVIDER,
     }
+
+
+def _self_profile_dict(
+    profile: SocialProfileView,
+    account: SocialAccount,
+) -> dict[str, Any]:
+    item = _profile_dict(profile)
+    item.update(
+        canonical_self_account_display(
+            account.profile,
+            account.account_display_data,
+        )
+    )
+    return item
 
 
 def _envelope(
@@ -742,7 +757,8 @@ def _dispatch_get(
 ) -> NativeSocialResponse:
     summary = _query_first(query, "summary", default="0") == "1"
     if path == "/api/profile/me":
-        user = _profile_dict(service.get_me(principal=principal))
+        profile, account = service.get_me_with_account(principal=principal)
+        user = _self_profile_dict(profile, account)
         return _response(
             {
                 "ok": True,
@@ -999,7 +1015,10 @@ def _dispatch_post(
                 else ""
             ),
         )
-        user = _profile_dict(service.get_me(principal=principal))
+        user = _self_profile_dict(
+            service.get_me(principal=principal),
+            result.profile,
+        )
         avatar_response = {}
         if field == "avatar":
             avatar_response["avatar"] = user["avatar"]

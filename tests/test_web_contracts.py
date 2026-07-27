@@ -4058,6 +4058,10 @@ class SocialFrontendContractTests(unittest.TestCase):
         )[0]
 
         self.assertIn('api("/api/profile/me", { signal })', page_me)
+        self.assertIn(
+            "const user = { ...(S.user || {}), ...(data.user || {}) };",
+            page_me,
+        )
         self.assertNotIn("/api/social/", page_me)
         self.assertIn("?summary=1", hydrate)
         self.assertIn('data-me-stat="friends"', page_me)

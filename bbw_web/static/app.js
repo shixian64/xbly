@@ -15614,8 +15614,8 @@ function profileGenderOptions(value) {
 
 async function pageMe(signal) {
   const { data } = await api("/api/profile/me", { signal });
-  if (data.user) applyUser(data.user);
-  const user = data.user || S.user || {};
+  const user = { ...(S.user || {}), ...(data.user || {}) };
+  if (data.user) applyUser(user);
   const name = user.nickname || "乐园用户";
   const countAt = (key) => {
     const value = Number(S.meStats?.[key]);

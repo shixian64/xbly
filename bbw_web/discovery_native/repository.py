@@ -28,6 +28,7 @@ from bbw_prod.models import (
     User,
     UserDiscoveryProfile,
 )
+from bbw_web.account_display import canonical_self_account_display
 from bbw_web.legacy_media_reference import projected_profile_avatar
 
 from .contracts import (
@@ -307,7 +308,7 @@ class SqlAlchemyDiscoveryStore:
     def canonical_user_display(
         self, principal: DiscoveryPrincipal
     ) -> dict[str, object] | None:
-        """Return the small non-sensitive account view expected by ``app.js``."""
+        """Return the authenticated user's small account view for ``app.js``."""
 
         row = self.db.execute(
             select(User, ExternalAccount)
@@ -323,20 +324,19 @@ class SqlAlchemyDiscoveryStore:
         ).one_or_none()
         if row is None:
             return None
-        user, _account = row
+        user, account = row
         profile = dict(user.profile or {})
-        avatar = projected_profile_avatar(profile)
+        account_data = dict(account.device_data or {})
+        avatar = projected_profile_avatar(profile) or str(
+            account_data.get("portrait") or ""
+        )
         return {
             "avatar": avatar,
             "portrait": avatar,
-            "signature": str(profile.get("signature") or "")[:500],
-            "is_realname": bool(profile.get("is_realname")),
-            "money": str(profile.get("money") or "0"),
-            "vip": str(profile.get("vip") or "0"),
-            "svip": str(profile.get("svip") or "0"),
-            "user_role": str(profile.get("user_role") or ""),
-            "rp_verify_time": str(profile.get("rp_verify_time") or "0"),
-            "logged_in": True,
+            "signature": str(
+                profile.get("signature") or account_data.get("user_sign") or ""
+            )[:500],
+            **canonical_self_account_display(profile, account_data),
         }
 
     def get_discovery_profile(self, user_id: uuid.UUID) -> DiscoveryProfile | None:
@@ -361,6 +361,7 @@ class SqlAlchemyDiscoveryStore:
         row.age = profile.age
         row.discoverable = profile.discoverable
         row.last_active_at = profile.last_seen_at
+        self.db.flush()
         return self._profile(row)
 
     def touch_discovery_last_seen(
@@ -478,6 +479,7 @@ class SqlAlchemyDiscoveryStore:
         row.max_age = preference.max_age
         row.enabled = preference.enabled
         row.version = preference.version
+        self.db.flush()
         return self._preference(row)
 
     @staticmethod
@@ -648,6 +650,7 @@ class SqlAlchemyDiscoveryStore:
             expires_at=expires_at,
         )
         self.db.add(row)
+        self.db.flush()
         return self._queue(row)
 
     def list_waiting_text_candidates(

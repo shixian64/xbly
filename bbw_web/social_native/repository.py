@@ -234,7 +234,13 @@ class SqlAlchemyCanonicalSocialStore:
         self.db = db
 
     @staticmethod
-    def _account(user: User, account: ExternalAccount) -> SocialAccount:
+    def _account(
+        user: User,
+        account: ExternalAccount,
+        *,
+        include_private_display: bool = False,
+    ) -> SocialAccount:
+        account_data = dict(account.device_data or {})
         return SocialAccount(
             user_id=user.id,
             external_account_id=account.id,
@@ -243,6 +249,24 @@ class SqlAlchemyCanonicalSocialStore:
             profile=dict(user.profile or {}),
             updated_at=user.updated_at,
             account_provider=account.provider,
+            account_display_data=(
+                {
+                    key: account_data[key]
+                    for key in (
+                        "is_realname",
+                        "money",
+                        "portrait",
+                        "rp_verify_time",
+                        "svip",
+                        "user_sign",
+                        "user_role",
+                        "vip",
+                    )
+                    if key in account_data
+                }
+                if include_private_display
+                else {}
+            ),
         )
 
     def resolve_principal(self, principal: SocialPrincipal) -> SocialAccount | None:
@@ -258,7 +282,11 @@ class SqlAlchemyCanonicalSocialStore:
                 ExternalAccount.upstream_uid == principal.upstream_uid,
             )
         ).one_or_none()
-        return self._account(row[0], row[1]) if row is not None else None
+        return (
+            self._account(row[0], row[1], include_private_display=True)
+            if row is not None
+            else None
+        )
 
     def resolve_active_target(
         self, upstream_uid: str, *, provider: str
