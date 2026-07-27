@@ -247,6 +247,7 @@ class FakeStore(AgentAutonomyStore):
         self.dispatch_requests: list[DispatchReservationRequest] = []
         self.deferred: list[tuple[datetime, str]] = []
         self.completions: list[TaskCompletion] = []
+        self.finish_lease_tokens: list[str] = []
         self.finish_allowed = True
 
     def claim_next(
@@ -333,7 +334,8 @@ class FakeStore(AgentAutonomyStore):
         completion: TaskCompletion,
         now: datetime,
     ) -> bool:
-        del task_id, lease_token, now
+        del task_id, now
+        self.finish_lease_tokens.append(lease_token)
         self.completions.append(completion)
         return self.finish_allowed
 
@@ -564,6 +566,7 @@ class AgentAutonomyOrchestratorTests(unittest.TestCase):
         self.assertEqual(reservation.daily_total_limit, 8)
         self.assertEqual(reservation.daily_action_limit, 4)
         self.assertEqual(reservation.minimum_interval_seconds, 120)
+        self.assertEqual(store.finish_lease_tokens[-1], "permit-001")
         self.assertTrue(store.completions[-1].reset_failures)
 
     def test_outgoing_or_already_replied_head_is_stale_without_model_call(self) -> None:

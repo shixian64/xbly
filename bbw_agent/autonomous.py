@@ -17,7 +17,7 @@ import hashlib
 import json
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from enum import Enum
 from typing import Callable, Mapping, Protocol, Sequence
@@ -1127,6 +1127,8 @@ class AgentAutonomyOrchestrator:
         if denied is not None:
             return denied
 
+        dispatch_task = replace(task, lease_token=reservation.permit_token)
+
         try:
             dispatched = self.dispatcher.execute_fixed_action(
                 command=command,
@@ -1134,7 +1136,7 @@ class AgentAutonomyOrchestrator:
             )
         except Exception:
             return self._finish(
-                task,
+                dispatch_task,
                 TaskCompletion(
                     status=AutonomyTaskStatus.MANUAL_REVIEW,
                     stable_error_code="dispatch_outcome_unknown",
@@ -1146,7 +1148,7 @@ class AgentAutonomyOrchestrator:
             )
         if dispatched.outcome == FixedActionOutcome.SUCCEEDED:
             return self._finish(
-                task,
+                dispatch_task,
                 TaskCompletion(
                     status=AutonomyTaskStatus.SUCCEEDED,
                     result_id=dispatched.result_id,
@@ -1156,7 +1158,7 @@ class AgentAutonomyOrchestrator:
             )
         if dispatched.outcome == FixedActionOutcome.OUTCOME_UNKNOWN:
             return self._finish(
-                task,
+                dispatch_task,
                 TaskCompletion(
                     status=AutonomyTaskStatus.MANUAL_REVIEW,
                     stable_error_code=dispatched.stable_error_code,
@@ -1168,7 +1170,7 @@ class AgentAutonomyOrchestrator:
             )
         if dispatched.stable_error_code == "local_message_source_stale":
             return self._finish(
-                task,
+                dispatch_task,
                 TaskCompletion(
                     status=AutonomyTaskStatus.STALE,
                     stable_error_code=dispatched.stable_error_code,
@@ -1176,7 +1178,7 @@ class AgentAutonomyOrchestrator:
                 now=self._now(),
             )
         return self._finish(
-            task,
+            dispatch_task,
             TaskCompletion(
                 status=AutonomyTaskStatus.FAILED,
                 stable_error_code=dispatched.stable_error_code,
