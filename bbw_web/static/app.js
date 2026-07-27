@@ -3358,7 +3358,6 @@ async function switchMineTab(id, { force = false, replace = false, pageData = nu
   if (S.routeController) S.routeController.abort();
   const controller = new AbortController();
   const seq = ++S.routeSeq;
-  const matchResultRevision = S.matchResultRevision;
   S.routeController = controller;
   S.route = target;
   root().classList.remove("message-route");
@@ -3786,6 +3785,7 @@ async function activateRoute(id, { force = false } = {}) {
   if (S.routeController) S.routeController.abort();
   const controller = new AbortController();
   const seq = ++S.routeSeq;
+  const matchResultRevision = S.matchResultRevision;
   S.routeController = controller;
   S.route = target;
   if (target !== "match" || S.matchTab !== "match") stopMatchStatusPolling();

@@ -480,6 +480,12 @@ class MatchHistoryFrontendContractTests(unittest.TestCase):
         matching = app_js.split("async function pageMatching", 1)[1].split(
             "async function pageVoiceMatch", 1
         )[0]
+        activate_route = app_js.split("async function activateRoute", 1)[1].split(
+            "function loadingState", 1
+        )[0]
+        switch_mine = app_js.split("async function switchMineTab", 1)[1].split(
+            "function routeCacheKey", 1
+        )[0]
         self.assertIn('api("/api/match/history?page=1"', matching)
         self.assertIn("Promise.allSettled", matching)
         self.assertIn("匹配历史", matching)
@@ -499,6 +505,15 @@ class MatchHistoryFrontendContractTests(unittest.TestCase):
         )
         self.assertIn("matchLatestResultHtml(latest)", app_js)
         self.assertIn("hydrateMatchStatusPolling()", app_js)
+        revision_snapshot = "const matchResultRevision = S.matchResultRevision;"
+        revision_guard = "matchResultRevision !== S.matchResultRevision"
+        self.assertIn(revision_snapshot, activate_route)
+        self.assertIn(revision_guard, activate_route)
+        self.assertLess(
+            activate_route.index(revision_snapshot),
+            activate_route.index(revision_guard),
+        )
+        self.assertNotIn(revision_snapshot, switch_mine)
         self.assertIn(".match-history-card", app_css)
         self.assertIn(".match-history-mode", app_css)
         css_version = index_html.split('/static/app.css?v=', 1)[1].split('"', 1)[0]
