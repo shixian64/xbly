@@ -1069,6 +1069,8 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
             "最近动作",
         ):
             self.assertIn(hierarchy, section)
+        self.assertIn("仅展示已完成动作，不提供预算设置", section)
+        self.assertNotIn("不限制每日预算", section)
         self.assertIn("模型与表达设置", page)
         self.assertIn("个人运行器", page)
         self.assertIn("语言风格", page)

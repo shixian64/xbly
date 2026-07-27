@@ -15915,7 +15915,7 @@ function agentAutonomySectionHtml(autonomy) {
         }
       </form>
       <div class="agent-social-side">
-        <section class="surface-card agent-social-summary"><div class="section-head"><div><p class="eyebrow">运行概览</p><h2>今日统计</h2><p>只做统计，不限制每日预算</p></div></div><div class="agent-social-stats" aria-label="今日动作统计">${stats}</div>${
+        <section class="surface-card agent-social-summary"><div class="section-head"><div><p class="eyebrow">运行概览</p><h2>今日统计</h2><p>仅展示已完成动作，不提供预算设置</p></div></div><div class="agent-social-stats" aria-label="今日动作统计">${stats}</div>${
           errorStats ? `<div class="agent-social-stat-note">今日异常：${esc(errorStats)}</div>` : ""
         }</section>
         <section class="surface-card agent-social-activity"><div class="section-head"><div><h2>最近动作</h2><p>消息、匹配和关系变化会同时进入对应记录</p></div><button type="button" class="btn secondary small" data-action="agent-refresh-autonomy-tasks">刷新</button></div><div id="agent-autonomy-tasks">${agentAutonomyRecentTasksHtml(
