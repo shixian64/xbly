@@ -2251,6 +2251,22 @@ function normalizedAiAgentAutonomyStatus(status) {
         outcome_unknown_actions: boundedInteger(usageSource.outcome_unknown_actions, 0, 0, 1000000),
       })
     : null;
+  const legacyDiscoveryIntervalMinutes = boundedInteger(
+    source.discovery_interval_minutes,
+    30,
+    5,
+    1440
+  );
+  const discoveryIntervalSeconds = boundedInteger(
+    source.discovery_interval_seconds == null
+      ? legacyDiscoveryIntervalMinutes === 30
+        ? 10
+        : legacyDiscoveryIntervalMinutes * 60
+      : source.discovery_interval_seconds,
+    10,
+    10,
+    86400
+  );
   return Object.freeze({
     visible: true,
     available: source.available === true,
@@ -2286,7 +2302,7 @@ function normalizedAiAgentAutonomyStatus(status) {
     daily_post_limit: boundedInteger(source.daily_post_limit, 1, 0, 20),
     daily_relationship_limit: boundedInteger(source.daily_relationship_limit, 5, 0, 100),
     post_interval_minutes: boundedInteger(source.post_interval_minutes, 1440, 60, 10080),
-    discovery_interval_minutes: boundedInteger(source.discovery_interval_minutes, 30, 5, 1440),
+    discovery_interval_seconds: discoveryIntervalSeconds,
     consecutive_failure_limit: boundedInteger(source.consecutive_failure_limit, 3, 1, 20),
     last_discovery_at: String(source.last_discovery_at || ""),
     last_match_at: String(source.last_match_at || ""),
@@ -15948,7 +15964,7 @@ function agentAutonomySectionHtml(autonomy) {
         <div class="agent-form-section agent-communication-section"><div class="section-head"><div><h3>交流原则</h3><p>只控制聊天目标和表达边界，不会替代发送前安全检查</p></div></div><div class="field agent-communication-field"><label for="agent-autonomy-brief">表达要求</label><textarea id="agent-autonomy-brief" name="operation_brief" rows="4" maxlength="4000" placeholder="例如：表达自然直接，少用语气词，不连续使用哈哈，不乱用称呼；不要索取联系方式" ${controlDisabled}>${esc(
           autonomy.operation_brief
         )}</textarea><p class="field-help">首次触达不得声称看过对方主页、动态或资料；上下文不足时只能使用中性开场。</p></div></div>
-        <fieldset class="agent-cadence-group"><legend>运行时间与节奏</legend><p>推荐采用更自然的低频探索。技术下限仅用于特殊场景，不代表推荐值。</p><div class="form-grid">
+        <fieldset class="agent-cadence-group"><legend>运行时间与节奏</legend><p>动作间隔推荐采用更自然的节奏；发现间隔默认 10 秒。</p><div class="form-grid">
           <div class="field"><label for="agent-autonomy-timezone">时区</label><input id="agent-autonomy-timezone" name="timezone" maxlength="64" value="${esc(
             autonomy.timezone
           )}" ${controlDisabled} required /></div>
@@ -15961,9 +15977,9 @@ function agentAutonomySectionHtml(autonomy) {
           <div class="field"><label for="agent-autonomy-action-interval">动作间隔（秒）</label><input id="agent-autonomy-action-interval" name="minimum_action_interval_seconds" type="number" min="10" max="86400" step="1" value="${esc(
             autonomy.minimum_action_interval_seconds
           )}" ${controlDisabled} required /><p class="field-help">推荐至少 30 秒；10 秒只是技术下限，持续使用会显得机械。</p></div>
-          <div class="field"><label for="agent-autonomy-discovery-interval">发现间隔（分钟）</label><input id="agent-autonomy-discovery-interval" name="discovery_interval_minutes" type="number" min="5" max="1440" step="1" value="${esc(
-            autonomy.discovery_interval_minutes
-          )}" ${controlDisabled} required /><p class="field-help">推荐 30 分钟；5 分钟只是技术下限，发现后也不会必然发消息。</p></div>
+          <div class="field"><label for="agent-autonomy-discovery-interval">发现间隔（秒）</label><input id="agent-autonomy-discovery-interval" name="discovery_interval_seconds" type="number" min="10" max="86400" step="1" value="${esc(
+            autonomy.discovery_interval_seconds
+          )}" ${controlDisabled} required /><p class="field-help">默认每 10 秒重新浏览在线列表和寻找新候选，不表示每次都会发消息。</p></div>
         </div></fieldset>
         <button type="submit" class="btn primary full mt-sm" ${controlDisabled}>${
           autonomy.user_enabled ? "保存运行设置" : "开始运行"
@@ -19257,12 +19273,12 @@ async function handleProductForm(form, submitter, submittedValues = null) {
       10,
       86400
     );
-    const discoveryIntervalMinutes = aiAgentAutonomyInteger(
+    const discoveryIntervalSeconds = aiAgentAutonomyInteger(
       values,
-      "discovery_interval_minutes",
+      "discovery_interval_seconds",
       "发现间隔",
-      5,
-      1440
+      10,
+      86400
     );
     const requiredActions = [];
     if (discoveryEnabled) requiredActions.push("browse_online_users");
@@ -19329,7 +19345,7 @@ async function handleProductForm(form, submitter, submittedValues = null) {
           autonomy.daily_relationship_limit
         ),
         post_interval_minutes: autonomy.post_interval_minutes,
-        discovery_interval_minutes: discoveryIntervalMinutes,
+        discovery_interval_seconds: discoveryIntervalSeconds,
         consecutive_failure_limit: autonomy.consecutive_failure_limit,
       }),
       timeout: 30000,

@@ -188,7 +188,8 @@ class AutonomySettingsBody(_StrictBody):
     daily_post_limit: int = Field(default=1, ge=0, le=20)
     daily_relationship_limit: int = Field(default=5, ge=0, le=100)
     post_interval_minutes: int = Field(default=1440, ge=60, le=10080)
-    discovery_interval_minutes: int = Field(default=30, ge=5, le=1440)
+    discovery_interval_seconds: int = Field(default=10, ge=10, le=86400)
+    discovery_interval_minutes: int | None = Field(default=None, ge=5, le=1440)
     consecutive_failure_limit: int = Field(default=3, ge=1, le=20)
 
     @field_validator("allowed_actions", mode="before")
@@ -1129,6 +1130,23 @@ def update_autonomy_settings(
                 context.owner_user_id,
             )
             previous_version = int(previous.version) if previous is not None else 0
+            discovery_interval_seconds = int(body.discovery_interval_seconds)
+            if (
+                "discovery_interval_seconds" not in body.model_fields_set
+                and body.discovery_interval_minutes is not None
+            ):
+                legacy_minutes = int(body.discovery_interval_minutes)
+                if (
+                    previous is not None
+                    and int(previous.discovery_interval_minutes) == legacy_minutes
+                ):
+                    discovery_interval_seconds = int(
+                        previous.discovery_interval_seconds
+                    )
+                elif previous is None and legacy_minutes == 30:
+                    discovery_interval_seconds = 10
+                else:
+                    discovery_interval_seconds = legacy_minutes * 60
             row = save_autonomy_settings(
                 db,
                 owner_user_id=context.owner_user_id,
@@ -1153,7 +1171,7 @@ def update_autonomy_settings(
                 daily_post_limit=body.daily_post_limit,
                 daily_relationship_limit=body.daily_relationship_limit,
                 post_interval_minutes=body.post_interval_minutes,
-                discovery_interval_minutes=body.discovery_interval_minutes,
+                discovery_interval_seconds=discovery_interval_seconds,
                 consecutive_failure_limit=body.consecutive_failure_limit,
             )
             changed = int(row.version) != previous_version

@@ -710,7 +710,7 @@ class ByokAutonomySettingRepositoryTests(unittest.TestCase):
         "daily_post_limit": 1,
         "daily_relationship_limit": 5,
         "post_interval_minutes": 1440,
-        "discovery_interval_minutes": 30,
+        "discovery_interval_seconds": 1800,
         "consecutive_failure_limit": 3,
     }
 
@@ -719,6 +719,7 @@ class ByokAutonomySettingRepositoryTests(unittest.TestCase):
             id=uuid.uuid4(),
             owner_user_id=owner_id,
             auto_reply_started_at=datetime(2026, 7, 25, 11, 0, tzinfo=UTC),
+            discovery_interval_minutes=30,
             consecutive_failures=0,
             version=7,
             **self._POLICY_KWARGS,
@@ -779,6 +780,52 @@ class ByokAutonomySettingRepositoryTests(unittest.TestCase):
         self.assertIsNone(row.halted_at)
         self.assertIsNone(row.halted_reason)
         self.assertEqual(row.consecutive_failures, 0)
+
+    def test_discovery_interval_uses_seconds_and_syncs_legacy_minutes(self) -> None:
+        owner_id = uuid.uuid4()
+        row = self._existing_row(owner_id)
+        session = _ScalarSession(row)
+
+        ten_second_kwargs = dict(
+            self._POLICY_KWARGS,
+            discovery_interval_seconds=10,
+        )
+        AgentAutonomySettingRepository(session).configure(
+            owner_id,
+            **ten_second_kwargs,
+        )
+        self.assertEqual(row.discovery_interval_seconds, 10)
+        self.assertEqual(row.discovery_interval_minutes, 30)
+
+        session = _ScalarSession(row)
+        five_minute_kwargs = dict(
+            self._POLICY_KWARGS,
+            discovery_interval_seconds=300,
+        )
+        AgentAutonomySettingRepository(session).configure(
+            owner_id,
+            **five_minute_kwargs,
+        )
+        self.assertEqual(row.discovery_interval_seconds, 300)
+        self.assertEqual(row.discovery_interval_minutes, 5)
+
+    def test_discovery_interval_rejects_less_than_ten_seconds(self) -> None:
+        owner_id = uuid.uuid4()
+        row = self._existing_row(owner_id)
+        session = _ScalarSession(row)
+        invalid_kwargs = dict(
+            self._POLICY_KWARGS,
+            discovery_interval_seconds=9,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "autonomous discovery interval is invalid",
+        ):
+            AgentAutonomySettingRepository(session).configure(
+                owner_id,
+                **invalid_kwargs,
+            )
 
     def test_auto_reply_watermark_resets_on_each_new_enablement(self) -> None:
         owner_id = uuid.uuid4()

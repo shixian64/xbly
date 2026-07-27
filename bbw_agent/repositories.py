@@ -1358,6 +1358,7 @@ class AgentAutonomySettingRepository:
             daily_relationship_limit=5,
             post_interval_minutes=1440,
             discovery_interval_minutes=30,
+            discovery_interval_seconds=10,
             consecutive_failure_limit=3,
             consecutive_failures=0,
             version=1,
@@ -1393,7 +1394,7 @@ class AgentAutonomySettingRepository:
         daily_post_limit: int,
         daily_relationship_limit: int,
         post_interval_minutes: int,
-        discovery_interval_minutes: int,
+        discovery_interval_seconds: int,
         consecutive_failure_limit: int,
     ) -> AiAgentAutonomySetting:
         enabled = bool(user_enabled)
@@ -1421,7 +1422,12 @@ class AgentAutonomySettingRepository:
         post_limit = int(daily_post_limit)
         relationship_limit = int(daily_relationship_limit)
         post_interval = int(post_interval_minutes)
-        discovery_interval = int(discovery_interval_minutes)
+        discovery_interval = int(discovery_interval_seconds)
+        legacy_discovery_interval = (
+            30
+            if discovery_interval == 10
+            else max(5, min(1440, (discovery_interval + 59) // 60))
+        )
         failure_limit = int(consecutive_failure_limit)
         if not 0 <= start_minute < 1440 or not 0 <= end_minute < 1440:
             raise ValueError("autonomous active time is invalid")
@@ -1437,7 +1443,7 @@ class AgentAutonomySettingRepository:
             raise ValueError("autonomous relationship daily limit is invalid")
         if not 60 <= post_interval <= 10080:
             raise ValueError("autonomous post interval is invalid")
-        if not 5 <= discovery_interval <= 1440:
+        if not 10 <= discovery_interval <= 86400:
             raise ValueError("autonomous discovery interval is invalid")
         if not 1 <= failure_limit <= 20:
             raise ValueError("autonomous failure threshold is invalid")
@@ -1517,7 +1523,8 @@ class AgentAutonomySettingRepository:
             "daily_post_limit": post_limit,
             "daily_relationship_limit": relationship_limit,
             "post_interval_minutes": post_interval,
-            "discovery_interval_minutes": discovery_interval,
+            "discovery_interval_minutes": legacy_discovery_interval,
+            "discovery_interval_seconds": discovery_interval,
             "consecutive_failure_limit": failure_limit,
         }
         changed = any(getattr(row, name) != value for name, value in values.items())

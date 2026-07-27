@@ -301,8 +301,7 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         self.assertIn('server_default=sa.text("30")', natural_upgrade)
         self.assertIn("SET minimum_action_interval_seconds = 30", natural_upgrade)
         self.assertIn("WHERE minimum_action_interval_seconds < 30", natural_upgrade)
-        self.assertIn("SET discovery_interval_minutes = 30", natural_upgrade)
-        self.assertIn("WHERE discovery_interval_minutes < 30", natural_upgrade)
+        self.assertNotIn("SET discovery_interval_minutes", natural_upgrade)
 
         models = self.read("bbw_prod/models.py")
         self.assertIn(
@@ -316,6 +315,48 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
             "minimum_action_interval_seconds: int = Field(default=30, ge=10, le=86400)",
             api,
         )
+
+    def test_0022_migration_uses_ten_second_discovery_cadence(self) -> None:
+        migration = self.read(
+            "migrations/versions/20260727_0022_ten_second_discovery_interval.py"
+        )
+        self.assertIn('revision: str = "20260727_0022"', migration)
+        self.assertIn(
+            'down_revision: Union[str, Sequence[str], None] = "20260727_0021"',
+            migration,
+        )
+        upgrade = self.fragment(
+            migration,
+            "def upgrade() -> None:",
+            "def downgrade() -> None:",
+        )
+        self.assertIn('"discovery_interval_seconds"', upgrade)
+        self.assertIn('server_default=sa.text("10")', upgrade)
+        self.assertIn("WHEN discovery_interval_minutes = 30 THEN 10", upgrade)
+        self.assertIn(
+            "discovery_interval_seconds BETWEEN 10 AND 86400", upgrade
+        )
+        self.assertIn("CREATE TRIGGER", upgrade)
+        self.assertIn("discovery_interval_minutes * 60", upgrade)
+
+        models = self.read("bbw_prod/models.py")
+        self.assertIn(
+            "discovery_interval_seconds BETWEEN 10 AND 86400", models
+        )
+        self.assertIn(
+            'Integer, nullable=False, default=10, server_default="10"', models
+        )
+        api = self.read("bbw_agent/api.py")
+        self.assertIn(
+            "discovery_interval_seconds: int = Field(default=10, ge=10, le=86400)",
+            api,
+        )
+        jobs = self.read("bbw_web/jobs.py")
+        self.assertIn("int(setting.discovery_interval_seconds)", jobs)
+        self.assertNotIn("int(setting.discovery_interval_minutes) * 60", jobs)
+        page = self.read("bbw_web/static/app.js")
+        self.assertIn("发现间隔（秒）", page)
+        self.assertIn('name="discovery_interval_seconds"', page)
 
     def test_owner_scheduler_does_not_build_an_action_backlog(self) -> None:
         owner_scheduler, _ = self.function_source(
@@ -1110,7 +1151,7 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         self.assertIn('data-agent-tab-panel="overview"', section)
         self.assertIn('data-agent-tab-panel="capabilities"', section)
         self.assertIn("推荐至少 30 秒", section)
-        self.assertIn("推荐 30 分钟", section)
+        self.assertIn("发现间隔默认 10 秒", section)
         for selector in (
             ".agent-menu-layout",
             ".agent-menu-item",

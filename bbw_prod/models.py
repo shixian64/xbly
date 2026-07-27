@@ -942,6 +942,10 @@ class AiAgentAutonomySetting(
             name="ai_agent_autonomy_discovery_interval_valid",
         ),
         CheckConstraint(
+            "discovery_interval_seconds BETWEEN 10 AND 86400",
+            name="ai_agent_autonomy_discovery_seconds_valid",
+        ),
+        CheckConstraint(
             "consecutive_failure_limit BETWEEN 1 AND 20 "
             "AND consecutive_failures >= 0",
             name="ai_agent_autonomy_failure_limits_valid",
@@ -1089,6 +1093,9 @@ class AiAgentAutonomySetting(
     )
     discovery_interval_minutes: Mapped[int] = mapped_column(
         Integer, nullable=False, default=30, server_default="30"
+    )
+    discovery_interval_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=10, server_default="10"
     )
     consecutive_failure_limit: Mapped[int] = mapped_column(
         SmallInteger, nullable=False, default=3, server_default="3"

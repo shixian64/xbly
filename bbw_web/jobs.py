@@ -3343,8 +3343,8 @@ def _schedule_autonomy_owner(
                     break
 
         discovery_interval_seconds = max(
-            300,
-            int(setting.discovery_interval_minutes) * 60,
+            10,
+            int(setting.discovery_interval_seconds),
         )
         browse_due = bool(
             policy.discovery_enabled

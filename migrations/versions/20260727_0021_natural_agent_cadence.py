@@ -35,13 +35,6 @@ def upgrade() -> None:
         "SET minimum_action_interval_seconds = 30 "
         "WHERE minimum_action_interval_seconds < 30"
     )
-    op.execute(
-        "UPDATE ai_agent_autonomy_settings "
-        "SET discovery_interval_minutes = 30 "
-        "WHERE discovery_interval_minutes < 30"
-    )
-
-
 def downgrade() -> None:
     op.alter_column(
         _TABLE,

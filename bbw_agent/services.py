@@ -492,6 +492,7 @@ def autonomy_public(
         "daily_post_limit": 1,
         "daily_relationship_limit": 5,
         "post_interval_minutes": 1440,
+        "discovery_interval_seconds": 10,
         "discovery_interval_minutes": 30,
         "consecutive_failure_limit": 3,
         "consecutive_failures": 0,
@@ -558,6 +559,9 @@ def autonomy_public(
                 "daily_post_limit": int(row.daily_post_limit),
                 "daily_relationship_limit": int(row.daily_relationship_limit),
                 "post_interval_minutes": int(row.post_interval_minutes),
+                "discovery_interval_seconds": int(
+                    row.discovery_interval_seconds
+                ),
                 "discovery_interval_minutes": int(
                     row.discovery_interval_minutes
                 ),
@@ -963,7 +967,7 @@ def save_autonomy_settings(
     daily_post_limit: int,
     daily_relationship_limit: int,
     post_interval_minutes: int,
-    discovery_interval_minutes: int,
+    discovery_interval_seconds: int,
     consecutive_failure_limit: int,
 ) -> AiAgentAutonomySetting:
     require_autonomy_access(db, owner_user_id, for_update=True)
@@ -1153,7 +1157,7 @@ def save_autonomy_settings(
             daily_post_limit=int(daily_post_limit),
             daily_relationship_limit=int(daily_relationship_limit),
             post_interval_minutes=int(post_interval_minutes),
-            discovery_interval_minutes=int(discovery_interval_minutes),
+            discovery_interval_seconds=int(discovery_interval_seconds),
             consecutive_failure_limit=int(consecutive_failure_limit),
         )
     except (TypeError, ValueError) as exc:
