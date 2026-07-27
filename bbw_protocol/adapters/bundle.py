@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict
 
 from ..app import BeibeiwuApp
 from .face import FaceAdapter
 from .im import ImAdapter
-from .roomkit import RoomKitAdapter
 from .tim_rest import TimRestClient
+
+if TYPE_CHECKING:
+    from .roomkit import RoomKitAdapter
 
 
 class NativeBundle:
@@ -18,8 +20,20 @@ class NativeBundle:
         self.app = app
         self.im = ImAdapter(app)
         self.face = FaceAdapter(app)
-        self.roomkit = RoomKitAdapter(app)
+        self._roomkit: RoomKitAdapter | None = None
         self.tim_rest = TimRestClient()
+
+    @property
+    def roomkit(self) -> RoomKitAdapter:
+        """Load the independent voice-room adapter only when it is used."""
+
+        adapter = self._roomkit
+        if adapter is None:
+            from .roomkit import RoomKitAdapter
+
+            adapter = RoomKitAdapter(self.app)
+            self._roomkit = adapter
+        return adapter
 
     def status(self) -> Dict[str, Any]:
         """What can be done now with current session + adapters."""

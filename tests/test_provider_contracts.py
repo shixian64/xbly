@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -27,6 +29,43 @@ from bbw_web.providers.legacy_banghua import (  # noqa: E402
 
 
 class LegacyBanghuaProviderContractTests(unittest.TestCase):
+    def test_runtime_does_not_require_roomkit_secret_until_roomkit_is_used(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            secret_path = Path(directory) / "txim-secret"
+            secret_path.write_text("test-txim-secret", encoding="utf-8")
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "BBW_ENV": "production",
+                    "BBW_TXIM_SECRET_KEY_FILE": str(secret_path),
+                    "BBW_ROOMKIT_BUSINESS_TOKEN_FILE": "",
+                    "PYTHONPATH": str(ROOT),
+                }
+            )
+            environment.pop("BBW_TXIM_SECRET_KEY", None)
+            environment.pop("BBW_ROOMKIT_BUSINESS_TOKEN", None)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from bbw_protocol.session import Session; "
+                        "from bbw_web.providers.legacy_banghua import LegacyBanghuaProvider; "
+                        "runtime = LegacyBanghuaProvider().create_runtime(Session(uid='42', token='token')); "
+                        "assert runtime.native._roomkit is None; "
+                        "runtime.app.client.close()"
+                    ),
+                ],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_default_provider_preserves_existing_runtime_object_graph(self) -> None:
         session = Session(uid="42", token="token-42", nickname="测试用户")
         provider = LegacyBanghuaProvider()
