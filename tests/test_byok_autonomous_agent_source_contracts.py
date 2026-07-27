@@ -807,16 +807,26 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
             "function normalizedAiAgentAutonomyStatus(status)",
             "function setAiAgentAutonomyStatus(status)",
         )
+        presentation = self.fragment(
+            app,
+            "function aiAgentAutonomyPresentation(autonomy)",
+            "function syncAiAgentAutonomyStatusUi",
+        )
         section = self.fragment(
             app,
             "function agentAutonomySectionHtml(autonomy)",
             "function agentExecutionSectionHtml(execution)",
         )
-        page = self.fragment(app, "async function pageAgent(signal)", "async function pageLab()")
+        page = self.fragment(app, "async function pageAgent(signal,", "async function pageLab()")
         self.assertIn("source.visible !== true", normalized)
         self.assertIn("background_enabled: source.background_enabled === true", normalized)
         self.assertIn('if (!autonomy?.visible) return "";', section)
-        self.assertIn("后台调度", section)
+        self.assertIn("后台调度", presentation)
+        self.assertIn('? "已自动停机"', presentation)
+        self.assertLess(
+            presentation.index('? "已自动停机"'),
+            presentation.index('? "正在运行"'),
+        )
         self.assertIn("agentAutonomySectionHtml(autonomy)", page)
         self.assertIn('data-action="agent-refresh-autonomy-tasks"', section)
         self.assertIn('id="agent-autonomy-tasks"', section)

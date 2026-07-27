@@ -1454,6 +1454,26 @@ async function withPending(button, task) {
   }
 }
 
+function withFormPending(form, button, task) {
+  if (!form || form.dataset.pending === "true") return Promise.resolve();
+  const controls = [...form.querySelectorAll("input, select, textarea, button")];
+  const disabledStates = controls.map((control) => [control, control.disabled]);
+  form.dataset.pending = "true";
+  form.setAttribute("aria-busy", "true");
+  controls.forEach((control) => {
+    control.disabled = true;
+  });
+  return Promise.resolve(withPending(button, task)).finally(() => {
+    if (!form.isConnected) return;
+    form.dataset.pending = "false";
+    form.removeAttribute("aria-busy");
+    disabledStates.forEach(([control, wasDisabled]) => {
+      if (!control.isConnected) return;
+      control.disabled = wasDisabled || control.dataset.locked === "true";
+    });
+  });
+}
+
 function reportAsyncError(error, timeout = 3600) {
   if (!error || error.name === "AbortError" || error instanceof AuthExpiredError) return;
   toast(error.message || String(error), "error", timeout);
@@ -1930,6 +1950,207 @@ function clearAgentApiKeyInputs(scope = document) {
     .forEach((input) => {
       input.value = "";
     });
+}
+
+function updateAiAgentStatusItem(page, name, tone, label, detail) {
+  const item = page?.querySelector?.(`[data-agent-status="${name}"]`);
+  if (!item) return;
+  item.dataset.tone = tone;
+  const strong = item.querySelector("strong");
+  const small = item.querySelector("small");
+  if (strong) strong.textContent = label;
+  if (small) small.textContent = detail;
+}
+
+function syncAiAgentReadyControls(page, ready) {
+  if (!page) return;
+  page.querySelectorAll("[data-agent-ready-control]").forEach((control) => {
+    const baseDisabled = control.dataset.agentReadyBaseDisabled === "true";
+    control.disabled = !ready || baseDisabled;
+  });
+}
+
+function aiAgentAutonomyPresentation(autonomy) {
+  const title = autonomy.halted
+    ? "无人值守 Agent 已自动停机"
+    : autonomy.effective_enabled
+      ? "无人值守 Agent 正在运行"
+      : autonomy.user_enabled && !autonomy.background_enabled
+        ? "配置已保存，部署端后台调度未启用"
+        : autonomy.user_enabled
+          ? "配置已保存，但当前门禁未全部满足"
+          : "无人值守 Agent 保持关闭";
+  const detail = `系统开关${autonomy.system_enabled ? "已开启" : "未开启"} · 管理授权${
+    autonomy.user_authorized ? "已授予" : "未授予"
+  } · 后台调度${autonomy.background_enabled ? "已启用" : "未启用"} · 运行条件${
+    autonomy.available ? "已满足" : "未满足"
+  }`;
+  const state = autonomy.halted
+    ? "已自动停机"
+    : autonomy.effective_enabled
+      ? "正在运行"
+      : autonomy.user_enabled
+        ? "等待条件满足"
+        : "未开启";
+  return { title, detail, state, warning: autonomy.halted || !autonomy.effective_enabled };
+}
+
+function syncAiAgentAutonomyStatusUi(page, autonomy = S.aiAgentAutonomyStatus) {
+  const section = page?.querySelector?.("#agent-autonomy-section");
+  if (!section || !autonomy) return;
+  const presentation = aiAgentAutonomyPresentation(autonomy);
+  const state = section.querySelector("[data-agent-autonomy-state]");
+  const notice = section.querySelector("[data-agent-autonomy-notice]");
+  const title = section.querySelector("[data-agent-autonomy-title]");
+  const detail = section.querySelector("[data-agent-autonomy-detail]");
+  if (state) state.textContent = presentation.state;
+  if (title) title.textContent = presentation.title;
+  if (detail) detail.textContent = presentation.detail;
+  notice?.classList.toggle("warn", presentation.warning);
+}
+
+function syncAiAgentAutonomyModelReadiness(page, ready) {
+  const current = S.aiAgentAutonomyStatus;
+  if (!current) return;
+  const execution = S.aiAgentExecutionStatus;
+  const executionReady = Boolean(
+    execution?.user_enabled === true && execution.selected_actions.length
+  );
+  const available = Boolean(
+    ready &&
+      current.system_enabled &&
+      current.user_authorized &&
+      current.background_enabled &&
+      executionReady
+  );
+  const effectiveEnabled = Boolean(
+    current.user_enabled && !current.halted && available && current.allowed_actions.length
+  );
+  setAiAgentAutonomyStatus({
+    autonomy: { ...current, available, effective_enabled: effectiveEnabled },
+  });
+  syncAiAgentAutonomyStatusUi(page);
+}
+
+function aiAgentRunnerEnabledFromPage(page) {
+  const input = page?.querySelector?.(
+    'form[data-form="agent-settings"] input[name="user_enabled"]'
+  );
+  return input?.defaultChecked === true;
+}
+
+function markAiAgentConnectionReady(form) {
+  const page = form?.closest?.(".agent-page");
+  const runnerEnabled = aiAgentRunnerEnabledFromPage(page);
+  const ready = runnerEnabled;
+  S.aiAgentModelReady = ready;
+  syncAiAgentReadyControls(page, ready);
+  syncAiAgentAutonomyModelReadiness(page, ready);
+  updateAiAgentStatusItem(
+    page,
+    "connection",
+    "success",
+    "连接可用",
+    String(form?.elements?.namedItem("model")?.value || "模型连接已通过测试").trim()
+  );
+  updateAiAgentStatusItem(
+    page,
+    "runner",
+    ready ? "success" : "neutral",
+    ready ? "可以生成草稿" : "个人运行器未开启",
+    ready ? "连接与个人运行开关均已生效" : "连接已通过测试，可按需开启个人运行器"
+  );
+}
+
+function markAiAgentConnectionPending(form, { testing = false } = {}) {
+  S.aiAgentModelReady = false;
+  clearAiAgentPendingExecution();
+  const page = form?.closest?.(".agent-page");
+  if (!page) return;
+  syncAiAgentReadyControls(page, false);
+  syncAiAgentAutonomyModelReadiness(page, false);
+  form.querySelectorAll('button[type="submit"]').forEach((button) => {
+    button.disabled = true;
+  });
+  updateAiAgentStatusItem(
+    page,
+    "connection",
+    "warning",
+    testing ? "正在测试" : "等待测试",
+    testing ? "连接已保存，测试完成前相关功能暂不可用" : "连接信息已更新，请完成连接测试"
+  );
+  updateAiAgentStatusItem(page, "runner", "warning", "暂不可用", "模型连接需要重新确认");
+}
+
+function markAiAgentConnectionFailed(form) {
+  const page = form?.closest?.(".agent-page");
+  S.aiAgentModelReady = false;
+  clearAiAgentPendingExecution();
+  syncAiAgentReadyControls(page, false);
+  syncAiAgentAutonomyModelReadiness(page, false);
+  updateAiAgentStatusItem(page, "connection", "danger", "测试失败", "请检查服务地址、模型名称和 API Key");
+  const runnerEnabled = aiAgentRunnerEnabledFromPage(page);
+  updateAiAgentStatusItem(
+    page,
+    "runner",
+    runnerEnabled ? "warning" : "neutral",
+    runnerEnabled ? "等待连接通过" : "个人运行器未开启",
+    runnerEnabled ? "个人运行器已开启，但模型连接尚未就绪" : "连接测试成功后再主动开启"
+  );
+}
+
+function aiAgentConnectionFormChanged(form, values) {
+  const valueChanged = (name, fallback = "") => {
+    const input = form?.elements?.namedItem(name);
+    const next = String(values[name] ?? fallback).trim();
+    const initial = String(input?.defaultValue ?? fallback).trim();
+    return next !== initial;
+  };
+  const enabled = form?.elements?.namedItem("enabled");
+  return Boolean(
+    String(values.api_key || "") ||
+      valueChanged("label", "默认连接") ||
+      valueChanged("base_url") ||
+      valueChanged("model") ||
+      Boolean(enabled?.checked) !== Boolean(enabled?.defaultChecked)
+  );
+}
+
+function commitAiAgentConnectionFormDefaults(form, connection) {
+  if (!form || !connection) return;
+  [
+    ["label", connection.label || "默认连接"],
+    ["base_url", connection.base_url || ""],
+    ["model", connection.model || ""],
+  ].forEach(([name, value]) => {
+    const input = form.elements.namedItem(name);
+    if (!input) return;
+    input.value = String(value);
+    input.defaultValue = String(value);
+  });
+  const enabled = form.elements.namedItem("enabled");
+  if (enabled) {
+    enabled.checked = connection.enabled === true;
+    enabled.defaultChecked = connection.enabled === true;
+  }
+  const apiKey = form.elements.namedItem("api_key");
+  if (apiKey) {
+    apiKey.value = "";
+    apiKey.defaultValue = "";
+    apiKey.required = connection.key_configured !== true;
+    apiKey.placeholder = connection.key_configured
+      ? "留空表示保留已保存的密钥"
+      : "首次配置必须填写";
+  }
+}
+
+async function refreshAiAgentPageAfterConnection(form) {
+  const status = await agentApi("/api/agent/status", { timeout: 7000 });
+  setAiAgentAccess(true, status, { redirect: false });
+  if (!form?.isConnected || S.route !== "agent" || !$("mine-tab-panel")) return status;
+  clearViewCacheKey("agent");
+  await switchMineTab("agent", { force: true, pageData: status });
+  return status;
 }
 
 let aiAgentConfirmationCountdownTimer = 0;
@@ -3101,7 +3322,7 @@ function go(id, options = {}) {
   }
 }
 
-async function switchMineTab(id, { force = false, replace = false } = {}) {
+async function switchMineTab(id, { force = false, replace = false, pageData = null } = {}) {
   const target = isMineRoute(id) ? id : "me";
   const panel = $("mine-tab-panel");
   if (!isMineRoute(S.route) || !panel) {
@@ -3171,7 +3392,7 @@ async function switchMineTab(id, { force = false, replace = false } = {}) {
 
   try {
     const page = PAGE_RENDERERS[target] || pageMe;
-    const html = await page(controller.signal, { force });
+    const html = await page(controller.signal, { force, data: pageData });
     if (controller.signal.aborted || seq !== S.routeSeq || S.route !== target) return;
     if (!panelDomRestored || cached?.html !== html) panel.innerHTML = html;
     rememberPanelSnapshot(panelKey, html);
@@ -16100,6 +16321,7 @@ function syncAgentAutonomySettingsForm(form) {
 
 function agentAutonomySectionHtml(autonomy) {
   if (!autonomy?.visible) return "";
+  const presentation = aiAgentAutonomyPresentation(autonomy);
   const executionActions = new Set(S.aiAgentExecutionStatus?.selected_actions || []);
   const selectedActions = new Set(
     autonomy.allowed_actions.filter((action) => executionActions.has(action))
@@ -16118,20 +16340,6 @@ function agentAutonomySectionHtml(autonomy) {
       }</span></label>`;
     })
     .join("");
-  const activeTitle = autonomy.halted
-    ? "无人值守 Agent 已自动停机"
-    : autonomy.effective_enabled
-      ? "无人值守 Agent 正在运行"
-      : autonomy.user_enabled && !autonomy.background_enabled
-        ? "配置已保存，部署端后台调度未启用"
-      : autonomy.user_enabled
-        ? "配置已保存，但当前门禁未全部满足"
-        : "无人值守 Agent 保持关闭";
-  const statusDetail = `系统开关${autonomy.system_enabled ? "已开启" : "未开启"} · 管理授权${
-    autonomy.user_authorized ? "已授予" : "未授予"
-  } · 后台调度${autonomy.background_enabled ? "已启用" : "未启用"} · 运行条件${
-    autonomy.available ? "已满足" : "未满足"
-  }`;
   const haltedReason = autonomy.halted_reason
     ? `<div>停机原因：${esc(autonomy.halted_reason)}</div>`
     : "";
@@ -16141,12 +16349,16 @@ function agentAutonomySectionHtml(autonomy) {
         usage.failed_actions ? ` · 失败 ${usage.failed_actions}` : ""
       }${usage.outcome_unknown_actions ? ` · 结果未知 ${usage.outcome_unknown_actions}` : ""}</div>`
     : "";
-  return `<section class="section" id="agent-autonomy-section"><div class="section-head"><div><h2>无人值守运行</h2><p>该区域与手动二次确认执行相互独立，只有全部门禁同时满足时才会在后台运行</p></div></div>
-    <div class="notice${autonomy.halted || !autonomy.effective_enabled ? " warn" : ""}"><strong>${esc(
-      activeTitle
-    )}</strong><div>${esc(statusDetail)}</div>${usageLine}${haltedReason}</div>
+  return `<details class="agent-capability" id="agent-autonomy-section" ${
+    autonomy.user_enabled || autonomy.halted ? "open" : ""
+  }><summary class="agent-capability-summary"><span><strong>无人值守运行</strong><small>自动回复、定时文字动态与白名单关系维护</small></span><span class="agent-capability-state" data-agent-autonomy-state>${esc(
+    presentation.state
+  )}</span></summary><div class="agent-capability-body">
+    <div class="notice${presentation.warning ? " warn" : ""}" data-agent-autonomy-notice><strong data-agent-autonomy-title>${esc(
+      presentation.title
+    )}</strong><div data-agent-autonomy-detail>${esc(presentation.detail)}</div>${usageLine}${haltedReason}</div>
     <div class="notice mt-sm"><strong>自动化边界</strong><div>自动回复只处理当前仍待回复的入站文字消息；如果你已经回复或会话最新消息发生变化，任务会失效。关系动作只对精确用户编号白名单生效，不支持通配符。无人值守动作只以 Web 本地权威事务成功为准，兼容镜像异步处理且失败不会回滚本地结果。任何结果未知的操作都不会自动重试，而会等待人工检查。</div></div>
-    <div class="form-grid mt-md">
+    <div class="agent-autonomy-grid mt-md">
       <form class="surface-card" data-form="agent-autonomy-settings" autocomplete="off"><div class="section-head"><div><h2>后台策略</h2><p>默认全部关闭，可按动作和预算逐项启用</p></div></div>
         <label class="check-line"><input name="user_enabled" type="checkbox" ${
           autonomy.user_enabled ? "checked" : ""
@@ -16207,7 +16419,7 @@ function agentAutonomySectionHtml(autonomy) {
         autonomy.recent_tasks
       )}</div></div>
     </div>
-  </section>`;
+  </div></details>`;
 }
 
 function agentExecutionSectionHtml(execution) {
@@ -16227,20 +16439,25 @@ function agentExecutionSectionHtml(execution) {
   const enabledActions = execution.selected_actions.filter((action) => execution.allowed_actions.includes(action));
   const initialAction = enabledActions[0] || "";
   const initialSpec = AI_AGENT_EXECUTION_ACTIONS[initialAction] || null;
-  const executionReady = execution.user_enabled === true && S.aiAgentModelReady;
-  const directSendReady =
-    executionReady &&
+  const executionBaseReady = execution.user_enabled === true && enabledActions.length > 0;
+  const directSendBaseReady =
+    execution.user_enabled === true &&
     execution.auto_send_enabled === true &&
-    selected.has("send_private_message") &&
-    S.aiAgentModelReady;
+    selected.has("send_private_message");
+  const executionReady = executionBaseReady && S.aiAgentModelReady;
+  const directSendReady = directSendBaseReady && S.aiAgentModelReady;
   const actionOptions = enabledActions.length
     ? enabledActions
         .map((action) => `<option value="${esc(action)}">${esc(aiAgentExecutionActionLabel(action))}</option>`)
         .join("")
     : '<option value="">请先保存动作白名单</option>';
-  return `<section class="section" id="agent-execution-section"><div class="section-head"><div><h2>账号执行</h2><p>此能力与草稿生成独立，只有管理员授权、用户主动开启和动作白名单同时满足时才能使用</p></div></div>
+  return `<details class="agent-capability" id="agent-execution-section" ${
+    execution.user_enabled ? "open" : ""
+  }><summary class="agent-capability-summary"><span><strong>账号执行</strong><small>手动发送、发布文字动态或变更关注关系</small></span><span class="agent-capability-state">${
+    execution.user_enabled ? "已开启" : "未开启"
+  }</span></summary><div class="agent-capability-body">
     <div class="notice"><strong>本区域的每次实际执行都需要二次确认</strong><div>本区域开启后不会自动监听或接管账号，只处理你在本页发起、核对并再次确认的单次请求。无人值守运行必须在下方独立配置和开启。</div></div>
-    <div class="form-grid mt-md">
+    <div class="agent-action-grid mt-md">
       <form class="surface-card" data-form="agent-execution-settings"><div class="section-head"><div><h2>执行权限设置</h2><p>默认不选择任何动作，可随时关闭</p></div></div>
         <label class="check-line"><input name="user_enabled" type="checkbox" ${execution.user_enabled ? "checked" : ""} /><span>主动开启账号执行</span></label>
         <div class="field"><label>动作白名单</label><div class="stack">${actionsHtml}</div></div>
@@ -16258,12 +16475,16 @@ function agentExecutionSectionHtml(execution) {
           ? `<form class="surface-card" data-form="agent-reply-send-review" autocomplete="off"><div class="section-head"><div><h2>生成后直接发送</h2><p>最终文本不会先作为草稿返回，请仅在明确接受该风险时使用</p></div></div>
             <div class="field"><label for="agent-reply-send-peer">目标用户编号</label><input id="agent-reply-send-peer" name="peer_upstream_uid" maxlength="128" required /></div>
             <div class="field"><label for="agent-reply-send-objective">本次回复目标</label><textarea id="agent-reply-send-objective" name="objective" rows="4" maxlength="2000" required></textarea></div>
-            <button type="submit" class="btn primary full" ${directSendReady ? "" : "disabled"}>检查并进入二次确认</button>
+            <button type="submit" class="btn primary full" data-agent-ready-control data-agent-ready-base-disabled="${
+              directSendBaseReady ? "false" : "true"
+            }" ${directSendReady ? "" : "disabled"}>检查并进入二次确认</button>
           </form>`
           : ""
       }
       <form class="surface-card" data-form="agent-action-review" autocomplete="off"><div class="section-head"><div><h2>执行白名单动作</h2><p>可发送已审核文字、发布文字动态或变更关注关系</p></div></div>
-        <div class="field"><label for="agent-execution-action">动作</label><select id="agent-execution-action" name="action" ${
+        <div class="field"><label for="agent-execution-action">动作</label><select id="agent-execution-action" name="action" data-agent-ready-control data-agent-ready-base-disabled="${
+          executionBaseReady ? "false" : "true"
+        }" ${
           executionReady && enabledActions.length ? "" : "disabled"
         }>${actionOptions}</select></div>
         <div class="field" data-agent-execution-target-field ${initialSpec?.needsTarget ? "" : "hidden"}><label for="agent-execution-target">目标用户编号</label><input id="agent-execution-target" name="target_upstream_uid" maxlength="128" ${
@@ -16272,68 +16493,135 @@ function agentExecutionSectionHtml(execution) {
         <div class="field" data-agent-execution-content-field ${initialSpec?.needsContent ? "" : "hidden"}><label for="agent-execution-content">文字内容</label><textarea id="agent-execution-content" name="content" rows="5" maxlength="2000" ${
           initialSpec?.needsContent ? "required" : ""
         }></textarea></div>
-        <button type="submit" class="btn primary full" ${executionReady && enabledActions.length ? "" : "disabled"}>检查并进入二次确认</button>
+        <button type="submit" class="btn primary full" data-agent-ready-control data-agent-ready-base-disabled="${
+          executionBaseReady ? "false" : "true"
+        }" ${executionReady && enabledActions.length ? "" : "disabled"}>检查并进入二次确认</button>
       </form>
     </div>
     <div id="agent-execution-confirmation" class="result-panel" aria-live="polite"></div>
-  </section>`;
+  </div></details>`;
 }
 
-async function pageAgent(signal) {
-  const data = await agentApi("/api/agent/status", { signal, timeout: 7000 });
+async function pageAgent(signal, { data: prefetchedData = null } = {}) {
+  const data = prefetchedData || (await agentApi("/api/agent/status", { signal, timeout: 7000 }));
   setAiAgentAccess(true, data, { redirect: false });
   const connection = data.connection || null;
   const settings = data.settings || {};
   const ready = settings.ready === true;
   const execution = S.aiAgentExecutionStatus;
   const autonomy = S.aiAgentAutonomyStatus;
-  return `<section class="hero-card"><div class="hero-copy"><p class="eyebrow">个人模型</p><h2>草稿、账号执行与无人值守分别受控</h2><p>默认只生成草稿。手动账号执行需要独立授权并逐次确认；无人值守还需要管理员单独授权、个人策略开关和后台安全门禁全部满足。会话内容只会发送到你配置且由系统白名单允许的模型服务。</p></div></section>
-    <section class="section"><div class="form-grid">
-      <form class="surface-card" data-form="agent-connection" autocomplete="off"><div class="section-head"><div><h2>模型连接</h2><p>${esc(
-        agentConnectionStatusText(connection)
-      )}；API Key 使用应用主密钥加密保存且永不回显</p></div></div>
-        <div class="field"><label for="agent-connection-label">连接名称</label><input id="agent-connection-label" name="label" maxlength="120" value="${esc(
-          connection?.label || "默认连接"
-        )}" required /></div>
-        <div class="field"><label for="agent-base-url">服务基础地址</label><input id="agent-base-url" name="base_url" type="url" inputmode="url" maxlength="512" value="${esc(
-          connection?.base_url || ""
-        )}" placeholder="https://provider.example.com/v1" required /></div>
-        <div class="field"><label for="agent-model">模型名称</label><input id="agent-model" name="model" maxlength="160" value="${esc(
-          connection?.model || ""
-        )}" placeholder="填写服务商支持的模型名称" required /></div>
-        <div class="field"><label for="agent-api-key">API Key</label><input id="agent-api-key" name="api_key" type="password" autocomplete="off" maxlength="8192" placeholder="${
-          connection?.key_configured ? "留空表示保留已保存的密钥" : "首次配置必须填写"
-        }" /></div>
-        <label class="check-line"><input name="enabled" type="checkbox" ${connection?.enabled !== false ? "checked" : ""} /><span>启用此模型连接</span></label>
-        <div class="button-row mt-sm"><button type="submit" class="btn primary">保存模型连接</button><button type="button" class="btn secondary" data-action="agent-test-connection" ${
-          connection?.key_configured ? "" : "disabled"
-        }>测试连接</button></div>
-      </form>
-      <form class="surface-card" data-form="agent-settings"><div class="section-head"><div><h2>运行设置</h2><p>管理员模型授权与个人开关必须同时开启；实际账号动作在独立区域授权</p></div></div>
-        <label class="check-line"><input name="user_enabled" type="checkbox" ${settings.user_enabled ? "checked" : ""} /><span>启用个人模型运行器</span></label>
-        <div class="field"><label for="agent-custom-instructions">个人写作要求</label><textarea id="agent-custom-instructions" name="custom_instructions" rows="5" maxlength="4000" placeholder="例如语气自然、避免过度热情；不要填写账号密码或其他密钥">${esc(
-          settings.custom_instructions || ""
-        )}</textarea></div>
-        <div class="field"><label for="agent-temperature">随机度</label><input id="agent-temperature" name="temperature" type="number" min="0" max="2" step="0.1" value="${esc(
-          settings.temperature ?? 0.7
-        )}" required /></div>
-        <div class="field"><label for="agent-context-limit">会话上下文条数</label><input id="agent-context-limit" name="context_message_limit" type="number" min="1" max="100" step="1" value="${esc(
-          settings.context_message_limit ?? 30
-        )}" required /></div>
-        <div class="field"><label for="agent-output-tokens">最大输出长度</label><input id="agent-output-tokens" name="max_output_tokens" type="number" min="64" max="4096" step="1" value="${esc(
-          settings.max_output_tokens ?? 512
-        )}" required /></div>
-        <button type="submit" class="btn primary full mt-sm">保存运行设置</button>
-      </form>
-    </div></section>
-    <section class="section"><div class="surface-card"><div class="section-head"><div><h2>个人语言风格</h2><p>仅分析本人发出的历史文字消息，不分析敏感身份属性</p></div><button type="button" class="btn secondary small" data-action="agent-analyze-style" ${
-      ready ? "" : "disabled"
-    }>重新分析</button></div>${agentStyleProfileHtml(data.style_profile)}</div></section>
-    <section class="section"><div class="surface-card"><div class="section-head"><div><h2>回复草稿</h2><p>读取指定联系人的已归档会话，生成后不会自动发送</p></div></div>
-      <form data-form="agent-draft"><div class="field"><label for="agent-peer-uid">对方用户编号</label><input id="agent-peer-uid" name="peer_upstream_uid" maxlength="128" placeholder="输入已有会话中的对方用户编号" required /></div><div class="field"><label for="agent-objective">本次回复意图</label><textarea id="agent-objective" name="objective" rows="3" maxlength="2000" placeholder="可选，例如礼貌回应并继续了解对方"></textarea></div><button type="submit" class="btn primary" ${
-        ready ? "" : "disabled"
-      }>生成审核草稿</button></form><div id="agent-result" class="result-panel" aria-live="polite"></div>
-    </div></section>${agentExecutionSectionHtml(execution)}${agentAutonomySectionHtml(autonomy)}`;
+  const connectionState = !connection
+    ? { label: "尚未配置", tone: "neutral", detail: "填写模型服务地址、模型名称和 API Key" }
+    : connection.enabled === false
+      ? { label: "连接已停用", tone: "neutral", detail: "在其他连接设置中重新启用后才能调用" }
+      : connection.last_test_status === "ok"
+        ? { label: "连接可用", tone: "success", detail: connection.model || "模型连接已通过测试" }
+        : connection.last_test_status === "failed"
+          ? { label: "测试失败", tone: "danger", detail: "更新密钥或连接信息后重新测试" }
+          : { label: "等待测试", tone: "warning", detail: connection.model || "保存后完成一次连接测试" };
+  const runnerState = ready
+    ? { label: "可以生成草稿", tone: "success", detail: "连接与个人运行开关均已生效" }
+    : settings.user_enabled
+      ? { label: "等待连接通过", tone: "warning", detail: "个人运行器已开启，但模型连接尚未就绪" }
+      : { label: "个人运行器未开启", tone: "neutral", detail: "连接测试成功后再主动开启" };
+  const connectionFailure = connection?.last_test_status === "failed"
+    ? `<div class="notice error agent-inline-notice"><strong>最近一次连接测试失败</strong><div>请重新填写该模型服务签发的 API Key，并确认模型名称可用。留空会继续使用已保存的旧密钥。</div></div>`
+    : "";
+  const styleContent = data.style_profile
+    ? `<details class="agent-inline-details agent-style-details"><summary>查看已分析的语言风格</summary><div class="agent-details-body">${agentStyleProfileHtml(
+        data.style_profile
+      )}</div></details>`
+    : `<div class="agent-style-empty">尚未分析语言风格。该功能只读取本人已归档的历史文字消息。</div>`;
+  const executionSection = agentExecutionSectionHtml(execution);
+  const autonomySection = agentAutonomySectionHtml(autonomy);
+  const advancedSections = `${executionSection}${autonomySection}`;
+  return `<div class="agent-page">
+    <section class="agent-overview">
+      <div class="agent-overview-copy"><p class="eyebrow">模型助手</p><h2>连接自己的模型，生成可审核草稿</h2><p>先完成连接测试，再开启个人运行器。基础功能只生成草稿，不会自动发送；账号执行和无人值守能力可在下方按需展开。</p></div>
+      <div class="agent-status-grid" aria-label="模型助手状态">
+        <div class="agent-status-item" data-agent-status="connection" data-tone="${connectionState.tone}"><span>模型连接</span><strong>${esc(
+          connectionState.label
+        )}</strong><small>${esc(connectionState.detail)}</small></div>
+        <div class="agent-status-item" data-agent-status="runner" data-tone="${runnerState.tone}"><span>运行状态</span><strong>${esc(
+          runnerState.label
+        )}</strong><small>${esc(runnerState.detail)}</small></div>
+      </div>
+    </section>
+
+    <section class="agent-primary-grid" aria-label="模型助手基础设置">
+      <div class="agent-setup-stack">
+        <form class="surface-card agent-card" data-form="agent-connection" autocomplete="off">
+          <div class="section-head"><div><h2>模型连接</h2><p>${esc(
+            agentConnectionStatusText(connection)
+          )}；密钥加密保存且不会回显</p></div></div>
+          ${connectionFailure}
+          <div class="field"><label for="agent-base-url">服务地址</label><input id="agent-base-url" name="base_url" type="url" inputmode="url" maxlength="512" value="${esc(
+            connection?.base_url || ""
+          )}" placeholder="https://provider.example.com/v1" required /><p class="field-help">填写 OpenAI-compatible 服务的基础地址，通常以 /v1 结尾。</p></div>
+          <div class="field"><label for="agent-model">模型名称</label><input id="agent-model" name="model" maxlength="160" value="${esc(
+            connection?.model || ""
+          )}" placeholder="填写服务商提供的准确模型名称" required /></div>
+          <div class="field"><label for="agent-api-key">API Key</label><input id="agent-api-key" name="api_key" type="password" autocomplete="off" maxlength="8192" placeholder="${
+            connection?.key_configured ? "留空表示保留已保存的密钥" : "首次配置必须填写"
+          }" ${connection?.key_configured ? "" : "required"} /><p class="field-help">更换密钥时请重新填写；留空不会清除已有密钥。</p></div>
+          <details class="agent-inline-details" ${connection?.enabled === false ? "open" : ""}><summary>其他连接设置</summary><div class="agent-details-body">
+            <div class="field"><label for="agent-connection-label">连接名称</label><input id="agent-connection-label" name="label" maxlength="120" value="${esc(
+              connection?.label || "默认连接"
+            )}" required /></div>
+            <label class="check-line"><input name="enabled" type="checkbox" ${
+              connection?.enabled !== false ? "checked" : ""
+            } /><span>启用此模型连接</span></label>
+          </div></details>
+          <div class="agent-form-actions"><button type="submit" class="btn primary" name="intent" value="save_test">保存并测试</button><button type="submit" class="btn secondary" name="intent" value="save">仅保存</button></div>
+        </form>
+
+        <form class="surface-card agent-card agent-runner-card" data-form="agent-settings">
+          <div class="section-head"><div><h2>个人运行器</h2><p>连接测试通过后，主动开启才会调用模型</p></div></div>
+          <label class="check-line agent-primary-toggle"><input name="user_enabled" type="checkbox" ${
+            settings.user_enabled ? "checked" : ""
+          } /><span>启用个人模型运行器</span></label>
+          <details class="agent-inline-details"><summary>写作偏好与生成参数</summary><div class="agent-details-body">
+            <div class="field"><label for="agent-custom-instructions">个人写作要求</label><textarea id="agent-custom-instructions" name="custom_instructions" rows="4" maxlength="4000" placeholder="例如语气自然、避免过度热情；不要填写账号密码或其他密钥">${esc(
+              settings.custom_instructions || ""
+            )}</textarea></div>
+            <div class="agent-parameter-grid">
+              <div class="field"><label for="agent-temperature">随机度</label><input id="agent-temperature" name="temperature" type="number" min="0" max="2" step="0.1" value="${esc(
+                settings.temperature ?? 0.7
+              )}" required /></div>
+              <div class="field"><label for="agent-context-limit">上下文条数</label><input id="agent-context-limit" name="context_message_limit" type="number" min="1" max="100" step="1" value="${esc(
+                settings.context_message_limit ?? 30
+              )}" required /></div>
+              <div class="field"><label for="agent-output-tokens">最大输出长度</label><input id="agent-output-tokens" name="max_output_tokens" type="number" min="64" max="4096" step="1" value="${esc(
+                settings.max_output_tokens ?? 512
+              )}" required /></div>
+            </div>
+          </div></details>
+          <button type="submit" class="btn primary full">保存运行设置</button>
+        </form>
+      </div>
+
+      <section class="surface-card agent-card agent-compose-card">
+        <div class="section-head"><div><h2>回复草稿</h2><p>读取指定联系人的已归档会话，生成后不会自动发送</p></div></div>
+        ${
+          ready
+            ? ""
+            : `<div class="notice warn agent-inline-notice"><strong>草稿功能尚未就绪</strong><div>请先完成模型连接测试，并开启个人模型运行器。</div></div>`
+        }
+        <form class="agent-draft-form" data-form="agent-draft"><div class="field"><label for="agent-peer-uid">对方用户编号</label><input id="agent-peer-uid" name="peer_upstream_uid" maxlength="128" placeholder="输入已有会话中的对方用户编号" required /></div><div class="field"><label for="agent-objective">本次回复意图</label><textarea id="agent-objective" name="objective" rows="4" maxlength="2000" placeholder="可选，例如礼貌回应并继续了解对方"></textarea></div><button type="submit" class="btn primary full" ${
+          ready ? "" : "disabled"
+        } data-agent-ready-control>生成审核草稿</button></form><div id="agent-result" class="result-panel" aria-live="polite"></div>
+        <div class="agent-style-panel"><div class="agent-style-head"><div><h3>个人语言风格</h3><p>可选；仅分析本人发出的历史文字消息</p></div><button type="button" class="btn secondary small" data-action="agent-analyze-style" ${
+          ready ? "" : "disabled"
+        } data-agent-ready-control>${data.style_profile ? "重新分析" : "开始分析"}</button></div>${styleContent}</div>
+      </section>
+    </section>
+
+    ${
+      advancedSections
+        ? `<section class="agent-advanced"><div class="section-head"><div><h2>高级能力</h2><p>仅在确实需要账号操作时展开；各项默认关闭并受独立权限控制</p></div></div>${advancedSections}</section>`
+        : ""
+    }
+  </div>`;
 }
 
 async function pageLab() {
@@ -19147,26 +19435,70 @@ function formValues(form) {
   return Object.fromEntries(new FormData(form).entries());
 }
 
-async function handleProductForm(form, submitter) {
+async function handleProductForm(form, submitter, submittedValues = null) {
   const kind = form.dataset.form;
-  const values = formValues(form);
+  const values = submittedValues || formValues(form);
   if (kind === "agent-connection") {
     const apiKey = String(values.api_key || "");
+    const testAfterSave = submitter?.value === "save_test";
+    const connectionChanged = aiAgentConnectionFormChanged(form, values);
     clearAgentApiKeyInputs(form);
-    await agentApi("/api/agent/connection", {
-      method: "PUT",
-      body: JSON.stringify({
-        label: String(values.label || "默认连接").trim(),
-        base_url: String(values.base_url || "").trim(),
-        model: String(values.model || "").trim(),
-        api_key: apiKey || null,
-        enabled: Boolean(form.elements.namedItem("enabled")?.checked),
-      }),
-      timeout: 30000,
-    });
-    toast("模型连接已保存");
-    clearViewCacheKey("agent");
-    return switchMineTab("agent", { force: true });
+    if (connectionChanged) {
+      const saved = await agentApi("/api/agent/connection", {
+        method: "PUT",
+        body: JSON.stringify({
+          label: String(values.label || "默认连接").trim(),
+          base_url: String(values.base_url || "").trim(),
+          model: String(values.model || "").trim(),
+          api_key: apiKey || null,
+          enabled: Boolean(form.elements.namedItem("enabled")?.checked),
+        }),
+        timeout: 30000,
+      });
+      const savedConnection = saved?.connection;
+      commitAiAgentConnectionFormDefaults(form, savedConnection);
+      const savedConnectionReady = Boolean(
+        savedConnection?.enabled === true && savedConnection?.last_test_status === "ok"
+      );
+      if (savedConnectionReady) markAiAgentConnectionReady(form);
+      else markAiAgentConnectionPending(form, { testing: testAfterSave });
+    } else if (!testAfterSave) {
+      toast("模型连接信息未变化");
+      return;
+    }
+    if (testAfterSave) {
+      try {
+        const tested = await agentApi("/api/agent/connection/test", {
+          method: "POST",
+          body: "{}",
+          timeout: 90000,
+        });
+        markAiAgentConnectionReady(form);
+        toast(tested.message || "模型连接测试成功");
+      } catch (error) {
+        markAiAgentConnectionFailed(form);
+        try {
+          await refreshAiAgentPageAfterConnection(form);
+        } catch {
+          /* Keep the conservative local failure state when status refresh is unavailable. */
+        }
+        throw error;
+      }
+    } else {
+      toast("模型连接已保存");
+    }
+    try {
+      await refreshAiAgentPageAfterConnection(form);
+    } catch {
+      toast(
+        testAfterSave
+          ? "连接测试已成功，但状态刷新失败；当前页面已按测试结果恢复"
+          : "连接已保存，但状态刷新失败；请稍后刷新页面确认",
+        "error",
+        4200
+      );
+    }
+    return;
   }
   if (kind === "agent-settings") {
     await agentApi("/api/agent/settings", {
@@ -19429,7 +19761,7 @@ async function handleProductForm(form, submitter) {
         draft
       )}</textarea></div><div class="button-row"><button type="button" class="btn secondary" data-action="agent-copy-draft">复制草稿</button>${
         draftCanExecute
-          ? `<button type="button" class="btn primary" data-action="agent-review-draft-send" data-peer-upstream-uid="${esc(
+          ? `<button type="button" class="btn primary" data-action="agent-review-draft-send" data-agent-ready-control data-peer-upstream-uid="${esc(
               peer
             )}">检查并进入发送确认</button>`
           : ""
@@ -20405,6 +20737,13 @@ document.addEventListener("submit", (event) => {
   if (!form) return;
   event.preventDefault();
   const submitter = event.submitter || form.querySelector('button[type="submit"]');
+  if (form.dataset.form === "agent-connection") {
+    const submittedValues = formValues(form);
+    void withFormPending(form, submitter, () =>
+      handleProductForm(form, submitter, submittedValues)
+    );
+    return;
+  }
   if (form.dataset.form === "im-send") {
     void handleProductForm(form, submitter).catch((error) => reportAsyncError(error));
     return;

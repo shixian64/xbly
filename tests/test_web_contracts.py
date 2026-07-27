@@ -6981,6 +6981,109 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
         self.assertEqual(app_js.count('"/api/agent/actions/execute"'), 1)
         self.assertEqual(app_js.count('"/api/agent/replies/send"'), 1)
 
+    def test_byok_connection_refreshes_stale_ready_ui_and_keeps_checkbox_focus_visible(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        app_css = (root / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
+        form_pending = self._app_fragment(
+            app_js,
+            "function withFormPending",
+            "function reportAsyncError",
+        )
+        pending = self._app_fragment(
+            app_js,
+            "function markAiAgentConnectionPending",
+            "let aiAgentConfirmationCountdownTimer",
+        )
+        readiness = self._app_fragment(
+            app_js,
+            "function syncAiAgentAutonomyModelReadiness",
+            "function aiAgentRunnerEnabledFromPage",
+        )
+        changed = self._app_fragment(
+            app_js,
+            "function aiAgentConnectionFormChanged",
+            "function commitAiAgentConnectionFormDefaults",
+        )
+        refresh = self._app_fragment(
+            app_js,
+            "async function refreshAiAgentPageAfterConnection",
+            "let aiAgentConfirmationCountdownTimer",
+        )
+        page = self._app_fragment(
+            app_js,
+            "async function pageAgent(signal,",
+            "async function pageLab()",
+        )
+        forms = self._app_fragment(
+            app_js,
+            "async function handleProductForm",
+            "function applyFeatureEnvelope",
+        )
+        connection_form = forms.split('if (kind === "agent-connection")', 1)[1].split(
+            'if (kind === "agent-settings")', 1
+        )[0]
+        submit = self._app_fragment(
+            app_js,
+            'document.addEventListener("submit"',
+            'document.addEventListener("keydown"',
+        )
+
+        self.assertIn('form.dataset.pending === "true"', form_pending)
+        self.assertIn('querySelectorAll("input, select, textarea, button")', form_pending)
+        self.assertIn("control.disabled = true", form_pending)
+        self.assertIn("control.disabled = wasDisabled", form_pending)
+        self.assertIn('form.dataset.form === "agent-connection"', submit)
+        self.assertIn("const submittedValues = formValues(form)", submit)
+        self.assertIn("withFormPending(form, submitter", submit)
+        self.assertIn("handleProductForm(form, submitter, submittedValues)", submit)
+        self.assertLess(
+            submit.index("const submittedValues = formValues(form)"),
+            submit.index("withFormPending(form, submitter"),
+        )
+        self.assertIn("input?.defaultValue", changed)
+        self.assertIn("enabled?.defaultChecked", changed)
+        self.assertIn("const connectionChanged = aiAgentConnectionFormChanged", connection_form)
+        self.assertIn("if (connectionChanged) {", connection_form)
+        self.assertLess(
+            connection_form.index("if (connectionChanged) {"),
+            connection_form.index('agentApi("/api/agent/connection"'),
+        )
+        self.assertLess(
+            connection_form.index('agentApi("/api/agent/connection"'),
+            connection_form.index('agentApi("/api/agent/connection/test"'),
+        )
+        self.assertIn("S.aiAgentModelReady = false", pending)
+        self.assertIn("clearAiAgentPendingExecution()", pending)
+        self.assertIn("syncAiAgentReadyControls(page, false)", pending)
+        self.assertIn("syncAiAgentAutonomyModelReadiness(page, false)", pending)
+        self.assertIn("effective_enabled: effectiveEnabled", readiness)
+        self.assertIn("ready &&", readiness)
+        self.assertIn("markAiAgentConnectionReady(form)", connection_form)
+        self.assertLess(
+            connection_form.index("markAiAgentConnectionReady(form)"),
+            connection_form.index("refreshAiAgentPageAfterConnection(form)"),
+        )
+        self.assertIn('agentApi("/api/agent/status"', refresh)
+        self.assertIn("pageData: status", refresh)
+        self.assertIn("prefetchedData ||", page)
+        self.assertIn("markAiAgentConnectionPending(form, { testing: testAfterSave })", connection_form)
+        self.assertLess(
+            connection_form.index("markAiAgentConnectionPending(form, { testing: testAfterSave })"),
+            connection_form.index('agentApi("/api/agent/connection/test"'),
+        )
+        self.assertIn("connection.enabled === false", page)
+        self.assertLess(
+            page.index("connection.enabled === false"),
+            page.index('connection.last_test_status === "ok"'),
+        )
+        self.assertIn('.check-line input[type="checkbox"]:focus-visible', app_css)
+        self.assertIn("outline:", app_css.split('.check-line input[type="checkbox"]:focus-visible', 1)[1].split("}", 1)[0])
+        capability = app_css.split(".agent-capability {", 1)[1].split("}", 1)[0]
+        capability_focus = app_css.split(".agent-capability-summary:focus-visible", 1)[1].split("}", 1)[0]
+        self.assertIn("overflow: visible", capability)
+        self.assertIn("outline-offset: -", capability_focus)
+
     def test_profile_avatar_uses_owner_bound_native_asset_and_full_local_profile_editor(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
