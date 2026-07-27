@@ -27,6 +27,7 @@ from .errors import (
     SocialIdentityUnavailable,
     SocialNativeError,
     SocialSelfActionForbidden,
+    SocialTargetNotMigrated,
     SocialTargetUnavailable,
 )
 from .service import LocalSocialService, normalize_nickname, normalize_profile_patch
@@ -54,6 +55,7 @@ __all__ = [
     "SocialPrincipal",
     "SocialProfileView",
     "SocialSelfActionForbidden",
+    "SocialTargetNotMigrated",
     "SocialTargetUnavailable",
     "SqlAlchemyCanonicalSocialStore",
     "normalize_nickname",

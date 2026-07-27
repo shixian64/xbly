@@ -31,6 +31,7 @@ from .errors import (
     SocialBlocked,
     SocialIdentityUnavailable,
     SocialSelfActionForbidden,
+    SocialTargetNotMigrated,
     SocialTargetUnavailable,
 )
 
@@ -238,6 +239,12 @@ class LocalSocialService:
             return self._profile(actor, RelationshipFlags())
         target = self.store.resolve_active_target(uid, provider=principal.account_provider)
         if target is None:
+            if not self.store.target_binding_exists(
+                uid, provider=principal.account_provider
+            ):
+                raise SocialTargetNotMigrated(
+                    "目标账号不存在、未迁移或已停用"
+                )
             raise SocialTargetUnavailable("目标账号不存在、未迁移或已停用")
         return self._profile(target, self.store.relationship_flags(actor, target))
 

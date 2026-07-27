@@ -14,7 +14,10 @@ from sqlalchemy.dialects import postgresql
 from bbw_prod.models import Relationship
 from bbw_web import native_social_api as API
 from bbw_web.media_native.references import BoundMediaAssetReference
-from bbw_web.social_native import SocialIdempotencyConflict
+from bbw_web.social_native import (
+    SocialIdempotencyConflict,
+    SocialTargetNotMigrated,
+)
 from bbw_web.social_native.contracts import (
     REQUEST_PENDING,
     FriendRequestView,
@@ -176,6 +179,30 @@ class NativeSocialDispatchContractTests(unittest.TestCase):
         self.assertEqual(
             service.get_user.call_args.kwargs["upstream_uid"], "用户-乙_7"
         )
+
+    def test_unmigrated_profile_error_allows_only_internal_legacy_read_fallback(self) -> None:
+        service = Mock()
+        service.get_user.side_effect = SocialTargetNotMigrated(
+            "目标账号不存在、未迁移或已停用"
+        )
+        db = object()
+        with (
+            patch.object(API, "session_scope", side_effect=lambda: _scope(db)),
+            patch.object(API, "SqlAlchemyCanonicalSocialStore", return_value=Mock()),
+            patch.object(API, "LocalSocialService", return_value=service),
+        ):
+            response = API.dispatch_social_native(
+                _identity(),
+                "GET",
+                "/api/profile/user",
+                {"uid": "未迁移-9"},
+                {},
+            )
+
+        self.assertEqual(response.status, 404)
+        self.assertEqual(response.payload["code"], "SOCIAL_TARGET_UNAVAILABLE")
+        self.assertNotIn("legacy_read_fallback_allowed", response.payload)
+        self.assertTrue(response.legacy_read_fallback_allowed)
 
     def test_me_profile_includes_private_state_and_derives_realname(self) -> None:
         identity = _identity("账号-A_9")

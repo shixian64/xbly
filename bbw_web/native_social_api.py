@@ -29,6 +29,7 @@ from bbw_web.social_native import (
     SocialNativeError,
     SocialPrincipal,
     SocialSelfActionForbidden,
+    SocialTargetNotMigrated,
     SocialTargetUnavailable,
 )
 from bbw_web.social_native.contracts import (
@@ -152,10 +153,20 @@ GENDER_ALIASES = {
 class NativeSocialResponse:
     status: int
     payload: dict[str, Any]
+    legacy_read_fallback_allowed: bool = False
 
 
-def _response(payload: Mapping[str, Any], status: int = 200) -> NativeSocialResponse:
-    return NativeSocialResponse(status=status, payload=dict(payload))
+def _response(
+    payload: Mapping[str, Any],
+    status: int = 200,
+    *,
+    legacy_read_fallback_allowed: bool = False,
+) -> NativeSocialResponse:
+    return NativeSocialResponse(
+        status=status,
+        payload=dict(payload),
+        legacy_read_fallback_allowed=legacy_read_fallback_allowed,
+    )
 
 
 def _error(exc: SocialNativeError) -> NativeSocialResponse:
@@ -180,6 +191,7 @@ def _error(exc: SocialNativeError) -> NativeSocialResponse:
             "source": SOCIAL_NATIVE_PROVIDER,
         },
         status,
+        legacy_read_fallback_allowed=isinstance(exc, SocialTargetNotMigrated),
     )
 
 

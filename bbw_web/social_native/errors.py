@@ -25,6 +25,10 @@ class SocialTargetUnavailable(SocialNativeError):
     code = "SOCIAL_TARGET_UNAVAILABLE"
 
 
+class SocialTargetNotMigrated(SocialTargetUnavailable):
+    """内部标记：目标没有本地账号绑定，但对外保持统一错误。"""
+
+
 class SocialSelfActionForbidden(SocialNativeError):
     code = "SOCIAL_SELF_ACTION_FORBIDDEN"
 

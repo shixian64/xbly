@@ -146,6 +146,10 @@ class CanonicalSocialStore(Protocol):
         self, upstream_uid: str, *, provider: str
     ) -> SocialAccount | None: ...
 
+    def target_binding_exists(
+        self, upstream_uid: str, *, provider: str
+    ) -> bool: ...
+
     def resolve_active_targets(
         self, upstream_uids: Sequence[str], *, provider: str
     ) -> Mapping[str, SocialAccount]: ...

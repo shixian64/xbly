@@ -193,6 +193,19 @@ def active_account_query(*, upstream_uid: str, provider: str):
     )
 
 
+def target_binding_query(*, upstream_uid: str, provider: str):
+    """查询本地绑定是否存在，不把停用账号误判为未迁移。"""
+
+    return (
+        select(ExternalAccount.id)
+        .where(
+            ExternalAccount.provider == provider,
+            ExternalAccount.upstream_uid == upstream_uid,
+        )
+        .limit(1)
+    )
+
+
 def block_between_query(left: SocialAccount, right: SocialAccount):
     """单向 blacklist canonical 行同时支持 blocked/blocked_by 派生。"""
 
@@ -295,6 +308,14 @@ class SqlAlchemyCanonicalSocialStore:
             active_account_query(upstream_uid=upstream_uid, provider=provider)
         ).one_or_none()
         return self._account(row[0], row[1]) if row is not None else None
+
+    def target_binding_exists(self, upstream_uid: str, *, provider: str) -> bool:
+        return (
+            self.db.scalar(
+                target_binding_query(upstream_uid=upstream_uid, provider=provider)
+            )
+            is not None
+        )
 
     def resolve_active_targets(
         self, upstream_uids: Sequence[str], *, provider: str

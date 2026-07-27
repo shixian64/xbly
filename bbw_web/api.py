@@ -1364,10 +1364,23 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
                 status_code=503,
             )
         if native_social is not None:
-            return JSONResponse(
-                native_social.payload,
-                status_code=native_social.status,
+            legacy_read_fallback_allowed = (
+                getattr(native_social, "legacy_read_fallback_allowed", False)
+                is True
             )
+            use_legacy_profile_read = bool(
+                request.method == "GET"
+                and path == "/api/profile/user"
+                and upstream_auth_mode == "provider-first"
+                and native_social.status == 404
+                and native_social.payload.get("code") == "SOCIAL_TARGET_UNAVAILABLE"
+                and legacy_read_fallback_allowed
+            )
+            if not use_legacy_profile_read:
+                return JSONResponse(
+                    native_social.payload,
+                    status_code=native_social.status,
+                )
 
     # Discovery and text matching are canonical PostgreSQL operations.  The
     # compatibility provider is not consulted in the request path and its

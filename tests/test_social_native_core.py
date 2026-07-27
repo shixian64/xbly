@@ -19,6 +19,7 @@ from bbw_web.social_native import (
     SocialIdempotencyConflict,
     SocialPrincipal,
     SocialSelfActionForbidden,
+    SocialTargetNotMigrated,
     SocialTargetUnavailable,
 )
 from bbw_web.social_native.contracts import (
@@ -44,6 +45,7 @@ from bbw_web.social_native.repository import (
     SqlAlchemyCanonicalSocialStore,
     active_account_query,
     block_between_query,
+    target_binding_query,
 )
 
 
@@ -99,6 +101,12 @@ class _MemorySocialStore:
     def resolve_active_target(self, upstream_uid: str, *, provider: str) -> SocialAccount | None:
         del provider
         return self.accounts.get(upstream_uid) if upstream_uid in self.active else None
+
+    def target_binding_exists(
+        self, upstream_uid: str, *, provider: str
+    ) -> bool:
+        del provider
+        return upstream_uid in self.accounts
 
     def resolve_active_targets(self, upstream_uids, *, provider: str):
         del provider
@@ -583,6 +591,19 @@ class LocalSocialServiceTests(unittest.TestCase):
                 operation_id="inactive",
             )
 
+    def test_profile_read_distinguishes_unmigrated_from_inactive_internally(self) -> None:
+        with self.assertRaises(SocialTargetNotMigrated):
+            self.service.get_user(
+                principal=self.principal,
+                upstream_uid="404",
+            )
+        with self.assertRaises(SocialTargetUnavailable) as inactive:
+            self.service.get_user(
+                principal=self.principal,
+                upstream_uid="10",
+            )
+        self.assertNotIsInstance(inactive.exception, SocialTargetNotMigrated)
+
 
 class SocialNativeSqlContractTests(unittest.TestCase):
     def test_active_target_query_requires_status_disabled_and_account_provider(self) -> None:
@@ -596,6 +617,19 @@ class SocialNativeSqlContractTests(unittest.TestCase):
         self.assertIn("external_accounts.provider =", sql)
         self.assertIn("external_accounts.upstream_uid =", sql)
         self.assertIn("active", values)
+        self.assertIn("beibeiwu", values)
+        self.assertIn("9", values)
+
+    def test_target_binding_query_includes_inactive_accounts(self) -> None:
+        compiled = target_binding_query(
+            upstream_uid="9", provider="beibeiwu"
+        ).compile(dialect=postgresql.dialect())
+        sql = str(compiled)
+        values = {str(value) for value in compiled.params.values()}
+        self.assertIn("external_accounts.provider =", sql)
+        self.assertIn("external_accounts.upstream_uid =", sql)
+        self.assertNotIn("users.status", sql)
+        self.assertNotIn("disabled_at", sql)
         self.assertIn("beibeiwu", values)
         self.assertIn("9", values)
 
@@ -680,6 +714,7 @@ class SocialNativeSqlContractTests(unittest.TestCase):
 
     def test_repository_exposes_all_atomic_store_methods(self) -> None:
         for method in (
+            "target_binding_exists",
             "update_profile",
             "set_following",
             "create_friend_request",
