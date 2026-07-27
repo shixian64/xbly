@@ -487,8 +487,18 @@ class MatchHistoryFrontendContractTests(unittest.TestCase):
         self.assertIn('data-action="match-history-refresh"', matching)
         self.assertIn('data-action="match-history-load-more"', app_js)
         self.assertIn("loadMatchHistory(1)", app_js)
-        self.assertIn("data.history_saved === false", app_js)
+        self.assertIn(
+            "data.matched === true && data.history_saved === false", app_js
+        )
         self.assertIn("匹配结果已保留在当前页面", app_js)
+        self.assertIn("function matchWaitingHtml(queue, message = \"\")", app_js)
+        self.assertIn("function startMatchStatusPolling(queue)", app_js)
+        self.assertIn('api("/api/match/status", { timeout: 8000 })', app_js)
+        self.assertIn(
+            'String(latest.request_id || "").trim() === requestId', app_js
+        )
+        self.assertIn("matchLatestResultHtml(latest)", app_js)
+        self.assertIn("hydrateMatchStatusPolling()", app_js)
         self.assertIn(".match-history-card", app_css)
         self.assertIn(".match-history-mode", app_css)
         css_version = index_html.split('/static/app.css?v=', 1)[1].split('"', 1)[0]

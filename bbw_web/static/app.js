@@ -85,6 +85,7 @@ const FLASH_ACK_STORAGE_PREFIX = "bbw:im:flash-acks:";
 const PAGE_CACHE_TTL_MS = 2 * 60 * 1000;
 const PAGE_CACHE_MAX_AGE_MS = 15 * 60 * 1000;
 const FAST_VIEW_CACHE_TTL_MS = 15 * 1000;
+const MATCH_STATUS_POLL_INTERVAL_MS = 2000;
 const FEED_VIEW_CACHE_TTL_MS = 45 * 1000;
 const RELATION_VIEW_CACHE_TTL_MS = 60 * 1000;
 const ME_STATS_TTL_MS = 60 * 1000;
@@ -179,6 +180,11 @@ const S = {
   meStats: null,
   meStatsAt: 0,
   matchTab: "match",
+  matchPollTimer: null,
+  matchPollGeneration: 0,
+  matchPollRequestId: "",
+  matchPollExpiresAt: 0,
+  matchResultRevision: 0,
   voiceMatchServerState: { state: "idle", active: false, target: null },
   voiceMatchQuota: { free: null, cards: null },
   voiceMatchSdkLoading: null,
@@ -1045,6 +1051,7 @@ async function api(path, options = {}) {
     if (response.status === 401 && !authOptional && !path.includes("/api/auth/")) {
       S.authenticated = false;
       S.sessionGeneration += 1;
+      stopMatchStatusPolling();
       setAiAgentAccess(false, null, { redirect: false });
       S.user = null;
       S.meStats = null;
@@ -3351,6 +3358,7 @@ async function switchMineTab(id, { force = false, replace = false, pageData = nu
   if (S.routeController) S.routeController.abort();
   const controller = new AbortController();
   const seq = ++S.routeSeq;
+  const matchResultRevision = S.matchResultRevision;
   S.routeController = controller;
   S.route = target;
   root().classList.remove("message-route");
@@ -3704,6 +3712,7 @@ function hydrateRenderedRoute(route, signal, seq) {
       }
     });
   }
+  if (route === "match" && S.matchTab === "match") hydrateMatchStatusPolling();
   if (route === "moments") {
     setMomentComposeLocked(
       document.querySelector('form[data-form="moment-publish"]'),
@@ -3779,6 +3788,7 @@ async function activateRoute(id, { force = false } = {}) {
   const seq = ++S.routeSeq;
   S.routeController = controller;
   S.route = target;
+  if (target !== "match" || S.matchTab !== "match") stopMatchStatusPolling();
   root().classList.toggle("message-route", target === "msg");
   document.body.classList.toggle("message-route-active", target === "msg");
   document.body.classList.toggle("chat-conversation-open", target === "msg" && Boolean(S.activePeer));
@@ -3850,6 +3860,7 @@ async function activateRoute(id, { force = false } = {}) {
     const page = PAGE_RENDERERS[target] || pageNearby;
     const html = await page(controller.signal, { force });
     if (controller.signal.aborted || seq !== S.routeSeq) return;
+    if (target === "match" && matchResultRevision !== S.matchResultRevision) return;
     const rendered = `<div class="page-enter">${withMineSubnav(target, html)}</div>`;
     if (!routeDomRestored || cached?.html !== rendered) root().innerHTML = rendered;
     S.routeDomKey = cacheKey;
@@ -15111,6 +15122,57 @@ async function loadMatchHistory(page = 1, { append = false } = {}) {
   }
 }
 
+function matchWaitingQueue(data) {
+  return [data?.waiting, data?.status?.waiting, data?.queue].find(
+    (candidate) => candidate && typeof candidate === "object" && candidate.status === "waiting"
+  ) || null;
+}
+
+function matchLatestResult(data) {
+  const candidate = data?.latest_match || data?.status?.latest_match;
+  if (!candidate || typeof candidate !== "object" || !candidate.peer) return null;
+  return candidate;
+}
+
+function matchResultUserCard(item) {
+  return userCard(item, { chat: true, profile: true, chatOrigin: "match" });
+}
+
+function matchWaitingHtml(queue, message = "") {
+  const requestId = String(queue?.request_id || "").trim();
+  const expiresAt = String(queue?.expires_at || "").trim();
+  const expiresLabel = expiresAt ? formatBottleTime(expiresAt) : "";
+  const detail = [
+    String(message || "已进入本地匹配队列，请保持页面在线").trim(),
+    expiresLabel ? `等待有效期至 ${expiresLabel}` : "匹配完成后会自动显示对方资料",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return `<div class="empty-state match-waiting-state" data-match-waiting data-request-id="${esc(
+    requestId
+  )}" data-expires-at="${esc(expiresAt)}"><div><strong>正在等待匹配</strong><span>${esc(detail)}</span></div></div>`;
+}
+
+function matchLatestResultHtml(latest) {
+  const peer = latest?.peer && typeof latest.peer === "object" ? { ...latest.peer } : null;
+  if (!peer) return emptyState("暂时没有匹配结果", "稍后再试，或检查匹配次数");
+  if (latest.matched_at && !peer.matched_at) peer.matched_at = latest.matched_at;
+  return envelopeHtml(
+    { ok: true, items: [peer] },
+    matchResultUserCard,
+    "暂时没有匹配结果",
+    "稍后再试，或检查匹配次数"
+  );
+}
+
+function matchStatusResultHtml(data) {
+  const waiting = matchWaitingQueue(data);
+  if (waiting) return matchWaitingHtml(waiting, data?.message);
+  const latest = matchLatestResult(data);
+  if (latest) return matchLatestResultHtml(latest);
+  return emptyState("准备好后开始匹配", "设置条件并选择匹配方式，结果会显示在这里");
+}
+
 async function pageMatching(signal) {
   const [statusResult, historyResult] = await Promise.allSettled([
     api("/api/match/status", { signal }),
@@ -15130,6 +15192,9 @@ async function pageMatching(signal) {
   const gender = MATCH_GENDERS.includes(filters.gender) ? filters.gender : "不限";
   const savedProperties = normalizedMatchProperties(filters.properties || filters.property);
   const properties = savedProperties.length ? savedProperties : ["双"];
+  const latest = matchLatestResult(data);
+  if (latest) rememberMatchMessagePeers({ ok: true, items: [latest.peer], target: latest.peer });
+  const resultHtml = matchStatusResultHtml(data);
   return `<div class="match-page">
     <section class="match-overview">
       <div class="match-overview-copy"><span class="match-kicker">匹配中心</span><h2>按你的偏好，发现合适的人</h2><p>单项条件按官方客户端的方式保存，多选属性由网页端依次轮换。你可以先设置偏好，再选择在线或同城匹配。</p><div class="match-current-filter"><span>当前条件</span><strong data-match-filter-summary>性别 ${esc(
@@ -15150,10 +15215,7 @@ async function pageMatching(signal) {
       </form>
     </section>
 
-    <section class="section match-result-section"><div class="section-head match-section-head"><div><h2>匹配结果</h2><p>新的相遇会集中显示在这里</p></div></div><div id="match-result" class="match-result-surface">${emptyState(
-      "准备好后开始匹配",
-      "设置条件并选择匹配方式，结果会显示在这里"
-    )}</div></section>
+    <section class="section match-result-section"><div class="section-head match-section-head"><div><h2>匹配结果</h2><p>新的相遇会集中显示在这里</p></div></div><div id="match-result" class="match-result-surface" aria-live="polite">${resultHtml}</div></section>
 
     <section class="section match-history-section"><div class="section-head match-section-head"><div><h2>匹配历史</h2><p>记录在线、同城和语音匹配成功的用户</p></div><button type="button" class="btn secondary small" data-action="match-history-refresh">刷新</button></div><div id="match-history" class="match-history-surface">${matchHistoryHtml(
       historyData
@@ -15714,6 +15776,7 @@ function syncMatchHubTabUI(tab) {
 async function switchMatchHubTab(tab) {
   const { force = false } = arguments[1] || {};
   const activeTab = normalizeMatchTab(tab);
+  if (activeTab !== "match") stopMatchStatusPolling();
   const panel = $("match-hub-panel");
   if (S.route !== "match" || !panel) {
     S.matchTab = activeTab;
@@ -15728,6 +15791,7 @@ async function switchMatchHubTab(tab) {
   if (S.routeController) S.routeController.abort();
   const controller = new AbortController();
   const seq = ++S.routeSeq;
+  const resultRevision = S.matchResultRevision;
   S.routeController = controller;
   S.matchTab = activeTab;
   syncMatchHubTabUI(activeTab);
@@ -15746,6 +15810,7 @@ async function switchMatchHubTab(tab) {
     if (!panelDomRestored) panel.innerHTML = cached.html;
     if (VOICE_MATCH_ENABLED && activeTab === "voice") void hydrateVoiceMatchPanel();
     if (!force && cached.fresh) {
+      if (activeTab === "match") hydrateMatchStatusPolling();
       rememberPanelDomSnapshot(cacheKey, panel);
       rememberCurrentPageSnapshot(cacheKey);
       return;
@@ -15760,11 +15825,13 @@ async function switchMatchHubTab(tab) {
   try {
     const content = await loadMatchHubTab(activeTab, controller.signal);
     if (controller.signal.aborted || seq !== S.routeSeq || S.route !== "match" || S.matchTab !== activeTab) return;
+    if (activeTab === "match" && resultRevision !== S.matchResultRevision) return;
     if (!panelDomRestored || cached?.html !== content) panel.innerHTML = content;
     rememberPanelSnapshot(cacheKey, content);
     rememberPanelDomSnapshot(cacheKey, panel);
     rememberCurrentPageSnapshot(cacheKey);
     if (VOICE_MATCH_ENABLED && activeTab === "voice") void hydrateVoiceMatchPanel();
+    if (activeTab === "match") hydrateMatchStatusPolling();
   } catch (error) {
     if (error?.name === "AbortError" || seq !== S.routeSeq || S.route !== "match") return;
     if (error instanceof AuthExpiredError) return;
@@ -16842,6 +16909,129 @@ async function openProfile(uid, { chatOrigin = "" } = {}) {
     <section class="profile-dialog-section profile-moments-section" id="profile-moments" data-uid="${esc(profileUid)}" hidden></section>`;
 }
 
+function stopMatchStatusPolling() {
+  clearTimeout(S.matchPollTimer);
+  S.matchPollTimer = null;
+  S.matchPollGeneration += 1;
+  S.matchPollRequestId = "";
+  S.matchPollExpiresAt = 0;
+}
+
+function rememberMatchPanelSnapshot() {
+  clearViewCachePrefix("match:");
+  const cacheKey = routeCacheKey("match");
+  rememberPanelElementSnapshot(cacheKey, $("match-hub-panel"));
+  rememberCurrentPageSnapshot(cacheKey);
+}
+
+function hydrateMatchStatusPolling() {
+  const waiting = $("match-result")?.querySelector("[data-match-waiting]");
+  if (!waiting) {
+    stopMatchStatusPolling();
+    return;
+  }
+  startMatchStatusPolling({
+    status: "waiting",
+    request_id: waiting.dataset.requestId,
+    expires_at: waiting.dataset.expiresAt,
+  });
+}
+
+function startMatchStatusPolling(queue) {
+  const requestId = String(queue?.request_id || "").trim();
+  if (!requestId) {
+    stopMatchStatusPolling();
+    return;
+  }
+  const parsedExpiry = Date.parse(String(queue?.expires_at || ""));
+  const expiresAt = Number.isFinite(parsedExpiry) ? parsedExpiry : Date.now() + 2 * 60 * 1000;
+  if (
+    S.matchPollRequestId === requestId &&
+    S.matchPollExpiresAt === expiresAt
+  ) {
+    return;
+  }
+
+  stopMatchStatusPolling();
+  S.matchPollRequestId = requestId;
+  S.matchPollExpiresAt = expiresAt;
+  const pollGeneration = S.matchPollGeneration;
+  const sessionGeneration = S.sessionGeneration;
+
+  const isCurrent = () =>
+    S.authenticated &&
+    S.sessionGeneration === sessionGeneration &&
+    S.matchPollGeneration === pollGeneration &&
+    S.matchPollRequestId === requestId;
+
+  const schedule = () => {
+    if (!isCurrent()) return;
+    const delay = document.hidden ? 5000 : MATCH_STATUS_POLL_INTERVAL_MS;
+    S.matchPollTimer = setTimeout(() => void poll(), delay);
+  };
+
+  const finishWithoutMatch = () => {
+    if (S.route === "match" && S.matchTab === "match") {
+      S.matchResultRevision += 1;
+      setPanel(
+        "match-result",
+        emptyState("本次匹配等待已结束", "暂时没有匹配到合适的人，可以重新发起匹配")
+      );
+    }
+    stopMatchStatusPolling();
+    rememberMatchPanelSnapshot();
+  };
+
+  const poll = async () => {
+    S.matchPollTimer = null;
+    if (!isCurrent()) return;
+    if (S.route !== "match" || S.matchTab !== "match") {
+      stopMatchStatusPolling();
+      return;
+    }
+    if (Date.now() >= S.matchPollExpiresAt) {
+      finishWithoutMatch();
+      return;
+    }
+    try {
+      const { data } = await api("/api/match/status", { timeout: 8000 });
+      if (!isCurrent()) return;
+      applyCapabilities(data?.capabilities);
+      if (data?.user) applyUser(data.user);
+      const latest = matchLatestResult(data);
+      if (latest && String(latest.request_id || "").trim() === requestId) {
+        const peer = latest.peer;
+        rememberMatchMessagePeers({ ok: true, items: [peer], target: peer });
+        syncPrivateMessageControls({ refreshChat: false });
+        S.matchResultRevision += 1;
+        setPanel("match-result", matchLatestResultHtml(latest));
+        stopMatchStatusPolling();
+        toast("匹配成功");
+        await Promise.allSettled([refreshMatchStats(), loadMatchHistory(1)]);
+        rememberMatchPanelSnapshot();
+        return;
+      }
+
+      const waiting = matchWaitingQueue(data);
+      if (waiting && String(waiting.request_id || "").trim() === requestId) {
+        setPanel("match-result", matchWaitingHtml(waiting));
+        schedule();
+        return;
+      }
+      finishWithoutMatch();
+    } catch (error) {
+      if (!isCurrent() || error instanceof AuthExpiredError) return;
+      if (Date.now() >= S.matchPollExpiresAt) {
+        finishWithoutMatch();
+        return;
+      }
+      schedule();
+    }
+  };
+
+  schedule();
+}
+
 async function refreshMatchStats() {
   try {
     const { data } = await api("/api/match/status", { timeout: 8000 });
@@ -16857,38 +17047,41 @@ async function refreshMatchStats() {
 
 async function runMatch(path, body = {}) {
   const isBottle = path.includes("bottle");
+  if (!isBottle) S.matchResultRevision += 1;
   setPanel("match-result", loadingState(isBottle ? "正在捡漂流瓶…" : "正在寻找合适的人…"));
   const { data } = await api(path, { method: "POST", body: JSON.stringify(body) });
   if (!isBottle) rememberMatchMessagePeers(data);
   const success = data.active_property && Array.isArray(data.filters?.properties) && data.filters.properties.length > 1
     ? `本次按属性 ${data.active_property} 匹配`
     : "请求已完成";
-  const historyWarning = data.history_saved === false
+  const historyWarning = data.matched === true && data.history_saved === false
     ? String(data.history_warning || "匹配成功，但历史记录暂时没有保存")
     : "";
   if (historyWarning) toast(historyWarning, "error", 5200);
   else toastEnv(data, success);
   const renderer = isBottle
     ? bottleCard
-    : (item) => userCard(item, { chat: true, profile: true, chatOrigin: "match" });
+    : matchResultUserCard;
+  const waiting = !isBottle && data.matched !== true ? matchWaitingQueue(data) : null;
   setPanel(
     "match-result",
-    `${historyWarning ? `<div class="notice warn match-history-warning"><strong>匹配结果已保留在当前页面</strong><div>${esc(
-      historyWarning
-    )}</div></div>` : ""}${envelopeHtml(
-      data,
-      renderer,
-      isBottle ? "暂时没有捡到漂流瓶" : "暂时没有匹配结果",
-      isBottle ? "稍后再来捡一个" : "稍后再试，或检查匹配次数"
-    )}`
+    waiting
+      ? matchWaitingHtml(waiting, data.message)
+      : `${historyWarning ? `<div class="notice warn match-history-warning"><strong>匹配结果已保留在当前页面</strong><div>${esc(
+          historyWarning
+        )}</div></div>` : ""}${envelopeHtml(
+          data,
+          renderer,
+          isBottle ? "暂时没有捡到漂流瓶" : "暂时没有匹配结果",
+          isBottle ? "稍后再来捡一个" : "稍后再试，或检查匹配次数"
+        )}`
   );
+  if (waiting) startMatchStatusPolling(waiting);
+  else if (!isBottle) stopMatchStatusPolling();
   if (!isBottle) {
     await Promise.allSettled([refreshMatchStats(), loadMatchHistory(1)]);
   }
-  clearViewCachePrefix("match:");
-  const cacheKey = routeCacheKey("match");
-  rememberPanelElementSnapshot(cacheKey, $("match-hub-panel"));
-  rememberCurrentPageSnapshot(cacheKey);
+  rememberMatchPanelSnapshot();
 }
 
 function voiceMatchPeerId(peer = S.voiceMatchPeer) {
@@ -18493,6 +18686,7 @@ async function logout({ notifyServer = true } = {}) {
     S.nearbyController = null;
     S.authenticated = false;
     S.sessionGeneration += 1;
+    stopMatchStatusPolling();
     setAiAgentAccess(false, null, { redirect: false });
     S.user = null;
     finishVoiceRecording(null, true);
@@ -20964,6 +21158,7 @@ window.addEventListener("pageshow", (event) => {
     S.imNextReconnectAt = 0;
   }
   void startMessageServices();
+  if (S.route === "match" && S.matchTab === "match") hydrateMatchStatusPolling();
   void refreshAiAgentAccess({ redirect: true })
     .then(() => {
       if (S.route === "agent" && S.aiAgentAccessEnabled) return switchMineTab("agent", { force: true });
@@ -20984,6 +21179,7 @@ window.addEventListener("pagehide", (event) => {
   stopMessageSyncTimer();
   clearPeerMediaReconcile();
   if (!event.persisted) {
+    stopMatchStatusPolling();
     closeMessageSyncChannel();
     revokeAllChatObjectUrls();
     clearComposeDrafts();

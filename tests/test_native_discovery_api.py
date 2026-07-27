@@ -384,6 +384,36 @@ class NativeDiscoveryApiTests(unittest.TestCase):
         self.assertTrue(response.payload["canonical_result_saved"])
         self.assertFalse(response.payload["external_dependency"])
 
+    def test_waiting_match_is_not_reported_as_history_save_failure(self) -> None:
+        identity = _identity()
+        store, service, _owner_profile = _configured(identity)
+        store.get_text_match_outcome.return_value = None
+        store.get_match_preference.return_value = None
+        service.set_match_preference.return_value = _preference(identity)
+        service.request_text_match.return_value = _outcome(
+            identity, "waiting-request", matched=False
+        )
+        with (
+            patch.object(API, "session_scope", side_effect=lambda: _scope(object())),
+            patch.object(API, "SqlAlchemyDiscoveryStore", return_value=store),
+            patch.object(API, "DiscoveryNativeService", return_value=service),
+        ):
+            response = API.dispatch_discovery_native(
+                identity,
+                "POST",
+                "/api/match/online",
+                {},
+                {"request_id": "waiting-request", "property": "Z"},
+            )
+
+        self.assertEqual(response.status, 200)
+        self.assertFalse(response.payload["matched"])
+        self.assertTrue(response.payload["waiting"])
+        self.assertEqual(response.payload["items"], [])
+        self.assertIsNone(response.payload["history_saved"])
+        self.assertFalse(response.payload["canonical_result_saved"])
+        self.assertEqual(response.payload["message"], "已进入本地匹配队列")
+
     def test_existing_request_replays_without_changing_preference_or_rate_identity(self) -> None:
         identity = _identity()
         store, service, _owner_profile = _configured(identity)
@@ -467,6 +497,35 @@ class NativeDiscoveryApiTests(unittest.TestCase):
         self.assertNotIn("match_card", status)
         self.assertFalse(response.payload["voice_quota_available"])
         self.assertEqual(response.payload["user"]["city"], profile.city_name)
+
+    def test_status_identifies_the_request_that_produced_latest_match(self) -> None:
+        identity = _identity()
+        store, service, _profile_value = _configured(identity)
+        store.get_match_preference.return_value = _preference(identity)
+        store.match_frequency_status.return_value = {
+            "limit": 10,
+            "used": 1,
+            "remaining": 9,
+            "window_seconds": 60,
+            "retry_after_seconds": 0,
+        }
+        store.current_waiting_outcome.return_value = None
+        store.latest_match_outcome.return_value = _outcome(
+            identity, "completed-request", matched=True
+        )
+        with (
+            patch.object(API, "session_scope", side_effect=lambda: _scope(object())),
+            patch.object(API, "SqlAlchemyDiscoveryStore", return_value=store),
+            patch.object(API, "DiscoveryNativeService", return_value=service),
+            patch.object(API, "_now", return_value=NOW),
+        ):
+            response = API.dispatch_discovery_native(
+                identity, "GET", "/api/match/status", {}, {}
+            )
+
+        latest = response.payload["latest_match"]
+        self.assertEqual(latest["request_id"], "completed-request")
+        self.assertEqual(latest["peer"]["id"], "用户-乙_7")
 
     def test_rate_limit_is_local_429_with_retry_after(self) -> None:
         identity = _identity()

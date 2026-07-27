@@ -444,6 +444,7 @@ def _status_payload(
         "latest_match": (
             {
                 "id": latest.match_result.public_id,
+                "request_id": latest.request_id,
                 "matched_at": latest.match_result.matched_at.isoformat(),
                 "peer": latest_item,
             }
@@ -629,7 +630,9 @@ def _match_payload(
                 else "single"
             ),
             "idempotent_replay": not outcome.created,
-            "history_saved": bool(outcome.match_result),
+            # ``None`` means no match has happened yet.  A waiting queue entry
+            # must not be reported as a failed attempt to save match history.
+            "history_saved": bool(outcome.match_result) if matched else None,
             "canonical_result_saved": bool(outcome.match_result),
             "message": "匹配成功" if matched else "已进入本地匹配队列",
             "source": DISCOVERY_PROVIDER,
