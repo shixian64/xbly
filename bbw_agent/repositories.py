@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, aliased
 from bbw_prod.models import (
     AiAgentActionExecution,
     AiAgentAutonomyDailyUsage,
+    AiAgentContactPolicy,
     AiAgentDiscoveryCandidate,
     AiAgentAutonomySetting,
     AiAgentAutonomyTask,
@@ -28,14 +29,35 @@ from bbw_prod.models import (
     Conversation,
     ExternalAccount,
     Message,
+    MatchPreference,
     Relationship,
     User,
     utcnow,
 )
 from .autonomous import (
+    AUTONOMY_RELATIONSHIP_ADDRESS_TERMS,
+    agent_candidate_compatibility,
+    autonomy_message_identity,
     autonomy_reply_message_is_eligible,
     autonomy_reply_message_is_fresh,
+    autonomy_reply_not_before,
 )
+from .contact_policy import (
+    CONTACT_MODE_SUGGEST_ONLY,
+    CONTACT_POLICY_MODES,
+    DEFAULT_MAXIMUM_REPLY_AGE_SECONDS,
+    DEFAULT_MINIMUM_REPLY_DELAY_SECONDS,
+    MAXIMUM_REPLY_AGE_SECONDS,
+    MAXIMUM_REPLY_DELAY_SECONDS,
+    MINIMUM_REPLY_AGE_SECONDS,
+    MINIMUM_REPLY_DELAY_SECONDS,
+    RELATIONSHIP_STAGES,
+    ContactRelationshipSignals,
+    contact_policy_allows_auto_reply,
+    derive_relationship_stage,
+    reply_risk_boundary,
+)
+from .style_sampling import style_profile_is_current
 
 
 SUPPORTED_ACCOUNT_ACTION_TYPES = frozenset(
@@ -393,6 +415,12 @@ class StyleProfileRepository:
             stmt = stmt.with_for_update()
         return self.db.scalar(stmt)
 
+    def get_current(
+        self, owner_user_id: uuid.UUID, *, for_update: bool = False
+    ) -> AiStyleProfile | None:
+        row = self.get(owner_user_id, for_update=for_update)
+        return row if style_profile_is_current(row) else None
+
     def upsert(
         self,
         *,
@@ -401,7 +429,10 @@ class StyleProfileRepository:
         summary: str,
         traits: dict[str, object],
         source_message_count: int,
+        source_peer_count: int,
         source_last_message_at: datetime | None,
+        sampling_policy_version: int,
+        sanitizer_version: int,
     ) -> AiStyleProfile:
         row = self.get(owner_user_id, for_update=True)
         if row is None:
@@ -412,6 +443,9 @@ class StyleProfileRepository:
                 summary=summary,
                 traits=traits,
                 source_message_count=source_message_count,
+                source_peer_count=source_peer_count,
+                sampling_policy_version=sampling_policy_version,
+                sanitizer_version=sanitizer_version,
                 source_last_message_at=source_last_message_at,
                 generated_at=utcnow(),
             )
@@ -421,6 +455,9 @@ class StyleProfileRepository:
             row.summary = summary
             row.traits = traits
             row.source_message_count = source_message_count
+            row.source_peer_count = source_peer_count
+            row.sampling_policy_version = sampling_policy_version
+            row.sanitizer_version = sanitizer_version
             row.source_last_message_at = source_last_message_at
             row.generated_at = utcnow()
         self.db.flush()
@@ -1071,17 +1108,24 @@ def _normalize_autonomy_targets(values: Sequence[str]) -> list[str]:
     return normalized
 
 
-def _autonomy_message_identity(message: Message) -> str:
-    metadata = message.extra_data if isinstance(message.extra_data, Mapping) else {}
-    canonical = str(metadata.get("canonical_message_id") or "").strip()
-    return canonical or f"{message.provider}:{message.upstream_message_id}"
-
-
 def _autonomy_message_revoked(message: Message) -> bool:
     metadata = message.extra_data if isinstance(message.extra_data, Mapping) else {}
     return bool(
         str(message.status or "").lower() == "revoked"
         or str(metadata.get("revoked") or "").strip().lower() in {"1", "true"}
+    )
+
+
+def _autonomy_message_identity(message: Message) -> str:
+    metadata = message.extra_data if isinstance(message.extra_data, Mapping) else {}
+    return autonomy_message_identity(
+        provider=message.provider,
+        upstream_message_id=message.upstream_message_id,
+        canonical_message_id=metadata.get("canonical_message_id"),
+        direction=message.direction,
+        message_type=message.message_type,
+        body=message.body,
+        revoked=_autonomy_message_revoked(message),
     )
 
 
@@ -1096,6 +1140,13 @@ class AutonomyConversationHeadRow:
     occurred_at: datetime
     revoked: bool
     conversation_title: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ContactConversationState:
+    signals: ContactRelationshipSignals
+    conversation_ids: tuple[uuid.UUID, ...]
+    conversation_titles: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1170,6 +1221,8 @@ class AgentDiscoveryCandidateRepository:
     def _snapshot(cls, candidate: Mapping[str, Any], target: str) -> dict[str, Any]:
         result: dict[str, Any] = {"uid": target, "id": target}
         for field in cls.PROFILE_FIELDS:
+            if field in {"uid", "id"}:
+                continue
             value = candidate.get(field)
             if value is None or isinstance(value, (bool, int, float)):
                 if field in candidate:
@@ -1259,8 +1312,10 @@ class AgentDiscoveryCandidateRepository:
         seen_after: datetime,
         interaction_before: datetime,
         limit: int = 20,
+        owner_profile: Mapping[str, object] | None = None,
+        match_preference: object = None,
     ) -> list[AiAgentDiscoveryCandidate]:
-        return list(
+        candidates = list(
             self.db.scalars(
                 select(AiAgentDiscoveryCandidate)
                 .where(
@@ -1279,6 +1334,22 @@ class AgentDiscoveryCandidateRepository:
                 .limit(min(max(1, int(limit)), 50))
             )
         )
+        if owner_profile is None:
+            return candidates
+        return [
+            candidate
+            for candidate in candidates
+            if agent_candidate_compatibility(
+                owner_profile=owner_profile,
+                candidate_profile=(
+                    candidate.profile_snapshot
+                    if isinstance(candidate.profile_snapshot, Mapping)
+                    else {}
+                ),
+                target_upstream_uid=candidate.target_upstream_uid,
+                match_preference=match_preference,
+            ).allowed
+        ]
 
     def mark_interaction(
         self,
@@ -1302,6 +1373,304 @@ class AgentDiscoveryCandidateRepository:
             )
         )
         return bool(result.rowcount)
+
+
+class AgentContactPolicyRepository:
+    """Owner-scoped contact authorization and relationship facts."""
+
+    _UNAVAILABLE_TITLE_MARKERS = ("已注销", "已封禁", "注销或封禁")
+
+    def __init__(self, db: Session) -> None:
+        self.db = db
+
+    @staticmethod
+    def normalize_peer(value: object) -> str:
+        return _normalize_autonomy_targets((str(value or ""),))[0]
+
+    def get(
+        self,
+        owner_user_id: uuid.UUID,
+        peer_upstream_uid: str,
+        *,
+        for_update: bool = False,
+    ) -> AiAgentContactPolicy | None:
+        peer = self.normalize_peer(peer_upstream_uid)
+        stmt = select(AiAgentContactPolicy).where(
+            AiAgentContactPolicy.owner_user_id == owner_user_id,
+            AiAgentContactPolicy.peer_upstream_uid == peer,
+        )
+        if for_update:
+            stmt = stmt.with_for_update()
+        return self.db.scalar(stmt)
+
+    @staticmethod
+    def _normalized_updates(updates: Mapping[str, object]) -> dict[str, object]:
+        supported = {
+            "mode",
+            "stage_override",
+            "paused",
+            "minimum_reply_delay_seconds",
+            "maximum_reply_age_seconds",
+            "allow_address_terms",
+        }
+        unknown = set(updates) - supported
+        if unknown:
+            raise ValueError("unsupported contact policy field")
+        normalized: dict[str, object] = {}
+        if "mode" in updates:
+            mode = str(updates.get("mode") or "").strip().lower()
+            if mode not in CONTACT_POLICY_MODES:
+                raise ValueError("unsupported contact policy mode")
+            normalized["mode"] = mode
+        if "stage_override" in updates:
+            raw_stage = updates.get("stage_override")
+            stage = str(raw_stage or "").strip().lower() or None
+            if stage is not None and stage not in RELATIONSHIP_STAGES:
+                raise ValueError("unsupported relationship stage override")
+            normalized["stage_override"] = stage
+        if "paused" in updates:
+            paused = updates.get("paused")
+            if type(paused) is not bool:
+                raise ValueError("contact policy paused state is invalid")
+            normalized["paused"] = paused
+        if "minimum_reply_delay_seconds" in updates:
+            raw_delay = updates.get("minimum_reply_delay_seconds")
+            if type(raw_delay) is not int:
+                raise ValueError("contact reply delay is invalid")
+            delay = raw_delay
+            if not MINIMUM_REPLY_DELAY_SECONDS <= delay <= MAXIMUM_REPLY_DELAY_SECONDS:
+                raise ValueError("contact reply delay is outside the supported range")
+            normalized["minimum_reply_delay_seconds"] = delay
+        if "maximum_reply_age_seconds" in updates:
+            raw_age = updates.get("maximum_reply_age_seconds")
+            if type(raw_age) is not int:
+                raise ValueError("contact reply age is invalid")
+            maximum_age = raw_age
+            if not MINIMUM_REPLY_AGE_SECONDS <= maximum_age <= MAXIMUM_REPLY_AGE_SECONDS:
+                raise ValueError("contact reply age is outside the supported range")
+            normalized["maximum_reply_age_seconds"] = maximum_age
+        if "allow_address_terms" in updates:
+            raw_terms = updates.get("allow_address_terms")
+            if isinstance(raw_terms, (str, bytes)) or not isinstance(
+                raw_terms, Sequence
+            ):
+                raise ValueError("contact address terms must be an array")
+            supported_terms = set(AUTONOMY_RELATIONSHIP_ADDRESS_TERMS)
+            terms: list[str] = []
+            for raw_term in raw_terms:
+                term = str(raw_term or "").strip()
+                if term not in supported_terms:
+                    raise ValueError("contact address term is unsupported")
+                if term not in terms:
+                    terms.append(term)
+            if len(terms) > 20:
+                raise ValueError("too many contact address terms")
+            normalized["allow_address_terms"] = terms
+        delay = int(
+            normalized.get(
+                "minimum_reply_delay_seconds",
+                DEFAULT_MINIMUM_REPLY_DELAY_SECONDS,
+            )
+        )
+        maximum_age = int(
+            normalized.get(
+                "maximum_reply_age_seconds",
+                DEFAULT_MAXIMUM_REPLY_AGE_SECONDS,
+            )
+        )
+        if (
+            "minimum_reply_delay_seconds" in normalized
+            and "maximum_reply_age_seconds" in normalized
+            and maximum_age < delay
+        ):
+            raise ValueError("contact reply age must include the reply delay")
+        return normalized
+
+    def configure(
+        self,
+        owner_user_id: uuid.UUID,
+        peer_upstream_uid: str,
+        *,
+        updates: Mapping[str, object],
+    ) -> tuple[AiAgentContactPolicy, bool, bool]:
+        peer = self.normalize_peer(peer_upstream_uid)
+        normalized = self._normalized_updates(updates)
+        inserted_id = self.db.scalar(
+            insert(AiAgentContactPolicy)
+            .values(
+                id=uuid.uuid4(),
+                owner_user_id=owner_user_id,
+                peer_upstream_uid=peer,
+                mode=CONTACT_MODE_SUGGEST_ONLY,
+                stage_override=None,
+                paused=False,
+                minimum_reply_delay_seconds=(
+                    DEFAULT_MINIMUM_REPLY_DELAY_SECONDS
+                ),
+                maximum_reply_age_seconds=(
+                    DEFAULT_MAXIMUM_REPLY_AGE_SECONDS
+                ),
+                allow_address_terms=[],
+                version=1,
+            )
+            .on_conflict_do_nothing(
+                constraint="uq_ai_agent_contact_policies_owner_peer"
+            )
+            .returning(AiAgentContactPolicy.id)
+        )
+        created = inserted_id is not None
+        row = self.get(owner_user_id, peer, for_update=True)
+        if row is None:
+            raise RuntimeError("failed to create contact policy")
+
+        effective_delay = int(
+            normalized.get(
+                "minimum_reply_delay_seconds",
+                row.minimum_reply_delay_seconds,
+            )
+        )
+        effective_age = int(
+            normalized.get(
+                "maximum_reply_age_seconds",
+                row.maximum_reply_age_seconds,
+            )
+        )
+        if effective_age < effective_delay:
+            raise ValueError("contact reply age must include the reply delay")
+
+        changed = created
+        for field, value in normalized.items():
+            current = getattr(row, field)
+            if field == "allow_address_terms":
+                current = list(current or [])
+                value = list(value)  # type: ignore[arg-type]
+            if current == value:
+                continue
+            setattr(row, field, value)
+            changed = True
+        if changed and not created:
+            row.version = int(row.version) + 1
+        if changed:
+            row.updated_at = utcnow()
+            self.db.flush()
+        return row, created, changed
+
+    def conversation_state(
+        self,
+        *,
+        owner_user_id: uuid.UUID,
+        peer_upstream_uid: str,
+    ) -> ContactConversationState | None:
+        peer = self.normalize_peer(peer_upstream_uid)
+        conversation_rows = list(
+            self.db.execute(
+                select(Conversation.id, Conversation.title)
+                .where(
+                    Conversation.owner_user_id == owner_user_id,
+                    Conversation.peer_upstream_uid == peer,
+                )
+                .order_by(
+                    Conversation.last_message_at.desc().nullslast(),
+                    Conversation.updated_at.desc(),
+                )
+            )
+        )
+        conversation_ids = tuple(row[0] for row in conversation_rows)
+        if not conversation_ids:
+            return None
+        titles = tuple(
+            str(row[1] or "").strip()[:200]
+            for row in conversation_rows
+            if str(row[1] or "").strip()
+        )
+        metadata_revoked = func.lower(
+            func.coalesce(Message.extra_data.op("->>")("revoked"), "false")
+        )
+        message_conditions = (
+            Message.owner_user_id == owner_user_id,
+            Message.conversation_id.in_(conversation_ids),
+            Message.direction.in_(("incoming", "outgoing")),
+            func.lower(Message.status) != "revoked",
+            metadata_revoked.notin_(("true", "1")),
+        )
+        aggregate = self.db.execute(
+            select(
+                func.count(Message.id),
+                func.count(Message.id).filter(Message.direction == "incoming"),
+                func.count(Message.id).filter(Message.direction == "outgoing"),
+                func.max(Message.occurred_at).filter(
+                    Message.direction == "incoming"
+                ),
+                func.max(Message.occurred_at).filter(
+                    Message.direction == "outgoing"
+                ),
+            ).where(*message_conditions)
+        ).one()
+        latest = self.db.execute(
+            select(Message.direction, Message.occurred_at)
+            .where(*message_conditions)
+            .order_by(
+                Message.occurred_at.desc(),
+                Message.created_at.desc(),
+                Message.id.desc(),
+            )
+            .limit(1)
+        ).first()
+        blocked = bool(
+            self.db.scalar(
+                select(Relationship.id)
+                .where(
+                    Relationship.owner_user_id == owner_user_id,
+                    Relationship.subject_upstream_uid == peer,
+                    Relationship.kind.in_(("blacklist", "blacklisted_by")),
+                    Relationship.status == "active",
+                    Relationship.ended_at.is_(None),
+                )
+                .limit(1)
+            )
+        )
+        available = not any(
+            marker in title
+            for title in titles
+            for marker in self._UNAVAILABLE_TITLE_MARKERS
+        )
+        signals = ContactRelationshipSignals(
+            total_message_count=int(aggregate[0] or 0),
+            incoming_message_count=int(aggregate[1] or 0),
+            outgoing_message_count=int(aggregate[2] or 0),
+            last_incoming_at=aggregate[3],
+            last_outgoing_at=aggregate[4],
+            latest_direction=str(latest[0] or "") if latest else "",
+            latest_message_at=latest[1] if latest else None,
+            blocked=blocked,
+            conversation_available=available,
+        )
+        return ContactConversationState(
+            signals=signals,
+            conversation_ids=conversation_ids,
+            conversation_titles=titles,
+        )
+
+    def relationship_stage(
+        self,
+        *,
+        owner_user_id: uuid.UUID,
+        peer_upstream_uid: str,
+        policy: AiAgentContactPolicy | None,
+        now: datetime,
+    ) -> str | None:
+        state = self.conversation_state(
+            owner_user_id=owner_user_id,
+            peer_upstream_uid=peer_upstream_uid,
+        )
+        if state is None:
+            return None
+        return derive_relationship_stage(
+            state.signals,
+            now=now,
+            mode=(policy.mode if policy is not None else CONTACT_MODE_SUGGEST_ONLY),
+            stage_override=(policy.stage_override if policy is not None else None),
+        )
 
 
 class AgentAutonomySettingRepository:
@@ -1773,6 +2142,19 @@ class AgentAutonomySettingRepository:
         setting = self.get(owner_user_id, for_update=for_update)
         if setting is None:
             return None
+        match_preference = scalar(
+            MatchPreference,
+            MatchPreference.user_id == owner_user_id,
+        )
+        contact_policy = (
+            scalar(
+                AiAgentContactPolicy,
+                AiAgentContactPolicy.owner_user_id == owner_user_id,
+                AiAgentContactPolicy.peer_upstream_uid == target_uid,
+            )
+            if target_uid
+            else None
+        )
         return {
             "autonomy_setting": setting,
             "system_setting": system,
@@ -1781,6 +2163,8 @@ class AgentAutonomySettingRepository:
             "agent_setting": agent,
             "execution_setting": execution,
             "connection": connection,
+            "match_preference": match_preference,
+            "contact_policy": contact_policy,
             "target_external_account": (
                 locked_target if target_mapping_current else None
             ),
@@ -1911,6 +2295,8 @@ class AgentAutonomyTaskRepository:
         runner_setting_version: int,
         model_connection_id: uuid.UUID,
         runner_configuration_fingerprint: str,
+        contact_policy_version: int | None = None,
+        relationship_stage: str = "",
         source_message_id: uuid.UUID | None = None,
         source_message_identity: str = "",
         schedule_slot: str = "",
@@ -1932,12 +2318,26 @@ class AgentAutonomyTaskRepository:
         runner_fingerprint = str(
             runner_configuration_fingerprint or ""
         ).strip().lower()
+        contact_version = (
+            int(contact_policy_version)
+            if contact_policy_version is not None
+            else None
+        )
+        normalized_stage = str(relationship_stage or "").strip().lower()
         if len(source_identity) > 256 or any(ord(char) < 32 for char in source_identity):
             raise ValueError("invalid autonomous source identity")
         if target:
             target = _normalize_autonomy_targets((target,))[0]
         if len(instruction) > 4000:
             raise ValueError("autonomous generation instruction is too long")
+        if contact_version is not None and contact_version < 1:
+            raise ValueError("contact policy version must be positive")
+        if normalized_stage and normalized_stage not in RELATIONSHIP_STAGES:
+            raise ValueError("autonomous relationship stage is invalid")
+        if normalized_type == "reply_to_message" and (
+            contact_version is None or not normalized_stage
+        ):
+            raise ValueError("autonomous reply requires contact authorization")
         if int(runner_setting_version) < 1:
             raise ValueError("autonomous runner setting version must be positive")
         if not isinstance(model_connection_id, uuid.UUID):
@@ -1956,6 +2356,8 @@ class AgentAutonomyTaskRepository:
             "status": "queued",
             "idempotency_key": key,
             "policy_version": int(policy_version),
+            "contact_policy_version": contact_version,
+            "relationship_stage": normalized_stage or None,
             "execution_setting_version": int(execution_setting_version),
             "runner_setting_version": int(runner_setting_version),
             "model_connection_id": model_connection_id,
@@ -2011,6 +2413,89 @@ class AgentAutonomyTaskRepository:
                 .limit(1)
             )
         )
+
+    def cancel_superseded_reply_tasks(
+        self,
+        *,
+        owner_user_id: uuid.UUID,
+        at: datetime,
+    ) -> int:
+        """Cancel queued reply work whose bound message is no longer the head."""
+
+        rows = list(
+            self.db.scalars(
+                select(AiAgentAutonomyTask)
+                .where(
+                    AiAgentAutonomyTask.owner_user_id == owner_user_id,
+                    AiAgentAutonomyTask.task_type == "reply_to_message",
+                    AiAgentAutonomyTask.status.in_(("queued", "deferred")),
+                )
+                .order_by(AiAgentAutonomyTask.queued_at, AiAgentAutonomyTask.id)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        cancelled = 0
+        for task in rows:
+            target = str(task.target_upstream_uid or "").strip()
+            head = (
+                self.get_conversation_head(
+                    owner_user_id=owner_user_id,
+                    peer_upstream_uid=target,
+                )
+                if target
+                else None
+            )
+            if (
+                head is not None
+                and head.direction == "incoming"
+                and not head.revoked
+                and head.message_identity
+                == str(task.source_message_identity or "")
+            ):
+                continue
+            task.status = "stale"
+            task.stable_error_code = "inbound_message_superseded"
+            task.completed_at = at
+            task.lease_owner = None
+            task.lease_token = None
+            task.lease_until = None
+            task.updated_at = at
+            cancelled += 1
+        if cancelled:
+            self.db.flush()
+        return cancelled
+
+    def cancel_reply_tasks_for_contact_policy_change(
+        self,
+        *,
+        owner_user_id: uuid.UUID,
+        peer_upstream_uid: str,
+        at: datetime,
+    ) -> int:
+        """Invalidate reply work that has not entered final dispatch."""
+
+        peer = AgentContactPolicyRepository.normalize_peer(peer_upstream_uid)
+        result = self.db.execute(
+            update(AiAgentAutonomyTask)
+            .where(
+                AiAgentAutonomyTask.owner_user_id == owner_user_id,
+                AiAgentAutonomyTask.target_upstream_uid == peer,
+                AiAgentAutonomyTask.task_type == "reply_to_message",
+                AiAgentAutonomyTask.status.in_(
+                    tuple(AUTONOMY_NOT_STARTED_STATUSES)
+                ),
+            )
+            .values(
+                status="stale",
+                stable_error_code="contact_policy_changed",
+                completed_at=at,
+                lease_owner=None,
+                lease_token=None,
+                lease_until=None,
+                updated_at=at,
+            )
+        )
+        return int(result.rowcount or 0)
 
     def has_open_task_for_target(
         self,
@@ -2477,6 +2962,92 @@ class AgentAutonomyTaskRepository:
             is not None
         )
 
+    def _contact_reply_gate_code(
+        self,
+        *,
+        task: AiAgentAutonomyTask,
+        snapshot: Mapping[str, Any],
+        now: datetime,
+    ) -> Any | None:
+        from bbw_agent.autonomous import DispatchDecisionCode
+
+        if str(task.task_type or "") != "reply_to_message":
+            return None
+        contact_policy = snapshot.get("contact_policy")
+        if contact_policy is None:
+            return DispatchDecisionCode.ACTION_NOT_ALLOWED
+        task_contact_version = getattr(task, "contact_policy_version", None)
+        task_stage = str(getattr(task, "relationship_stage", "") or "").strip()
+        if (
+            task_contact_version is None
+            or int(task_contact_version) != int(contact_policy.version)
+            or not task_stage
+        ):
+            return DispatchDecisionCode.POLICY_CHANGED
+        current_stage = AgentContactPolicyRepository(self.db).relationship_stage(
+            owner_user_id=task.owner_user_id,
+            peer_upstream_uid=str(task.target_upstream_uid or ""),
+            policy=contact_policy,
+            now=now,
+        )
+        if current_stage is None:
+            return DispatchDecisionCode.ACTION_NOT_ALLOWED
+        if current_stage != task_stage:
+            return DispatchDecisionCode.POLICY_CHANGED
+        if not contact_policy_allows_auto_reply(
+            persisted=True,
+            mode=str(contact_policy.mode or ""),
+            paused=bool(contact_policy.paused),
+            relationship_stage=current_stage,
+        ):
+            return DispatchDecisionCode.ACTION_NOT_ALLOWED
+        return None
+
+    @staticmethod
+    def _reply_head_is_dispatchable(
+        *,
+        head: AutonomyConversationHeadRow | None,
+        expected_identity: str,
+        now: datetime,
+        autonomy_setting: AiAgentAutonomySetting,
+        contact_policy: AiAgentContactPolicy | None,
+    ) -> bool:
+        if contact_policy is None or head is None:
+            return False
+        return bool(
+            head.message_identity == str(expected_identity or "")
+            and head.direction == "incoming"
+            and not head.revoked
+            and str(head.message_type or "").strip().lower()
+            in {"text", "timtextelem"}
+            and str(head.body or "").strip()
+            and autonomy_reply_message_is_eligible(
+                head.body,
+                peer_upstream_uid=head.peer_upstream_uid,
+                conversation_title=head.conversation_title,
+            )
+            and not reply_risk_boundary(
+                head.body,
+                message_type=head.message_type,
+            )
+            and autonomy_reply_message_is_fresh(
+                head.occurred_at,
+                now=now,
+                started_at=autonomy_setting.auto_reply_started_at,
+                max_age_seconds=int(
+                    contact_policy.maximum_reply_age_seconds
+                ),
+            )
+            and autonomy_reply_not_before(
+                head.occurred_at,
+                now=now,
+                delay_seconds=int(
+                    contact_policy.minimum_reply_delay_seconds
+                ),
+            )
+            <= now
+        )
+
     def begin_dispatch(self, request: Any) -> Any:
         from bbw_agent.autonomous import (
             DispatchDecisionCode,
@@ -2516,24 +3087,12 @@ class AgentAutonomyTaskRepository:
                 owner_user_id=request.owner_user_id,
                 peer_upstream_uid=str(task.target_upstream_uid or ""),
             )
-            if (
-                head is None
-                or head.message_identity != request.expected_source_message_identity
-                or head.direction != "incoming"
-                or head.revoked
-                or str(head.message_type or "").strip().lower()
-                not in {"text", "timtextelem"}
-                or not str(head.body or "").strip()
-                or not autonomy_reply_message_is_eligible(
-                    head.body,
-                    peer_upstream_uid=head.peer_upstream_uid,
-                    conversation_title=head.conversation_title,
-                )
-                or not autonomy_reply_message_is_fresh(
-                    head.occurred_at,
-                    now=request.now,
-                    started_at=setting.auto_reply_started_at,
-                )
+            if not self._reply_head_is_dispatchable(
+                head=head,
+                expected_identity=request.expected_source_message_identity,
+                now=request.now,
+                autonomy_setting=setting,
+                contact_policy=snapshot.get("contact_policy"),
             ):
                 return DispatchReservationDecision(
                     DispatchDecisionCode.SOURCE_STALE
@@ -2670,15 +3229,42 @@ class AgentAutonomyTaskRepository:
         if not feature_enabled:
             return DispatchDecisionCode.ACTION_NOT_ALLOWED
         target = str(request.target_upstream_uid or "").strip()
+        contact_gate = self._contact_reply_gate_code(
+            task=task,
+            snapshot=snapshot,
+            now=getattr(request, "now", None) or utcnow(),
+        )
+        if contact_gate is not None:
+            return contact_gate
         if task.task_type in {"follow_target", "unfollow_target"} and target not in set(
             setting.managed_target_uids or []
         ):
             return DispatchDecisionCode.ACTION_NOT_ALLOWED
         if task.task_type in AUTONOMY_DYNAMIC_CANDIDATE_TASKS:
-            if not target or AgentDiscoveryCandidateRepository(self.db).get(
-                owner_user_id=task.owner_user_id,
-                target_upstream_uid=target,
-            ) is None:
+            candidate = (
+                AgentDiscoveryCandidateRepository(self.db).get(
+                    owner_user_id=task.owner_user_id,
+                    target_upstream_uid=target,
+                )
+                if target
+                else None
+            )
+            if (
+                candidate is None
+                or target != str(task.target_upstream_uid or "").strip()
+                or not agent_candidate_compatibility(
+                    owner_profile=(
+                        user.profile if isinstance(user.profile, Mapping) else {}
+                    ),
+                    candidate_profile=(
+                        candidate.profile_snapshot
+                        if isinstance(candidate.profile_snapshot, Mapping)
+                        else {}
+                    ),
+                    target_upstream_uid=target,
+                    match_preference=snapshot.get("match_preference"),
+                ).allowed
+            ):
                 return DispatchDecisionCode.ACTION_NOT_ALLOWED
         if task.action_type in {
             "send_private_message",
@@ -2887,24 +3473,12 @@ class AgentAutonomyTaskRepository:
                 owner_user_id=task.owner_user_id,
                 peer_upstream_uid=str(task.target_upstream_uid or ""),
             )
-            if (
-                head is None
-                or head.message_identity != str(task.source_message_identity or "")
-                or head.direction != "incoming"
-                or head.revoked
-                or str(head.message_type or "").strip().lower()
-                not in {"text", "timtextelem"}
-                or not str(head.body or "").strip()
-                or not autonomy_reply_message_is_eligible(
-                    head.body,
-                    peer_upstream_uid=head.peer_upstream_uid,
-                    conversation_title=head.conversation_title,
-                )
-                or not autonomy_reply_message_is_fresh(
-                    head.occurred_at,
-                    now=dispatch_now,
-                    started_at=setting.auto_reply_started_at,
-                )
+            if not self._reply_head_is_dispatchable(
+                head=head,
+                expected_identity=str(task.source_message_identity or ""),
+                now=dispatch_now,
+                autonomy_setting=setting,
+                contact_policy=snapshot.get("contact_policy"),
             ):
                 return None
         elif task.task_type == "proactive_message" and self.get_conversation_head(

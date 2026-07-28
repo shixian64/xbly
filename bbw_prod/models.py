@@ -1134,6 +1134,14 @@ class AiStyleProfile(UUIDPrimaryKeyMixin, TimestampMixin, SerializableMixin, Bas
         CheckConstraint(
             "source_message_count >= 0", name="ai_style_profile_source_count_nonnegative"
         ),
+        CheckConstraint(
+            "source_peer_count >= 0 AND source_peer_count <= source_message_count",
+            name="ai_style_profile_source_peer_count_valid",
+        ),
+        CheckConstraint(
+            "sampling_policy_version >= 0 AND sanitizer_version >= 0",
+            name="ai_style_profile_policy_versions_nonnegative",
+        ),
     )
     __sensitive_fields__ = frozenset({"summary", "traits"})
 
@@ -1146,6 +1154,15 @@ class AiStyleProfile(UUIDPrimaryKeyMixin, TimestampMixin, SerializableMixin, Bas
         JSONB, nullable=False, default=dict, server_default=JSON_EMPTY_OBJECT
     )
     source_message_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    source_peer_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    sampling_policy_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    sanitizer_version: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
     source_last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -1436,6 +1453,15 @@ class AiAgentAutonomyTask(
             name="ai_agent_autonomy_task_versions_positive",
         ),
         CheckConstraint(
+            "contact_policy_version IS NULL OR contact_policy_version >= 1",
+            name="ai_agent_autonomy_task_contact_policy_version_positive",
+        ),
+        CheckConstraint(
+            "relationship_stage IS NULL OR relationship_stage IN "
+            "('new', 'engaged', 'established', 'close', 'manual_only', 'inactive')",
+            name="ai_agent_autonomy_task_relationship_stage_valid",
+        ),
+        CheckConstraint(
             "length(runner_configuration_fingerprint) = 64",
             name="ai_agent_autonomy_task_runner_fingerprint_valid",
         ),
@@ -1476,6 +1502,13 @@ class AiAgentAutonomyTask(
             "owner_user_id",
             "source_message_id",
         ),
+        Index(
+            "ix_ai_agent_autonomy_tasks_contact_policy",
+            "owner_user_id",
+            "target_upstream_uid",
+            "task_type",
+            "status",
+        ),
     )
     __sensitive_fields__ = frozenset(
         {
@@ -1505,6 +1538,8 @@ class AiAgentAutonomyTask(
     idempotency_key: Mapped[str] = mapped_column(String(160), nullable=False)
     action_idempotency_key: Mapped[str | None] = mapped_column(String(160))
     policy_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    contact_policy_version: Mapped[int | None] = mapped_column(Integer)
+    relationship_stage: Mapped[str | None] = mapped_column(String(24))
     execution_setting_version: Mapped[int] = mapped_column(Integer, nullable=False)
     runner_setting_version: Mapped[int] = mapped_column(Integer, nullable=False)
     model_connection_id: Mapped[uuid.UUID] = mapped_column(
@@ -1548,6 +1583,85 @@ class AiAgentAutonomyTask(
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     outcome_unknown: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
+    )
+
+
+class AiAgentContactPolicy(
+    UUIDPrimaryKeyMixin, TimestampMixin, SerializableMixin, Base
+):
+    """用户针对单个联系人显式保存的聊天 Agent 授权。"""
+
+    __tablename__ = "ai_agent_contact_policies"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_user_id",
+            "peer_upstream_uid",
+            name="uq_ai_agent_contact_policies_owner_peer",
+        ),
+        CheckConstraint(
+            "mode IN ('suggest_only', 'auto_low_risk', 'manual_only')",
+            name="ai_agent_contact_policy_mode_valid",
+        ),
+        CheckConstraint(
+            "stage_override IS NULL OR stage_override IN "
+            "('new', 'engaged', 'established', 'close', 'manual_only', 'inactive')",
+            name="ai_agent_contact_policy_stage_override_valid",
+        ),
+        CheckConstraint(
+            "minimum_reply_delay_seconds BETWEEN 10 AND 300",
+            name="ai_agent_contact_policy_minimum_delay_valid",
+        ),
+        CheckConstraint(
+            "maximum_reply_age_seconds BETWEEN 60 AND 7200 "
+            "AND maximum_reply_age_seconds >= minimum_reply_delay_seconds",
+            name="ai_agent_contact_policy_maximum_age_valid",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(allow_address_terms) = 'array' "
+            "AND jsonb_array_length(allow_address_terms) <= 20",
+            name="ai_agent_contact_policy_address_terms_valid",
+        ),
+        CheckConstraint(
+            "version >= 1",
+            name="ai_agent_contact_policy_version_positive",
+        ),
+        Index(
+            "ix_ai_agent_contact_policies_owner_updated",
+            "owner_user_id",
+            "updated_at",
+        ),
+    )
+    __sensitive_fields__ = frozenset(
+        {"peer_upstream_uid", "allow_address_terms"}
+    )
+
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    peer_upstream_uid: Mapped[str] = mapped_column(String(128), nullable=False)
+    mode: Mapped[str] = mapped_column(
+        String(24),
+        nullable=False,
+        default="suggest_only",
+        server_default="suggest_only",
+    )
+    stage_override: Mapped[str | None] = mapped_column(String(24))
+    paused: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    minimum_reply_delay_seconds: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, default=30, server_default="30"
+    )
+    maximum_reply_age_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=7200, server_default="7200"
+    )
+    allow_address_terms: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=JSON_EMPTY_ARRAY
+    )
+    version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
     )
 
 

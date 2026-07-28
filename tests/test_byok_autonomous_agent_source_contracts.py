@@ -256,7 +256,11 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         )
         self.assertIn("setting.auto_reply_started_at is not None", owner_scheduler)
         self.assertIn("tasks.has_open_task_type(", owner_scheduler)
-        self.assertIn("limit=1", owner_scheduler)
+        self.assertIn("remaining = min(1, max(1, int(task_limit)))", owner_scheduler)
+        self.assertIn("limit=20", owner_scheduler)
+        self.assertIn("if contact_policy is None:", owner_scheduler)
+        self.assertIn("contact_policy_version=int(contact_policy.version)", owner_scheduler)
+        self.assertIn("relationship_stage=relationship_stage", owner_scheduler)
 
     def test_agent_cadence_keeps_safe_lower_bounds_and_uses_natural_defaults(self) -> None:
         migration = self.read(
@@ -984,10 +988,18 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
             self.assertIn(binding, permit)
 
         self.assertIn('if task.task_type == "reply_to_message":', permit)
-        self.assertIn(
-            'head.message_identity != str(task.source_message_identity or "")',
-            permit,
+        self.assertIn("self._reply_head_is_dispatchable(", permit)
+        reply_source_gate, _ = self.function_source(
+            "bbw_agent/repositories.py",
+            "_reply_head_is_dispatchable",
         )
+        self.assertIn(
+            'head.message_identity == str(expected_identity or "")',
+            reply_source_gate,
+        )
+        self.assertIn("not reply_risk_boundary(", reply_source_gate)
+        self.assertIn("contact_policy.minimum_reply_delay_seconds", reply_source_gate)
+        self.assertIn("contact_policy.maximum_reply_age_seconds", reply_source_gate)
         self.assertIn('elif task.task_type == "proactive_message"', permit)
 
         send, _ = self.function_source(

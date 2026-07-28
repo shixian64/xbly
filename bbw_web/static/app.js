@@ -314,6 +314,12 @@ const S = {
   imComposerDraftRevisions: new Map(),
   imQuote: null,
   imQuoteDrafts: new Map(),
+  chatAssistByPeer: new Map(),
+  chatAssistLoadingPeers: new Set(),
+  chatAssistGeneratingPeers: new Set(),
+  chatAssistRequestTokens: new Map(),
+  chatAssistRefreshTimers: new Map(),
+  chatAssistSuggestions: new Map(),
   imVoiceMode: false,
   imStickers: [],
   imStickerGroups: [],
@@ -2327,8 +2333,18 @@ function setAiAgentAccess(enabled, status = null, { redirect = true } = {}) {
   setAiAgentExecutionStatus(nextEnabled ? status : null);
   setAiAgentAutonomyStatus(nextEnabled ? status : null);
   if (!nextEnabled) {
+    S.chatAssistRefreshTimers.forEach((timer) => clearTimeout(timer));
+    S.chatAssistRefreshTimers.clear();
+    S.chatAssistByPeer.clear();
+    S.chatAssistLoadingPeers.clear();
+    S.chatAssistGeneratingPeers.clear();
+    S.chatAssistRequestTokens.clear();
+    S.chatAssistSuggestions.clear();
+    document.querySelector("[data-chat-agent-assist]")?.remove();
     clearAgentApiKeyInputs(document);
     clearViewCacheKey("agent");
+  } else if (changed && S.activePeer) {
+    void loadChatAssistStatus(S.activePeer, { force: true });
   }
   if (changed) buildNav();
   if (!nextEnabled && redirect && S.authenticated && S.route === "agent") {
@@ -9093,6 +9109,7 @@ async function loadConversationMessages(peer, { force = false } = {}) {
     if (S.activePeer === target) {
       if (changed) refreshChatLog();
       scheduleSdkMessageReadReceipts(target);
+      scheduleChatAssistRefresh(target, 250);
     }
   } finally {
     S.imMessageLoadingPeers.delete(target);
@@ -10083,6 +10100,7 @@ async function openPrivateConversation(
     replaceName,
   });
   S.activePeerName = conversationEntryDisplayName(conversation, name, target);
+  void loadChatAssistStatus(target);
   if (Array.isArray(seedMessages) && seedMessages.length) {
     mergePeerMessages(target, seedMessages.map((entry) => ({ ...entry, peer: target })));
   }
@@ -10432,6 +10450,12 @@ function removeConversationListItems(peers) {
     S.imMessageHistoryExhaustedPeers.delete(peer);
     S.imMessageArchiveCursors.delete(peer);
     S.imMessageRenderLimits.delete(peer);
+    clearChatAssistRefreshTimer(peer);
+    S.chatAssistByPeer.delete(peer);
+    S.chatAssistLoadingPeers.delete(peer);
+    S.chatAssistGeneratingPeers.delete(peer);
+    S.chatAssistRequestTokens.delete(peer);
+    S.chatAssistSuggestions.delete(peer);
   });
   const wasActive = targets.has(String(S.activePeer || ""));
   if (wasActive) {
@@ -10705,6 +10729,332 @@ function chatComposerQuoteHtml() {
   )}</strong><span>${esc(messageQuoteDisplayText(quote))}</span></div><button type="button" data-action="cancel-chat-quote">取消引用</button></div>`;
 }
 
+const CHAT_ASSIST_STAGE_LABELS = Object.freeze({
+  new: "陌生",
+  engaged: "初步互动",
+  established: "稳定关系",
+  close: "深关系",
+  manual_only: "始终人工",
+  inactive: "暂停触达",
+});
+const CHAT_ASSIST_MODE_LABELS = Object.freeze({
+  suggest_only: "仅建议",
+  auto_low_risk: "允许低风险自动回复",
+  manual_only: "始终人工处理",
+});
+const CHAT_ASSIST_RISK_LABELS = Object.freeze({
+  credentials: "账号或凭据",
+  financial: "资金或交易",
+  contact_details: "联系方式",
+  precise_location_or_meeting: "精确位置或线下见面",
+  health_or_self_harm: "健康或人身安全",
+  legal_or_conflict: "法律、举报或冲突",
+  identity_or_commitment: "身份或关系承诺",
+  explicit_or_consent: "露骨内容或边界同意",
+  unsupported_media: "需要人工查看的媒体",
+  empty_message: "空消息",
+});
+
+function chatAssistEntry(peer = S.activePeer) {
+  return S.chatAssistByPeer.get(String(peer || "").trim()) || null;
+}
+
+function chatAssistSuggestion(peer = S.activePeer) {
+  return S.chatAssistSuggestions.get(String(peer || "").trim()) || null;
+}
+
+function invalidateChatAssistSuggestion(peer) {
+  const target = String(peer || "").trim();
+  if (!target) return false;
+  const removed = S.chatAssistSuggestions.delete(target);
+  if (removed && target === String(S.activePeer || "")) {
+    refreshChatAgentAssistRegion();
+  }
+  return removed;
+}
+
+function chatAssistLatestSignature(status) {
+  const latest = status?.latest_message;
+  if (!latest || typeof latest !== "object") return "";
+  return [
+    latest.fingerprint,
+    latest.direction,
+    latest.message_type,
+    latest.occurred_at,
+    latest.needs_reply,
+  ]
+    .map((value) => String(value || ""))
+    .join("|");
+}
+
+function chatSuggestionEditDistance(generatedText, finalText) {
+  let left = Array.from(String(generatedText || "")).slice(0, 4000);
+  let right = Array.from(String(finalText || "")).slice(0, 4000);
+  if (left.length > right.length) [left, right] = [right, left];
+  if (!left.length) return right.length;
+  const previous = new Uint16Array(left.length + 1);
+  const current = new Uint16Array(left.length + 1);
+  for (let index = 0; index <= left.length; index += 1) previous[index] = index;
+  for (let row = 1; row <= right.length; row += 1) {
+    current[0] = row;
+    for (let column = 1; column <= left.length; column += 1) {
+      current[column] = Math.min(
+        current[column - 1] + 1,
+        previous[column] + 1,
+        previous[column - 1] + (left[column - 1] === right[row - 1] ? 0 : 1)
+      );
+    }
+    previous.set(current);
+  }
+  return previous[left.length];
+}
+
+async function reportChatAgentSuggestionFeedback(peer, suggestion, event, finalText = "") {
+  const target = String(peer || "").trim();
+  const runId = String(suggestion?.runId || "").trim();
+  if (!target || !runId) return false;
+  const finalValue = String(finalText || "");
+  const finalCharCount = Array.from(finalValue).length;
+  const editDistance = event === "sent"
+    ? chatSuggestionEditDistance(suggestion?.text, finalValue)
+    : 0;
+  try {
+    const { data, ok } = await api(
+      `/api/agent/conversations/${encodeURIComponent(target)}/suggestion-feedback`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          run_id: runId,
+          event,
+          final_char_count: Math.min(4000, finalCharCount),
+          edit_distance: Math.min(4000, editDistance),
+        }),
+        timeout: 12000,
+      }
+    );
+    return Boolean(ok && data?.ok !== false);
+  } catch {
+    return false;
+  }
+}
+
+function clearChatAssistRefreshTimer(peer) {
+  const target = String(peer || "").trim();
+  const timer = S.chatAssistRefreshTimers.get(target);
+  if (timer) clearTimeout(timer);
+  S.chatAssistRefreshTimers.delete(target);
+}
+
+function refreshChatAgentAssistRegion() {
+  const region = document.querySelector("[data-chat-agent-assist]");
+  if (!region || String(region.dataset.peer || "") !== String(S.activePeer || "")) return false;
+  region.innerHTML = chatAgentAssistContentHtml();
+  return true;
+}
+
+function scheduleChatAssistRefresh(peer, delay = 500) {
+  const target = String(peer || "").trim();
+  if (!target || !S.aiAgentAccessEnabled || isSystemCustomerServicePeer(target)) return;
+  clearChatAssistRefreshTimer(target);
+  const timer = setTimeout(() => {
+    S.chatAssistRefreshTimers.delete(target);
+    void loadChatAssistStatus(target, { force: true });
+  }, Math.max(0, Number(delay) || 0));
+  S.chatAssistRefreshTimers.set(target, timer);
+}
+
+async function loadChatAssistStatus(peer, { force = false } = {}) {
+  const target = String(peer || "").trim();
+  if (!target || !S.aiAgentAccessEnabled || isSystemCustomerServicePeer(target)) return null;
+  if (S.chatAssistLoadingPeers.has(target) && !force) return chatAssistEntry(target);
+  const token = `${Date.now()}:${Math.random()}`;
+  S.chatAssistRequestTokens.set(target, token);
+  S.chatAssistLoadingPeers.add(target);
+  if (target === String(S.activePeer || "")) refreshChatAgentAssistRegion();
+  try {
+    const { data, ok } = await api(
+      `/api/agent/conversations/${encodeURIComponent(target)}/assist-status`,
+      { timeout: 12000 }
+    );
+    if (!ok || data?.ok === false) {
+      throw new Error(errorInfo(data, "聊天建议状态加载失败").title);
+    }
+    if (S.chatAssistRequestTokens.get(target) !== token) return null;
+    const status = data?.assist_status && typeof data.assist_status === "object" ? data.assist_status : null;
+    const previousStatus = chatAssistEntry(target);
+    if (
+      status &&
+      previousStatus &&
+      chatAssistLatestSignature(previousStatus) !== chatAssistLatestSignature(status)
+    ) {
+      invalidateChatAssistSuggestion(target);
+    }
+    S.chatAssistByPeer.set(target, status || { error: "聊天建议状态不可用" });
+    return status;
+  } catch (error) {
+    if (S.chatAssistRequestTokens.get(target) !== token) return null;
+    S.chatAssistByPeer.set(target, {
+      error: error?.message || "聊天建议状态加载失败",
+    });
+    return null;
+  } finally {
+    if (S.chatAssistRequestTokens.get(target) === token) {
+      S.chatAssistLoadingPeers.delete(target);
+      if (target === String(S.activePeer || "")) refreshChatAgentAssistRegion();
+    }
+  }
+}
+
+function chatAgentAssistContentHtml() {
+  const peer = String(S.activePeer || "");
+  const loading = S.chatAssistLoadingPeers.has(peer);
+  const generating = S.chatAssistGeneratingPeers.has(peer);
+  const busy = loading || generating;
+  const status = chatAssistEntry(peer);
+  const suggestion = chatAssistSuggestion(peer);
+  if (!status) {
+    return `<div class="chat-agent-assist-loading">${loading ? "正在读取聊天辅助状态" : "聊天辅助状态尚未加载"}<button type="button" data-action="reload-chat-agent-assist">重新加载</button></div>`;
+  }
+  if (status.error) {
+    return `<div class="chat-agent-assist-loading is-error"><span>${esc(status.error)}</span><button type="button" data-action="reload-chat-agent-assist">重试</button></div>`;
+  }
+  const policy = status.policy || {};
+  const capabilities = status.capabilities || {};
+  const stage = String(status.relationship_stage || "new");
+  const mode = String(policy.mode || "suggest_only");
+  const risk = String(status.risk_boundary || "");
+  const addressTerms = Array.isArray(policy.allow_address_terms) ? policy.allow_address_terms : [];
+  const canSuggest = capabilities.can_suggest === true && !busy;
+  const suggestionReady = Boolean(suggestion?.text);
+  const suggestionState = suggestionReady
+    ? suggestion.accepted
+      ? "建议已采用，可继续修改后发送"
+      : suggestion.applied
+        ? "建议已写入输入框，请检查或修改后再发送"
+        : "建议已生成，点击采用后写入输入框"
+    : risk
+      ? `当前消息涉及${CHAT_ASSIST_RISK_LABELS[risk] || "人工处理边界"}，不会自动发送`
+      : capabilities.runner_ready
+        ? "建议只会写入输入框，不会直接发送"
+        : "请先在社交 Agent 中启用并测试模型连接";
+  const modeOptions = Object.entries(CHAT_ASSIST_MODE_LABELS)
+    .map(([value, label]) => `<option value="${esc(value)}" ${value === mode ? "selected" : ""}>${esc(label)}</option>`)
+    .join("");
+  return `<div class="chat-agent-assist-head"><div><strong>聊天建议</strong><span>关系阶段：${esc(
+    CHAT_ASSIST_STAGE_LABELS[stage] || stage
+  )} · 上下文 ${Math.max(0, Number(status.context_message_count || 0))} 条</span></div><label>联系人模式<select data-chat-agent-mode ${busy ? "disabled" : ""}>${modeOptions}</select></label></div>
+    <div class="chat-agent-assist-meta"><span>称呼白名单：${esc(addressTerms.join("、") || "无")}</span><span>${esc(suggestionState)}</span></div>
+    <div class="chat-agent-assist-actions" role="group" aria-label="聊天建议操作">
+      <button type="button" data-action="generate-chat-agent-suggestion" ${canSuggest ? "" : "disabled"}>${generating ? "正在生成" : "生成建议"}</button>
+      <button type="button" data-action="rewrite-chat-agent-suggestion" ${canSuggest && suggestionReady ? "" : "disabled"}>换一种表达</button>
+      <button type="button" data-action="adopt-chat-agent-suggestion" ${suggestionReady && !suggestion.accepted ? "" : "disabled"}>采用</button>
+      <button type="button" data-action="dismiss-chat-agent-suggestion" ${suggestionReady ? "" : "disabled"}>不回复</button>
+      <button type="button" data-action="set-chat-agent-manual-only" ${mode === "manual_only" || busy ? "disabled" : ""}>始终人工处理</button>
+    </div>`;
+}
+
+function chatAgentAssistHtml() {
+  if (!S.aiAgentAccessEnabled || !S.activePeer || isSystemCustomerServicePeer(S.activePeer)) return "";
+  return `<section class="chat-agent-assist" data-chat-agent-assist data-peer="${esc(
+    S.activePeer
+  )}" aria-label="聊天 Agent 辅助">${chatAgentAssistContentHtml()}</section>`;
+}
+
+async function updateChatAgentPolicy(peer, updates) {
+  const target = String(peer || "").trim();
+  if (!target) throw new Error("当前会话不可用");
+  const { data, ok } = await api(
+    `/api/agent/conversations/${encodeURIComponent(target)}/policy`,
+    {
+      method: "PUT",
+      body: JSON.stringify(updates || {}),
+      timeout: 12000,
+    }
+  );
+  if (!ok || data?.ok === false) {
+    throw new Error(errorInfo(data, "联系人 Agent 设置未保存").title);
+  }
+  if (data?.assist_status && typeof data.assist_status === "object") {
+    S.chatAssistByPeer.set(target, data.assist_status);
+  }
+  if (target === String(S.activePeer || "")) refreshChatAgentAssistRegion();
+  return data?.assist_status || null;
+}
+
+async function generateChatAgentSuggestion(peer, { rewrite = false } = {}) {
+  const target = String(peer || "").trim();
+  if (!target) throw new Error("当前会话不可用");
+  const previous = chatAssistSuggestion(target);
+  const activeAtStart = target === String(S.activePeer || "");
+  const inputAtStart = activeAtStart ? $("im-text") : null;
+  const sourceDraft = activeAtStart
+    ? String(inputAtStart?.value ?? S.imComposerDraft)
+    : String(S.imComposerDrafts.get(target) || "");
+  if (activeAtStart) setChatComposerDraft(sourceDraft);
+  const sourceDraftRevision = Number(S.imComposerDraftRevisions.get(target) || 0);
+  const previousDraft = rewrite
+    ? String(previous?.previousDraft ?? sourceDraft)
+    : sourceDraft;
+  S.chatAssistGeneratingPeers.add(target);
+  if (target === String(S.activePeer || "")) refreshChatAgentAssistRegion();
+  try {
+    const { data, ok } = await api(
+      `/api/agent/conversations/${encodeURIComponent(target)}/suggest`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          idempotency_key: newAgentIdempotencyKey(),
+          objective: rewrite
+            ? "换一种更自然、简洁的表达，仍然直接承接对方最新消息"
+            : "直接承接对方最新消息，生成一条自然、简洁的回复建议",
+        }),
+        timeout: 90000,
+      }
+    );
+    if (!ok || data?.ok === false) {
+      throw new Error(errorInfo(data, "回复建议生成失败").title);
+    }
+    const draft = String(data?.draft || "").trim();
+    if (!draft) throw new Error("模型没有生成可用建议");
+    if (data?.assist_status && typeof data.assist_status === "object") {
+      S.chatAssistByPeer.set(target, data.assist_status);
+    }
+    const generatedSuggestion = {
+      text: draft,
+      runId: String(data?.run_id || ""),
+      accepted: false,
+      applied: false,
+      previousDraft,
+    };
+    S.chatAssistSuggestions.set(target, generatedSuggestion);
+    const visibleInput = $("im-text");
+    const sourceDraftUnchanged =
+      target === String(S.activePeer || "") &&
+      Number(S.imComposerDraftRevisions.get(target) || 0) === sourceDraftRevision &&
+      String(S.imComposerDrafts.get(target) || "") === sourceDraft &&
+      String(visibleInput?.value ?? S.imComposerDraft) === sourceDraft;
+    if (sourceDraftUnchanged) {
+      setChatComposerDraft(draft);
+      S.chatAssistSuggestions.set(target, {
+        ...generatedSuggestion,
+        applied: true,
+      });
+      if (visibleInput) {
+        visibleInput.value = draft;
+        syncChatComposerInput(visibleInput);
+        if (!S.imVoiceMode) visibleInput.focus({ preventScroll: true });
+      }
+    }
+    if (rewrite && previous?.runId) {
+      void reportChatAgentSuggestionFeedback(target, previous, "rewritten");
+    }
+    return draft;
+  } finally {
+    S.chatAssistGeneratingPeers.delete(target);
+    if (target === String(S.activePeer || "")) refreshChatAgentAssistRegion();
+  }
+}
+
 function chatComposerHtml() {
   const recording = S.imRecordingState;
   const recordingAvailability = voiceRecordingAvailability();
@@ -10714,7 +11064,7 @@ function chatComposerHtml() {
     S.imComposerPanel ? " panel-open" : ""
   }" data-form="im-send"><input type="hidden" name="peer" value="${esc(
     S.activePeer
-  )}" />${chatComposerQuoteHtml()}<div class="chat-compose-main">
+  )}" />${chatAgentAssistHtml()}${chatComposerQuoteHtml()}<div class="chat-compose-main">
       <button type="button" class="chat-tool-button chat-voice-toggle${voiceMode ? " on" : ""}" data-action="toggle-chat-voice" ${
         recordingAvailability.available ? "" : "disabled"
       } title="${esc(recordingAvailability.reason)}" aria-pressed="${voiceMode ? "true" : "false"}">${
@@ -14508,7 +14858,10 @@ async function pageMessages(signal) {
   if (active && !S.activePeerName) {
     S.activePeerName = active.nickname || active.peer_name || active.user?.nickname || `用户 ${S.activePeer}`;
   }
-  if (S.activePeer) void loadConversationMessages(S.activePeer);
+  if (S.activePeer) {
+    void loadConversationMessages(S.activePeer);
+    void loadChatAssistStatus(S.activePeer);
+  }
   return `<div class="message-page${S.activePeer ? " conversation-open" : ""}"><section class="conversation-layout${S.activePeer ? " has-active" : ""}${S.conversationListCollapsed ? " is-list-collapsed" : ""}"${S.messageSearchOpen ? ' inert aria-hidden="true"' : ""}>
       <aside class="conversation-list-pane" aria-label="聊天列表">
         <div data-conversation-list-controls>${conversationListControlsHtml()}</div>
@@ -17498,7 +17851,11 @@ function applyMessageRevokedEvent(event, me = String(S.user?.uid || S.user?.id |
     archiveMessageBestEffort(archived);
   });
   if (!changedPeers.size) return;
-  changedPeers.forEach(updateConversationPreviewFromMessages);
+  changedPeers.forEach((peer) => {
+    updateConversationPreviewFromMessages(peer);
+    invalidateChatAssistSuggestion(peer);
+    scheduleChatAssistRefresh(peer, 250);
+  });
   const activeEntries = changedEntries.filter(
     (entry) => String(entry.peer || "") === String(S.activePeer || "")
   );
@@ -17532,6 +17889,8 @@ function attachTimHandlers(chat, TIM, credential) {
       if (active && sender.authoritative) S.activePeerName = sender.name;
       addImMessage(entry.text, entry.type, peer, entry);
       archiveMessageBestEffort(entry, entry.type === "mine" ? "outgoing" : "incoming");
+      invalidateChatAssistSuggestion(peer);
+      scheduleChatAssistRefresh(peer, 800);
       if (["image", "audio", "video", "file", "face"].includes(entry.kind)) schedulePeerMediaReconcile(peer);
       if (active && entry.type !== "mine") {
         markConversationRead(peer);
@@ -17555,6 +17914,8 @@ function attachTimHandlers(chat, TIM, credential) {
         if (deferReplayedMessageRevocation(entry)) return;
         mergePeerMessages(peer, [entry]);
         archiveMessageBestEffort(entry, entry.type === "mine" ? "outgoing" : "incoming");
+        invalidateChatAssistSuggestion(peer);
+        scheduleChatAssistRefresh(peer, 250);
         if (entry.revoked) updateConversationPreviewFromMessages(peer);
         else updateConversationActivity(peer, { lastMessage: messagePreview(entry) });
         if (peer === String(S.activePeer)) {
@@ -18580,6 +18941,60 @@ async function handleAction(action, button) {
       chatOrigin: button.dataset.chatOrigin || "",
     });
   }
+  if (action === "reload-chat-agent-assist") {
+    await loadChatAssistStatus(S.activePeer, { force: true });
+    return;
+  }
+  if (action === "generate-chat-agent-suggestion") {
+    await generateChatAgentSuggestion(S.activePeer);
+    return;
+  }
+  if (action === "rewrite-chat-agent-suggestion") {
+    await generateChatAgentSuggestion(S.activePeer, { rewrite: true });
+    return;
+  }
+  if (action === "adopt-chat-agent-suggestion") {
+    const peer = String(S.activePeer || "");
+    const suggestion = chatAssistSuggestion(peer);
+    if (!suggestion?.text) return;
+    setChatComposerDraft(suggestion.text);
+    const input = $("im-text");
+    if (input) {
+      input.value = suggestion.text;
+      syncChatComposerInput(input);
+      if (!S.imVoiceMode) input.focus({ preventScroll: true });
+    }
+    S.chatAssistSuggestions.set(peer, {
+      ...suggestion,
+      accepted: true,
+      applied: true,
+    });
+    void reportChatAgentSuggestionFeedback(peer, suggestion, "adopted");
+    refreshChatAgentAssistRegion();
+    return;
+  }
+  if (action === "dismiss-chat-agent-suggestion") {
+    const peer = String(S.activePeer || "");
+    const suggestion = chatAssistSuggestion(peer);
+    const input = $("im-text");
+    if (suggestion?.text && String(input?.value ?? S.imComposerDraft) === suggestion.text) {
+      const restoredDraft = String(suggestion.previousDraft || "");
+      setChatComposerDraft(restoredDraft);
+      if (input) {
+        input.value = restoredDraft;
+        syncChatComposerInput(input);
+      }
+    }
+    void reportChatAgentSuggestionFeedback(peer, suggestion, "dismissed");
+    S.chatAssistSuggestions.delete(peer);
+    refreshChatAgentAssistRegion();
+    return;
+  }
+  if (action === "set-chat-agent-manual-only") {
+    await updateChatAgentPolicy(S.activePeer, { mode: "manual_only" });
+    toast("该联系人已设为始终人工处理");
+    return;
+  }
   if (action === "revoke-chat-message") {
     await revokeChatMessage(button.dataset.messageId);
     return;
@@ -18873,6 +19288,7 @@ async function handleAction(action, button) {
         action === "open-chat" && !conversationNameIsPlaceholder(requestedName, uid),
     });
     S.activePeerName = conversationEntryDisplayName(conversation, requestedName, uid);
+    void loadChatAssistStatus(uid);
     markConversationRead(uid);
     closeProfileDialog();
     if (S.route !== "msg") {
@@ -19651,7 +20067,16 @@ async function handleProductForm(form, submitter, submittedValues = null) {
       `用户 ${peer}`;
     if (!(await ensurePrivateChatPermission(peer))) throw new Error("该私信入口仅向管理员授权的用户开放");
 
+    const suggestion = chatAssistSuggestion(peer);
     const sendTask = sendTextMessage(peer, text, { peerName: submittedPeerName, quote: submittedQuote });
+    if (suggestion?.runId) {
+      void Promise.resolve(sendTask)
+        .then(() => reportChatAgentSuggestionFeedback(peer, suggestion, "sent", text))
+        .catch(() => false);
+    }
+    scheduleChatAssistRefresh(peer, 900);
+    S.chatAssistSuggestions.delete(peer);
+    if (peer === String(S.activePeer || "")) refreshChatAgentAssistRegion();
     consumeSubmittedChatDraft(peer, submittedDraft, submittedDraftRevision, submittedPeerDraftRevision);
     clearChatMessageQuote(peer);
     if (peer === String(S.activePeer || "")) document.querySelector(".chat-compose-quote")?.remove();
@@ -20025,6 +20450,26 @@ document.addEventListener("focusout", (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  const chatAgentMode =
+    event.target.closest && event.target.closest("select[data-chat-agent-mode]");
+  if (chatAgentMode) {
+    const peer = String(S.activePeer || "");
+    const previousMode = String(chatAssistEntry(peer)?.policy?.mode || "suggest_only");
+    const nextMode = String(chatAgentMode.value || "suggest_only");
+    chatAgentMode.disabled = true;
+    void updateChatAgentPolicy(peer, { mode: nextMode })
+      .then(() => {
+        toast(`联系人模式已设为${CHAT_ASSIST_MODE_LABELS[nextMode] || nextMode}`);
+      })
+      .catch((error) => {
+        chatAgentMode.value = previousMode;
+        toast(error?.message || "联系人 Agent 设置未保存", "error", 4200);
+      })
+      .finally(() => {
+        if (chatAgentMode.isConnected) chatAgentMode.disabled = false;
+      });
+    return;
+  }
   const agentAutonomySetting =
     event.target.closest &&
     event.target.closest('form[data-form="agent-autonomy-settings"] input[type="checkbox"]');

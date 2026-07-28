@@ -48,6 +48,7 @@ from bbw_agent.autonomous import (  # noqa: E402
     MessageDirection,
     TaskCompletion,
     allowed_relationship_address_terms,
+    autonomy_message_identity,
     autonomy_reply_message_is_eligible,
     deterministic_action_key,
     deterministic_task_key,
@@ -1266,8 +1267,16 @@ class AgentAutonomyRuntimeAdapterTests(unittest.TestCase):
             extra_data={"canonical_message_id": "canonical-message-001"},
         )
         mapped_head = conversation_head_from_row(message_row)
-        self.assertEqual(mapped_head.message_identity, "canonical-message-001")
-        self.assertTrue(mapped_head.is_unanswered_inbound("canonical-message-001"))
+        expected_identity = autonomy_message_identity(
+            provider="tim",
+            upstream_message_id="upstream-001",
+            canonical_message_id="canonical-message-001",
+            direction="incoming",
+            message_type="text",
+            body="hello",
+        )
+        self.assertEqual(mapped_head.message_identity, expected_identity)
+        self.assertTrue(mapped_head.is_unanswered_inbound(expected_identity))
 
     def test_sql_store_opens_a_transaction_for_repository_calls(self) -> None:
         events: list[str] = []

@@ -37,8 +37,14 @@ from bbw_agent.repositories import (
 from bbw_agent.autonomous import (
     AUTONOMY_REPLY_CLOCK_SKEW_SECONDS,
     AUTONOMY_REPLY_MAX_AGE_SECONDS,
+    agent_candidate_compatibility,
+    autonomy_reply_not_before,
     autonomy_reply_message_is_eligible,
     autonomy_reply_message_is_fresh,
+)
+from bbw_agent.contact_policy import (
+    contact_policy_allows_auto_reply,
+    reply_risk_boundary,
 )
 from bbw_prod.compatibility import (
     CompatibilityMode,
@@ -2975,6 +2981,10 @@ class _AutonomyReplyCandidate:
     message_id: uuid.UUID
     peer_upstream_uid: str
     message_identity: str
+    occurred_at: datetime
+    message_type: str
+    body: str
+    conversation_title: str
 
 
 def _unanswered_autonomy_reply_candidates(
@@ -3100,6 +3110,10 @@ def _unanswered_autonomy_reply_candidates(
                 message_id=message.id,
                 peer_upstream_uid=peer,
                 message_identity=identity,
+                occurred_at=message.occurred_at,
+                message_type=str(message.message_type or ""),
+                body=str(message.body or ""),
+                conversation_title=str(conversation.title or ""),
             )
         )
         if len(candidates) >= maximum:
@@ -3210,6 +3224,7 @@ def _schedule_autonomy_owner(
         quiet_window_end,
     )
     from bbw_agent.repositories import (
+        AgentContactPolicyRepository,
         AgentDiscoveryCandidateRepository,
         AgentAutonomySettingRepository,
         AgentAutonomyTaskRepository,
@@ -3278,6 +3293,10 @@ def _schedule_autonomy_owner(
             return {"eligible": False, "created": 0, "reused": 0}
 
         tasks = AgentAutonomyTaskRepository(db)
+        tasks.cancel_superseded_reply_tasks(
+            owner_user_id=owner_user_id,
+            at=now,
+        )
         if tasks.has_open_task(owner_user_id=owner_user_id):
             setting.last_run_at = now
             setting.next_run_at = now + timedelta(
@@ -3307,9 +3326,46 @@ def _schedule_autonomy_owner(
                 owner_user_id=owner_user_id,
                 not_before=reply_not_before,
                 now=now,
-                limit=1,
+                limit=20,
             )
+            contact_policies = AgentContactPolicyRepository(db)
             for candidate in candidates:
+                contact_policy = contact_policies.get(
+                    owner_user_id,
+                    candidate.peer_upstream_uid,
+                    for_update=True,
+                )
+                if contact_policy is None:
+                    continue
+                relationship_stage = contact_policies.relationship_stage(
+                    owner_user_id=owner_user_id,
+                    peer_upstream_uid=candidate.peer_upstream_uid,
+                    policy=contact_policy,
+                    now=now,
+                )
+                risk_boundary = reply_risk_boundary(
+                    candidate.body,
+                    message_type=candidate.message_type,
+                )
+                if (
+                    relationship_stage is None
+                    or not autonomy_reply_message_is_fresh(
+                        candidate.occurred_at,
+                        now=now,
+                        started_at=setting.auto_reply_started_at,
+                        max_age_seconds=int(
+                            contact_policy.maximum_reply_age_seconds
+                        ),
+                    )
+                    or not contact_policy_allows_auto_reply(
+                        persisted=True,
+                        mode=str(contact_policy.mode or ""),
+                        paused=bool(contact_policy.paused),
+                        relationship_stage=relationship_stage,
+                        risk_boundary=risk_boundary,
+                    )
+                ):
+                    continue
                 key = deterministic_task_key(
                     owner_user_id=owner_user_id,
                     task_type=AutonomyTaskType.REPLY_TO_MESSAGE,
@@ -3322,6 +3378,8 @@ def _schedule_autonomy_owner(
                     action_type=SEND_PRIVATE_MESSAGE,
                     idempotency_key=key,
                     policy_version=policy.version,
+                    contact_policy_version=int(contact_policy.version),
+                    relationship_stage=relationship_stage,
                     execution_setting_version=policy.execution_setting_version,
                     runner_setting_version=policy.runner_setting_version,
                     model_connection_id=policy.model_connection_id,
@@ -3332,7 +3390,13 @@ def _schedule_autonomy_owner(
                     source_message_identity=candidate.message_identity,
                     target_upstream_uid=candidate.peer_upstream_uid,
                     generation_instruction=str(setting.operation_brief or ""),
-                    not_before=now,
+                    not_before=autonomy_reply_not_before(
+                        candidate.occurred_at,
+                        now=now,
+                        delay_seconds=int(
+                            contact_policy.minimum_reply_delay_seconds
+                        ),
+                    ),
                 )
                 if was_created:
                     created += 1
@@ -3528,17 +3592,35 @@ def _schedule_autonomy_owner(
                 or policy.proactive_message_enabled
             )
         ):
+            owner = snapshot.get("user")
+            owner_profile = (
+                owner.profile
+                if owner is not None and isinstance(owner.profile, Mapping)
+                else {}
+            )
             candidates = AgentDiscoveryCandidateRepository(db).list_recent_eligible(
                 owner_user_id,
                 seen_after=now - timedelta(days=7),
                 interaction_before=now - timedelta(minutes=15),
                 limit=50,
+                owner_profile=owner_profile,
+                match_preference=snapshot.get("match_preference"),
             )
             budget_day = policy_budget_day(policy, now=now).isoformat()
             for candidate in candidates:
                 target = str(candidate.target_upstream_uid or "").strip()
                 if (
                     not target
+                    or not agent_candidate_compatibility(
+                        owner_profile=owner_profile,
+                        candidate_profile=(
+                            candidate.profile_snapshot
+                            if isinstance(candidate.profile_snapshot, Mapping)
+                            else {}
+                        ),
+                        target_upstream_uid=target,
+                        match_preference=snapshot.get("match_preference"),
+                    ).allowed
                     or tasks.has_open_task_for_target(
                         owner_user_id=owner_user_id,
                         target_upstream_uid=target,

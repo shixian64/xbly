@@ -25,6 +25,7 @@ from pydantic import (
 )
 
 from bbw_prod.db import session_scope
+from bbw_prod.models import utcnow
 from bbw_prod.services import AuditService
 
 from .action_executor import (
@@ -44,6 +45,7 @@ from .repositories import (
     AgentActionExecutionRepository,
     AgentAutonomySettingRepository,
     AgentAutonomyTaskRepository,
+    AgentContactPolicyRepository,
     AgentExecutionSettingRepository,
     AgentRunRepository,
     AgentSettingRepository,
@@ -63,6 +65,7 @@ from .services import (
     execution_access,
     execution_settings_public,
     load_execution_configuration,
+    load_contact_assist_status,
     load_runtime_configuration,
     load_status,
     mark_connection_test,
@@ -71,6 +74,7 @@ from .services import (
     save_agent_settings,
     save_autonomy_settings,
     save_connection,
+    save_contact_policy,
     save_execution_settings,
     save_style_profile,
     settings_public,
@@ -144,6 +148,78 @@ class ReplyDraftBody(IdempotentRunBody):
         if any(ord(char) < 32 for char in normalized):
             raise ValueError("control characters are not allowed")
         return normalized
+
+
+class ConversationSuggestBody(IdempotentRunBody):
+    objective: str = Field(default="", max_length=2000)
+
+    @field_validator("objective", mode="before")
+    @classmethod
+    def normalize_objective(cls, value: Any) -> str:
+        return str(value or "").strip()
+
+
+class ConversationSuggestionFeedbackBody(_StrictBody):
+    run_id: uuid.UUID
+    event: str = Field(min_length=1, max_length=24)
+    final_char_count: int = Field(default=0, ge=0, le=4000)
+    edit_distance: int = Field(default=0, ge=0, le=4000)
+
+    @field_validator("event", mode="before")
+    @classmethod
+    def normalize_event(cls, value: Any) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized not in {"adopted", "dismissed", "rewritten", "sent"}:
+            raise ValueError("unsupported suggestion feedback event")
+        return normalized
+
+
+class ContactPolicyBody(_StrictBody):
+    mode: str | None = Field(default=None, max_length=24)
+    stage_override: str | None = Field(default=None, max_length=24)
+    paused: StrictBool | None = None
+    minimum_reply_delay_seconds: int | None = Field(
+        default=None, ge=10, le=300
+    )
+    maximum_reply_age_seconds: int | None = Field(
+        default=None, ge=60, le=7200
+    )
+    allow_address_terms: list[str] | None = Field(
+        default=None, max_length=20
+    )
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def normalize_mode(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("mode cannot be null")
+        return str(value or "").strip().lower()
+
+    @field_validator("stage_override", mode="before")
+    @classmethod
+    def normalize_stage_override(cls, value: Any) -> Any:
+        return None if value is None else str(value or "").strip().lower()
+
+    @field_validator(
+        "paused",
+        "minimum_reply_delay_seconds",
+        "maximum_reply_age_seconds",
+        mode="before",
+    )
+    @classmethod
+    def reject_null_policy_values(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("contact policy value cannot be null")
+        return value
+
+    @field_validator("allow_address_terms", mode="before")
+    @classmethod
+    def normalize_address_terms(cls, value: Any) -> Any:
+        if value is None:
+            raise ValueError("allow_address_terms cannot be null")
+        if not isinstance(value, list):
+            raise ValueError("allow_address_terms must be an array")
+        return [str(item or "").strip() for item in value]
 
 
 class ExecutionSettingsBody(_StrictBody):
@@ -1294,6 +1370,100 @@ def list_autonomy_tasks(
     return {"ok": True, "items": items}
 
 
+@router.get("/conversations/{peer}/assist-status")
+def conversation_assist_status(
+    peer: str,
+    request: Request,
+    context: AgentContext = Depends(_agent_context),
+) -> dict[str, Any]:
+    _rate_limit(
+        request,
+        context,
+        "conversation-assist-status",
+        limit=120,
+        window_seconds=60,
+    )
+    try:
+        with session_scope() as db:
+            status = load_contact_assist_status(
+                db,
+                owner_user_id=context.owner_user_id,
+                peer_upstream_uid=peer,
+            )
+    except AgentServiceError as exc:
+        _raise_service_error(exc)
+    return {"ok": True, "assist_status": status}
+
+
+@router.put("/conversations/{peer}/policy")
+def update_conversation_contact_policy(
+    peer: str,
+    body: ContactPolicyBody,
+    request: Request,
+    context: AgentContext = Depends(_agent_context),
+) -> dict[str, Any]:
+    _rate_limit(
+        request,
+        context,
+        "conversation-contact-policy",
+        limit=30,
+        window_seconds=60,
+    )
+    updates = body.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="请至少提交一项联系人设置")
+    try:
+        with session_scope() as db:
+            row, created, changed = save_contact_policy(
+                db,
+                owner_user_id=context.owner_user_id,
+                peer_upstream_uid=peer,
+                updates=updates,
+            )
+            cancelled_tasks = (
+                AgentAutonomyTaskRepository(db).cancel_reply_tasks_for_contact_policy_change(
+                    owner_user_id=context.owner_user_id,
+                    peer_upstream_uid=peer,
+                    at=utcnow(),
+                )
+                if changed
+                else 0
+            )
+            status = load_contact_assist_status(
+                db,
+                owner_user_id=context.owner_user_id,
+                peer_upstream_uid=peer,
+            )
+            peer_digest = hashlib.sha256(
+                str(peer or "").strip().encode("utf-8")
+            ).hexdigest()[:16]
+            _audit(db, request).record(
+                actor_type="user",
+                action="ai.contact_policy_changed",
+                target_user_id=context.owner_user_id,
+                resource_type="ai_agent_contact_policy",
+                resource_id=peer_digest,
+                client_ip=context.client_ip,
+                details={
+                    "created": created,
+                    "changed": changed,
+                    "mode": str(row.mode or ""),
+                    "stage_override": str(row.stage_override or "") or None,
+                    "paused": bool(row.paused),
+                    "version": int(row.version),
+                    "cancelled_tasks": cancelled_tasks,
+                },
+            )
+    except AgentServiceError as exc:
+        _raise_service_error(exc)
+    return {
+        "ok": True,
+        "changed": changed,
+        "cancelled_tasks": cancelled_tasks,
+        "assist_status": status,
+    }
+
+
 @router.post("/actions/prepare")
 def prepare_account_action(
     body: AccountActionBody,
@@ -1613,7 +1783,9 @@ def analyze_style(
                 )
                 if existing is not None and existing.status == "succeeded":
                     profile = style_public(
-                        StyleProfileRepository(db).get(context.owner_user_id)
+                        StyleProfileRepository(db).get_current(
+                            context.owner_user_id
+                        )
                     )
                     return {
                         "ok": True,
@@ -1637,7 +1809,9 @@ def analyze_style(
                 if not acquired:
                     if run.status == "succeeded":
                         profile = style_public(
-                            StyleProfileRepository(db).get(context.owner_user_id)
+                            StyleProfileRepository(db).get_current(
+                                context.owner_user_id
+                            )
                         )
                         return {
                             "ok": True,
@@ -1705,6 +1879,9 @@ def analyze_style(
                     client_ip=context.client_ip,
                     details={
                         "source_message_count": plan.source_message_count,
+                        "source_peer_count": plan.source_peer_count,
+                        "sampling_policy_version": plan.sampling_policy_version,
+                        "sanitizer_version": plan.sanitizer_version,
                         "latency_ms": completion.latency_ms,
                     },
                 )
@@ -1885,6 +2062,173 @@ def generate_reply_draft(
         "executed": False,
         "message": "草稿已生成，发送前请人工检查",
     }
+
+
+@router.post("/conversations/{peer}/suggest")
+def generate_conversation_suggestion(
+    peer: str,
+    body: ConversationSuggestBody,
+    request: Request,
+    context: AgentContext = Depends(_agent_context),
+) -> dict[str, Any]:
+    _rate_limit(
+        request,
+        context,
+        "conversation-suggest",
+        limit=10,
+        window_seconds=60,
+    )
+    try:
+        with session_scope() as db:
+            assist_before = load_contact_assist_status(
+                db,
+                owner_user_id=context.owner_user_id,
+                peer_upstream_uid=peer,
+            )
+            capabilities = dict(assist_before.get("capabilities") or {})
+            if not capabilities.get("runner_ready"):
+                raise AgentServiceError(
+                    "runner_not_ready",
+                    "请先在社交 Agent 中启用并测试模型连接",
+                    status_code=409,
+                )
+            if not capabilities.get("can_suggest"):
+                raise AgentServiceError(
+                    "conversation_suggestion_not_needed",
+                    "当前没有可生成建议的最新文字消息",
+                    status_code=409,
+                )
+            normalized_peer = str(
+                assist_before.get("peer_upstream_uid") or ""
+            )
+            head_before = AgentAutonomyTaskRepository(db).get_conversation_head(
+                owner_user_id=context.owner_user_id,
+                peer_upstream_uid=normalized_peer,
+            )
+            if head_before is None:
+                raise AgentServiceError(
+                    "conversation_head_missing",
+                    "当前会话内容已变化，请刷新后重试",
+                    status_code=409,
+                )
+            source_identity = head_before.message_identity
+    except AgentServiceError as exc:
+        _raise_service_error(exc)
+
+    bound_key = "assist:" + hashlib.sha256(
+        (
+            f"{context.owner_user_id}:{normalized_peer}:"
+            f"{source_identity}:{body.idempotency_key}"
+        ).encode("utf-8")
+    ).hexdigest()
+    result = generate_reply_draft(
+        ReplyDraftBody(
+            idempotency_key=bound_key,
+            peer_upstream_uid=normalized_peer,
+            objective=body.objective,
+        ),
+        request,
+        context,
+    )
+    try:
+        with session_scope() as db:
+            head_after = AgentAutonomyTaskRepository(db).get_conversation_head(
+                owner_user_id=context.owner_user_id,
+                peer_upstream_uid=normalized_peer,
+            )
+            if (
+                head_after is None
+                or head_after.message_identity != source_identity
+                or head_after.direction != "incoming"
+            ):
+                raise AgentServiceError(
+                    "conversation_changed_during_generation",
+                    "生成期间会话内容已变化，本次建议已作废，请重新生成",
+                    status_code=409,
+                )
+            assist_after = load_contact_assist_status(
+                db,
+                owner_user_id=context.owner_user_id,
+                peer_upstream_uid=normalized_peer,
+            )
+    except AgentServiceError as exc:
+        _raise_service_error(exc)
+    return {
+        **result,
+        "assist_status": assist_after,
+        "message": "建议已生成，请检查或修改后再发送",
+    }
+
+
+@router.post("/conversations/{peer}/suggestion-feedback")
+def record_conversation_suggestion_feedback(
+    peer: str,
+    body: ConversationSuggestionFeedbackBody,
+    request: Request,
+    context: AgentContext = Depends(_agent_context),
+) -> dict[str, Any]:
+    _rate_limit(
+        request,
+        context,
+        "conversation-suggestion-feedback",
+        limit=60,
+        window_seconds=60,
+    )
+    try:
+        normalized_peer = AgentContactPolicyRepository.normalize_peer(peer)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="对方用户编号无效",
+        ) from exc
+    try:
+        with session_scope() as db:
+            require_visible_access(db, context.owner_user_id)
+            run = AgentRunRepository(db).get(
+                context.owner_user_id,
+                body.run_id,
+            )
+            if run is None:
+                raise AgentServiceError(
+                    "suggestion_run_not_found",
+                    "没有找到本次聊天建议记录",
+                    status_code=404,
+                )
+            if (
+                run.run_type != "reply_draft"
+                or run.status != "succeeded"
+                or not str(run.idempotency_key or "").startswith("assist:")
+                or str(run.peer_upstream_uid or "") != normalized_peer
+            ):
+                raise AgentServiceError(
+                    "suggestion_run_mismatch",
+                    "聊天建议记录与当前会话不匹配",
+                    status_code=409,
+                )
+            final_char_count = (
+                int(body.final_char_count) if body.event == "sent" else 0
+            )
+            edit_distance = (
+                int(body.edit_distance) if body.event == "sent" else 0
+            )
+            _audit(db, request).record(
+                actor_type="user",
+                action="ai.conversation_suggestion_feedback",
+                target_user_id=context.owner_user_id,
+                resource_type="ai_agent_run",
+                resource_id=str(run.id),
+                client_ip=context.client_ip,
+                details={
+                    "event": body.event,
+                    "generated_char_count": int(run.output_char_count or 0),
+                    "final_char_count": final_char_count,
+                    "edit_distance": edit_distance,
+                    "modified": bool(edit_distance),
+                },
+            )
+    except AgentServiceError as exc:
+        _raise_service_error(exc)
+    return {"ok": True}
 
 
 @router.post("/replies/send")

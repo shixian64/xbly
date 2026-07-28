@@ -49,6 +49,7 @@ from bbw_prod.services import (
     RawResponseService,
     UserCredentialService,
     UserSessionService,
+    sanitize_provider_profile,
 )
 from bbw_web.match_history import load_match_history, record_match_history_response
 from bbw_web.dependency_health import (
@@ -423,31 +424,29 @@ _PROFILE_SECRET_KEYS = {
     "certname",
     "idcard",
     "identitynumber",
+    "clientip",
+    "ipaddress",
+    "deviceid",
+    "androidid",
+    "imei",
+    "imsi",
+    "oaid",
+    "idfa",
+    "uniquelogintoken",
+    "uniquelogintokenlocal",
+    "pushid",
+    "pushregid",
+    "registrationid",
 }
 
 
 def _sanitize_profile(value: Any) -> Any:
-    """Keep useful profile fields while preventing plaintext credential copies."""
-    if isinstance(value, Mapping):
-        result: dict[str, Any] = {}
-        for key, item in list(value.items())[:500]:
-            key_text = str(key)[:160]
-            normalized = re.sub(r"[^a-z0-9]", "", key_text.casefold())
-            result[key_text] = (
-                "[REDACTED]"
-                if normalized in _PROFILE_SECRET_KEYS
-                or any(
-                    fragment in normalized
-                    for fragment in _BYOK_SECRET_KEY_FRAGMENTS
-                )
-                else _sanitize_profile(item)
-            )
-        return result
-    if isinstance(value, (list, tuple)):
-        return [_sanitize_profile(item) for item in list(value)[:500]]
-    if isinstance(value, str):
-        return value[:20_000]
-    return value
+    """Keep useful profile fields while omitting credential-shaped keys."""
+
+    # Keep the local spelling catalog above as an explicit review surface for
+    # request/profile redaction tests, while making the production service the
+    # authoritative recursive implementation used by every login path.
+    return sanitize_provider_profile(value)
 
 
 def _conversation_message_preview(message: Any) -> str:

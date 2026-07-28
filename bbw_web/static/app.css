@@ -3699,6 +3699,119 @@ summary:focus-visible {
   padding: 0.65rem 0.75rem;
 }
 
+.chat-agent-assist {
+  display: grid;
+  gap: 0.42rem;
+  border: 1px solid rgba(117, 79, 181, 0.18);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.78);
+  padding: 0.5rem 0.58rem;
+}
+
+.chat-agent-assist-head {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.65rem;
+}
+
+.chat-agent-assist-head > div {
+  display: grid;
+  min-width: 0;
+  gap: 0.12rem;
+}
+
+.chat-agent-assist-head strong {
+  color: var(--brand-dark);
+  font-size: 0.72rem;
+}
+
+.chat-agent-assist-head span,
+.chat-agent-assist-head label,
+.chat-agent-assist-meta {
+  color: var(--muted);
+  font-size: 0.63rem;
+  line-height: 1.4;
+}
+
+.chat-agent-assist-head label {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.chat-agent-assist-head select {
+  max-width: 12.5rem;
+  min-height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--text);
+  padding: 0.25rem 0.42rem;
+  font: inherit;
+  font-size: 0.65rem;
+}
+
+.chat-agent-assist-meta {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.25rem 0.65rem;
+}
+
+.chat-agent-assist-meta span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.chat-agent-assist-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.34rem;
+}
+
+.chat-agent-assist-actions button,
+.chat-agent-assist-loading button {
+  min-height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--muted);
+  padding: 0.28rem 0.5rem;
+  font-size: 0.65rem;
+  font-weight: 680;
+}
+
+.chat-agent-assist-actions button:hover,
+.chat-agent-assist-actions button:focus-visible,
+.chat-agent-assist-loading button:hover,
+.chat-agent-assist-loading button:focus-visible {
+  border-color: rgba(117, 79, 181, 0.32);
+  background: var(--brand-soft);
+  color: var(--brand-dark);
+}
+
+.chat-agent-assist-actions button:disabled {
+  opacity: 0.46;
+}
+
+.chat-agent-assist-loading {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  color: var(--muted);
+  font-size: 0.66rem;
+}
+
+.chat-agent-assist-loading.is-error {
+  color: var(--danger);
+}
+
 .chat-compose-quote {
   display: flex;
   min-width: 0;
@@ -6522,6 +6635,36 @@ html.flash-viewing body {
     padding: 0.5rem max(0.55rem, var(--safe-right)) max(0.5rem, var(--safe-bottom)) max(0.55rem, var(--safe-left));
   }
 
+  .chat-agent-assist-head {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+
+  .chat-agent-assist-head label {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .chat-agent-assist-head select {
+    min-width: 0;
+    max-width: none;
+    flex: 1 1 auto;
+    font-size: 16px;
+  }
+
+  .chat-agent-assist-actions {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: 0.08rem;
+    scrollbar-width: thin;
+  }
+
+  .chat-agent-assist-actions button {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
   .chat-compose-main {
     grid-template-columns: auto minmax(0, 1fr) auto;
     gap: 0.35rem;
@@ -6710,6 +6853,11 @@ html.flash-viewing body {
   .chat-compose-quote > button,
   .chat-compose-main .btn,
   .chat-head > .utility-btn {
+    min-height: 44px;
+  }
+
+  .chat-agent-assist-actions button,
+  .chat-agent-assist-loading button {
     min-height: 44px;
   }
 

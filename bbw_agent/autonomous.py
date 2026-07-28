@@ -57,6 +57,7 @@ AUTONOMOUS_OUTREACH_DAILY_LIMIT = 6
 AUTONOMY_REPLY_MAX_AGE_SECONDS = 2 * 60 * 60
 AUTONOMY_REPLY_CLOCK_SKEW_SECONDS = 5 * 60
 AUTONOMY_REPLY_SESSION_GAP_SECONDS = 6 * 60 * 60
+AUTONOMY_REPLY_DEBOUNCE_SECONDS = 30
 AUTONOMY_NO_REPLY_SENTINEL = "[[NO_REPLY]]"
 AUTONOMY_GENERATED_TEXT_STYLE_RULES = (
     "控制口头语：每条最多使用一个语气词，不得以‘哈哈’‘嗯’‘啊’‘哦’等"
@@ -220,6 +221,35 @@ def _normalized_autonomy_message_text(value: object) -> str:
     return unicodedata.normalize("NFKC", str(value or "")).strip()
 
 
+def autonomy_message_identity(
+    *,
+    provider: object,
+    upstream_message_id: object,
+    canonical_message_id: object = "",
+    direction: object,
+    message_type: object,
+    body: object,
+    revoked: bool = False,
+) -> str:
+    """Bind one message ID to the exact mutable content used for a reply."""
+
+    stable_id = str(canonical_message_id or "").strip() or (
+        f"{str(provider or '').strip()}:{str(upstream_message_id or '').strip()}"
+    )
+    payload = json.dumps(
+        (
+            stable_id,
+            str(direction or "").strip().lower(),
+            str(message_type or "").strip().lower(),
+            str(body or ""),
+            bool(revoked),
+        ),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return "msgv2:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _autonomy_semantic_token(value: object) -> str:
     text = _normalized_autonomy_message_text(value)
     if not text or _AUTONOMY_TUI_EMOJI_ONLY.fullmatch(text):
@@ -279,6 +309,22 @@ def autonomy_reply_message_is_fresh(
         age >= -timedelta(seconds=AUTONOMY_REPLY_CLOCK_SKEW_SECONDS)
         and age <= timedelta(seconds=max(1, int(max_age_seconds)))
     )
+
+
+def autonomy_reply_not_before(
+    occurred_at: datetime,
+    *,
+    now: datetime,
+    delay_seconds: int = AUTONOMY_REPLY_DEBOUNCE_SECONDS,
+) -> datetime:
+    """Return the debounce deadline for the newest inbound message."""
+
+    delay = int(delay_seconds)
+    if not 10 <= delay <= 300:
+        raise ValueError("autonomy reply delay must be between 10 and 300 seconds")
+    current = _aware_utc(now)
+    deadline = _aware_utc(occurred_at) + timedelta(seconds=delay)
+    return max(current, deadline)
 
 
 def allowed_relationship_address_terms(
@@ -403,6 +449,263 @@ def sanitize_social_style_profile(
     ]
     safe_traits["avoid"] = [*avoid[:8], *enforced_boundaries]
     return safe_summary[:1000], safe_traits
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateCompatibilityDecision:
+    """Fail-closed compatibility result for one dynamic discovery target."""
+
+    allowed: bool
+    reason: str
+
+
+def _candidate_profile_value(source: object, *keys: str) -> object:
+    if isinstance(source, Mapping):
+        for key in keys:
+            value = source.get(key)
+            if value is not None and str(value).strip():
+                return value
+        return None
+    for key in keys:
+        value = getattr(source, key, None)
+        if value is not None and str(value).strip():
+            return value
+    return None
+
+
+def _candidate_gender(value: object, *, preference: bool) -> str | None:
+    normalized = str(value or "").strip().casefold()
+    aliases = {
+        "男": "male",
+        "male": "male",
+        "m": "male",
+        "1": "male",
+        "女": "female",
+        "female": "female",
+        "f": "female",
+        "2": "female",
+        "其他": "other",
+        "other": "other",
+        "不限": "any",
+        "any": "any",
+        "all": "any",
+        "*": "any",
+    }
+    result = aliases.get(normalized)
+    if result == "any" and not preference:
+        return None
+    return result
+
+
+def _candidate_property(value: object) -> str | None:
+    normalized = str(value or "").strip()
+    if normalized.casefold() in {"z", "b"}:
+        normalized = normalized.upper()
+    return normalized if normalized in {"双", "Z", "B"} else None
+
+
+def _candidate_age(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        age = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return age if 18 <= age <= 120 else None
+
+
+def _candidate_boolean(value: object) -> bool:
+    return value is True or str(value or "").strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "enabled",
+    }
+
+
+def agent_candidate_compatibility(
+    *,
+    owner_profile: Mapping[str, object] | None,
+    candidate_profile: Mapping[str, object] | None,
+    target_upstream_uid: object,
+    match_preference: object = None,
+) -> CandidateCompatibilityDecision:
+    """Require identity, adult age, gender and property compatibility.
+
+    The current legacy match fields and an enabled native match preference are
+    combined by intersection, so adding another source of preference can only
+    narrow the eligible set.  Candidate identity and demographic fields must
+    be explicit; missing or malformed values never become an implicit match.
+    """
+
+    target = str(target_upstream_uid or "").strip()
+    owner = owner_profile if isinstance(owner_profile, Mapping) else {}
+    candidate = candidate_profile if isinstance(candidate_profile, Mapping) else {}
+    if not target:
+        return CandidateCompatibilityDecision(False, "candidate_target_missing")
+
+    identities = {
+        str(value).strip()
+        for key in ("uid", "id", "user_id", "userId")
+        if (value := candidate.get(key)) is not None and str(value).strip()
+    }
+    if not identities:
+        return CandidateCompatibilityDecision(False, "candidate_identity_missing")
+    if identities != {target}:
+        return CandidateCompatibilityDecision(False, "candidate_identity_mismatch")
+
+    candidate_gender = _candidate_gender(
+        _candidate_profile_value(candidate, "sex", "gender"),
+        preference=False,
+    )
+    if candidate_gender is None:
+        return CandidateCompatibilityDecision(False, "candidate_gender_missing")
+
+    gender_constraints: list[str] = []
+    legacy_gender_value = _candidate_profile_value(
+        owner,
+        "match_gender",
+        "matchGender",
+        "matchgender",
+    )
+    if legacy_gender_value is not None:
+        legacy_gender = _candidate_gender(legacy_gender_value, preference=True)
+        if legacy_gender is None:
+            return CandidateCompatibilityDecision(
+                False, "owner_gender_preference_invalid"
+            )
+        if legacy_gender != "any":
+            gender_constraints.append(legacy_gender)
+
+    native_enabled = (
+        _candidate_boolean(_candidate_profile_value(match_preference, "enabled"))
+        if match_preference is not None
+        else False
+    )
+    if native_enabled:
+        native_gender_value = _candidate_profile_value(
+            match_preference,
+            "gender_preference",
+        )
+        native_gender = _candidate_gender(native_gender_value, preference=True)
+        if native_gender is None:
+            return CandidateCompatibilityDecision(
+                False, "owner_gender_preference_invalid"
+            )
+        if native_gender != "any":
+            gender_constraints.append(native_gender)
+    if any(value != candidate_gender for value in gender_constraints):
+        return CandidateCompatibilityDecision(False, "candidate_gender_incompatible")
+
+    property_constraints: list[str] = []
+    legacy_property_value = _candidate_profile_value(
+        owner,
+        "match_property",
+        "matchProperty",
+        "matchproperty",
+    )
+    if legacy_property_value is not None:
+        legacy_property = _candidate_property(legacy_property_value)
+        if legacy_property is None:
+            return CandidateCompatibilityDecision(
+                False, "owner_property_preference_invalid"
+            )
+        property_constraints.append(legacy_property)
+    if native_enabled:
+        native_property_value = _candidate_profile_value(
+            match_preference,
+            "property_preference",
+        )
+        if native_property_value is not None:
+            native_property = _candidate_property(native_property_value)
+            if native_property is None:
+                return CandidateCompatibilityDecision(
+                    False, "owner_property_preference_invalid"
+                )
+            property_constraints.append(native_property)
+    if not property_constraints:
+        return CandidateCompatibilityDecision(
+            False, "owner_property_preference_missing"
+        )
+    if len(set(property_constraints)) != 1:
+        return CandidateCompatibilityDecision(False, "owner_preferences_conflict")
+
+    candidate_property = _candidate_property(
+        _candidate_profile_value(
+            candidate,
+            "property",
+            "profile_property",
+            "attribute",
+        )
+    )
+    if candidate_property is None:
+        return CandidateCompatibilityDecision(False, "candidate_property_missing")
+    if candidate_property != property_constraints[0]:
+        return CandidateCompatibilityDecision(
+            False, "candidate_property_incompatible"
+        )
+
+    minimum_age = 18
+    maximum_age = 120
+    profile_minimum = _candidate_profile_value(
+        owner,
+        "match_min_age",
+        "matchMinAge",
+        "_web_match_min_age",
+    )
+    profile_maximum = _candidate_profile_value(
+        owner,
+        "match_max_age",
+        "matchMaxAge",
+        "_web_match_max_age",
+    )
+    age_bounds: list[tuple[object, object]] = []
+    if profile_minimum is not None or profile_maximum is not None:
+        age_bounds.append(
+            (
+                profile_minimum if profile_minimum is not None else 18,
+                profile_maximum if profile_maximum is not None else 120,
+            )
+        )
+    if native_enabled:
+        native_minimum = _candidate_profile_value(match_preference, "min_age")
+        native_maximum = _candidate_profile_value(match_preference, "max_age")
+        age_bounds.append(
+            (
+                native_minimum if native_minimum is not None else 18,
+                native_maximum if native_maximum is not None else 120,
+            )
+        )
+    for raw_minimum, raw_maximum in age_bounds:
+        try:
+            constrained_minimum = int(str(raw_minimum).strip())
+            constrained_maximum = int(str(raw_maximum).strip())
+        except (TypeError, ValueError):
+            return CandidateCompatibilityDecision(
+                False, "owner_age_preference_invalid"
+            )
+        if not 18 <= constrained_minimum <= constrained_maximum <= 120:
+            return CandidateCompatibilityDecision(
+                False, "owner_age_preference_invalid"
+            )
+        minimum_age = max(minimum_age, constrained_minimum)
+        maximum_age = min(maximum_age, constrained_maximum)
+    if minimum_age > maximum_age:
+        return CandidateCompatibilityDecision(False, "owner_preferences_conflict")
+
+    raw_candidate_age = _candidate_profile_value(candidate, "age")
+    candidate_age = _candidate_age(raw_candidate_age)
+    if candidate_age is None:
+        reason = (
+            "candidate_underage_or_invalid"
+            if raw_candidate_age is not None
+            else "candidate_age_missing"
+        )
+        return CandidateCompatibilityDecision(False, reason)
+    if not minimum_age <= candidate_age <= maximum_age:
+        return CandidateCompatibilityDecision(False, "candidate_age_incompatible")
+    return CandidateCompatibilityDecision(True, "allowed")
 
 
 class AgentAutonomyError(RuntimeError):

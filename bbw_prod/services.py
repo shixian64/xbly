@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import threading
 import uuid
 from dataclasses import asdict, dataclass
@@ -114,6 +115,90 @@ WEB_LOCAL_PROFILE_FIELDS = frozenset(
 LOCAL_MEDIA_SIDECAR_KEY = "_local_media"
 _PRESERVED_LOCAL_PROFILE_KEYS = frozenset({LOCAL_MEDIA_SIDECAR_KEY})
 
+# Provider responses historically included plaintext credential-shaped fields
+# inside the general-purpose profile object.  Authentication material already
+# has a dedicated encrypted home on ExternalAccount, so profile persistence
+# must omit these keys entirely instead of retaining even a redacted marker.
+_PROVIDER_PROFILE_SECRET_KEYS = frozenset(
+    {
+        "password",
+        "passwd",
+        "pwd",
+        "userpassword",
+        "apikey",
+        "xapikey",
+        "clientsecret",
+        "token",
+        "accesstoken",
+        "refreshtoken",
+        "authorization",
+        "phone",
+        "phonenumber",
+        "mobile",
+        "useraccount",
+        "loginaccount",
+        "usersig",
+        "secret",
+        "secretkey",
+        "cookie",
+        "sessionid",
+        "certno",
+        "certname",
+        "idcard",
+        "identitynumber",
+        "clientip",
+        "ipaddress",
+        "deviceid",
+        "androidid",
+        "imei",
+        "imsi",
+        "oaid",
+        "idfa",
+        "uniquelogintoken",
+        "uniquelogintokenlocal",
+        "pushid",
+        "pushregid",
+        "registrationid",
+    }
+)
+_PROVIDER_PROFILE_SECRET_FRAGMENTS = frozenset(
+    {"apikey", "clientsecret", "confirmationtoken"}
+)
+
+
+def _normalized_profile_key(value: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+
+def provider_profile_key_is_sensitive(value: object) -> bool:
+    normalized = _normalized_profile_key(value)
+    return normalized in _PROVIDER_PROFILE_SECRET_KEYS or any(
+        fragment in normalized for fragment in _PROVIDER_PROFILE_SECRET_FRAGMENTS
+    )
+
+
+def sanitize_provider_profile(value: Any) -> Any:
+    """Return a bounded provider profile with credential fields removed.
+
+    This function deliberately preserves product profile values such as
+    nickname, matching preferences and user-controlled location visibility.
+    Callers that build model context must still use a much narrower allowlist.
+    """
+
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key, item in list(value.items())[:500]:
+            key_text = str(key)[:160]
+            if provider_profile_key_is_sensitive(key_text):
+                continue
+            result[key_text] = sanitize_provider_profile(item)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [sanitize_provider_profile(item) for item in list(value)[:500]]
+    if isinstance(value, str):
+        return value[:20_000]
+    return value
+
 # 机会式凭据登记与 bbw_web 的本地认证闸门（_LocalPasswordAuthGate）是同进程
 # 内两个独立的信号量：同进程 Argon2 峰值为 bbw_web 本地认证闸门容量 + 本闸门
 # 容量之和；本闸门取配置值的一半（至少 1）以控制总内存预算。登记失败不影响
@@ -153,8 +238,8 @@ def merge_provider_profile_preserving_local(
     response is stale.
     """
 
-    current_values = dict(current or {})
-    merged = dict(incoming or {})
+    current_values = dict(sanitize_provider_profile(current or {}))
+    merged = dict(sanitize_provider_profile(incoming or {}))
     raw_local_fields = current_values.get(WEB_LOCAL_PROFILE_FIELDS_KEY)
     local_fields = {
         str(field)
@@ -1022,7 +1107,7 @@ class LoginAccountService:
             id=uuid.uuid4(),
             status="active",
             display_name=(display_name or "")[:160] or None,
-            profile=dict(profile or {}),
+            profile=dict(sanitize_provider_profile(profile or {})),
             invite_code_id=invite.id if invite is not None else None,
             media_quota_bytes=self.settings.per_user_media_quota_bytes,
             chat_retention_days=self.settings.message_retention_days,

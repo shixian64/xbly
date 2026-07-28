@@ -46,6 +46,7 @@ from .autonomous import (
     GeneratedText,
     MessageDirection,
     MAX_AUTONOMOUS_TEXT_LENGTH,
+    autonomy_message_identity,
     generated_text_filler_violations,
     sanitize_social_style_profile,
     TaskCompletion,
@@ -672,9 +673,20 @@ def conversation_head_from_row(
 ) -> ConversationHead:
     metadata = getattr(row, "extra_data", None)
     metadata = metadata if isinstance(metadata, dict) else {}
-    identity = str(metadata.get("canonical_message_id") or "").strip()
-    if not identity:
-        identity = f"{row.provider}:{row.upstream_message_id}"
+    revoked = bool(
+        str(row.status or "").strip().lower() == "revoked"
+        or str(metadata.get("revoked") or "").strip().lower()
+        in {"1", "true"}
+    )
+    identity = autonomy_message_identity(
+        provider=row.provider,
+        upstream_message_id=row.upstream_message_id,
+        canonical_message_id=metadata.get("canonical_message_id"),
+        direction=row.direction,
+        message_type=row.message_type,
+        body=row.body,
+        revoked=revoked,
+    )
     return ConversationHead(
         peer_upstream_uid=str(
             row.sender_upstream_uid
@@ -687,10 +699,7 @@ def conversation_head_from_row(
         message_type=str(row.message_type or ""),
         body=str(row.body or ""),
         occurred_at=row.occurred_at,
-        revoked=bool(
-            str(row.status or "").lower() == "revoked"
-            or str(metadata.get("revoked") or "").lower() in {"1", "true"}
-        ),
+        revoked=revoked,
         has_outgoing_after=bool(has_outgoing_after),
     )
 
@@ -1162,7 +1171,7 @@ class ByokAgentAutonomyModelRunner(AgentAutonomyModelRunner):
                     cipher=self.cipher,
                     require_user_enabled=True,
                 )
-                style = StyleProfileRepository(db).get(task.owner_user_id)
+                style = StyleProfileRepository(db).get_current(task.owner_user_id)
                 messages = _post_generation_messages(
                     instruction=task.generation_instruction,
                     style_summary=str(style.summary or "") if style is not None else "",
@@ -1270,7 +1279,7 @@ class ByokAgentAutonomyModelRunner(AgentAutonomyModelRunner):
                     cipher=self.cipher,
                     require_user_enabled=True,
                 )
-                style = StyleProfileRepository(db).get(task.owner_user_id)
+                style = StyleProfileRepository(db).get_current(task.owner_user_id)
                 messages = _outreach_generation_messages(
                     task_type=task.task_type,
                     instruction=task.generation_instruction,

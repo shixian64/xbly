@@ -16,6 +16,7 @@ from bbw_prod.crypto import CredentialCipher, EncryptionError
 from bbw_prod.models import (
     AiAgentAutonomySetting,
     AiAgentAutonomyTask,
+    AiAgentContactPolicy,
     AiAgentExecutionSetting,
     AiAgentSetting,
     AiModelConnection,
@@ -35,7 +36,24 @@ from .autonomous import (
     AUTONOMY_NO_REPLY_SENTINEL,
     AUTONOMY_REPLY_SESSION_GAP_SECONDS,
     allowed_relationship_address_terms,
+    autonomy_message_identity,
+    autonomy_reply_message_is_eligible,
     sanitize_social_style_profile,
+)
+from .contact_policy import (
+    CONTACT_MODE_SUGGEST_ONLY,
+    DEFAULT_MAXIMUM_REPLY_AGE_SECONDS,
+    DEFAULT_MINIMUM_REPLY_DELAY_SECONDS,
+    RELATIONSHIP_STAGE_CLOSE,
+    RELATIONSHIP_STAGE_ENGAGED,
+    RELATIONSHIP_STAGE_ESTABLISHED,
+    RELATIONSHIP_STAGE_INACTIVE,
+    RELATIONSHIP_STAGE_MANUAL_ONLY,
+    RELATIONSHIP_STAGE_NEW,
+    contact_policy_allows_auto_reply,
+    derive_relationship_stage,
+    relationship_stage_allows_address_terms,
+    reply_risk_boundary,
 )
 from .action_executor import (
     BROWSE_ONLINE_USERS,
@@ -47,6 +65,7 @@ from .action_executor import (
     UNFOLLOW_USER,
 )
 from .repositories import (
+    AgentContactPolicyRepository,
     AgentAutonomyDailyUsageRepository,
     AgentAutonomySettingRepository,
     AgentAutonomyTaskRepository,
@@ -55,6 +74,15 @@ from .repositories import (
     ModelConnectionRepository,
     ModelRunnerSystemSettingRepository,
     StyleProfileRepository,
+)
+from .style_sampling import (
+    STYLE_CANDIDATE_ROWS_PER_PEER,
+    STYLE_SAMPLING_POLICY_VERSION,
+    STYLE_SANITIZER_VERSION,
+    StyleSampleCandidate,
+    StyleSamplingError,
+    stratified_style_samples,
+    style_profile_is_current,
 )
 
 
@@ -162,6 +190,9 @@ class StyleAnalysisPlan:
     source_message_count: int
     source_last_message_at: datetime | None
     prompt_char_count: int
+    source_peer_count: int
+    sampling_policy_version: int
+    sanitizer_version: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +202,9 @@ class DraftPlan:
     prompt_char_count: int
     allowed_address_terms: tuple[str, ...] = ()
     autonomous: bool = False
+    relationship_stage: str = RELATIONSHIP_STAGE_NEW
+    risk_boundary: str = ""
+    latest_message_identity: str = ""
 
 
 def api_key_context(owner_user_id: uuid.UUID, connection_id: uuid.UUID) -> str:
@@ -433,6 +467,9 @@ def autonomy_task_public(row: AiAgentAutonomyTask) -> dict[str, Any]:
         "action_type": row.action_type,
         "status": row.status,
         "target_upstream_uid": str(row.target_upstream_uid or ""),
+        "relationship_stage": str(
+            getattr(row, "relationship_stage", "") or ""
+        ),
         "stable_error_code": row.stable_error_code,
         "result_id": str(row.result_id or ""),
         "scheduled_for": (
@@ -451,6 +488,224 @@ def autonomy_task_public(row: AiAgentAutonomyTask) -> dict[str, Any]:
         "finished_at": row.completed_at.isoformat() if row.completed_at else None,
         "outcome_unknown": bool(row.outcome_unknown),
     }
+
+
+def contact_policy_public(
+    row: AiAgentContactPolicy | None,
+) -> dict[str, Any]:
+    if row is None:
+        return {
+            "persisted": False,
+            "mode": CONTACT_MODE_SUGGEST_ONLY,
+            "stage_override": None,
+            "paused": False,
+            "minimum_reply_delay_seconds": (
+                DEFAULT_MINIMUM_REPLY_DELAY_SECONDS
+            ),
+            "maximum_reply_age_seconds": (
+                DEFAULT_MAXIMUM_REPLY_AGE_SECONDS
+            ),
+            "allow_address_terms": [],
+            "version": 0,
+            "updated_at": None,
+        }
+    return {
+        "persisted": True,
+        "mode": str(row.mode or CONTACT_MODE_SUGGEST_ONLY),
+        "stage_override": str(row.stage_override or "") or None,
+        "paused": bool(row.paused),
+        "minimum_reply_delay_seconds": int(
+            row.minimum_reply_delay_seconds
+        ),
+        "maximum_reply_age_seconds": int(row.maximum_reply_age_seconds),
+        "allow_address_terms": list(row.allow_address_terms or []),
+        "version": int(row.version),
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def load_contact_assist_status(
+    db: Session,
+    *,
+    owner_user_id: uuid.UUID,
+    peer_upstream_uid: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    require_visible_access(db, owner_user_id)
+    current = now or utcnow()
+    policies = AgentContactPolicyRepository(db)
+    try:
+        peer = policies.normalize_peer(peer_upstream_uid)
+    except ValueError as exc:
+        raise AgentServiceError("peer_invalid", "对方用户编号无效") from exc
+    state = policies.conversation_state(
+        owner_user_id=owner_user_id,
+        peer_upstream_uid=peer,
+    )
+    if state is None:
+        raise AgentServiceError(
+            "conversation_not_found",
+            "没有找到与该用户的已归档会话",
+            status_code=404,
+        )
+    contact_policy = policies.get(owner_user_id, peer)
+    relationship_stage = derive_relationship_stage(
+        state.signals,
+        now=current,
+        mode=(
+            str(contact_policy.mode or CONTACT_MODE_SUGGEST_ONLY)
+            if contact_policy is not None
+            else CONTACT_MODE_SUGGEST_ONLY
+        ),
+        stage_override=(
+            contact_policy.stage_override if contact_policy is not None else None
+        ),
+    )
+    head = AgentAutonomyTaskRepository(db).get_conversation_head(
+        owner_user_id=owner_user_id,
+        peer_upstream_uid=peer,
+    )
+    latest_is_text = bool(
+        head is not None
+        and not head.revoked
+        and str(head.message_type or "").strip().lower()
+        in {"text", "timtextelem"}
+        and str(head.body or "").strip()
+    )
+    latest_needs_reply = bool(
+        latest_is_text
+        and head is not None
+        and head.direction == "incoming"
+        and autonomy_reply_message_is_eligible(
+            head.body,
+            peer_upstream_uid=head.peer_upstream_uid,
+            conversation_title=head.conversation_title,
+        )
+    )
+    risk_boundary = (
+        reply_risk_boundary(head.body, message_type=head.message_type)
+        if latest_needs_reply and head is not None
+        else ""
+    )
+
+    runner_setting = AgentSettingRepository(db).get(owner_user_id)
+    connection = None
+    if runner_setting is not None and runner_setting.active_connection_id:
+        connection = ModelConnectionRepository(db).get(
+            owner_user_id,
+            runner_setting.active_connection_id,
+        )
+    runner_ready = bool(
+        runner_setting is not None
+        and runner_setting.user_enabled
+        and connection is not None
+        and connection.enabled
+        and connection.api_key_encrypted
+        and str(connection.last_test_status or "") == "ok"
+    )
+    execution = AgentExecutionSettingRepository(db).get(owner_user_id)
+    autonomy = AgentAutonomySettingRepository(db).get(owner_user_id)
+    access = autonomy_access(db, owner_user_id)
+    global_auto_ready = bool(
+        access.available
+        and runner_ready
+        and execution is not None
+        and execution.user_enabled
+        and execution.auto_send_enabled
+        and SEND_PRIVATE_MESSAGE in set(execution.allowed_actions or [])
+        and autonomy is not None
+        and autonomy.user_enabled
+        and autonomy.auto_reply_enabled
+        and autonomy.auto_reply_started_at is not None
+        and SEND_PRIVATE_MESSAGE in set(autonomy.allowed_actions or [])
+        and autonomy.halted_at is None
+    )
+    contact_auto_allowed = contact_policy_allows_auto_reply(
+        persisted=contact_policy is not None,
+        mode=(str(contact_policy.mode or "") if contact_policy is not None else ""),
+        paused=(bool(contact_policy.paused) if contact_policy is not None else False),
+        relationship_stage=relationship_stage,
+        risk_boundary=risk_boundary,
+    )
+    context_limit = int(
+        runner_setting.context_message_limit
+        if runner_setting is not None
+        else 30
+    )
+    return {
+        "peer_upstream_uid": peer,
+        "relationship_stage": relationship_stage,
+        "message_counts": {
+            "total": int(state.signals.total_message_count),
+            "incoming": int(state.signals.incoming_message_count),
+            "outgoing": int(state.signals.outgoing_message_count),
+        },
+        "context_message_count": min(
+            int(state.signals.total_message_count),
+            max(1, context_limit),
+        ),
+        "risk_boundary": risk_boundary or None,
+        "requires_manual_review": bool(risk_boundary),
+        "latest_message": {
+            "fingerprint": (
+                str(head.message_identity or "") if head is not None else ""
+            ),
+            "direction": str(head.direction or "") if head is not None else "",
+            "message_type": str(head.message_type or "") if head is not None else "",
+            "occurred_at": (
+                head.occurred_at.isoformat() if head is not None else None
+            ),
+            "needs_reply": latest_needs_reply,
+        },
+        "policy": contact_policy_public(contact_policy),
+        "capabilities": {
+            "runner_ready": runner_ready,
+            "can_suggest": bool(runner_ready and latest_needs_reply),
+            "contact_auto_reply_allowed": contact_auto_allowed,
+            "global_auto_reply_ready": global_auto_ready,
+            "auto_reply_active": bool(
+                latest_needs_reply
+                and contact_auto_allowed
+                and global_auto_ready
+            ),
+            "can_change_policy": True,
+        },
+    }
+
+
+def save_contact_policy(
+    db: Session,
+    *,
+    owner_user_id: uuid.UUID,
+    peer_upstream_uid: str,
+    updates: Mapping[str, object],
+) -> tuple[AiAgentContactPolicy, bool, bool]:
+    require_visible_access(db, owner_user_id)
+    policies = AgentContactPolicyRepository(db)
+    try:
+        peer = policies.normalize_peer(peer_upstream_uid)
+    except ValueError as exc:
+        raise AgentServiceError("peer_invalid", "对方用户编号无效") from exc
+    if policies.conversation_state(
+        owner_user_id=owner_user_id,
+        peer_upstream_uid=peer,
+    ) is None:
+        raise AgentServiceError(
+            "conversation_not_found",
+            "没有找到与该用户的已归档会话",
+            status_code=404,
+        )
+    try:
+        return policies.configure(
+            owner_user_id,
+            peer,
+            updates=updates,
+        )
+    except (TypeError, ValueError) as exc:
+        raise AgentServiceError(
+            "contact_policy_invalid",
+            "联系人 Agent 设置无效",
+        ) from exc
 
 
 def autonomy_public(
@@ -633,8 +888,9 @@ def autonomy_usage_today(
 
 
 def style_public(row: AiStyleProfile | None) -> dict[str, Any] | None:
-    if row is None:
+    if not style_profile_is_current(row):
         return None
+    assert row is not None
     safe_summary, safe_traits = sanitize_social_style_profile(
         row.summary,
         dict(row.traits or {}),
@@ -643,6 +899,9 @@ def style_public(row: AiStyleProfile | None) -> dict[str, Any] | None:
         "summary": safe_summary,
         "traits": safe_traits,
         "source_message_count": int(row.source_message_count),
+        "source_peer_count": int(row.source_peer_count),
+        "sampling_policy_version": int(row.sampling_policy_version),
+        "sanitizer_version": int(row.sanitizer_version),
         "source_last_message_at": (
             row.source_last_message_at.isoformat()
             if row.source_last_message_at
@@ -668,7 +927,7 @@ def load_status(
         )
     if connection is None:
         connection = ModelConnectionRepository(db).first_for_owner(owner_user_id)
-    style = StyleProfileRepository(db).get(owner_user_id)
+    style = StyleProfileRepository(db).get_current(owner_user_id)
     public_settings = settings_public(settings, connection=connection)
     action_access = execution_access(db, owner_user_id)
     execution_settings = AgentExecutionSettingRepository(db).get(owner_user_id)
@@ -1402,25 +1661,59 @@ def _prompt_char_count(messages: Sequence[Mapping[str, str]]) -> int:
 def build_style_analysis_plan(
     db: Session, *, owner_user_id: uuid.UUID
 ) -> StyleAnalysisPlan:
+    ranked_messages = (
+        select(
+            Message.id.label("message_id"),
+            Conversation.peer_upstream_uid.label("peer_upstream_uid"),
+            func.row_number()
+            .over(
+                partition_by=Conversation.peer_upstream_uid,
+                order_by=(Message.occurred_at.desc(), Message.id.desc()),
+            )
+            .label("peer_message_rank"),
+        )
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .where(
+            Message.owner_user_id == owner_user_id,
+            Conversation.owner_user_id == owner_user_id,
+            Conversation.kind == "direct",
+            Conversation.peer_upstream_uid.is_not(None),
+            Message.direction == "outgoing",
+            Message.body.is_not(None),
+            func.lower(Message.message_type).in_(("text", "timtextelem")),
+            Message.status != "revoked",
+            func.coalesce(Message.extra_data["revoked"].astext, "false").notin_(
+                ("true", "1")
+            ),
+            func.lower(
+                func.coalesce(Message.extra_data["origin"].astext, "")
+            )
+            != "agent",
+            func.coalesce(
+                Message.extra_data["client_message_key"].astext,
+                Message.extra_data["client_message_id"].astext,
+                "",
+            ).notlike("agent:%"),
+        )
+        .cte("ranked_style_messages")
+    )
     rows = list(
-        db.scalars(
-            select(Message)
+        db.execute(
+            select(Message, ranked_messages.c.peer_upstream_uid)
+            .join(
+                ranked_messages,
+                ranked_messages.c.message_id == Message.id,
+            )
             .where(
-                Message.owner_user_id == owner_user_id,
-                Message.direction == "outgoing",
-                Message.body.is_not(None),
-                Message.status != "revoked",
-                func.coalesce(Message.extra_data["revoked"].astext, "false").notin_(
-                    ("true", "1")
-                ),
+                ranked_messages.c.peer_message_rank
+                <= STYLE_CANDIDATE_ROWS_PER_PEER
             )
             .order_by(Message.occurred_at.desc(), Message.id.desc())
-            .limit(400)
+            .limit(4_000)
         )
     )
-    samples: list[str] = []
-    last_at: datetime | None = None
-    for row in rows:
+    candidates: list[StyleSampleCandidate] = []
+    for row, peer_upstream_uid in rows:
         metadata = row.extra_data if isinstance(row.extra_data, Mapping) else {}
         if str(metadata.get("revoked") or "").strip().lower() in {"1", "true"}:
             continue
@@ -1439,17 +1732,28 @@ def build_style_analysis_plan(
         text_value = str(row.body or "").strip()
         if not text_value:
             continue
-        samples.append(text_value[:1000])
-        if last_at is None or row.occurred_at > last_at:
-            last_at = row.occurred_at
-        if len(samples) >= 100:
-            break
-    if len(samples) < 8:
+        candidates.append(
+            StyleSampleCandidate(
+                peer_key=str(peer_upstream_uid or "").strip(),
+                text=text_value,
+                occurred_at=row.occurred_at,
+            )
+        )
+    try:
+        selection = stratified_style_samples(candidates)
+    except StyleSamplingError as exc:
+        if exc.code == "insufficient_style_diversity":
+            raise AgentServiceError(
+                exc.code,
+                "可用于分析的联系人分布不足，至少需要八个联系人的有效发言",
+                status_code=409,
+            ) from exc
         raise AgentServiceError(
             "insufficient_style_samples",
             "可用于分析的本人历史文字消息不足，至少需要八条",
             status_code=409,
-        )
+        ) from exc
+    samples = list(selection.samples)
     sample_payload = json.dumps(samples, ensure_ascii=False, separators=(",", ":"))
     messages = (
         {
@@ -1479,8 +1783,11 @@ def build_style_analysis_plan(
     return StyleAnalysisPlan(
         messages=messages,
         source_message_count=len(samples),
-        source_last_message_at=last_at,
+        source_last_message_at=selection.source_last_message_at,
         prompt_char_count=_prompt_char_count(messages),
+        source_peer_count=selection.source_peer_count,
+        sampling_policy_version=STYLE_SAMPLING_POLICY_VERSION,
+        sanitizer_version=STYLE_SANITIZER_VERSION,
     )
 
 
@@ -1538,12 +1845,53 @@ def parse_style_profile(text: str) -> tuple[str, dict[str, object]]:
 
 def _conversation_message_identity(message: Message) -> str:
     metadata = message.extra_data if isinstance(message.extra_data, Mapping) else {}
-    canonical = str(metadata.get("canonical_message_id") or "").strip()
-    return canonical or f"{message.provider}:{message.upstream_message_id}"
+    revoked = bool(
+        str(message.status or "").strip().lower() == "revoked"
+        or str(metadata.get("revoked") or "").strip().lower()
+        in {"1", "true"}
+    )
+    return autonomy_message_identity(
+        provider=message.provider,
+        upstream_message_id=message.upstream_message_id,
+        canonical_message_id=metadata.get("canonical_message_id"),
+        direction=message.direction,
+        message_type=message.message_type,
+        body=message.body,
+        revoked=revoked,
+    )
 
 
 def _aware_message_datetime(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _relationship_stage_text_rules(stage: str) -> str:
+    return {
+        RELATIONSHIP_STAGE_NEW: (
+            "当前是陌生关系：回复保持六至十六字，最多提出一个具体问题，"
+            "不要使用笑声、昵称、亲密表达或角色表达。"
+        ),
+        RELATIONSHIP_STAGE_ENGAGED: (
+            "当前是初步互动：回复保持四至十六字，一次只推进一个话题，"
+            "默认不要使用称呼，语气词最多一个且不得位于句首。"
+        ),
+        RELATIONSHIP_STAGE_ESTABLISHED: (
+            "当前是稳定关系：回复保持三至十四字，自然承接上下文；"
+            "只有 allowed_address_terms 中的称呼可以使用。"
+        ),
+        RELATIONSHIP_STAGE_CLOSE: (
+            "当前是深关系：回复保持二至十四字并跟随真实会话节奏；"
+            "只有 allowed_address_terms 中的联系人专属称呼可以使用。"
+        ),
+        RELATIONSHIP_STAGE_MANUAL_ONLY: (
+            "当前联系人由本人始终人工处理：只提供克制、可编辑的草稿，"
+            "不要使用称呼、承诺、亲密或角色表达。"
+        ),
+        RELATIONSHIP_STAGE_INACTIVE: (
+            "当前关系处于暂停或不可触达状态：只提供保守草稿，不主动重启旧话题，"
+            "不要使用称呼、亲密表达或关系承诺。"
+        ),
+    }.get(stage, "按陌生关系处理，不得使用称呼或亲密表达。")
 
 
 def build_reply_draft_plan(
@@ -1575,6 +1923,42 @@ def build_reply_draft_plan(
     if not conversation_ids:
         raise AgentServiceError(
             "conversation_not_found", "没有找到与该用户的已归档会话", status_code=404
+        )
+    latest_message = db.scalar(
+        select(Message)
+        .where(
+            Message.owner_user_id == owner_user_id,
+            Message.conversation_id.in_(conversation_ids),
+        )
+        .order_by(
+            Message.occurred_at.desc(),
+            Message.created_at.desc(),
+            Message.id.desc(),
+        )
+        .limit(1)
+    )
+    if latest_message is None:
+        raise AgentServiceError(
+            "conversation_text_unavailable",
+            "该会话暂时没有可用于生成草稿的文字消息",
+            status_code=409,
+        )
+    latest_metadata = (
+        latest_message.extra_data
+        if isinstance(latest_message.extra_data, Mapping)
+        else {}
+    )
+    latest_revoked = bool(
+        str(latest_message.status or "").strip().lower() == "revoked"
+        or str(latest_metadata.get("revoked") or "").strip().lower()
+        in {"1", "true"}
+    )
+    latest_type = str(latest_message.message_type or "").strip().lower()
+    if latest_revoked or latest_type not in {"text", "timtextelem"}:
+        raise AgentServiceError(
+            "conversation_latest_message_unsupported",
+            "对方最新内容需要人工查看，暂不根据更早的文字生成回复",
+            status_code=409,
         )
     conversation_title = next(
         (
@@ -1655,14 +2039,64 @@ def build_reply_draft_plan(
         }
         for row in deduplicated
     ]
-    allowed_address_terms = allowed_relationship_address_terms(
+    observed_address_terms = allowed_relationship_address_terms(
         [
             str(row.body or "")
             for row in all_context_rows
             if row.direction == "outgoing"
         ]
     )
-    style = StyleProfileRepository(db).get(owner_user_id)
+    contact_policies = AgentContactPolicyRepository(db)
+    contact_policy = contact_policies.get(owner_user_id, peer)
+    contact_state = contact_policies.conversation_state(
+        owner_user_id=owner_user_id,
+        peer_upstream_uid=peer,
+    )
+    if contact_state is None:
+        raise AgentServiceError(
+            "conversation_not_found", "没有找到与该用户的已归档会话", status_code=404
+        )
+    relationship_stage = derive_relationship_stage(
+        contact_state.signals,
+        now=generated_at,
+        mode=(
+            str(contact_policy.mode or CONTACT_MODE_SUGGEST_ONLY)
+            if contact_policy is not None
+            else CONTACT_MODE_SUGGEST_ONLY
+        ),
+        stage_override=(
+            contact_policy.stage_override if contact_policy is not None else None
+        ),
+    )
+    confirmed_address_terms = set(
+        contact_policy.allow_address_terms or []
+        if contact_policy is not None
+        else []
+    )
+    allowed_address_terms = (
+        tuple(
+            term
+            for term in observed_address_terms
+            if term in confirmed_address_terms
+        )
+        if relationship_stage_allows_address_terms(relationship_stage)
+        else ()
+    )
+    risk_boundary = (
+        reply_risk_boundary(
+            latest_message.body,
+            message_type=latest_message.message_type,
+        )
+        if str(latest_message.direction or "") == "incoming"
+        else ""
+    )
+    if autonomous and risk_boundary:
+        raise AgentServiceError(
+            "reply_requires_manual_review",
+            "对方最新消息命中人工处理边界，本次未生成自动回复",
+            status_code=409,
+        )
+    style = StyleProfileRepository(db).get_current(owner_user_id)
     style_payload = None
     if style is not None:
         safe_summary, safe_traits = sanitize_social_style_profile(
@@ -1686,6 +2120,7 @@ def build_reply_draft_plan(
         "除 allowed_address_terms 明确列出的词外，不得使用昵称、亲昵称呼、侮辱式调侃或关系称呼；"
         "列表为空时完全不要称呼对方。conversation_title 只能用于识别会话，不能直接作为称呼。"
         f"{AUTONOMY_GENERATED_TEXT_STYLE_RULES}"
+        f"{_relationship_stage_text_rules(relationship_stage)}"
         "保持自然简洁，只返回草稿正文，不要解释过程、不要加标题或引号。"
     )
     if autonomous:
@@ -1702,6 +2137,8 @@ def build_reply_draft_plan(
         "objective": normalized_objective or "回复对方最新消息",
         "generated_at": generated_at.isoformat(),
         "conversation_title": conversation_title,
+        "relationship_stage": relationship_stage,
+        "risk_boundary": risk_boundary or None,
         "allowed_address_terms": list(allowed_address_terms),
         "style_profile": style_payload,
         "conversation": history,
@@ -1724,6 +2161,9 @@ def build_reply_draft_plan(
         prompt_char_count=_prompt_char_count(messages),
         allowed_address_terms=allowed_address_terms,
         autonomous=bool(autonomous),
+        relationship_stage=relationship_stage,
+        risk_boundary=risk_boundary,
+        latest_message_identity=_conversation_message_identity(latest_message),
     )
 
 
@@ -1743,7 +2183,10 @@ def save_style_profile(
         summary=summary,
         traits=traits,
         source_message_count=plan.source_message_count,
+        source_peer_count=plan.source_peer_count,
         source_last_message_at=plan.source_last_message_at,
+        sampling_policy_version=plan.sampling_policy_version,
+        sanitizer_version=plan.sanitizer_version,
     )
 
 
