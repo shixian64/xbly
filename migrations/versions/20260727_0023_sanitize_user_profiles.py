@@ -79,7 +79,7 @@ def upgrade() -> None:
                     FROM jsonb_each(
                         CASE
                             WHEN jsonb_typeof(profile) = 'object' THEN profile
-                            ELSE '{}'::jsonb
+                            ELSE '{{}}'::jsonb
                         END
                     ) AS entry(key, value)
                     WHERE regexp_replace(lower(entry.key), '[^a-z0-9]', '', 'g')
@@ -99,7 +99,7 @@ def upgrade() -> None:
                     FROM jsonb_each(
                         CASE
                             WHEN jsonb_typeof(profile) = 'object' THEN profile
-                            ELSE '{}'::jsonb
+                            ELSE '{{}}'::jsonb
                         END
                     ) AS entry(key, value)
                     WHERE regexp_replace(lower(entry.key), '[^a-z0-9]', '', 'g')
