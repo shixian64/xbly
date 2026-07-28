@@ -2916,62 +2916,6 @@ summary:focus-visible {
   gap: 0.4rem;
 }
 
-.chat-agent-contact-policy {
-  display: flex;
-  min-width: 0;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.55rem;
-  border-bottom: 1px solid var(--line);
-  background: rgba(249, 249, 251, 0.96);
-  padding: 0.38rem 0.75rem;
-  color: var(--muted);
-  font-size: 0.66rem;
-  line-height: 1.35;
-}
-
-.chat-agent-contact-policy label {
-  display: flex;
-  min-width: 0;
-  width: 100%;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.55rem;
-}
-
-.chat-agent-contact-policy select,
-.chat-agent-contact-policy button {
-  min-height: 30px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: #fff;
-  color: var(--text);
-  padding: 0.25rem 0.46rem;
-  font: inherit;
-  font-size: 0.65rem;
-}
-
-.chat-agent-contact-policy select {
-  max-width: 15rem;
-}
-
-.chat-agent-contact-policy button {
-  color: var(--muted);
-  font-weight: 680;
-}
-
-.chat-agent-contact-policy button:hover,
-.chat-agent-contact-policy button:focus-visible {
-  border-color: rgba(117, 79, 181, 0.32);
-  background: var(--brand-soft);
-  color: var(--brand-dark);
-}
-
-.chat-agent-contact-policy button:disabled {
-  opacity: 0.56;
-}
-
 .chat-peer-presence {
   display: flex;
   align-items: center;
@@ -6121,17 +6065,6 @@ html.flash-viewing body {
     backdrop-filter: none;
   }
 
-  .chat-agent-contact-policy {
-    padding: 0.35rem max(0.7rem, var(--safe-right)) 0.35rem max(0.7rem, var(--safe-left));
-  }
-
-  .chat-agent-contact-policy select {
-    min-width: 0;
-    max-width: min(65vw, 15rem);
-    flex: 1 1 auto;
-    font-size: 16px;
-  }
-
   .mobile-only {
     display: inline-flex !important;
   }
@@ -6916,11 +6849,6 @@ html.flash-viewing body {
     min-height: 44px;
   }
 
-  .chat-agent-contact-policy select,
-  .chat-agent-contact-policy button {
-    min-height: 44px;
-  }
-
   .message-search-trigger,
   .message-search-filter,
   .message-search-date,
@@ -7329,6 +7257,37 @@ html.flash-viewing body {
   display: grid;
   min-width: 0;
   gap: 0.8rem;
+}
+
+.agent-contact-policy-card,
+#agent-contact-policy-manager {
+  display: grid;
+  min-width: 0;
+  gap: 0.8rem;
+}
+
+.agent-contact-policy-controls {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1.25fr) minmax(220px, 0.75fr) auto;
+  align-items: end;
+  gap: 0.7rem;
+}
+
+.agent-contact-policy-controls > * {
+  min-width: 0;
+}
+
+.agent-contact-policy-controls .field {
+  margin: 0;
+}
+
+.agent-contact-policy-controls select {
+  width: 100%;
+}
+
+.agent-contact-policy-boundary {
+  margin-top: 0.1rem;
 }
 
 .agent-social-workspace {
@@ -7891,7 +7850,7 @@ html.flash-viewing body {
   }
 
   .agent-menu {
-    grid-template-columns: repeat(3, minmax(170px, 1fr));
+    grid-template-columns: repeat(4, minmax(170px, 1fr));
     position: static;
     overflow-x: auto;
     scrollbar-width: thin;
@@ -7925,8 +7884,13 @@ html.flash-viewing body {
   .agent-social-capability-grid,
   .agent-form-actions,
   .agent-parameter-grid,
-  .agent-action-grid {
+  .agent-action-grid,
+  .agent-contact-policy-controls {
     grid-template-columns: 1fr;
+  }
+
+  .agent-contact-policy-controls > .btn {
+    width: 100%;
   }
 
   .agent-social-stats {

@@ -492,7 +492,7 @@ class RelationshipAgentSourceContractTests(unittest.TestCase):
         self.assertIn("aiAgentChatSuggestionsEnabled: false", app)
         self.assertIn("在聊天界面显示聊天建议", app)
         self.assertIn("默认关闭；开启后可在当前会话中生成", app)
-        self.assertIn("联系人自动回复设置始终显示", app)
+        self.assertIn("联系人自动回复授权在“联系人回复”菜单中管理", app)
         access = self.javascript_function_source(
             "bbw_web/static/app.js", "setAiAgentAccess"
         )
@@ -504,11 +504,11 @@ class RelationshipAgentSourceContractTests(unittest.TestCase):
         )
         self.assertIn("!S.aiAgentChatSuggestionsEnabled", chat)
         self.assertIn('aria-label="聊天建议"', chat)
-        contact = self.javascript_function_source(
-            "bbw_web/static/app.js", "chatAgentContactPolicyHtml"
+        pane = self.javascript_function_source(
+            "bbw_web/static/app.js", "chatPaneHtml"
         )
-        self.assertNotIn("!S.aiAgentChatSuggestionsEnabled", contact)
-        self.assertIn("data-chat-agent-contact-policy", contact)
+        self.assertNotIn("ContactPolicy", pane)
+        self.assertNotIn("data-agent-contact-policy", pane)
         load = self.javascript_function_source(
             "bbw_web/static/app.js", "loadChatAssistStatus"
         )
@@ -519,12 +519,21 @@ class RelationshipAgentSourceContractTests(unittest.TestCase):
         self.assertIn("聊天建议", content)
         self.assertNotIn("联系人自动回复", content)
         self.assertNotIn("data-chat-agent-mode", content)
-        contact_content = self.javascript_function_source(
-            "bbw_web/static/app.js", "chatAgentContactPolicyContentHtml"
+        contact_manager = self.javascript_function_source(
+            "bbw_web/static/app.js", "agentContactPolicyManagerContentHtml"
         )
-        self.assertIn("联系人自动回复", contact_content)
-        self.assertIn("data-chat-agent-mode", contact_content)
-        self.assertNotIn("chatAssistSuggestion(", contact_content)
+        self.assertIn("联系人自动回复", contact_manager)
+        self.assertIn("data-agent-contact-policy-peer", contact_manager)
+        self.assertIn("data-agent-contact-policy-mode", contact_manager)
+        self.assertNotIn("chatAssistSuggestion(", contact_manager)
+        contact_section = self.javascript_function_source(
+            "bbw_web/static/app.js", "agentContactPoliciesSectionHtml"
+        )
+        self.assertIn("聊天界面不会显示这些设置", contact_section)
+        page = self.javascript_function_source(
+            "bbw_web/static/app.js", "pageAgent"
+        )
+        self.assertIn("agentContactPoliciesSectionHtml()", page)
         generate = self.javascript_function_source(
             "bbw_web/static/app.js", "generateChatAgentSuggestion"
         )
@@ -620,7 +629,8 @@ class RelationshipAgentSourceContractTests(unittest.TestCase):
         self.assertLess(generate.index("const previousDraft"), generate.index("await api("))
 
         css = self.read("bbw_web/static/app.css")
-        self.assertIn(".chat-agent-contact-policy", css)
+        self.assertIn(".agent-contact-policy-controls", css)
+        self.assertNotIn(".chat-agent-contact-policy", css)
         self.assertIn(".chat-agent-assist-head", css)
         self.assertIn(".chat-agent-assist-actions", css)
         self.assertIn("overflow-x: auto", css)
