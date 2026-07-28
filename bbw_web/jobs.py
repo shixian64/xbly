@@ -3211,6 +3211,7 @@ def _schedule_autonomy_owner(
     """Create bounded, database-idempotent tasks for one authorized owner."""
 
     from bbw_agent.autonomous import (
+        AUTONOMY_TRANSIENT_PROVIDER_RETRY_SECONDS,
         BROWSE_ONLINE_USERS,
         FOLLOW_USER,
         PUBLISH_TEXT_POST,
@@ -3425,7 +3426,11 @@ def _schedule_autonomy_owner(
             )
         )
         if browse_due:
-            slot = int(now.timestamp()) // discovery_interval_seconds
+            browse_slot_seconds = min(
+                discovery_interval_seconds,
+                AUTONOMY_TRANSIENT_PROVIDER_RETRY_SECONDS,
+            )
+            slot = int(now.timestamp()) // browse_slot_seconds
             key = deterministic_task_key(
                 owner_user_id=owner_user_id,
                 task_type=AutonomyTaskType.BROWSE_ONLINE,
@@ -3810,6 +3815,10 @@ def run_unattended_agent(task_id: str) -> dict[str, Any]:
     parsed_task_id = _uuid(task_id, field="task_id")
     persistence = RuntimePersistence(settings)
     try:
+        try:
+            persistence.start_raw_response_archive()
+        except Exception:
+            LOGGER.exception("Agent 上游响应归档线程启动失败")
         orchestrator = AgentAutonomyOrchestrator(
             store=SqlAgentAutonomyStore(
                 bound_sql_agent_autonomy_repository_factory(parsed_task_id)

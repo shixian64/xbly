@@ -720,6 +720,35 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         self.assertIsNone(run_node.args.vararg)
         self.assertIsNone(run_node.args.kwarg)
         self.assertIn('parsed_task_id = _uuid(task_id, field="task_id")', run_source)
+        self.assertIn("persistence.start_raw_response_archive()", run_source)
+
+    def test_transient_discovery_failure_is_observable_and_budget_refunded(self) -> None:
+        browse, _ = self.function_source(
+            "bbw_agent/action_executor.py", "_browse_online_users"
+        )
+        self.assertIn("_external_discovery_error_code", browse)
+        self.assertIn('"external_discovery_unavailable"', browse)
+
+        finish, _ = self.function_source(
+            "bbw_agent/repositories.py", "finish_task"
+        )
+        self.assertIn("count_failure and not retryable", finish)
+        self.assertIn("_refund_autonomy_usage", finish)
+        self.assertIn("setting.next_run_at = retry_at", finish)
+
+        scheduler, _ = self.function_source(
+            "bbw_web/jobs.py", "_schedule_autonomy_owner"
+        )
+        self.assertIn("browse_slot_seconds = min(", scheduler)
+        self.assertIn("AUTONOMY_TRANSIENT_PROVIDER_RETRY_SECONDS", scheduler)
+        self.assertIn("int(now.timestamp()) // browse_slot_seconds", scheduler)
+
+        refund, _ = self.function_source(
+            "bbw_agent/repositories.py", "_refund_autonomy_usage"
+        )
+        self.assertIn("usage.total_actions = total - 1", refund)
+        self.assertIn("setattr(usage, field, category_total - 1)", refund)
+        self.assertIn("total <= 0 or category_total <= 0", refund)
 
     def test_unattended_executor_uses_only_short_lived_provider_sessions(self) -> None:
         send, _ = self.function_source("bbw_agent/action_executor.py", "_send_private_message")

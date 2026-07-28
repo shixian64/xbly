@@ -9,6 +9,7 @@ existing owner-scoped services.
 from __future__ import annotations
 
 import hashlib
+import logging
 import uuid
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -18,6 +19,9 @@ from sqlalchemy import select
 
 from bbw_prod.db import session_scope
 from bbw_prod.models import Relationship
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 SEND_PRIVATE_MESSAGE = "send_private_message"
@@ -628,6 +632,32 @@ def _remember_discovery_candidates(
         )
 
 
+def _external_discovery_error_code(result: Any) -> str:
+    try:
+        status = int(getattr(result, "status", 0) or 0)
+    except (TypeError, ValueError):
+        status = 0
+    if status <= 0 or status in {408, 425, 429} or status >= 500:
+        return "external_discovery_unavailable"
+    return "external_discovery_failed"
+
+
+def _log_external_discovery_failure(result: Any, *, code: str) -> None:
+    try:
+        status = int(getattr(result, "status", 0) or 0)
+    except (TypeError, ValueError):
+        status = 0
+    provider_code = str(getattr(result, "code", "") or "")[:80]
+    kind = str(getattr(result, "kind", "") or "")[:80]
+    LOGGER.warning(
+        "external discovery rejected error_code=%s status=%d provider_code=%s kind=%s",
+        code,
+        status,
+        provider_code or "none",
+        kind or "unknown",
+    )
+
+
 def _browse_online_users(
     *,
     identity: ActionIdentity,
@@ -652,15 +682,25 @@ def _browse_online_users(
                 pageIndex="1",
             )
         except Exception as exc:
+            LOGGER.warning(
+                "external discovery request raised error_type=%s",
+                type(exc).__name__,
+            )
             raise AccountActionError(
                 "external_discovery_unavailable",
                 "在线列表暂时不可用",
                 status_code=502,
             ) from exc
         if not bool(getattr(result, "ok", False)):
+            error_code = _external_discovery_error_code(result)
+            _log_external_discovery_failure(result, code=error_code)
             raise AccountActionError(
-                "external_discovery_failed",
-                "原账号服务没有返回可用的在线列表",
+                error_code,
+                (
+                    "在线列表暂时不可用"
+                    if error_code == "external_discovery_unavailable"
+                    else "原账号服务没有返回可用的在线列表"
+                ),
                 status_code=502,
             )
         items = _candidate_items(

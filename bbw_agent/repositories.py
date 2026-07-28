@@ -198,6 +198,29 @@ def _increment_autonomy_usage(usage: Any, category: str) -> None:
     setattr(usage, field, int(getattr(usage, field, 0) or 0) + 1)
 
 
+def _refund_autonomy_usage(
+    usage: Any,
+    *,
+    task_type: str,
+    action_type: str,
+) -> None:
+    category = _autonomy_usage_category(task_type, action_type)
+    field = {
+        "reply": "reply_actions",
+        "outreach": "outreach_actions",
+        "post": "post_actions",
+        "relationship": "relationship_actions",
+        "browse": "browse_actions",
+        "match": "match_actions",
+    }[category]
+    total = int(getattr(usage, "total_actions", 0) or 0)
+    category_total = int(getattr(usage, field, 0) or 0)
+    if total <= 0 or category_total <= 0:
+        raise RuntimeError("cannot refund an unreserved autonomous action budget")
+    usage.total_actions = total - 1
+    setattr(usage, field, category_total - 1)
+
+
 def _setting_category_limit(setting: Any, category: str) -> int:
     total = max(1, int(getattr(setting, "daily_total_limit", 1) or 1))
     if category == "reply":
@@ -3609,6 +3632,7 @@ class AgentAutonomyTaskRepository:
             if status != "succeeded"
             else ""
         )
+        requested_stable_error_code = stable_error_code
         result_id = str(getattr(completion, "result_id", "") or "")[:256]
         outcome_unknown = bool(getattr(completion, "outcome_unknown", False))
         count_failure = bool(
@@ -3616,6 +3640,9 @@ class AgentAutonomyTaskRepository:
         ) or outcome_unknown
         reset_failures = bool(getattr(completion, "reset_failures", False))
         force_halt = bool(getattr(completion, "force_halt", False))
+        retryable = bool(getattr(completion, "retryable", False))
+        refund_budget = bool(getattr(completion, "refund_budget", False))
+        retry_at = getattr(completion, "retry_at", None)
         candidate = self.db.scalar(
             select(AiAgentAutonomyTask)
             .where(
@@ -3889,6 +3916,14 @@ class AgentAutonomyTaskRepository:
                     count_failure = True
                     reset_failures = False
                     force_halt = True
+        retryable = bool(
+            retryable
+            and status == "failed"
+            and not outcome_unknown
+            and stable_error_code == requested_stable_error_code
+        )
+        refund_budget = bool(refund_budget and retryable)
+        retry_at = retry_at if retryable else None
         task.status = status
         task.stable_error_code = stable_error_code or None
         task.result_id = result_id or None
@@ -3904,14 +3939,22 @@ class AgentAutonomyTaskRepository:
                 setting.consecutive_failures = 0
             if status == "succeeded":
                 self._record_success_state(task=task, setting=setting, now=now)
-            if count_failure:
-                setting.consecutive_failures = int(setting.consecutive_failures or 0) + 1
-            if force_halt or int(
-                setting.consecutive_failures or 0
-            ) >= int(setting.consecutive_failure_limit):
+            if count_failure and not retryable:
+                setting.consecutive_failures = (
+                    int(setting.consecutive_failures or 0) + 1
+                )
+            if force_halt or (
+                not retryable
+                and int(setting.consecutive_failures or 0)
+                >= int(setting.consecutive_failure_limit)
+            ):
                 setting.halted_at = now
                 setting.halted_reason = task.stable_error_code or "autonomy_halted"
                 setting.next_run_at = None
+            elif retry_at is not None and (
+                setting.next_run_at is None or setting.next_run_at < retry_at
+            ):
+                setting.next_run_at = retry_at
             setting.updated_at = now
         if (task.dispatch_started_at is None) != (task.budget_day is None):
             raise RuntimeError(
@@ -3926,6 +3969,12 @@ class AgentAutonomyTaskRepository:
             if usage is None:
                 raise RuntimeError(
                     "reserved autonomous daily usage row is missing"
+                )
+            if refund_budget:
+                _refund_autonomy_usage(
+                    usage,
+                    task_type=str(task.task_type or ""),
+                    action_type=str(task.action_type or ""),
                 )
             if count_failure:
                 usage.failed_actions = int(usage.failed_actions or 0) + 1

@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bbw_agent.autonomous import (  # noqa: E402
+    AUTONOMY_TRANSIENT_PROVIDER_RETRY_SECONDS,
     BROWSE_ONLINE_USERS,
     FIXED_ACCOUNT_ACTIONS,
     FOLLOW_USER,
@@ -888,6 +889,33 @@ class AgentAutonomyOrchestratorTests(unittest.TestCase):
                 self.assertEqual(result.status, AutonomyTaskStatus.SUCCEEDED.value)
                 self.assertEqual(model.total_calls, 0)
                 self.assertEqual(dispatcher.commands[0][0].action_type, expected_action)
+
+    def test_transient_discovery_failure_refunds_budget_and_backs_off(self) -> None:
+        dispatched = FixedActionDispatchResult(
+            FixedActionOutcome.FAILED,
+            stable_error_code="external_discovery_unavailable",
+        )
+        store = FakeStore(task(AutonomyTaskType.BROWSE_ONLINE), policy())
+        runner, model, dispatcher = orchestrator(
+            store,
+            dispatcher=FakeDispatcher(dispatched),
+        )
+
+        result = runner.run_once(worker_id="worker-001")
+
+        self.assertEqual(result.status, AutonomyTaskStatus.FAILED.value)
+        self.assertEqual(result.code, "external_discovery_unavailable")
+        self.assertEqual(model.total_calls, 0)
+        self.assertEqual(len(dispatcher.commands), 1)
+        completion = store.completions[-1]
+        self.assertTrue(completion.count_failure)
+        self.assertTrue(completion.retryable)
+        self.assertTrue(completion.refund_budget)
+        self.assertFalse(completion.force_halt)
+        self.assertEqual(
+            completion.retry_at,
+            NOW + timedelta(seconds=AUTONOMY_TRANSIENT_PROVIDER_RETRY_SECONDS),
+        )
 
     def test_proactive_message_is_sent_once_only_when_no_conversation_exists(self) -> None:
         clean_store = FakeStore(

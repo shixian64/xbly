@@ -148,6 +148,7 @@ try:
         UNFOLLOW_USER,
         AccountActionCommand,
         AccountActionError,
+        _browse_online_users,
         _identity_view,
         normalize_account_action,
         parameter_snapshot,
@@ -226,6 +227,70 @@ def _request(redis: _AtomicRedis) -> SimpleNamespace:
     f"production dependencies are not installed: {DEPENDENCY_IMPORT_ERROR}",
 )
 class ByokAccountActionRuntimeSafetyTests(unittest.TestCase):
+    def test_online_discovery_distinguishes_transport_and_business_failures(self) -> None:
+        context = _context(sid="")
+
+        def execute_failure(status: int) -> AccountActionError:
+            result = SimpleNamespace(
+                ok=False,
+                status=status,
+                code="",
+                kind="error",
+            )
+            web_user = SimpleNamespace(
+                internal_user_id=str(context.owner_user_id),
+                external_account_id=str(context.external_account_id),
+                authentication_source="provider",
+                stop_heartbeat=lambda: None,
+                app=SimpleNamespace(
+                    session=SimpleNamespace(
+                        uid=context.upstream_uid,
+                        raw_user={},
+                    ),
+                    client=SimpleNamespace(
+                        reauth_callback=object(),
+                        close=lambda: None,
+                    ),
+                    match=SimpleNamespace(online_users=lambda **_params: result),
+                ),
+            )
+
+            class Persistence:
+                def restore_agent_web_user(
+                    self,
+                    owner_user_id: uuid.UUID,
+                    external_account_id: uuid.UUID,
+                    *,
+                    expected_upstream_uid: str,
+                ) -> object:
+                    self.expected = (
+                        owner_user_id,
+                        external_account_id,
+                        expected_upstream_uid,
+                    )
+                    return web_user
+
+            with self.assertLogs("bbw_agent.action_executor", level="WARNING"):
+                with self.assertRaises(AccountActionError) as raised:
+                    _browse_online_users(
+                        identity=context,
+                        persistence=Persistence(),
+                        db=None,
+                        allow_external_fallback=True,
+                    )
+            return raised.exception
+
+        for status in (-1, 408, 429, 503):
+            with self.subTest(status=status):
+                self.assertEqual(
+                    execute_failure(status).code,
+                    "external_discovery_unavailable",
+                )
+        self.assertEqual(
+            execute_failure(400).code,
+            "external_discovery_failed",
+        )
+
     def test_confirmation_binds_body_owner_session_and_consumes_once(self) -> None:
         redis = _AtomicRedis()
         request = _request(redis)

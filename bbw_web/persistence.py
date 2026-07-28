@@ -580,6 +580,11 @@ return 1
         self._start_product_event_worker()
         self._start_history_response_worker()
 
+    def start_raw_response_archive(self) -> None:
+        """Start only the observer needed by short-lived Agent workers."""
+
+        self._start_raw_response_worker()
+
     def close(self) -> None:
         self._stop_history_response_worker()
         self._stop_product_event_worker()

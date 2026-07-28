@@ -58,6 +58,10 @@ AUTONOMY_REPLY_MAX_AGE_SECONDS = 2 * 60 * 60
 AUTONOMY_REPLY_CLOCK_SKEW_SECONDS = 5 * 60
 AUTONOMY_REPLY_SESSION_GAP_SECONDS = 6 * 60 * 60
 AUTONOMY_REPLY_DEBOUNCE_SECONDS = 30
+AUTONOMY_TRANSIENT_PROVIDER_RETRY_SECONDS = 5 * 60
+AUTONOMY_RETRYABLE_ACTION_ERROR_CODES = frozenset(
+    {"external_discovery_unavailable"}
+)
 AUTONOMY_NO_REPLY_SENTINEL = "[[NO_REPLY]]"
 AUTONOMY_GENERATED_TEXT_STYLE_RULES = (
     "控制口头语：每条最多使用一个语气词，不得以‘哈哈’‘嗯’‘啊’‘哦’等"
@@ -1268,13 +1272,24 @@ class TaskCompletion:
     count_failure: bool = False
     reset_failures: bool = False
     force_halt: bool = False
+    retryable: bool = False
+    refund_budget: bool = False
+    retry_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.status not in TERMINAL_TASK_STATUSES:
             raise ValueError("task completion must use a terminal status")
         code = str(self.stable_error_code or "").strip().lower()
         if self.status == AutonomyTaskStatus.SUCCEEDED:
-            if code or self.outcome_unknown or self.count_failure or self.force_halt:
+            if (
+                code
+                or self.outcome_unknown
+                or self.count_failure
+                or self.force_halt
+                or self.retryable
+                or self.refund_budget
+                or self.retry_at is not None
+            ):
                 raise ValueError("successful completion cannot contain failure state")
         elif not _STABLE_CODE.fullmatch(code):
             raise ValueError("non-success completion requires a stable error code")
@@ -1286,8 +1301,25 @@ class TaskCompletion:
             raise ValueError("unknown outcomes must count as failures")
         if self.outcome_unknown and not self.force_halt:
             raise ValueError("unknown outcomes must halt unattended execution")
+        if self.retryable and (
+            self.status != AutonomyTaskStatus.FAILED
+            or not self.count_failure
+            or self.outcome_unknown
+            or self.force_halt
+            or not self.refund_budget
+            or self.retry_at is None
+        ):
+            raise ValueError(
+                "retryable failures must be known, counted and budget-refunded"
+            )
+        if self.refund_budget and not self.retryable:
+            raise ValueError("budget refunds require a retryable failure")
+        if self.retry_at is not None and not self.retryable:
+            raise ValueError("retry timestamps require a retryable failure")
         object.__setattr__(self, "stable_error_code", code)
         object.__setattr__(self, "result_id", str(self.result_id or "")[:256])
+        if self.retry_at is not None:
+            object.__setattr__(self, "retry_at", _aware_utc(self.retry_at))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1849,6 +1881,21 @@ class AgentAutonomyOrchestrator:
                     stable_error_code=dispatched.stable_error_code,
                 ),
                 now=self._now(),
+            )
+        if dispatched.stable_error_code in AUTONOMY_RETRYABLE_ACTION_ERROR_CODES:
+            completed_at = self._now()
+            return self._finish(
+                dispatch_task,
+                TaskCompletion(
+                    status=AutonomyTaskStatus.FAILED,
+                    stable_error_code=dispatched.stable_error_code,
+                    count_failure=True,
+                    retryable=True,
+                    refund_budget=True,
+                    retry_at=completed_at
+                    + timedelta(seconds=AUTONOMY_TRANSIENT_PROVIDER_RETRY_SECONDS),
+                ),
+                now=completed_at,
             )
         return self._finish(
             dispatch_task,
