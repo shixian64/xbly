@@ -492,18 +492,31 @@ class RelationshipAgentSourceContractTests(unittest.TestCase):
         self.assertIn("aiAgentChatSuggestionsEnabled: false", app)
         self.assertIn("在聊天界面显示聊天建议", app)
         self.assertIn("默认关闭；开启后可在当前会话中生成", app)
+        self.assertIn("联系人自动回复设置始终显示", app)
         access = self.javascript_function_source(
             "bbw_web/static/app.js", "setAiAgentAccess"
         )
         self.assertIn("status?.settings?.chat_suggestions_enabled === true", access)
+        self.assertIn("if (!nextEnabled)", access)
+        self.assertIn("if (!nextChatSuggestionsEnabled)", access)
         chat = self.javascript_function_source(
             "bbw_web/static/app.js", "chatAgentAssistHtml"
         )
-        self.assertIn("!S.aiAgentChatSuggestionsEnabled", chat)
+        self.assertNotIn("!S.aiAgentChatSuggestionsEnabled", chat)
         load = self.javascript_function_source(
             "bbw_web/static/app.js", "loadChatAssistStatus"
         )
-        self.assertIn("!S.aiAgentChatSuggestionsEnabled", load)
+        self.assertNotIn("!S.aiAgentChatSuggestionsEnabled", load)
+        content = self.javascript_function_source(
+            "bbw_web/static/app.js", "chatAgentAssistContentHtml"
+        )
+        self.assertIn("const suggestionsEnabled", content)
+        self.assertIn("联系人自动回复", content)
+        self.assertIn("data-chat-agent-mode", content)
+        generate = self.javascript_function_source(
+            "bbw_web/static/app.js", "generateChatAgentSuggestion"
+        )
+        self.assertIn("!S.aiAgentChatSuggestionsEnabled", generate)
         forms = self.javascript_function_source(
             "bbw_web/static/app.js", "handleProductForm"
         )

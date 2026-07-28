@@ -243,6 +243,27 @@ def _setting_category_limit(setting: Any, category: str) -> int:
     return min(total, AUTONOMY_MATCH_DAILY_LIMIT)
 
 
+def autonomy_daily_budget_available(
+    usage: Any | None,
+    setting: Any,
+    *,
+    task_type: str,
+    action_type: str,
+) -> bool:
+    total_count = int(getattr(usage, "total_actions", 0) or 0)
+    total_limit = max(
+        1,
+        int(getattr(setting, "daily_total_limit", 1) or 1),
+    )
+    if total_count >= total_limit:
+        return False
+    category = _autonomy_usage_category(task_type, action_type)
+    return _autonomy_usage_count(usage, category) < _setting_category_limit(
+        setting,
+        category,
+    )
+
+
 class ModelRunnerSystemSettingRepository:
     def __init__(self, db: Session) -> None:
         self.db = db
@@ -2436,6 +2457,51 @@ class AgentAutonomyTaskRepository:
                 .limit(1)
             )
         )
+
+    def cancel_budget_exhausted_not_started(
+        self,
+        *,
+        owner_user_id: uuid.UUID,
+        usage: Any | None,
+        setting: Any,
+        at: datetime,
+    ) -> int:
+        rows = list(
+            self.db.scalars(
+                select(AiAgentAutonomyTask)
+                .where(
+                    AiAgentAutonomyTask.owner_user_id == owner_user_id,
+                    AiAgentAutonomyTask.status.in_(("queued", "deferred")),
+                )
+                .order_by(
+                    AiAgentAutonomyTask.queued_at,
+                    AiAgentAutonomyTask.id,
+                )
+                .with_for_update(skip_locked=True)
+            )
+        )
+        cancelled = 0
+        for task in rows:
+            if autonomy_daily_budget_available(
+                usage,
+                setting,
+                task_type=str(task.task_type or ""),
+                action_type=str(task.action_type or ""),
+            ):
+                continue
+            task.status = "cancelled"
+            task.stable_error_code = "dispatch_daily_budget_exhausted"
+            task.result_id = None
+            task.outcome_unknown = False
+            task.completed_at = at
+            task.lease_owner = None
+            task.lease_token = None
+            task.lease_until = None
+            task.updated_at = at
+            cancelled += 1
+        if cancelled:
+            self.db.flush()
+        return cancelled
 
     def cancel_superseded_reply_tasks(
         self,

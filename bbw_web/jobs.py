@@ -3225,10 +3225,12 @@ def _schedule_autonomy_owner(
         quiet_window_end,
     )
     from bbw_agent.repositories import (
+        AgentAutonomyDailyUsageRepository,
         AgentContactPolicyRepository,
         AgentDiscoveryCandidateRepository,
         AgentAutonomySettingRepository,
         AgentAutonomyTaskRepository,
+        autonomy_daily_budget_available,
     )
     from bbw_agent.runtime import policy_from_rows
 
@@ -3298,6 +3300,28 @@ def _schedule_autonomy_owner(
             owner_user_id=owner_user_id,
             at=now,
         )
+        usage_today = AgentAutonomyDailyUsageRepository(db).get(
+            owner_user_id,
+            policy_budget_day(policy, now=now),
+        )
+        tasks.cancel_budget_exhausted_not_started(
+            owner_user_id=owner_user_id,
+            usage=usage_today,
+            setting=setting,
+            at=now,
+        )
+
+        def has_daily_budget(
+            task_type: AutonomyTaskType,
+            action_type: str,
+        ) -> bool:
+            return autonomy_daily_budget_available(
+                usage_today,
+                setting,
+                task_type=task_type.value,
+                action_type=action_type,
+            )
+
         if tasks.has_open_task(owner_user_id=owner_user_id):
             setting.last_run_at = now
             setting.next_run_at = now + timedelta(
@@ -3312,6 +3336,10 @@ def _schedule_autonomy_owner(
         if (
             policy.auto_reply_enabled
             and remaining > 0
+            and has_daily_budget(
+                AutonomyTaskType.REPLY_TO_MESSAGE,
+                SEND_PRIVATE_MESSAGE,
+            )
             and setting.auto_reply_started_at is not None
             and not tasks.has_open_task_type(
                 owner_user_id=owner_user_id,
@@ -3414,6 +3442,10 @@ def _schedule_autonomy_owner(
         browse_due = bool(
             policy.discovery_enabled
             and remaining > 0
+            and has_daily_budget(
+                AutonomyTaskType.BROWSE_ONLINE,
+                BROWSE_ONLINE_USERS,
+            )
             and not tasks.has_open_task_type(
                 owner_user_id=owner_user_id,
                 task_type=AutonomyTaskType.BROWSE_ONLINE.value,
@@ -3459,6 +3491,10 @@ def _schedule_autonomy_owner(
         match_due = bool(
             policy.text_match_enabled
             and remaining > 0
+            and has_daily_budget(
+                AutonomyTaskType.REQUEST_MATCH,
+                REQUEST_TEXT_MATCH,
+            )
             and not tasks.has_open_task_type(
                 owner_user_id=owner_user_id,
                 task_type=AutonomyTaskType.REQUEST_MATCH.value,
@@ -3500,6 +3536,10 @@ def _schedule_autonomy_owner(
         post_due = bool(
             policy.scheduled_posts_enabled
             and remaining > 0
+            and has_daily_budget(
+                AutonomyTaskType.SCHEDULED_POST,
+                PUBLISH_TEXT_POST,
+            )
             and (
                 setting.last_post_at is None
                 or setting.last_post_at
@@ -3559,6 +3599,8 @@ def _schedule_autonomy_owner(
                     action = UNFOLLOW_USER
                     task_type = AutonomyTaskType.UNFOLLOW_TARGET
                 if task_type is None:
+                    continue
+                if not has_daily_budget(task_type, action):
                     continue
                 source_identity = f"relationship:{action}:{target}:{budget_day}"
                 key = deterministic_task_key(
@@ -3644,6 +3686,8 @@ def _schedule_autonomy_owner(
                 if planned is None:
                     continue
                 task_type, action = planned
+                if not has_daily_budget(task_type, action):
+                    continue
                 key = deterministic_task_key(
                     owner_user_id=owner_user_id,
                     task_type=task_type,

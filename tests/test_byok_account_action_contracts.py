@@ -24,10 +24,12 @@ try:
         AgentActionExecutionRepository,
         AgentAutonomyDailyUsageRepository,
         AgentAutonomySettingRepository,
+        AgentAutonomyTaskRepository,
         AgentExecutionSettingRepository,
         AgentRunRepository,
         SUPPORTED_ACCOUNT_ACTION_TYPES,
         _normalize_action_type,
+        autonomy_daily_budget_available,
     )
     from bbw_prod.models import (
         AiAgentActionExecution,
@@ -864,12 +866,124 @@ class _ScalarsSession:
         self.calls += 1
         return self.rows
 
+    def flush(self) -> None:
+        self.calls += 1
+
 
 @unittest.skipIf(
     DEPENDENCY_IMPORT_ERROR is not None,
     f"production dependencies are not installed: {DEPENDENCY_IMPORT_ERROR}",
 )
 class ByokAutonomyDailyUsageRepositoryTests(unittest.TestCase):
+    def test_budget_availability_keeps_reply_capacity_when_browse_is_full(self) -> None:
+        setting = SimpleNamespace(
+            daily_total_limit=20,
+            daily_reply_limit=10,
+            daily_post_limit=1,
+            daily_relationship_limit=5,
+        )
+        usage = SimpleNamespace(
+            total_actions=13,
+            reply_actions=0,
+            outreach_actions=5,
+            post_actions=0,
+            relationship_actions=0,
+            browse_actions=8,
+            match_actions=0,
+        )
+
+        self.assertFalse(
+            autonomy_daily_budget_available(
+                usage,
+                setting,
+                task_type="browse_online",
+                action_type="browse_online_users",
+            )
+        )
+        self.assertTrue(
+            autonomy_daily_budget_available(
+                usage,
+                setting,
+                task_type="reply_to_message",
+                action_type="send_private_message",
+            )
+        )
+
+        usage.total_actions = 20
+        self.assertFalse(
+            autonomy_daily_budget_available(
+                usage,
+                setting,
+                task_type="reply_to_message",
+                action_type="send_private_message",
+            )
+        )
+
+    def test_budget_cleanup_only_cancels_the_exhausted_category(self) -> None:
+        now = datetime(2026, 7, 28, 6, 0, tzinfo=UTC)
+        browse = SimpleNamespace(
+            id=uuid.uuid4(),
+            task_type="browse_online",
+            action_type="browse_online_users",
+            status="queued",
+            stable_error_code=None,
+            result_id=None,
+            outcome_unknown=False,
+            completed_at=None,
+            lease_owner=None,
+            lease_token=None,
+            lease_until=None,
+            updated_at=now - timedelta(minutes=1),
+        )
+        reply = SimpleNamespace(
+            id=uuid.uuid4(),
+            task_type="reply_to_message",
+            action_type="send_private_message",
+            status="queued",
+            stable_error_code=None,
+            result_id=None,
+            outcome_unknown=False,
+            completed_at=None,
+            lease_owner=None,
+            lease_token=None,
+            lease_until=None,
+            updated_at=now - timedelta(minutes=1),
+        )
+        session = _ScalarsSession([browse, reply])
+        setting = SimpleNamespace(
+            daily_total_limit=20,
+            daily_reply_limit=10,
+            daily_post_limit=1,
+            daily_relationship_limit=5,
+        )
+        usage = SimpleNamespace(
+            total_actions=13,
+            reply_actions=0,
+            outreach_actions=5,
+            post_actions=0,
+            relationship_actions=0,
+            browse_actions=8,
+            match_actions=0,
+        )
+
+        cancelled = AgentAutonomyTaskRepository(
+            session
+        ).cancel_budget_exhausted_not_started(
+            owner_user_id=uuid.uuid4(),
+            usage=usage,
+            setting=setting,
+            at=now,
+        )
+
+        self.assertEqual(cancelled, 1)
+        self.assertEqual(browse.status, "cancelled")
+        self.assertEqual(
+            browse.stable_error_code,
+            "dispatch_daily_budget_exhausted",
+        )
+        self.assertEqual(browse.completed_at, now)
+        self.assertEqual(reply.status, "queued")
+
     def test_get_many_pairs_rows_by_owner_and_local_date(self) -> None:
         owner_a = uuid.uuid4()
         owner_b = uuid.uuid4()

@@ -373,6 +373,14 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         self.assertIn(
             "tasks.has_open_task(owner_user_id=owner_user_id)", owner_scheduler
         )
+        self.assertIn(
+            "tasks.cancel_budget_exhausted_not_started(", owner_scheduler
+        )
+        self.assertLess(
+            owner_scheduler.index("tasks.cancel_budget_exhausted_not_started("),
+            owner_scheduler.index("tasks.has_open_task(owner_user_id=owner_user_id)"),
+        )
+        self.assertGreaterEqual(owner_scheduler.count("has_daily_budget("), 7)
         self.assertIn("remaining = min(1, max(1, int(task_limit)))", owner_scheduler)
         self.assertIn(
             "seconds=AUTONOMY_CONTROL_INTERVAL_SECONDS", owner_scheduler
@@ -385,6 +393,25 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
             "AiAgentAutonomyTask.owner_user_id == owner_user_id", repository
         )
         self.assertIn("AUTONOMY_TERMINAL_STATUSES", repository)
+
+        cleanup, _ = self.function_source(
+            "bbw_agent/repositories.py",
+            "cancel_budget_exhausted_not_started",
+        )
+        self.assertIn('("queued", "deferred")', cleanup)
+        self.assertIn("autonomy_daily_budget_available(", cleanup)
+        self.assertIn('task.status = "cancelled"', cleanup)
+        self.assertIn(
+            'task.stable_error_code = "dispatch_daily_budget_exhausted"',
+            cleanup,
+        )
+
+        budget, _ = self.function_source(
+            "bbw_agent/repositories.py",
+            "autonomy_daily_budget_available",
+        )
+        self.assertIn("total_count >= total_limit", budget)
+        self.assertIn("_setting_category_limit", budget)
 
     def test_agent_run_type_constraints_use_alembic_complete_names(self) -> None:
         for migration in (
