@@ -2347,12 +2347,14 @@ function setAiAgentAccess(enabled, status = null, { redirect = true } = {}) {
     S.chatAssistRequestTokens.clear();
     S.chatAssistSuggestions.clear();
     document.querySelector("[data-chat-agent-assist]")?.remove();
+    document.querySelector("[data-chat-agent-contact-policy]")?.remove();
     clearAgentApiKeyInputs(document);
     clearViewCacheKey("agent");
   } else {
     if (!nextChatSuggestionsEnabled) {
       S.chatAssistGeneratingPeers.clear();
       S.chatAssistSuggestions.clear();
+      document.querySelector("[data-chat-agent-assist]")?.remove();
     }
     if ((changed || chatSuggestionsChanged) && S.activePeer) {
       void loadChatAssistStatus(S.activePeer, { force: true });
@@ -10749,8 +10751,8 @@ const CHAT_ASSIST_STAGE_LABELS = Object.freeze({
   manual_only: "始终人工",
   inactive: "暂停触达",
 });
-const CHAT_ASSIST_MODE_LABELS = Object.freeze({
-  suggest_only: "仅建议",
+const CHAT_CONTACT_MODE_LABELS = Object.freeze({
+  suggest_only: "不自动回复",
   auto_low_risk: "允许低风险自动回复",
   manual_only: "始终人工处理",
 });
@@ -10858,10 +10860,26 @@ function clearChatAssistRefreshTimer(peer) {
 }
 
 function refreshChatAgentAssistRegion() {
-  const region = document.querySelector("[data-chat-agent-assist]");
-  if (!region || String(region.dataset.peer || "") !== String(S.activePeer || "")) return false;
-  region.innerHTML = chatAgentAssistContentHtml();
-  return true;
+  const activePeer = String(S.activePeer || "");
+  let refreshed = false;
+  const contactPolicyRegion = document.querySelector("[data-chat-agent-contact-policy]");
+  if (
+    contactPolicyRegion &&
+    String(contactPolicyRegion.dataset.peer || "") === activePeer
+  ) {
+    contactPolicyRegion.innerHTML = chatAgentContactPolicyContentHtml();
+    refreshed = true;
+  }
+  const assistRegion = document.querySelector("[data-chat-agent-assist]");
+  if (assistRegion && String(assistRegion.dataset.peer || "") === activePeer) {
+    if (S.aiAgentChatSuggestionsEnabled) {
+      assistRegion.innerHTML = chatAgentAssistContentHtml();
+    } else {
+      assistRegion.remove();
+    }
+    refreshed = true;
+  }
+  return refreshed;
 }
 
 function scheduleChatAssistRefresh(peer, delay = 500) {
@@ -10925,28 +10943,19 @@ async function loadChatAssistStatus(peer, { force = false } = {}) {
   }
 }
 
-function chatAgentAssistContentHtml() {
+function chatAgentContactPolicyContentHtml() {
   const peer = String(S.activePeer || "");
-  const suggestionsEnabled = S.aiAgentChatSuggestionsEnabled;
   const loading = S.chatAssistLoadingPeers.has(peer);
-  const generating = suggestionsEnabled && S.chatAssistGeneratingPeers.has(peer);
-  const busy = loading || generating;
   const status = chatAssistEntry(peer);
-  const suggestion = suggestionsEnabled ? chatAssistSuggestion(peer) : null;
   if (!status) {
-    return `<div class="chat-agent-assist-loading">${loading ? "正在读取联系人 Agent 状态" : "联系人 Agent 状态尚未加载"}<button type="button" data-action="reload-chat-agent-assist">重新加载</button></div>`;
+    return `<span>联系人自动回复</span><button type="button" data-action="reload-chat-agent-assist" ${loading ? "disabled" : ""}>${loading ? "正在读取设置" : "读取设置"}</button>`;
   }
   if (status.error) {
-    return `<div class="chat-agent-assist-loading is-error"><span>${esc(status.error)}</span><button type="button" data-action="reload-chat-agent-assist">重试</button></div>`;
+    return `<span>联系人自动回复设置不可用</span><button type="button" data-action="reload-chat-agent-assist">重试</button>`;
   }
   const policy = status.policy || {};
   const capabilities = status.capabilities || {};
-  const stage = String(status.relationship_stage || "new");
   const mode = String(policy.mode || "suggest_only");
-  const risk = String(status.risk_boundary || "");
-  const addressTerms = Array.isArray(policy.allow_address_terms) ? policy.allow_address_terms : [];
-  const canSuggest = suggestionsEnabled && capabilities.can_suggest === true && !busy;
-  const suggestionReady = Boolean(suggestion?.text);
   const contactAutoReplyState = mode === "manual_only"
     ? "当前联系人始终由人工处理"
     : policy.persisted === true && mode === "auto_low_risk"
@@ -10956,47 +10965,76 @@ function chatAgentAssistContentHtml() {
           : "已允许低风险自动回复"
         : "联系人已授权，请先确认全局自动回复与自动发送均已开启"
       : "当前联系人尚未授权自动回复";
-  const suggestionState = !suggestionsEnabled
-    ? `${contactAutoReplyState}；聊天建议已关闭`
-    : suggestionReady
-      ? suggestion.accepted
-        ? "建议已采用，可继续修改后发送"
-        : suggestion.applied
-          ? "建议已写入输入框，请检查或修改后再发送"
-          : "建议已生成，点击采用后写入输入框"
-      : risk
-        ? `当前消息涉及${CHAT_ASSIST_RISK_LABELS[risk] || "人工处理边界"}，不会自动发送`
-        : capabilities.runner_ready
-          ? `${contactAutoReplyState}；建议只会写入输入框，不会直接发送`
-          : "请先在社交 Agent 中启用并测试模型连接";
-  const modeOptions = Object.entries(CHAT_ASSIST_MODE_LABELS)
+  const modeOptions = Object.entries(CHAT_CONTACT_MODE_LABELS)
     .map(([value, label]) => `<option value="${esc(value)}" ${value === mode ? "selected" : ""}>${esc(label)}</option>`)
     .join("");
-  const suggestionActions = suggestionsEnabled
-    ? `<button type="button" data-action="generate-chat-agent-suggestion" ${canSuggest ? "" : "disabled"}>${generating ? "正在生成" : "生成建议"}</button>
+  return `<label title="${esc(contactAutoReplyState)}"><span>联系人自动回复</span><select data-chat-agent-mode aria-label="联系人自动回复模式" ${loading ? "disabled" : ""}>${modeOptions}</select></label>`;
+}
+
+function chatAgentContactPolicyHtml() {
+  if (
+    !S.aiAgentAccessEnabled ||
+    !S.activePeer ||
+    isSystemCustomerServicePeer(S.activePeer)
+  ) return "";
+  return `<div class="chat-agent-contact-policy" data-chat-agent-contact-policy data-peer="${esc(
+    S.activePeer
+  )}" aria-label="联系人自动回复设置">${chatAgentContactPolicyContentHtml()}</div>`;
+}
+
+function chatAgentAssistContentHtml() {
+  const peer = String(S.activePeer || "");
+  const loading = S.chatAssistLoadingPeers.has(peer);
+  const generating = S.chatAssistGeneratingPeers.has(peer);
+  const busy = loading || generating;
+  const status = chatAssistEntry(peer);
+  const suggestion = chatAssistSuggestion(peer);
+  if (!status) {
+    return `<div class="chat-agent-assist-loading">${loading ? "正在读取聊天建议状态" : "聊天建议状态尚未加载"}<button type="button" data-action="reload-chat-agent-assist">重新加载</button></div>`;
+  }
+  if (status.error) {
+    return `<div class="chat-agent-assist-loading is-error"><span>${esc(status.error)}</span><button type="button" data-action="reload-chat-agent-assist">重试</button></div>`;
+  }
+  const policy = status.policy || {};
+  const capabilities = status.capabilities || {};
+  const stage = String(status.relationship_stage || "new");
+  const risk = String(status.risk_boundary || "");
+  const addressTerms = Array.isArray(policy.allow_address_terms) ? policy.allow_address_terms : [];
+  const canSuggest = capabilities.can_suggest === true && !busy;
+  const suggestionReady = Boolean(suggestion?.text);
+  const suggestionState = suggestionReady
+    ? suggestion.accepted
+      ? "建议已采用，可继续修改后发送"
+      : suggestion.applied
+        ? "建议已写入输入框，请检查或修改后再发送"
+        : "建议已生成，点击采用后写入输入框"
+    : risk
+      ? `当前消息涉及${CHAT_ASSIST_RISK_LABELS[risk] || "人工处理边界"}，不会自动发送`
+      : capabilities.runner_ready
+        ? "建议只会写入输入框，不会直接发送"
+        : "请先在社交 Agent 中启用并测试模型连接";
+  return `<div class="chat-agent-assist-head"><div><strong>聊天建议</strong><span>关系阶段：${esc(
+    CHAT_ASSIST_STAGE_LABELS[stage] || stage
+  )} · 上下文 ${Math.max(0, Number(status.context_message_count || 0))} 条</span></div></div>
+    <div class="chat-agent-assist-meta"><span>称呼白名单：${esc(addressTerms.join("、") || "无")}</span><span>${esc(suggestionState)}</span></div>
+    <div class="chat-agent-assist-actions" role="group" aria-label="聊天建议操作">
+      <button type="button" data-action="generate-chat-agent-suggestion" ${canSuggest ? "" : "disabled"}>${generating ? "正在生成" : "生成建议"}</button>
       <button type="button" data-action="rewrite-chat-agent-suggestion" ${canSuggest && suggestionReady ? "" : "disabled"}>换一种表达</button>
       <button type="button" data-action="adopt-chat-agent-suggestion" ${suggestionReady && !suggestion.accepted ? "" : "disabled"}>采用</button>
-      <button type="button" data-action="dismiss-chat-agent-suggestion" ${suggestionReady ? "" : "disabled"}>不回复</button>`
-    : "";
-  return `<div class="chat-agent-assist-head"><div><strong>${suggestionsEnabled ? "聊天建议与自动回复" : "联系人自动回复"}</strong><span>关系阶段：${esc(
-    CHAT_ASSIST_STAGE_LABELS[stage] || stage
-  )} · 上下文 ${Math.max(0, Number(status.context_message_count || 0))} 条</span></div><label>联系人模式<select data-chat-agent-mode ${busy ? "disabled" : ""}>${modeOptions}</select></label></div>
-    <div class="chat-agent-assist-meta"><span>称呼白名单：${esc(addressTerms.join("、") || "无")}</span><span>${esc(suggestionState)}</span></div>
-    <div class="chat-agent-assist-actions" role="group" aria-label="联系人 Agent 操作">
-      ${suggestionActions}
-      <button type="button" data-action="set-chat-agent-manual-only" ${mode === "manual_only" || busy ? "disabled" : ""}>始终人工处理</button>
+      <button type="button" data-action="dismiss-chat-agent-suggestion" ${suggestionReady ? "" : "disabled"}>不回复</button>
     </div>`;
 }
 
 function chatAgentAssistHtml() {
   if (
     !S.aiAgentAccessEnabled ||
+    !S.aiAgentChatSuggestionsEnabled ||
     !S.activePeer ||
     isSystemCustomerServicePeer(S.activePeer)
   ) return "";
   return `<section class="chat-agent-assist" data-chat-agent-assist data-peer="${esc(
     S.activePeer
-  )}" aria-label="聊天 Agent 辅助">${chatAgentAssistContentHtml()}</section>`;
+  )}" aria-label="聊天建议">${chatAgentAssistContentHtml()}</section>`;
 }
 
 async function updateChatAgentPolicy(peer, updates) {
@@ -11176,7 +11214,7 @@ function chatPaneHtml() {
     true
   )}</p></div><div class="chat-head-actions"><button type="button" class="utility-btn" data-action="open-conversation-message-search">查找聊天记录</button><button type="button" class="utility-btn chat-profile" data-action="open-profile" data-uid="${esc(
     S.activePeer
-  )}">资料</button></div></div>
+  )}">资料</button></div></div>${chatAgentContactPolicyHtml()}
     <div class="chat-log ui-scrollbar" id="im-log" aria-live="polite">${chatLogHtml()}</div>
     ${
       isSystemCustomerServicePeer(S.activePeer)
@@ -20507,7 +20545,7 @@ document.addEventListener("change", (event) => {
     chatAgentMode.disabled = true;
     void updateChatAgentPolicy(peer, { mode: nextMode })
       .then(() => {
-        toast(`联系人模式已设为${CHAT_ASSIST_MODE_LABELS[nextMode] || nextMode}`);
+        toast(`联系人自动回复已设为${CHAT_CONTACT_MODE_LABELS[nextMode] || nextMode}`);
       })
       .catch((error) => {
         chatAgentMode.value = previousMode;

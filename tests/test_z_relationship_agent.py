@@ -502,7 +502,13 @@ class RelationshipAgentSourceContractTests(unittest.TestCase):
         chat = self.javascript_function_source(
             "bbw_web/static/app.js", "chatAgentAssistHtml"
         )
-        self.assertNotIn("!S.aiAgentChatSuggestionsEnabled", chat)
+        self.assertIn("!S.aiAgentChatSuggestionsEnabled", chat)
+        self.assertIn('aria-label="聊天建议"', chat)
+        contact = self.javascript_function_source(
+            "bbw_web/static/app.js", "chatAgentContactPolicyHtml"
+        )
+        self.assertNotIn("!S.aiAgentChatSuggestionsEnabled", contact)
+        self.assertIn("data-chat-agent-contact-policy", contact)
         load = self.javascript_function_source(
             "bbw_web/static/app.js", "loadChatAssistStatus"
         )
@@ -510,9 +516,15 @@ class RelationshipAgentSourceContractTests(unittest.TestCase):
         content = self.javascript_function_source(
             "bbw_web/static/app.js", "chatAgentAssistContentHtml"
         )
-        self.assertIn("const suggestionsEnabled", content)
-        self.assertIn("联系人自动回复", content)
-        self.assertIn("data-chat-agent-mode", content)
+        self.assertIn("聊天建议", content)
+        self.assertNotIn("联系人自动回复", content)
+        self.assertNotIn("data-chat-agent-mode", content)
+        contact_content = self.javascript_function_source(
+            "bbw_web/static/app.js", "chatAgentContactPolicyContentHtml"
+        )
+        self.assertIn("联系人自动回复", contact_content)
+        self.assertIn("data-chat-agent-mode", contact_content)
+        self.assertNotIn("chatAssistSuggestion(", contact_content)
         generate = self.javascript_function_source(
             "bbw_web/static/app.js", "generateChatAgentSuggestion"
         )
@@ -590,7 +602,7 @@ class RelationshipAgentSourceContractTests(unittest.TestCase):
             "采用",
             "不回复",
             "始终人工处理",
-            "仅建议",
+            "不自动回复",
             "允许低风险自动回复",
             "称呼白名单",
         ):
@@ -608,6 +620,7 @@ class RelationshipAgentSourceContractTests(unittest.TestCase):
         self.assertLess(generate.index("const previousDraft"), generate.index("await api("))
 
         css = self.read("bbw_web/static/app.css")
+        self.assertIn(".chat-agent-contact-policy", css)
         self.assertIn(".chat-agent-assist-head", css)
         self.assertIn(".chat-agent-assist-actions", css)
         self.assertIn("overflow-x: auto", css)

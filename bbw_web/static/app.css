@@ -2916,6 +2916,62 @@ summary:focus-visible {
   gap: 0.4rem;
 }
 
+.chat-agent-contact-policy {
+  display: flex;
+  min-width: 0;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.55rem;
+  border-bottom: 1px solid var(--line);
+  background: rgba(249, 249, 251, 0.96);
+  padding: 0.38rem 0.75rem;
+  color: var(--muted);
+  font-size: 0.66rem;
+  line-height: 1.35;
+}
+
+.chat-agent-contact-policy label {
+  display: flex;
+  min-width: 0;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.55rem;
+}
+
+.chat-agent-contact-policy select,
+.chat-agent-contact-policy button {
+  min-height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--text);
+  padding: 0.25rem 0.46rem;
+  font: inherit;
+  font-size: 0.65rem;
+}
+
+.chat-agent-contact-policy select {
+  max-width: 15rem;
+}
+
+.chat-agent-contact-policy button {
+  color: var(--muted);
+  font-weight: 680;
+}
+
+.chat-agent-contact-policy button:hover,
+.chat-agent-contact-policy button:focus-visible {
+  border-color: rgba(117, 79, 181, 0.32);
+  background: var(--brand-soft);
+  color: var(--brand-dark);
+}
+
+.chat-agent-contact-policy button:disabled {
+  opacity: 0.56;
+}
+
 .chat-peer-presence {
   display: flex;
   align-items: center;
@@ -6065,6 +6121,17 @@ html.flash-viewing body {
     backdrop-filter: none;
   }
 
+  .chat-agent-contact-policy {
+    padding: 0.35rem max(0.7rem, var(--safe-right)) 0.35rem max(0.7rem, var(--safe-left));
+  }
+
+  .chat-agent-contact-policy select {
+    min-width: 0;
+    max-width: min(65vw, 15rem);
+    flex: 1 1 auto;
+    font-size: 16px;
+  }
+
   .mobile-only {
     display: inline-flex !important;
   }
@@ -6641,18 +6708,6 @@ html.flash-viewing body {
     gap: 0.4rem;
   }
 
-  .chat-agent-assist-head label {
-    width: 100%;
-    justify-content: space-between;
-  }
-
-  .chat-agent-assist-head select {
-    min-width: 0;
-    max-width: none;
-    flex: 1 1 auto;
-    font-size: 16px;
-  }
-
   .chat-agent-assist-actions {
     flex-wrap: nowrap;
     overflow-x: auto;
@@ -6858,6 +6913,11 @@ html.flash-viewing body {
 
   .chat-agent-assist-actions button,
   .chat-agent-assist-loading button {
+    min-height: 44px;
+  }
+
+  .chat-agent-contact-policy select,
+  .chat-agent-contact-policy button {
     min-height: 44px;
   }
 
