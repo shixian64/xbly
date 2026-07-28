@@ -158,6 +158,7 @@ const S = {
   inviteLoginAvailable: null,
   labEnabled: false,
   aiAgentAccessEnabled: false,
+  aiAgentChatSuggestionsEnabled: false,
   aiAgentAccessRefreshSeq: 0,
   aiAgentModelReady: false,
   aiAgentExecutionAccessEnabled: false,
@@ -2327,12 +2328,17 @@ function setAiAgentAutonomyStatus(status) {
 function setAiAgentAccess(enabled, status = null, { redirect = true } = {}) {
   S.aiAgentAccessRefreshSeq += 1;
   const nextEnabled = enabled === true;
+  const nextChatSuggestionsEnabled =
+    nextEnabled && status?.settings?.chat_suggestions_enabled === true;
   const changed = S.aiAgentAccessEnabled !== nextEnabled;
+  const chatSuggestionsChanged =
+    S.aiAgentChatSuggestionsEnabled !== nextChatSuggestionsEnabled;
   S.aiAgentAccessEnabled = nextEnabled;
+  S.aiAgentChatSuggestionsEnabled = nextChatSuggestionsEnabled;
   S.aiAgentModelReady = nextEnabled && status?.settings?.ready === true;
   setAiAgentExecutionStatus(nextEnabled ? status : null);
   setAiAgentAutonomyStatus(nextEnabled ? status : null);
-  if (!nextEnabled) {
+  if (!nextChatSuggestionsEnabled) {
     S.chatAssistRefreshTimers.forEach((timer) => clearTimeout(timer));
     S.chatAssistRefreshTimers.clear();
     S.chatAssistByPeer.clear();
@@ -2341,10 +2347,12 @@ function setAiAgentAccess(enabled, status = null, { redirect = true } = {}) {
     S.chatAssistRequestTokens.clear();
     S.chatAssistSuggestions.clear();
     document.querySelector("[data-chat-agent-assist]")?.remove();
+  } else if ((changed || chatSuggestionsChanged) && S.activePeer) {
+    void loadChatAssistStatus(S.activePeer, { force: true });
+  }
+  if (!nextEnabled) {
     clearAgentApiKeyInputs(document);
     clearViewCacheKey("agent");
-  } else if (changed && S.activePeer) {
-    void loadChatAssistStatus(S.activePeer, { force: true });
   }
   if (changed) buildNav();
   if (!nextEnabled && redirect && S.authenticated && S.route === "agent") {
@@ -10854,7 +10862,12 @@ function refreshChatAgentAssistRegion() {
 
 function scheduleChatAssistRefresh(peer, delay = 500) {
   const target = String(peer || "").trim();
-  if (!target || !S.aiAgentAccessEnabled || isSystemCustomerServicePeer(target)) return;
+  if (
+    !target ||
+    !S.aiAgentAccessEnabled ||
+    !S.aiAgentChatSuggestionsEnabled ||
+    isSystemCustomerServicePeer(target)
+  ) return;
   clearChatAssistRefreshTimer(target);
   const timer = setTimeout(() => {
     S.chatAssistRefreshTimers.delete(target);
@@ -10865,7 +10878,12 @@ function scheduleChatAssistRefresh(peer, delay = 500) {
 
 async function loadChatAssistStatus(peer, { force = false } = {}) {
   const target = String(peer || "").trim();
-  if (!target || !S.aiAgentAccessEnabled || isSystemCustomerServicePeer(target)) return null;
+  if (
+    !target ||
+    !S.aiAgentAccessEnabled ||
+    !S.aiAgentChatSuggestionsEnabled ||
+    isSystemCustomerServicePeer(target)
+  ) return null;
   if (S.chatAssistLoadingPeers.has(target) && !force) return chatAssistEntry(target);
   const token = `${Date.now()}:${Math.random()}`;
   S.chatAssistRequestTokens.set(target, token);
@@ -10954,7 +10972,12 @@ function chatAgentAssistContentHtml() {
 }
 
 function chatAgentAssistHtml() {
-  if (!S.aiAgentAccessEnabled || !S.activePeer || isSystemCustomerServicePeer(S.activePeer)) return "";
+  if (
+    !S.aiAgentAccessEnabled ||
+    !S.aiAgentChatSuggestionsEnabled ||
+    !S.activePeer ||
+    isSystemCustomerServicePeer(S.activePeer)
+  ) return "";
   return `<section class="chat-agent-assist" data-chat-agent-assist data-peer="${esc(
     S.activePeer
   )}" aria-label="聊天 Agent 辅助">${chatAgentAssistContentHtml()}</section>`;
@@ -10984,6 +11007,7 @@ async function updateChatAgentPolicy(peer, updates) {
 async function generateChatAgentSuggestion(peer, { rewrite = false } = {}) {
   const target = String(peer || "").trim();
   if (!target) throw new Error("当前会话不可用");
+  if (!S.aiAgentChatSuggestionsEnabled) throw new Error("聊天建议已关闭");
   const previous = chatAssistSuggestion(target);
   const activeAtStart = target === String(S.activePeer || "");
   const inputAtStart = activeAtStart ? $("im-text") : null;
@@ -11014,6 +11038,7 @@ async function generateChatAgentSuggestion(peer, { rewrite = false } = {}) {
     if (!ok || data?.ok === false) {
       throw new Error(errorInfo(data, "回复建议生成失败").title);
     }
+    if (!S.aiAgentChatSuggestionsEnabled) return "";
     const draft = String(data?.draft || "").trim();
     if (!draft) throw new Error("模型没有生成可用建议");
     if (data?.assist_status && typeof data.assist_status === "object") {
@@ -16517,6 +16542,10 @@ async function pageAgent(signal, { data: prefetchedData = null } = {}) {
             <label class="check-line agent-primary-toggle"><input name="user_enabled" type="checkbox" ${
               settings.user_enabled ? "checked" : ""
             } /><span>启用个人模型运行器</span></label>
+            <label class="check-line"><input name="chat_suggestions_enabled" type="checkbox" ${
+              settings.chat_suggestions_enabled ? "checked" : ""
+            } /><span>在聊天界面显示聊天建议</span></label>
+            <p class="field-help">默认关闭；开启后可在当前会话中生成、换写和采用建议，建议不会直接发送。</p>
             <details class="agent-inline-details"><summary>写作偏好与生成参数</summary><div class="agent-details-body">
               <div class="field"><label for="agent-custom-instructions">个人写作要求</label><textarea id="agent-custom-instructions" name="custom_instructions" rows="4" maxlength="4000" placeholder="例如表达自然直接，少用语气词，不连续使用哈哈；不要填写账号密码或其他密钥">${esc(
                 settings.custom_instructions || ""
@@ -19598,6 +19627,9 @@ async function handleProductForm(form, submitter, submittedValues = null) {
       method: "PUT",
       body: JSON.stringify({
         user_enabled: Boolean(form.elements.namedItem("user_enabled")?.checked),
+        chat_suggestions_enabled: Boolean(
+          form.elements.namedItem("chat_suggestions_enabled")?.checked
+        ),
         custom_instructions: String(values.custom_instructions || ""),
         temperature: Number(values.temperature || 0.7),
         max_output_tokens: Number(values.max_output_tokens || 512),

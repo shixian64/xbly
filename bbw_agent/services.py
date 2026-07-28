@@ -400,6 +400,7 @@ def settings_public(
     if row is None:
         return {
             "user_enabled": False,
+            "chat_suggestions_enabled": False,
             "mode": "draft",
             "custom_instructions": "",
             "temperature": 0.7,
@@ -409,6 +410,9 @@ def settings_public(
         }
     return {
         "user_enabled": bool(row.user_enabled),
+        "chat_suggestions_enabled": bool(
+            getattr(row, "chat_suggestions_enabled", False)
+        ),
         "mode": row.mode,
         "custom_instructions": str(row.custom_instructions or ""),
         "temperature": round(int(row.temperature_milli) / 1000, 3),
@@ -1079,6 +1083,7 @@ def save_agent_settings(
     *,
     owner_user_id: uuid.UUID,
     user_enabled: bool,
+    chat_suggestions_enabled: bool,
     custom_instructions: str,
     temperature: float,
     max_output_tokens: int,
@@ -1123,6 +1128,7 @@ def save_agent_settings(
     if not 1 <= int(context_message_limit) <= 100:
         raise AgentServiceError("context_limit_invalid", "上下文消息数量设置无效")
     row.user_enabled = bool(user_enabled)
+    row.chat_suggestions_enabled = bool(chat_suggestions_enabled)
     row.custom_instructions = instructions or None
     row.temperature_milli = round(normalized_temperature * 1000)
     row.max_output_tokens = int(max_output_tokens)

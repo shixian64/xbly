@@ -819,6 +819,9 @@ class AiAgentSetting(UUIDPrimaryKeyMixin, TimestampMixin, SerializableMixin, Bas
     user_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
+    chat_suggestions_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     mode: Mapped[str] = mapped_column(
         String(24), nullable=False, default="draft", server_default="draft"
     )

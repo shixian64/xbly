@@ -478,7 +478,15 @@ class ByokPermissionTests(unittest.TestCase):
             last_test_status="failed",
         )
 
-        self.assertFalse(settings_public(setting, connection=connection)["ready"])
+        public = settings_public(setting, connection=connection)
+        self.assertFalse(public["ready"])
+        self.assertFalse(public["chat_suggestions_enabled"])
+        setting.chat_suggestions_enabled = True
+        self.assertTrue(
+            settings_public(setting, connection=connection)[
+                "chat_suggestions_enabled"
+            ]
+        )
         connection.last_test_status = "ok"
         self.assertTrue(settings_public(setting, connection=connection)["ready"])
 

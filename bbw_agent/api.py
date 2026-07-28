@@ -119,6 +119,7 @@ class ModelConnectionBody(_StrictBody):
 
 class AgentSettingsBody(_StrictBody):
     user_enabled: StrictBool = False
+    chat_suggestions_enabled: StrictBool = False
     custom_instructions: str = Field(default="", max_length=4000)
     temperature: float = Field(default=0.7, ge=0, le=2)
     max_output_tokens: int = Field(default=512, ge=64, le=4096)
@@ -1040,6 +1041,7 @@ def update_agent_settings(
                 db,
                 owner_user_id=context.owner_user_id,
                 user_enabled=body.user_enabled,
+                chat_suggestions_enabled=body.chat_suggestions_enabled,
                 custom_instructions=body.custom_instructions,
                 temperature=body.temperature,
                 max_output_tokens=body.max_output_tokens,
@@ -1087,6 +1089,9 @@ def update_agent_settings(
                 client_ip=context.client_ip,
                 details={
                     "user_enabled": bool(row.user_enabled),
+                    "chat_suggestions_enabled": bool(
+                        row.chat_suggestions_enabled
+                    ),
                     "temperature_milli": int(row.temperature_milli),
                     "max_output_tokens": int(row.max_output_tokens),
                     "context_message_limit": int(row.context_message_limit),

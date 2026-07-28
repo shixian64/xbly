@@ -440,6 +440,75 @@ class RelationshipAgentSourceContractTests(unittest.TestCase):
         self.assertIn('server_default="suggest_only"', policy)
         self.assertIn('"peer_upstream_uid", "allow_address_terms"', policy)
 
+    def test_chat_suggestions_are_hidden_by_default_and_controlled_from_agent(self) -> None:
+        migration = self.read(
+            "migrations/versions/20260728_0026_chat_suggestion_visibility.py"
+        )
+        self.assertIn('revision: str = "20260728_0026"', migration)
+        self.assertIn(
+            'down_revision: Union[str, Sequence[str], None] = "20260727_0025"',
+            migration,
+        )
+        self.assertIn('"chat_suggestions_enabled"', migration)
+        self.assertIn('server_default=sa.text("false")', migration)
+
+        models = self.read("bbw_prod/models.py")
+        setting = models.split("class AiAgentSetting(", 1)[1].split(
+            "class AiAgentExecutionSetting(", 1
+        )[0]
+        self.assertIn("chat_suggestions_enabled: Mapped[bool]", setting)
+        self.assertIn('server_default=text("false")', setting)
+
+        api = self.read("bbw_agent/api.py")
+        body = api.split("class AgentSettingsBody(", 1)[1].split(
+            "class IdempotentRunBody(", 1
+        )[0]
+        self.assertIn("chat_suggestions_enabled: StrictBool = False", body)
+        update_settings = self.function_source(
+            "bbw_agent/api.py", "update_agent_settings"
+        )
+        self.assertIn(
+            "chat_suggestions_enabled=body.chat_suggestions_enabled",
+            update_settings,
+        )
+
+        public_settings = self.function_source(
+            "bbw_agent/services.py", "settings_public"
+        )
+        self.assertIn('"chat_suggestions_enabled": False', public_settings)
+        self.assertIn(
+            'getattr(row, "chat_suggestions_enabled", False)',
+            public_settings,
+        )
+        save_settings = self.function_source(
+            "bbw_agent/services.py", "save_agent_settings"
+        )
+        self.assertIn(
+            "row.chat_suggestions_enabled = bool(chat_suggestions_enabled)",
+            save_settings,
+        )
+
+        app = self.read("bbw_web/static/app.js")
+        self.assertIn("aiAgentChatSuggestionsEnabled: false", app)
+        self.assertIn("在聊天界面显示聊天建议", app)
+        self.assertIn("默认关闭；开启后可在当前会话中生成", app)
+        access = self.javascript_function_source(
+            "bbw_web/static/app.js", "setAiAgentAccess"
+        )
+        self.assertIn("status?.settings?.chat_suggestions_enabled === true", access)
+        chat = self.javascript_function_source(
+            "bbw_web/static/app.js", "chatAgentAssistHtml"
+        )
+        self.assertIn("!S.aiAgentChatSuggestionsEnabled", chat)
+        load = self.javascript_function_source(
+            "bbw_web/static/app.js", "loadChatAssistStatus"
+        )
+        self.assertIn("!S.aiAgentChatSuggestionsEnabled", load)
+        forms = self.javascript_function_source(
+            "bbw_web/static/app.js", "handleProductForm"
+        )
+        self.assertIn("chat_suggestions_enabled: Boolean(", forms)
+
     def test_scheduler_requires_explicit_contact_authorization(self) -> None:
         scheduler = self.function_source("bbw_web/jobs.py", "_schedule_autonomy_owner")
         self.assertIn("limit=20", scheduler)
