@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import math
 import socket
 import sys
@@ -28,6 +29,11 @@ if str(ROOT) not in sys.path:
 
 from bbw_web import normalize as N  # noqa: E402
 from bbw_web import flash_photo as F  # noqa: E402
+from bbw_web.dependency_health import (  # noqa: E402
+    DependencyCircuitOpen,
+    DependencyDeadlineExceeded,
+    RequestDeadline,
+)
 from bbw_web.message_quote import encode_message_quote, normalize_message_quote  # noqa: E402
 from bbw_web.providers import (  # noqa: E402
     ProviderAuthenticationRejected,
@@ -40,6 +46,128 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 COOKIE_NAME = "bbw_sid"
 STORE: Optional[SessionStore] = None
 PRESENCE_BACKEND: Any = None
+LOGGER = logging.getLogger(__name__)
+
+PRESENCE_LOCK_FREE_PATHS = frozenset(
+    {
+        "/api/frontback",
+        "/api/heartbeat/start",
+        "/api/heartbeat/stop",
+        "/api/heartbeat/once",
+    }
+)
+PEER_SCOPED_MUTATION_PATHS = frozenset({"/api/im/read"})
+
+
+class _InteractiveDependencyFailure(RuntimeError):
+    pass
+
+
+def _request_lock_mode(method: str, path: str) -> str:
+    normalized_method = str(method or "GET").upper()
+    normalized_path = str(path or "").split("?", 1)[0]
+    if normalized_path in PRESENCE_LOCK_FREE_PATHS:
+        return "none"
+    if normalized_path in PEER_SCOPED_MUTATION_PATHS:
+        return "peer"
+    if normalized_method in {"GET", "HEAD"}:
+        return "read"
+    # Unknown mutations stay account-exclusive during the gradual lock split.
+    return "write"
+
+
+def _budget_kwargs(timeout: Optional[float], deadline: Any) -> Dict[str, Any]:
+    output: Dict[str, Any] = {}
+    if timeout is not None:
+        output["timeout"] = timeout
+    if deadline is not None:
+        output["deadline"] = deadline
+    return output
+
+
+def _dependency_retryable(result: Any) -> bool:
+    if isinstance(result, Mapping):
+        if bool(result.get("retryable")):
+            return True
+        try:
+            mapped_status = int(result.get("status") or 0)
+        except (TypeError, ValueError, OverflowError):
+            mapped_status = 0
+        return mapped_status in {-1, 408, 425, 429, 504} or mapped_status >= 500
+    if bool(getattr(result, "retryable", False)):
+        return True
+    try:
+        status = int(getattr(result, "status", 0) or getattr(result, "status_code", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        status = 0
+    try:
+        error_code = int(getattr(result, "error_code", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        error_code = 0
+    return status == -1 or status in {408, 425, 429, 504} or status >= 500 or error_code == -1
+
+
+def _dependency_call(
+    method: Any,
+    *args: Any,
+    provider: str,
+    domain: str,
+    breakers: Any = None,
+    timeout: Optional[float] = None,
+    deadline: Any = None,
+    request_id: str = "",
+    **kwargs: Any,
+) -> Any:
+    if breakers is not None:
+        breakers.before_call(provider, domain)
+    started_at = time.monotonic()
+    outcome = "exception"
+    try:
+        result = method(
+            *args,
+            **kwargs,
+            **_budget_kwargs(timeout, deadline),
+        )
+        ok = bool(
+            result.get("ok", False)
+            if isinstance(result, Mapping)
+            else getattr(result, "ok", False)
+        )
+        retryable = _dependency_retryable(result)
+        outcome = "ok" if ok else "retryable_failure" if retryable else "rejected"
+        if breakers is not None:
+            if ok or not retryable:
+                breakers.record_success(provider, domain)
+            else:
+                breakers.record_failure(provider, domain, retryable=True)
+        return result
+    except DependencyCircuitOpen:
+        outcome = "short_circuit"
+        raise
+    except DependencyDeadlineExceeded:
+        outcome = "deadline_exceeded"
+        if breakers is not None:
+            breakers.record_failure(provider, domain, retryable=True)
+        raise
+    except Exception:
+        if breakers is not None:
+            breakers.record_failure(provider, domain, retryable=True)
+        raise
+    finally:
+        LOGGER.info(
+            json.dumps(
+                {
+                    "event": "interactive_dependency_call",
+                    "request_id": str(request_id or "")[:64],
+                    "provider": provider,
+                    "domain": domain,
+                    "outcome": outcome,
+                    "duration_ms": round((time.monotonic() - started_at) * 1000, 2),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
 
 
 def _flash_reveal_backend(method: str, *args: Any, default: Any = None) -> Any:
@@ -264,14 +392,45 @@ def RL(r: Any) -> Dict[str, Any]:
     return d
 
 
-def _fetch_social_profile(app: Any, uid: str) -> Optional[Dict[str, Any]]:
+def _fetch_social_profile(
+    app: Any,
+    uid: str,
+    *,
+    timeout: Optional[float] = None,
+    deadline: Any = None,
+    breakers: Any = None,
+    request_id: str = "",
+) -> Optional[Dict[str, Any]]:
     try:
-        result = app.profile.get_user(uid)
+        result = _dependency_call(
+            app.profile.get_user,
+            uid,
+            provider="beibeiwu",
+            domain="profile",
+            breakers=breakers,
+            timeout=timeout,
+            deadline=deadline,
+            request_id=request_id,
+        )
+        if (
+            not getattr(result, "ok", False)
+            and _dependency_retryable(result)
+            and (breakers is not None or timeout is not None or deadline is not None)
+        ):
+            raise _InteractiveDependencyFailure(
+                "profile provider temporarily unavailable"
+            )
         profiles = N.normalize_users(result.data)
         return next(
             (value for value in profiles if str(value.get("id") or "") == uid),
             profiles[0] if profiles else None,
         )
+    except (
+        DependencyCircuitOpen,
+        DependencyDeadlineExceeded,
+        _InteractiveDependencyFailure,
+    ):
+        raise
     except Exception:
         return None
 
@@ -1528,6 +1687,11 @@ def _tim_c2c_unread_counts(
     client: Any,
     account_uid: str,
     peers: List[str],
+    *,
+    deadline: Any = None,
+    call_timeout: Optional[float] = None,
+    breakers: Any = None,
+    request_id: str = "",
 ) -> Dict[str, int]:
     method = getattr(client, "c2c_unread_counts", None)
     normalized = list(
@@ -1542,7 +1706,17 @@ def _tim_c2c_unread_counts(
         return {}
     counts: Dict[str, int] = {}
     for offset in range(0, len(normalized), 100):
-        result = method(account_uid, normalized[offset : offset + 100])
+        result = _dependency_call(
+            method,
+            account_uid,
+            normalized[offset : offset + 100],
+            provider="tim",
+            domain="im-read",
+            breakers=breakers,
+            timeout=call_timeout,
+            deadline=deadline,
+            request_id=request_id,
+        )
         if not getattr(result, "ok", False):
             continue
         data = getattr(result, "data", None)
@@ -1592,6 +1766,10 @@ def _tim_recent_conversation_envelope(
     ] = None,
     *,
     max_pages: int = 5,
+    deadline: Any = None,
+    call_timeout: Optional[float] = None,
+    breakers: Any = None,
+    request_id: str = "",
 ) -> Dict[str, Any]:
     timestamp = 0
     start_index = 0
@@ -1603,12 +1781,19 @@ def _tim_recent_conversation_envelope(
     observed_at = time.time()
     snapshot_complete = False
     for _page in range(max(1, min(int(max_pages), 10))):
-        result = client.recent_contacts(
+        result = _dependency_call(
+            client.recent_contacts,
             account_uid,
             timestamp=timestamp,
             start_index=start_index,
             top_timestamp=top_timestamp,
             top_start_index=top_start_index,
+            provider="tim",
+            domain="im-read",
+            breakers=breakers,
+            timeout=call_timeout,
+            deadline=deadline,
+            request_id=request_id,
         )
         if not getattr(result, "ok", False):
             raise RuntimeError("TIM recent contacts unavailable")
@@ -1667,6 +1852,10 @@ def _tim_recent_conversation_envelope(
         client,
         account_uid,
         [str(item.get("peer_id") or "") for item in items],
+        deadline=deadline,
+        call_timeout=call_timeout,
+        breakers=breakers,
+        request_id=request_id,
     )
     for item in items:
         item["source"] = "tim_rest"
@@ -1713,6 +1902,10 @@ def _tim_roaming_message_envelope(
     around_time: Optional[int] = None,
     before_time: Optional[int] = None,
     include_read_state: bool = True,
+    deadline: Any = None,
+    call_timeout: Optional[float] = None,
+    breakers: Any = None,
+    request_id: str = "",
 ) -> Dict[str, Any]:
     now_epoch = int(time.time())
     if around_time is not None and int(around_time) > 0:
@@ -1743,13 +1936,20 @@ def _tim_roaming_message_envelope(
     for sender, recipient in ((peer_uid, account_uid), (account_uid, peer_uid)):
         last_msg_key = ""
         for _page in range(page_limit):
-            result = client.roaming_messages(
+            result = _dependency_call(
+                client.roaming_messages,
                 sender,
                 recipient,
                 min_time=min_time,
                 max_time=max_time,
                 max_count=min(100, max(1, int(max_messages))),
                 last_msg_key=last_msg_key,
+                provider="tim",
+                domain="im-read",
+                breakers=breakers,
+                timeout=call_timeout,
+                deadline=deadline,
+                request_id=request_id,
             )
             if not getattr(result, "ok", False):
                 raise RuntimeError("TIM roaming messages unavailable")
@@ -1777,7 +1977,15 @@ def _tim_roaming_message_envelope(
         -max(1, int(max_messages)):
     ]
     if include_read_state:
-        unread_counts = _tim_c2c_unread_counts(client, peer_uid, [account_uid])
+        unread_counts = _tim_c2c_unread_counts(
+            client,
+            peer_uid,
+            [account_uid],
+            deadline=deadline,
+            call_timeout=call_timeout,
+            breakers=breakers,
+            request_id=request_id,
+        )
         _tim_apply_outgoing_read_state(
             items,
             account_uid=account_uid,
@@ -1810,6 +2018,15 @@ def _batch_cached_profiles(
     app: Any,
     uids: List[str],
     cache: Dict[str, tuple[float, Optional[Dict[str, Any]]]],
+    *,
+    coordinator: Any = None,
+    account_key: str = "",
+    budget_seconds: float = 0.0,
+    call_timeout: Optional[float] = None,
+    max_sync: int = 12,
+    breakers: Any = None,
+    request_id: str = "",
+    details: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     targets = list(
         dict.fromkeys(
@@ -1828,18 +2045,57 @@ def _batch_cached_profiles(
                 resolved[uid] = dict(profile) if profile else None
                 continue
         missing.append(uid)
-    if missing:
-        with ThreadPoolExecutor(
-            max_workers=min(4, len(missing)), thread_name_prefix="bbw-profile-batch"
-        ) as pool:
-            profiles = list(pool.map(lambda uid: _fetch_social_profile(app, uid), missing))
+    pending: List[str] = []
+    saturated: List[str] = []
+    if missing and coordinator is not None and budget_seconds > 0:
+        batch = coordinator.fetch_many(
+            account_key=account_key or str(getattr(app.session, "uid", "") or ""),
+            uids=missing,
+            fetcher=lambda uid: _fetch_social_profile(
+                app,
+                uid,
+                timeout=call_timeout,
+                breakers=breakers,
+                request_id=request_id,
+            ),
+            budget_seconds=budget_seconds,
+            max_sync=max_sync,
+        )
         cached_at = time.monotonic()
-        for uid, profile in zip(missing, profiles):
+        for uid, profile in batch.completed.items():
             resolved[uid] = profile
             cache[uid] = (cached_at, dict(profile) if profile else None)
+        pending = list(batch.pending)
+        saturated = list(batch.saturated)
+    elif missing:
+        admitted = missing[: max(0, int(max_sync))]
+        pending = list(missing[len(admitted) :])
+        if admitted:
+            with ThreadPoolExecutor(
+                max_workers=min(4, len(admitted)),
+                thread_name_prefix="bbw-profile-batch",
+            ) as pool:
+                profiles = list(
+                    pool.map(lambda uid: _fetch_social_profile(app, uid), admitted)
+                )
+            cached_at = time.monotonic()
+            for uid, profile in zip(admitted, profiles):
+                resolved[uid] = profile
+                cache[uid] = (cached_at, dict(profile) if profile else None)
         while len(cache) > 200:
             oldest = min(cache, key=lambda key: cache[key][0])
             cache.pop(oldest, None)
+    if coordinator is not None:
+        while len(cache) > 200:
+            oldest = min(cache, key=lambda key: cache[key][0])
+            cache.pop(oldest, None)
+    if details is not None:
+        details.update(
+            pending_uids=pending,
+            saturated_uids=saturated,
+            requested_count=len(targets),
+            resolved_count=sum(1 for uid in targets if resolved.get(uid)),
+        )
     return [dict(resolved[uid]) for uid in targets if resolved.get(uid)]
 
 
@@ -1975,9 +2231,14 @@ class Handler(BaseHTTPRequestHandler):
     def handle_one_request(self) -> None:
         """Release a per-user request lock after every HTTP request."""
         self._held_user_lock = None
+        self._held_peer_lock = None
         try:
             super().handle_one_request()
         finally:
+            peer_lock = self._held_peer_lock
+            self._held_peer_lock = None
+            if peer_lock is not None:
+                peer_lock.release()
             lock = self._held_user_lock
             self._held_user_lock = None
             if lock is not None:
@@ -2053,6 +2314,7 @@ class Handler(BaseHTTPRequestHandler):
         set_cookie: Optional[str] = None,
         clear_cookie: bool = False,
         cache_control: Optional[str] = None,
+        extra_headers: Optional[Mapping[str, Any]] = None,
     ) -> None:
         try:
             self.send_response(status)
@@ -2087,6 +2349,11 @@ class Handler(BaseHTTPRequestHandler):
                     "object-src 'none'; base-uri 'self'; "
                     "frame-ancestors 'none'; form-action 'self'",
                 )
+            for header_name, header_value in dict(extra_headers or {}).items():
+                name = str(header_name or "").strip()
+                value = str(header_value or "").strip()
+                if name and value and "\r" not in name + value and "\n" not in name + value:
+                    self.send_header(name, value)
             if set_cookie:
                 secure = "; Secure" if COOKIE_SECURE else ""
                 self.send_header(
@@ -2178,14 +2445,57 @@ class Handler(BaseHTTPRequestHandler):
             user = STORE.require(sid)
             if self._held_user_lock is None:
                 method = str(getattr(self, "command", "GET") or "GET").upper()
-                if method in {"GET", "HEAD"}:
+                path = urlparse(str(getattr(self, "path", "") or "")).path
+                mode = _request_lock_mode(method, path)
+                started_at = time.monotonic()
+                if mode == "read":
                     self._held_user_lock = user.request_gate.acquire_read()
-                else:
+                elif mode == "write":
                     self._held_user_lock = user.request_gate.acquire_write()
+                wait_ms = (time.monotonic() - started_at) * 1000
+                if mode in {"read", "write"}:
+                    LOGGER.info(
+                        json.dumps(
+                            {
+                                "event": "request_gate_acquired",
+                                "request_id": str(
+                                    getattr(self, "_request_id", "") or ""
+                                )[:64],
+                                "path": path[:256],
+                                "mode": mode,
+                                "wait_ms": round(wait_ms, 2),
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                    )
             return user
         except KeyError:
             self.ok({"ok": False, "error": "请先登录"}, 401)
             return None
+
+    def acquire_peer_request_gate(self, user: Any, peers: List[str]) -> None:
+        if getattr(self, "_held_peer_lock", None) is not None:
+            return
+        gate = getattr(user, "peer_request_gate", None)
+        acquire = getattr(gate, "acquire", None)
+        if not callable(acquire):
+            return
+        started_at = time.monotonic()
+        self._held_peer_lock = acquire(peers)
+        LOGGER.info(
+            json.dumps(
+                {
+                    "event": "peer_gate_acquired",
+                    "request_id": str(getattr(self, "_request_id", "") or "")[:64],
+                    "path": urlparse(str(getattr(self, "path", "") or "")).path[:256],
+                    "peer_count": len(peers),
+                    "wait_ms": round((time.monotonic() - started_at) * 1000, 2),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
 
     def web_user_capabilities(self, user: Any) -> Dict[str, bool]:
         return _web_user_capabilities(
@@ -2807,9 +3117,49 @@ class Handler(BaseHTTPRequestHandler):
             requested = _presence_uids((qs.get("uids") or []) + (qs.get("uid") or []), limit=100)
             if not requested:
                 return self.ok({"ok": False, "error": "缺少用户 UID"}, 400)
-            items = _batch_cached_profiles(app, requested, u.profile_cache)
+            budget_config = dict(
+                getattr(self, "_request_budget_config", None) or {}
+            )
+            lookup_details: Dict[str, Any] = {}
+            items = _batch_cached_profiles(
+                app,
+                requested,
+                u.profile_cache,
+                coordinator=getattr(
+                    self,
+                    "_request_profile_lookup_coordinator",
+                    None,
+                ),
+                account_key=str(app.session.uid or ""),
+                budget_seconds=float(
+                    budget_config.get("profile_budget_seconds") or 0
+                ),
+                call_timeout=(
+                    float(budget_config.get("profile_timeout_seconds"))
+                    if budget_config.get("profile_timeout_seconds")
+                    else None
+                ),
+                max_sync=int(budget_config.get("profile_sync_limit") or 12),
+                breakers=getattr(
+                    self,
+                    "_request_dependency_breakers",
+                    None,
+                ),
+                request_id=str(getattr(self, "_request_id", "") or ""),
+                details=lookup_details,
+            )
+            pending_uids = list(lookup_details.get("pending_uids") or [])
             return self.ok(
-                {"ok": True, "items": items, "list": items, "count": len(items)}
+                {
+                    "ok": True,
+                    "partial": bool(pending_uids),
+                    "items": items,
+                    "list": items,
+                    "count": len(items),
+                    "requested_count": len(requested),
+                    "pending_uids": pending_uids,
+                    "retry_after": 2 if pending_uids else 0,
+                }
             )
         if path == "/api/profile/reset-num":
             return self.ok(R(app.profile.reset_num(q("type", "昵称")), include_value=True))
@@ -3340,9 +3690,35 @@ class Handler(BaseHTTPRequestHandler):
                 "count": 0,
                 "message": "在线状态暂时不可用",
             }
+            budget_config = dict(
+                getattr(self, "_request_budget_config", None) or {}
+            )
+            presence_timeout = float(
+                budget_config.get("presence_timeout_seconds") or 0
+            )
+            presence_deadline = (
+                RequestDeadline(presence_timeout)
+                if presence_timeout > 0
+                else None
+            )
             try:
                 if unresolved and retry_after <= 0:
-                    result = u.native.tim_rest.query_online(unresolved)
+                    result = _dependency_call(
+                        u.native.tim_rest.query_online,
+                        unresolved,
+                        provider="tim",
+                        domain="presence",
+                        breakers=getattr(
+                            self,
+                            "_request_dependency_breakers",
+                            None,
+                        ),
+                        timeout=presence_timeout or None,
+                        deadline=presence_deadline,
+                        request_id=str(
+                            getattr(self, "_request_id", "") or ""
+                        ),
+                    )
                     normalized = _normalize_presence_result(result, unresolved)
                     if not result.ok and PRESENCE_BACKEND is not None:
                         PRESENCE_BACKEND.mark_presence_rest_unavailable(result.error_code)
@@ -3355,6 +3731,13 @@ class Handler(BaseHTTPRequestHandler):
                         "count": 0,
                         "message": "在线状态已更新",
                     }
+            except DependencyCircuitOpen as exc:
+                retry_after = max(retry_after, exc.retry_after)
+                if PRESENCE_BACKEND is not None:
+                    try:
+                        PRESENCE_BACKEND.mark_presence_rest_unavailable(0)
+                    except Exception:
+                        pass
             except Exception:
                 if PRESENCE_BACKEND is not None:
                     try:
@@ -3407,26 +3790,108 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/im/stickers":
             return self.ok(RE(app.im.stickers(), "sticker"))
         if path == "/api/im/conversations":
+            budget_config = dict(
+                getattr(self, "_request_budget_config", None) or {}
+            )
+            im_budget = float(budget_config.get("im_budget_seconds") or 0)
+            tim_timeout = float(
+                budget_config.get("tim_timeout_seconds") or 0
+            )
+            provider_timeout = float(
+                budget_config.get("provider_timeout_seconds") or 0
+            )
+            deadline = RequestDeadline(im_budget) if im_budget > 0 else None
+            breakers = getattr(self, "_request_dependency_breakers", None)
+            request_id = str(getattr(self, "_request_id", "") or "")
             try:
                 payload = _tim_recent_conversation_envelope(
                     app,
                     u.native.tim_rest,
                     str(app.session.uid or ""),
                     u.profile_cache,
+                    deadline=deadline,
+                    call_timeout=tim_timeout or None,
+                    breakers=breakers,
+                    request_id=request_id,
                 )
             except Exception:
-                result = app.im.history_conversations(q("page", "1"))
-                if _is_html_protocol_result(result) or not getattr(result, "ok", False):
+                if deadline is not None and deadline.expired:
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "code": "IM_INTERACTIVE_BUDGET_EXHAUSTED",
+                            "error": "聊天列表暂时不可用，请稍后重试",
+                            "retryable": True,
+                            "retry_after": 2,
+                            "items": [],
+                            "list": [],
+                            "count": 0,
+                        },
+                        503,
+                        extra_headers={"Retry-After": "2"},
+                    )
+                try:
+                    result = _dependency_call(
+                        app.im.history_conversations,
+                        q("page", "1"),
+                        provider="beibeiwu",
+                        domain="im-read",
+                        breakers=breakers,
+                        timeout=provider_timeout or None,
+                        deadline=deadline,
+                        request_id=request_id,
+                    )
+                except DependencyCircuitOpen as exc:
                     return self.ok(
                         {
                             "ok": False,
                             "code": "UPSTREAM_CONVERSATIONS_UNAVAILABLE",
                             "error": "聊天列表暂时不可用，请稍后重试",
+                            "retryable": True,
+                            "retry_after": exc.retry_after,
+                            "items": [],
+                            "list": [],
+                            "count": 0,
+                        },
+                        503,
+                        extra_headers={"Retry-After": str(exc.retry_after)},
+                    )
+                except Exception:
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "code": "UPSTREAM_CONVERSATIONS_UNAVAILABLE",
+                            "error": "聊天列表暂时不可用，请稍后重试",
+                            "retryable": True,
                             "items": [],
                             "list": [],
                             "count": 0,
                         },
                         502,
+                    )
+                if _is_html_protocol_result(result) or not getattr(result, "ok", False):
+                    retry_after = (
+                        int(breakers.retry_after("beibeiwu", "im-read"))
+                        if breakers is not None
+                        else 0
+                    )
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "code": "UPSTREAM_CONVERSATIONS_UNAVAILABLE",
+                            "error": "聊天列表暂时不可用，请稍后重试",
+                            "retryable": True,
+                            "retry_after": retry_after,
+                            "items": [],
+                            "list": [],
+                            "count": 0,
+                        },
+                        502,
+                        extra_headers=(
+                            {"Retry-After": str(retry_after)}
+                            if retry_after > 0
+                            else None
+                        ),
                     )
                 payload = conversation_envelope(app, result, u.profile_cache)
             summary_loader = getattr(self, "_request_conversation_summary_loader", None)
@@ -3470,6 +3935,19 @@ class Handler(BaseHTTPRequestHandler):
             capabilities = Handler.web_user_capabilities(self, u)
             if not Handler.can_view_message_peer(self, u, peer):
                 return Handler.deny_private_message(self, capabilities)
+            budget_config = dict(
+                getattr(self, "_request_budget_config", None) or {}
+            )
+            im_budget = float(budget_config.get("im_budget_seconds") or 0)
+            tim_timeout = float(
+                budget_config.get("tim_timeout_seconds") or 0
+            )
+            provider_timeout = float(
+                budget_config.get("provider_timeout_seconds") or 0
+            )
+            deadline = RequestDeadline(im_budget) if im_budget > 0 else None
+            breakers = getattr(self, "_request_dependency_breakers", None)
+            request_id = str(getattr(self, "_request_id", "") or "")
             try:
                 payload = _tim_roaming_message_envelope(
                     u.native.tim_rest,
@@ -3479,10 +3957,81 @@ class Handler(BaseHTTPRequestHandler):
                     around_time=around_time if summary_only else None,
                     before_time=before_time if not summary_only else None,
                     include_read_state=not summary_only,
+                    deadline=deadline,
+                    call_timeout=tim_timeout or None,
+                    breakers=breakers,
+                    request_id=request_id,
                 )
             except Exception:
-                result = app.im.history_messages(peer)
+                if deadline is not None and deadline.expired:
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "code": "IM_INTERACTIVE_BUDGET_EXHAUSTED",
+                            "error": {
+                                "title": "上游聊天记录暂时不可用",
+                                "detail": "请求预算已用尽，请稍后重试",
+                            },
+                            "retryable": True,
+                            "retry_after": 2,
+                            "items": [],
+                            "list": [],
+                            "count": 0,
+                        },
+                        503,
+                        extra_headers={"Retry-After": "2"},
+                    )
+                try:
+                    result = _dependency_call(
+                        app.im.history_messages,
+                        peer,
+                        provider="beibeiwu",
+                        domain="im-read",
+                        breakers=breakers,
+                        timeout=provider_timeout or None,
+                        deadline=deadline,
+                        request_id=request_id,
+                    )
+                except DependencyCircuitOpen as exc:
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "code": "UPSTREAM_HISTORY_UNAVAILABLE",
+                            "error": {
+                                "title": "上游聊天记录暂时不可用",
+                                "detail": "上游服务正在恢复，请稍后重试",
+                            },
+                            "retryable": True,
+                            "retry_after": exc.retry_after,
+                            "items": [],
+                            "list": [],
+                            "count": 0,
+                        },
+                        503,
+                        extra_headers={"Retry-After": str(exc.retry_after)},
+                    )
+                except Exception:
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "code": "UPSTREAM_HISTORY_UNAVAILABLE",
+                            "error": {
+                                "title": "上游聊天记录暂时不可用",
+                                "detail": "请稍后重试",
+                            },
+                            "retryable": True,
+                            "items": [],
+                            "list": [],
+                            "count": 0,
+                        },
+                        502,
+                    )
                 if _is_html_protocol_result(result) or not getattr(result, "ok", False):
+                    retry_after = (
+                        int(breakers.retry_after("beibeiwu", "im-read"))
+                        if breakers is not None
+                        else 0
+                    )
                     return self.ok(
                         {
                             "ok": False,
@@ -3491,11 +4040,18 @@ class Handler(BaseHTTPRequestHandler):
                                 "title": "上游聊天记录暂时不可用",
                                 "detail": "已改用服务器归档的聊天记录",
                             },
+                            "retryable": True,
+                            "retry_after": retry_after,
                             "items": [],
                             "list": [],
                             "count": 0,
                         },
                         502,
+                        extra_headers=(
+                            {"Retry-After": str(retry_after)}
+                            if retry_after > 0
+                            else None
+                        ),
                     )
                 payload = RE(result, "message")
             if summary_only:
@@ -3717,6 +4273,63 @@ class Handler(BaseHTTPRequestHandler):
                 u.stop_heartbeat()
                 return self.ok({"ok": True, "running": False})
             if path == "/api/heartbeat/once":
+                coordinator = getattr(
+                    self,
+                    "_request_presence_coordinator",
+                    None,
+                )
+                if coordinator is not None:
+                    budget_config = dict(
+                        getattr(self, "_request_budget_config", None) or {}
+                    )
+                    timeout = float(
+                        budget_config.get("presence_timeout_seconds") or 0
+                    )
+
+                    def heartbeat_once() -> Any:
+                        deadline = RequestDeadline(timeout) if timeout > 0 else None
+                        return _dependency_call(
+                            u.heartbeat_once,
+                            provider="beibeiwu",
+                            domain="presence",
+                            breakers=getattr(
+                                self,
+                                "_request_dependency_breakers",
+                                None,
+                            ),
+                            timeout=timeout or None,
+                            deadline=deadline,
+                            request_id=str(
+                                getattr(self, "_request_id", "") or ""
+                            ),
+                        )
+
+                    accepted = coordinator.submit(
+                        str(app.session.uid or sid or ""),
+                        "heartbeat",
+                        heartbeat_once,
+                    )
+                    if not accepted:
+                        return self.ok(
+                            {
+                                "ok": False,
+                                "code": "PRESENCE_QUEUE_UNAVAILABLE",
+                                "error": "在线状态更新暂时繁忙",
+                                "retryable": True,
+                                "retry_after": 2,
+                            },
+                            503,
+                            extra_headers={"Retry-After": "2"},
+                        )
+                    return self.ok(
+                        {
+                            "ok": True,
+                            "accepted": True,
+                            "queued": True,
+                            "operation": "heartbeat",
+                        },
+                        202,
+                    )
                 return self.ok(u.heartbeat_once())
 
             if path == "/api/call":
@@ -3856,6 +4469,7 @@ class Handler(BaseHTTPRequestHandler):
                 for peer_uid in peer_uids:
                     if not Handler.can_view_message_peer(self, u, peer_uid):
                         return Handler.deny_private_message(self, capabilities)
+                Handler.acquire_peer_request_gate(self, u, peer_uids)
                 supplied_receipts = data.get("receipt_messages")
                 receipt_messages = (
                     [
@@ -3944,6 +4558,84 @@ class Handler(BaseHTTPRequestHandler):
                     for peer_uid in peer_uids
                     if peer_uid not in skipped_compatibility_peers
                 ]
+
+                read_sync_enqueuer = getattr(
+                    self,
+                    "_request_read_sync_enqueuer",
+                    None,
+                )
+                if callable(read_sync_enqueuer) and remote_read_peers:
+                    try:
+                        queued = read_sync_enqueuer(
+                            account_uid=account_uid,
+                            peers=remote_read_peers,
+                            receipt_messages=receipt_messages,
+                        )
+                    except Exception:
+                        if set(remote_read_peers).issubset(set(local_read_peers)):
+                            return self.ok(
+                                {
+                                    "ok": True,
+                                    "read": True,
+                                    "read_peers": local_read_peers,
+                                    "count": len(local_read_peers),
+                                    "local_read_peers": local_read_peers,
+                                    "local_read_counts": local_read_counts,
+                                    "compatibility_sync": "failed",
+                                    "compatibility_sync_skipped_peers": skipped_compatibility_peers,
+                                }
+                            )
+                        return self.ok(
+                            {
+                                "ok": False,
+                                "code": "IM_READ_QUEUE_UNAVAILABLE",
+                                "error": "消息已读同步队列暂时不可用",
+                                "retryable": True,
+                                "retry_after": 2,
+                                "read_peers": local_read_peers,
+                                "failed_peers": remote_read_peers,
+                                "local_read_peers": local_read_peers,
+                                "local_read_counts": local_read_counts,
+                            },
+                            503,
+                            extra_headers={"Retry-After": "2"},
+                        )
+                    queued_peers = list(
+                        dict.fromkeys(
+                            str(peer or "").strip()
+                            for peer in (
+                                queued.get("accepted_peers", remote_read_peers)
+                                if isinstance(queued, Mapping)
+                                else remote_read_peers
+                            )
+                            if str(peer or "").strip()
+                        )
+                    )
+                    accepted_peers = list(
+                        dict.fromkeys(local_read_peers + queued_peers)
+                    )
+                    return self.ok(
+                        {
+                            "ok": True,
+                            "read": True,
+                            "accepted": True,
+                            "queued": True,
+                            "durable": bool(
+                                queued.get("durable", True)
+                                if isinstance(queued, Mapping)
+                                else True
+                            ),
+                            "read_peers": local_read_peers,
+                            "accepted_peers": accepted_peers,
+                            "queued_peers": queued_peers,
+                            "count": len(accepted_peers),
+                            "local_read_peers": local_read_peers,
+                            "local_read_counts": local_read_counts,
+                            "compatibility_sync": "queued",
+                            "compatibility_sync_skipped_peers": skipped_compatibility_peers,
+                        },
+                        202,
+                    )
 
                 def mark_peer_read(peer_uid: str) -> Tuple[str, Any, Any]:
                     conversation_result = u.native.tim_rest.mark_c2c_read(
@@ -5250,9 +5942,67 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/online":
                 return self.ok(R(app.misc.update_online(first=_as_bool(data.get("first")))))
             if path == "/api/frontback":
-                return self.ok(
-                    R(app.misc.front_or_back(str(data.get("frontorback") or "1")))
+                frontorback = str(data.get("frontorback") or "1")
+                coordinator = getattr(
+                    self,
+                    "_request_presence_coordinator",
+                    None,
                 )
+                if coordinator is not None:
+                    budget_config = dict(
+                        getattr(self, "_request_budget_config", None) or {}
+                    )
+                    timeout = float(
+                        budget_config.get("presence_timeout_seconds") or 0
+                    )
+
+                    def update_frontback() -> Any:
+                        deadline = RequestDeadline(timeout) if timeout > 0 else None
+                        return _dependency_call(
+                            app.misc.front_or_back,
+                            frontorback,
+                            provider="beibeiwu",
+                            domain="presence",
+                            breakers=getattr(
+                                self,
+                                "_request_dependency_breakers",
+                                None,
+                            ),
+                            timeout=timeout or None,
+                            deadline=deadline,
+                            request_id=str(
+                                getattr(self, "_request_id", "") or ""
+                            ),
+                        )
+
+                    accepted = coordinator.submit(
+                        str(app.session.uid or sid or ""),
+                        "frontback",
+                        update_frontback,
+                    )
+                    if not accepted:
+                        return self.ok(
+                            {
+                                "ok": False,
+                                "code": "PRESENCE_QUEUE_UNAVAILABLE",
+                                "error": "在线状态更新暂时繁忙",
+                                "retryable": True,
+                                "retry_after": 2,
+                            },
+                            503,
+                            extra_headers={"Retry-After": "2"},
+                        )
+                    return self.ok(
+                        {
+                            "ok": True,
+                            "accepted": True,
+                            "queued": True,
+                            "operation": "frontback",
+                            "active": frontorback == "1",
+                        },
+                        202,
+                    )
+                return self.ok(R(app.misc.front_or_back(frontorback)))
 
         except Exception as e:
             return self.ok({"ok": False, "error": _safe_error(e, "请求处理失败")}, 400)

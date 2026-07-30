@@ -8,12 +8,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import random
 import ssl
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -41,6 +40,9 @@ class RestResult:
     error_info: str = ""
     data: Any = None
     raw: str = ""
+    failure_kind: str = ""
+    retryable: bool = False
+    status_code: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -68,11 +70,26 @@ class TimRestClient:
         admin_id: str = DEFAULT_ADMIN,
         timeout: int = 15,
     ):
+        import httpx
+
         self.sdk_app_id = int(sdk_app_id)
         self.secret_key = secret_key
         self.admin_id = admin_id
         self.timeout = timeout
         self._ctx = ssl.create_default_context()
+        self._http = httpx.Client(
+            follow_redirects=True,
+            verify=self._ctx,
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10,
+                keepalive_expiry=45.0,
+            ),
+            timeout=httpx.Timeout(float(timeout)),
+        )
+
+    def close(self) -> None:
+        self._http.close()
 
     def _usersig(self, identifier: Optional[str] = None, expire: int = 86400) -> str:
         return sign.gen_user_sig(
@@ -82,7 +99,59 @@ class TimRestClient:
             expire=expire,
         )
 
-    def call(self, command: str, body: Dict[str, Any], *, admin: Optional[str] = None) -> RestResult:
+    @staticmethod
+    def _deadline_remaining(deadline: Any) -> Optional[float]:
+        if deadline is None:
+            return None
+        remaining = getattr(deadline, "remaining", None)
+        try:
+            value = float(remaining() if callable(remaining) else float(deadline) - time.monotonic())
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return value if math.isfinite(value) else None
+
+    def _effective_timeout(self, timeout: Optional[float], deadline: Any) -> float:
+        values = [float(self.timeout)]
+        if timeout is not None:
+            values.append(float(timeout))
+        remaining = self._deadline_remaining(deadline)
+        if remaining is not None:
+            values.append(remaining)
+        finite = [value for value in values if math.isfinite(value)]
+        return min(finite) if finite else float(self.timeout)
+
+    @staticmethod
+    def _split_timeout(total: float) -> Any:
+        import httpx
+
+        normalized = max(0.05, float(total))
+        return httpx.Timeout(
+            connect=min(2.0, normalized),
+            read=normalized,
+            write=min(5.0, normalized),
+            pool=min(1.0, normalized),
+        )
+
+    @staticmethod
+    def _budget_kwargs(timeout: Optional[float], deadline: Any) -> Dict[str, Any]:
+        output: Dict[str, Any] = {}
+        if timeout is not None:
+            output["timeout"] = timeout
+        if deadline is not None:
+            output["deadline"] = deadline
+        return output
+
+    def call(
+        self,
+        command: str,
+        body: Dict[str, Any],
+        *,
+        admin: Optional[str] = None,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
+    ) -> RestResult:
+        import httpx
+
         identifier = admin or self.admin_id
         usersig = self._usersig(identifier)
         rnd = random.randint(0, 0xFFFFFFFF)
@@ -95,31 +164,68 @@ class TimRestClient:
             f"&contenttype=json"
         )
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            method="POST",
-        )
+        effective_timeout = self._effective_timeout(timeout, deadline)
+        if effective_timeout <= 0:
+            return RestResult(
+                ok=False,
+                action=command,
+                error_code=-1,
+                error_info="interactive deadline exceeded",
+                failure_kind="timeout",
+                retryable=True,
+            )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout, context=self._ctx) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as e:
-            raw = e.read().decode("utf-8", errors="replace") if e.fp else str(e)
+            response = self._http.post(
+                url,
+                content=payload,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                timeout=self._split_timeout(effective_timeout),
+            )
+            raw = response.content.decode("utf-8", errors="replace")
+        except httpx.TimeoutException:
+            return RestResult(
+                ok=False,
+                action=command,
+                error_code=-1,
+                error_info="request timeout",
+                failure_kind="timeout",
+                retryable=True,
+            )
+        except httpx.TransportError:
+            return RestResult(
+                ok=False,
+                action=command,
+                error_code=-1,
+                error_info="transport error",
+                failure_kind="connection",
+                retryable=True,
+            )
+
+        if response.status_code >= 400:
             try:
                 data = json.loads(raw) if raw else {}
             except json.JSONDecodeError:
                 data = {"raw": raw}
+            status = int(response.status_code)
             return RestResult(
                 ok=False,
                 action=command,
-                error_code=int(data.get("ErrorCode") or e.code or -1),
-                error_info=str(data.get("ErrorInfo") or e.reason or "HTTP error"),
+                error_code=int(data.get("ErrorCode") or status or -1),
+                error_info=str(data.get("ErrorInfo") or f"HTTP {status}"),
                 data=data,
                 raw=raw,
+                failure_kind=(
+                    "rate_limited"
+                    if status == 429
+                    else "timeout"
+                    if status in {408, 504}
+                    else "upstream"
+                    if status >= 500
+                    else "contract"
+                ),
+                retryable=status in {408, 425, 429} or status >= 500,
+                status_code=status,
             )
-        except Exception as e:
-            return RestResult(ok=False, action=command, error_code=-1, error_info=str(e)[:300])
 
         try:
             data = json.loads(raw) if raw else {}
@@ -130,6 +236,7 @@ class TimRestClient:
                 error_code=-1,
                 error_info="non-json response",
                 raw=raw[:500],
+                failure_kind="contract",
             )
 
         code = int(data.get("ErrorCode") or 0)
@@ -143,14 +250,31 @@ class TimRestClient:
             raw=raw,
         )
 
-    def account_check(self, user_ids: List[str]) -> RestResult:
+    def account_check(
+        self,
+        user_ids: List[str],
+        *,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
+    ) -> RestResult:
         items = [{"UserID": str(u)} for u in user_ids if str(u).strip()]
-        return self.call("im_open_login_svc/account_check", {"CheckItem": items})
+        return self.call(
+            "im_open_login_svc/account_check",
+            {"CheckItem": items},
+            **self._budget_kwargs(timeout, deadline),
+        )
 
-    def query_online(self, user_ids: List[str]) -> RestResult:
+    def query_online(
+        self,
+        user_ids: List[str],
+        *,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
+    ) -> RestResult:
         return self.call(
             "openim/query_online_status",
             {"To_Account": [str(u) for u in user_ids if str(u).strip()]},
+            **self._budget_kwargs(timeout, deadline),
         )
 
     def recent_contacts(
@@ -162,6 +286,8 @@ class TimRestClient:
         top_timestamp: int = 0,
         top_start_index: int = 0,
         assist_flags: int = 7,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
     ) -> RestResult:
         """Return the server-owned recent C2C conversation list for one user."""
 
@@ -183,6 +309,7 @@ class TimRestClient:
                 "TopStartIndex": max(0, int(top_start_index)),
                 "AssistFlags": max(0, int(assist_flags)),
             },
+            **self._budget_kwargs(timeout, deadline),
         )
 
     def roaming_messages(
@@ -194,6 +321,8 @@ class TimRestClient:
         max_time: int = 0,
         max_count: int = 100,
         last_msg_key: str = "",
+        timeout: Optional[float] = None,
+        deadline: Any = None,
     ) -> RestResult:
         """Read one direction of C2C roaming history through the administrator API."""
 
@@ -216,12 +345,16 @@ class TimRestClient:
                 "MaxTime": max(0, int(max_time)),
                 "LastMsgKey": str(last_msg_key or "")[:256],
             },
+            **self._budget_kwargs(timeout, deadline),
         )
 
     def c2c_unread_counts(
         self,
         to_account: str,
         peer_accounts: List[str],
+        *,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
     ) -> RestResult:
         """Return per-peer C2C unread counts for one account."""
 
@@ -247,9 +380,17 @@ class TimRestClient:
                 "To_Account": account,
                 "Peer_Account": peers,
             },
+            **self._budget_kwargs(timeout, deadline),
         )
 
-    def mark_c2c_read(self, report_account: str, peer_account: str) -> RestResult:
+    def mark_c2c_read(
+        self,
+        report_account: str,
+        peer_account: str,
+        *,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
+    ) -> RestResult:
         """Mark one C2C conversation as read for ``report_account``."""
 
         account = str(report_account or "").strip()
@@ -267,6 +408,7 @@ class TimRestClient:
                 "Report_Account": account,
                 "Peer_Account": peer,
             },
+            **self._budget_kwargs(timeout, deadline),
         )
 
     @staticmethod
@@ -361,6 +503,9 @@ class TimRestClient:
         operator_account: str,
         peer_account: str,
         messages: List[Mapping[str, Any]],
+        *,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
     ) -> RestResult:
         """Send explicit per-message receipts used by TUIKit C2C messages."""
 
@@ -410,6 +555,7 @@ class TimRestClient:
                 "Peer_Account": peer,
                 "C2CMsgInfo": normalized,
             },
+            **self._budget_kwargs(timeout, deadline),
         )
 
     def sync_c2c_message_read_receipts(
@@ -421,6 +567,8 @@ class TimRestClient:
         max_messages: int = 300,
         batch_size: int = 30,
         retention_days: int = 180,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
     ) -> RestResult:
         """Discover and send missing explicit C2C receipts for one conversation.
 
@@ -463,6 +611,7 @@ class TimRestClient:
                     max_time=max_time,
                     max_count=min(100, maximum - len(candidates)),
                     last_msg_key=last_msg_key,
+                    **self._budget_kwargs(timeout, deadline),
                 )
                 page_count += 1
                 if not result.ok:
@@ -525,7 +674,12 @@ class TimRestClient:
         batch_count = 0
         for offset in range(0, len(normalized), receipt_batch_size):
             batch = normalized[offset : offset + receipt_batch_size]
-            result = self.mark_c2c_message_read_receipts(operator, peer, batch)
+            result = self.mark_c2c_message_read_receipts(
+                operator,
+                peer,
+                batch,
+                **self._budget_kwargs(timeout, deadline),
+            )
             batch_count += 1
             if not result.ok:
                 return RestResult(

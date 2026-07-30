@@ -41,6 +41,22 @@ def _default_runtime_provider() -> RuntimeProvider:
     return LegacyBanghuaProvider()
 
 
+def close_web_runtime(app: Any, native: Any = None) -> None:
+    """Close both persistent HTTP clients owned by one Web runtime."""
+
+    try:
+        app.client.close()
+    except Exception:
+        pass
+    tim_rest = getattr(native, "tim_rest", None)
+    close_tim = getattr(tim_rest, "close", None)
+    if callable(close_tim):
+        try:
+            close_tim()
+        except Exception:
+            pass
+
+
 class _RequestGateLease:
     """One idempotent reader/writer gate lease held by an HTTP request."""
 
@@ -92,6 +108,81 @@ class RequestGate:
             self._condition.notify_all()
 
 
+class _PeerRequestGateLease:
+    def __init__(
+        self,
+        gate: "PeerRequestGate",
+        entries: list[tuple[str, threading.RLock]],
+    ) -> None:
+        self._gate = gate
+        self._entries = entries
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        for _peer, lock in reversed(self._entries):
+            lock.release()
+        self._gate._release_entries(self._entries)
+
+
+class PeerRequestGate:
+    """Serialize mutations for the same peer without blocking account reads."""
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._entries: dict[str, tuple[threading.RLock, int]] = {}
+
+    @staticmethod
+    def _peers(values: List[str]) -> list[str]:
+        return sorted(
+            dict.fromkeys(
+                str(value or "").strip()[:128]
+                for value in values[:100]
+                if str(value or "").strip()
+            )
+        )
+
+    def acquire(self, peers: List[str]) -> _PeerRequestGateLease:
+        keys = self._peers(peers)
+        entries: list[tuple[str, threading.RLock]] = []
+        with self._guard:
+            for peer in keys:
+                lock, references = self._entries.get(
+                    peer,
+                    (threading.RLock(), 0),
+                )
+                self._entries[peer] = (lock, references + 1)
+                entries.append((peer, lock))
+        acquired: list[tuple[str, threading.RLock]] = []
+        try:
+            for entry in entries:
+                entry[1].acquire()
+                acquired.append(entry)
+        except BaseException:
+            for _peer, lock in reversed(acquired):
+                lock.release()
+            self._release_entries(entries)
+            raise
+        return _PeerRequestGateLease(self, entries)
+
+    def _release_entries(
+        self,
+        entries: list[tuple[str, threading.RLock]],
+    ) -> None:
+        with self._guard:
+            for peer, lock in entries:
+                current = self._entries.get(peer)
+                if current is None or current[0] is not lock:
+                    continue
+                references = current[1] - 1
+                if references <= 0:
+                    self._entries.pop(peer, None)
+                else:
+                    self._entries[peer] = (lock, references)
+
+
 def _session_path(uid: Any) -> Optional[Path]:
     """Return a path confined to ``sessions/`` for a simple server uid."""
     value = str(uid or "").strip()
@@ -139,6 +230,10 @@ class WebUser:
         repr=False,
     )
     request_gate: RequestGate = field(default_factory=RequestGate, repr=False)
+    peer_request_gate: PeerRequestGate = field(
+        default_factory=PeerRequestGate,
+        repr=False,
+    )
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def touch(self) -> None:
@@ -162,10 +257,20 @@ class WebUser:
         self.heartbeat.start()
         return self.heartbeat.status()
 
-    def heartbeat_once(self) -> Dict[str, Any]:
+    def heartbeat_once(
+        self,
+        *,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
+    ) -> Dict[str, Any]:
         if self.heartbeat is None:
             self.heartbeat = self.app.create_heartbeat()
-        return self.heartbeat.once()
+        call_options: Dict[str, Any] = {}
+        if timeout is not None:
+            call_options["timeout"] = timeout
+        if deadline is not None:
+            call_options["deadline"] = deadline
+        return self.heartbeat.once(**call_options)
 
     def stop_heartbeat(self) -> None:
         if self.heartbeat:
@@ -316,10 +421,7 @@ class SessionStore:
             try:
                 runtime.app.set_device(seed=sid[:12])
             except Exception:
-                try:
-                    runtime.app.client.close()
-                except Exception:
-                    pass
+                close_web_runtime(runtime.app, runtime.native)
                 raise
             user = WebUser(
                 web_sid=sid,
@@ -337,10 +439,7 @@ class SessionStore:
         try:
             return runtime.app.auth.send_sms(phone)
         finally:
-            try:
-                runtime.app.client.close()
-            except Exception:
-                pass
+            close_web_runtime(runtime.app, runtime.native)
 
     def rotate_sid(self, user: WebUser) -> WebUser:
         """Rotate the browser credential after authentication.
@@ -422,10 +521,7 @@ class SessionStore:
                 daemon=True,
             ).start()
         else:
-            try:
-                u.app.client.close()
-            except Exception:
-                pass
+            close_web_runtime(u.app, u.native)
         return True
 
     def purge_expired(self) -> int:
@@ -601,10 +697,7 @@ class SessionStore:
             runtime = self.runtime_provider.load_runtime(path)
             sess = runtime.app.session
             if not sess.logged_in:
-                try:
-                    runtime.app.client.close()
-                except Exception:
-                    pass
+                close_web_runtime(runtime.app, runtime.native)
                 return None
             user = self.get(web_sid) if web_sid else None
             if not user:
@@ -616,13 +709,11 @@ class SessionStore:
             else:
                 user.stop_heartbeat()
                 previous_app = user.app
+                previous_native = user.native
                 user.app = runtime.app
                 user.native = runtime.native
                 if previous_app is not runtime.app:
-                    try:
-                        previous_app.client.close()
-                    except Exception:
-                        pass
+                    close_web_runtime(previous_app, previous_native)
             user.persist_sessions = True
             if self.auto_heartbeat:
                 user.start_heartbeat(self.heartbeat_interval)

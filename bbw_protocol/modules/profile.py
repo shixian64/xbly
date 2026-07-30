@@ -12,14 +12,28 @@ class ProfileAPI:
     def __init__(self, client: ProtocolClient):
         self.c = client
 
-    def get_user(self, user_id: Optional[str] = None, lat: str = "0", lng: str = "0") -> ApiResult:
+    def get_user(
+        self,
+        user_id: Optional[str] = None,
+        lat: str = "0",
+        lng: str = "0",
+        *,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
+    ) -> ApiResult:
         target = str(user_id or self.c.session.uid or "").strip()
         action = "getUserAttributes0" if target and target != str(self.c.session.uid or "") else "getUserAttributes"
+        call_options = {}
+        if timeout is not None:
+            call_options["timeout"] = timeout
+        if deadline is not None:
+            call_options["deadline"] = deadline
         return self.c.call(
             action,
             userId=target,
             latitude=lat,
             longitude=lng,
+            **call_options,
         )
 
     def get_user0(self, user_id: Optional[str] = None, lat: str = "0", lng: str = "0") -> ApiResult:

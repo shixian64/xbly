@@ -14,12 +14,14 @@ if str(ROOT) not in sys.path:
 from bbw_protocol.app import BeibeiwuApp  # noqa: E402
 from bbw_protocol.cli import build_parser  # noqa: E402
 from bbw_protocol.client import ApiResult, ProtocolClient, _parse_result  # noqa: E402
+from bbw_protocol.modules.auth import AuthAPI  # noqa: E402
 from bbw_protocol.modules.im import ImAPI  # noqa: E402
 from bbw_protocol.modules.match import MatchAPI  # noqa: E402
 from bbw_protocol.modules.profile import ProfileAPI  # noqa: E402
 from bbw_protocol.modules.social import SocialAPI  # noqa: E402
 from bbw_protocol.session import Session  # noqa: E402
 from bbw_web import bff_server as BFF  # noqa: E402
+from bbw_web.dependency_health import RequestDeadline  # noqa: E402
 from bbw_web.normalize import (  # noqa: E402
     normalize_bottles,
     normalize_conversations,
@@ -81,6 +83,79 @@ class ParseResultContractTests(unittest.TestCase):
         result = _parse_result(500, "[]", {})
         self.assertFalse(result.ok)
         self.assertEqual(result.data, [])
+
+
+class InteractiveProtocolBudgetTests(unittest.TestCase):
+    def test_reauthentication_receives_the_original_timeout_and_deadline(self) -> None:
+        class FakeHttp:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def request(self, *_args, **kwargs):
+                self.calls.append(kwargs)
+                if len(self.calls) == 1:
+                    return SimpleNamespace(
+                        status_code=401,
+                        content='{"message":"请先登录"}'.encode("utf-8"),
+                        headers={},
+                    )
+                return SimpleNamespace(
+                    status_code=200,
+                    content=b"true",
+                    headers={},
+                )
+
+            def close(self) -> None:
+                return None
+
+        client = ProtocolClient(Session(uid="42", token="expired"))
+        client._http.close()
+        fake_http = FakeHttp()
+        client._http = fake_http
+        self.addCleanup(client.close)
+        deadline = RequestDeadline(6)
+        observed = {}
+
+        def reauthenticate(*, timeout=None, deadline=None):
+            observed.update(timeout=timeout, deadline=deadline)
+            client.session.token = "refreshed"
+            return True
+
+        client.reauth_callback = reauthenticate
+        result = client.request(
+            "https://example.invalid/provider",
+            timeout=3,
+            deadline=deadline,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(fake_http.calls), 2)
+        self.assertEqual(observed["timeout"], 3)
+        self.assertIs(observed["deadline"], deadline)
+
+    def test_password_reauthentication_forwards_call_level_budget(self) -> None:
+        observed = {}
+        deadline = RequestDeadline(6)
+        client = SimpleNamespace(
+            session=Session(uid="42", token="expired"),
+            url=lambda action: f"https://example.invalid/{action}",
+            request=lambda url, body, **kwargs: observed.update(
+                url=url,
+                body=body,
+                kwargs=kwargs,
+            )
+            or ApiResult(False, 503, "", data=None),
+        )
+
+        AuthAPI(client).login_password(
+            "19100000000",
+            "secret",
+            timeout=3,
+            deadline=deadline,
+        )
+
+        self.assertEqual(observed["kwargs"]["timeout"], 3)
+        self.assertIs(observed["kwargs"]["deadline"], deadline)
 
 
 class BootstrapContractTests(unittest.TestCase):

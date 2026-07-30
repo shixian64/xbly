@@ -104,6 +104,7 @@ from bbw_web.transports import (
     MessageHistoryTransport,
     MessageMirrorTransport,
     MessageRecallLookupTransport,
+    MessageReadTransport,
     MessageSendTransport,
 )
 
@@ -139,6 +140,7 @@ TIM_MIRROR_JOB_TIMEOUT_SECONDS = 60
 TIM_MIRROR_BACKOFF_MAX_SECONDS = 3600
 TIM_MEDIA_READ_TTL_SECONDS = 900
 TIM_RECALL_LOOKUP_MAX_PAGES = 3
+TIM_READ_SYNC_LOCK_SECONDS = 200
 WEB_NATIVE_MEDIA_CLEANUP_BATCH = 200
 WEB_NATIVE_UPLOAD_CLEANUP_GRACE_SECONDS = 60 * 60
 WEB_NATIVE_MEDIA_UNSENT_GRACE_SECONDS = 24 * 60 * 60
@@ -181,6 +183,14 @@ def _default_message_send_transport() -> MessageMirrorTransport:
     return create_legacy_tim_rest_transport()
 
 
+def _default_message_read_transport() -> MessageReadTransport:
+    """Resolve TIM read operations only through the neutral transport edge."""
+
+    from bbw_web.transports import create_legacy_tim_rest_transport
+
+    return create_legacy_tim_rest_transport()
+
+
 def _safe_url(value: Any) -> str:
     raw = str(value or "").strip()
     if not raw.startswith(("https://", "http://")):
@@ -198,6 +208,121 @@ def _safe_url(value: Any) -> str:
         return "[INVALID_URL]"
     netloc = f"{host}:{port}" if port else host
     return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))[:MAX_METADATA_STRING]
+
+
+def sync_tim_conversation_read(state_key: str) -> dict[str, Any]:
+    """Apply the latest durable per-peer TIM read intent.
+
+    Multiple RQ jobs may exist for newer receipt snapshots.  A Redis lock
+    serializes one peer, and each worker reads the latest state before calling
+    TIM so an older queued job can coalesce a newer intent safely.
+    """
+
+    settings = get_settings()
+    key = str(state_key or "").strip()
+    expected_prefix = f"{settings.redis_prefix}:im-read:"
+    if not key.startswith(expected_prefix) or len(key) > len(expected_prefix) + 80:
+        raise ValueError("invalid TIM read state key")
+    redis = Redis.from_url(settings.redis_url, decode_responses=False)
+    lock = redis.lock(
+        f"{key}:lock",
+        timeout=TIM_READ_SYNC_LOCK_SECONDS,
+        blocking_timeout=5,
+    )
+    acquired = False
+    client: Any = None
+    try:
+        acquired = bool(lock.acquire(blocking=True))
+        if not acquired:
+            raise RuntimeError("TIM read sync is already active")
+        client = _default_message_read_transport()
+        processed: list[str] = []
+        receipt_count = 0
+        for _iteration in range(3):
+            raw = redis.get(key)
+            if not raw:
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "state_expired",
+                }
+            try:
+                payload = json.loads(bytes(raw).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("invalid TIM read state payload") from exc
+            if not isinstance(payload, Mapping):
+                raise ValueError("invalid TIM read state payload")
+            version = _bounded(payload.get("version"), 64)
+            account = _bounded(payload.get("account_uid"), 128)
+            peer = _bounded(payload.get("peer_uid"), 128)
+            if not version or not account or not peer or account == peer:
+                raise ValueError("invalid TIM read state identity")
+            synced = redis.get(f"{key}:synced")
+            if synced and bytes(synced).decode("ascii", errors="ignore") == version:
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "already_synced",
+                    "processed_versions": processed,
+                }
+            receipts = payload.get("receipt_messages")
+            receipt_messages = [
+                dict(item)
+                for item in receipts[:300]
+                if isinstance(item, Mapping)
+            ] if isinstance(receipts, list) else []
+
+            conversation_result = client.mark_c2c_read(account, peer)
+            if not getattr(conversation_result, "ok", False):
+                raise RuntimeError(
+                    f"TIM conversation read failed: {int(getattr(conversation_result, 'error_code', 0) or 0)}"
+                )
+            receipt_result = client.sync_c2c_message_read_receipts(
+                account,
+                peer,
+                messages=receipt_messages or None,
+            )
+            if not getattr(receipt_result, "ok", False):
+                raise RuntimeError(
+                    f"TIM receipt sync failed: {int(getattr(receipt_result, 'error_code', 0) or 0)}"
+                )
+            receipt_data = getattr(receipt_result, "data", None)
+            if isinstance(receipt_data, Mapping):
+                receipt_count += _as_int(
+                    receipt_data.get("receipt_count"),
+                    0,
+                    maximum=10000,
+                )
+            redis.set(
+                f"{key}:synced",
+                version.encode("ascii"),
+                ex=24 * 60 * 60,
+            )
+            processed.append(version)
+            latest = redis.get(key)
+            if latest == raw:
+                break
+        return {
+            "ok": True,
+            "processed_versions": processed,
+            "receipt_count": receipt_count,
+        }
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        if acquired:
+            try:
+                lock.release()
+            except Exception:
+                pass
+        try:
+            redis.close()
+        except Exception:
+            pass
 
 
 def _uuid(value: Any, *, field: str) -> uuid.UUID:
@@ -2735,6 +2860,12 @@ def _product_event_read_peers(event_payload: Mapping[str, Any]) -> list[str]:
     response = event_payload.get("response")
     request = event_payload.get("request")
     raw_peers = response.get("read_peers") if isinstance(response, Mapping) else None
+    if (
+        isinstance(response, Mapping)
+        and isinstance(response.get("accepted_peers"), list)
+        and not raw_peers
+    ):
+        raw_peers = response.get("accepted_peers")
     if not isinstance(raw_peers, list) and isinstance(request, Mapping):
         raw_peers = request.get("peers")
         if not isinstance(raw_peers, list):

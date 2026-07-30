@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+import math
 import mimetypes
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -282,12 +285,74 @@ class ProtocolClient:
         self.response_hook: Optional[
             Callable[[Dict[str, Any], ApiResult], None]
         ] = None
-        self.reauth_callback: Optional[Callable[[], bool]] = None
+        self.reauth_callback: Optional[Callable[..., bool]] = None
         self._reauthing = False
         self._reauth_lock = threading.Lock()
 
     def close(self) -> None:
         self._http.close()
+
+    @staticmethod
+    def _deadline_remaining(deadline: Any) -> Optional[float]:
+        if deadline is None:
+            return None
+        remaining = getattr(deadline, "remaining", None)
+        try:
+            value = float(remaining() if callable(remaining) else float(deadline) - time.monotonic())
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return value if math.isfinite(value) else None
+
+    def _effective_timeout(self, timeout: Optional[float], deadline: Any) -> float:
+        values = [float(self.timeout)]
+        if timeout is not None:
+            values.append(float(timeout))
+        remaining = self._deadline_remaining(deadline)
+        if remaining is not None:
+            values.append(remaining)
+        finite = [value for value in values if math.isfinite(value)]
+        return min(finite) if finite else float(self.timeout)
+
+    @staticmethod
+    def _split_timeout(total: float) -> httpx.Timeout:
+        normalized = max(0.05, float(total))
+        return httpx.Timeout(
+            connect=min(2.0, normalized),
+            read=normalized,
+            write=min(5.0, normalized),
+            pool=min(1.0, normalized),
+        )
+
+    def _run_reauth_callback(
+        self,
+        *,
+        timeout: Optional[float],
+        deadline: Any,
+    ) -> bool:
+        callback = self.reauth_callback
+        if callback is None:
+            return False
+        try:
+            parameters = inspect.signature(callback).parameters
+        except (TypeError, ValueError):
+            return bool(callback())
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        kwargs: Dict[str, Any] = {}
+        for name, value in (("timeout", timeout), ("deadline", deadline)):
+            parameter = parameters.get(name)
+            if accepts_kwargs or (
+                parameter is not None
+                and parameter.kind
+                in {
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                }
+            ):
+                kwargs[name] = value
+        return bool(callback(**kwargs))
 
     # ---- URL helpers ----
     def url(
@@ -316,6 +381,8 @@ class ProtocolClient:
         with_author_sig: bool = False,
         uid: Optional[str] = None,
         token: Optional[str] = None,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
         _allow_reauth: bool = True,
     ) -> ApiResult:
         blocked_target = disabled_commerce_target(url)
@@ -357,23 +424,33 @@ class ProtocolClient:
             data = parse.urlencode(payload).encode("utf-8")
             hdrs["Content-Type"] = "application/x-www-form-urlencoded"
 
-        try:
-            response = self._http.request(
-                method,
-                url,
-                content=data if method != "GET" else None,
-                headers=hdrs,
-                timeout=float(self.timeout),
+        effective_timeout = self._effective_timeout(timeout, deadline)
+        if effective_timeout <= 0:
+            result = ApiResult(
+                False,
+                -1,
+                "EXC:interactive deadline exceeded",
+                kind="error",
+                message="interactive deadline exceeded",
             )
-            raw = response.content.decode("utf-8", errors="replace")
-            rh = {k: v for k, v in response.headers.items()}
-            result = _parse_result(response.status_code, raw, rh)
-        except (httpx.TimeoutException, httpx.NetworkError, httpx.ProxyError) as e:
-            # 只有真正的连接/超时/代理层失败才能折算为 status=-1
-            # （下游会把 -1 视为「上游不可用」并允许本地密码回退）。
-            # 可达服务器返回的畸形响应（RemoteProtocolError 等）和其他
-            # 未分类异常必须原样上抛，走不允许回退的通用失败路径。
-            result = ApiResult(False, -1, f"EXC:{e}", kind="error", message=str(e))
+        else:
+            try:
+                response = self._http.request(
+                    method,
+                    url,
+                    content=data if method != "GET" else None,
+                    headers=hdrs,
+                    timeout=self._split_timeout(effective_timeout),
+                )
+                raw = response.content.decode("utf-8", errors="replace")
+                rh = {k: v for k, v in response.headers.items()}
+                result = _parse_result(response.status_code, raw, rh)
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.ProxyError) as e:
+                # 只有真正的连接/超时/代理层失败才能折算为 status=-1
+                # （下游会把 -1 视为「上游不可用」并允许本地密码回退）。
+                # 可达服务器返回的畸形响应（RemoteProtocolError 等）和其他
+                # 未分类异常必须原样上抛，走不允许回退的通用失败路径。
+                result = ApiResult(False, -1, f"EXC:{e}", kind="error", message=str(e))
 
         self.last = result
         request_meta = {
@@ -404,7 +481,14 @@ class ProtocolClient:
                 else:
                     try:
                         self._reauthing = True
-                        refreshed = bool(self.reauth_callback())
+                        remaining = self._deadline_remaining(deadline)
+                        refreshed = bool(
+                            (remaining is None or remaining > 0)
+                            and self._run_reauth_callback(
+                                timeout=timeout,
+                                deadline=deadline,
+                            )
+                        )
                     except Exception:
                         refreshed = False
                     finally:
@@ -419,6 +503,8 @@ class ProtocolClient:
                     with_author_sig=with_author_sig,
                     uid=None,
                     token=None,
+                    timeout=timeout,
+                    deadline=deadline,
                     _allow_reauth=False,
                 )
         return result
@@ -480,27 +566,65 @@ class ProtocolClient:
         self,
         action: str,
         params: Optional[Dict[str, Any]] = None,
+        *,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
         **kwargs: Any,
     ) -> ApiResult:
         """Call a short action via socialchat module (startHttp style)."""
         body = dict(params or {})
         body.update(kwargs)
-        return self.request(self.url(action), body)
+        return self.request(self.url(action), body, timeout=timeout, deadline=deadline)
 
-    def call_i888(self, action: str, params: Optional[Dict[str, Any]] = None, m: str = "socialchat", **kwargs: Any) -> ApiResult:
+    def call_i888(
+        self,
+        action: str,
+        params: Optional[Dict[str, Any]] = None,
+        m: str = "socialchat",
+        *,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
+        **kwargs: Any,
+    ) -> ApiResult:
         body = dict(params or {})
         body.update(kwargs)
-        return self.request(self.url(action, i="888", m=m), body)
+        return self.request(
+            self.url(action, i="888", m=m),
+            body,
+            timeout=timeout,
+            deadline=deadline,
+        )
 
-    def call_redis(self, action: str, params: Optional[Dict[str, Any]] = None, **kwargs: Any) -> ApiResult:
+    def call_redis(
+        self,
+        action: str,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
+        **kwargs: Any,
+    ) -> ApiResult:
         body = dict(params or {})
         body.update(kwargs)
-        return self.request(self.redis_url(action), body)
+        return self.request(
+            self.redis_url(action),
+            body,
+            timeout=timeout,
+            deadline=deadline,
+        )
 
-    def call_url(self, url: str, params: Optional[Dict[str, Any]] = None, **kwargs: Any) -> ApiResult:
+    def call_url(
+        self,
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
+        **kwargs: Any,
+    ) -> ApiResult:
         body = dict(params or {})
         body.update(kwargs)
-        return self.request(url, body)
+        return self.request(url, body, timeout=timeout, deadline=deadline)
 
     def call_multipart(
         self,

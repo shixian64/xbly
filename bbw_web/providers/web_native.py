@@ -159,13 +159,20 @@ class WebNativeSession:
 class _LocalHeartbeat:
     running = False
 
-    def once(self, first: bool | None = None) -> dict[str, Any]:
+    def once(
+        self,
+        first: bool | None = None,
+        *,
+        timeout: float | None = None,
+        deadline: Any = None,
+    ) -> dict[str, Any]:
         return {
             "ok": True,
             "running": False,
             "local": True,
             "skipped": True,
             "first": first,
+            "timeout": timeout,
         }
 
     def start(self) -> None:

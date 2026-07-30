@@ -12,7 +12,13 @@ class MiscAPI:
     def __init__(self, client: ProtocolClient):
         self.c = client
 
-    def update_online(self, first: bool = False) -> ApiResult:
+    def update_online(
+        self,
+        first: bool = False,
+        *,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
+    ) -> ApiResult:
         s = self.c.session
         body = {
             "id": s.uid,
@@ -21,16 +27,37 @@ class MiscAPI:
         }
         if first:
             body["first"] = "first"
-        return self.c.call("UpdateOnline0", body)
+        call_options = {}
+        if timeout is not None:
+            call_options["timeout"] = timeout
+        if deadline is not None:
+            call_options["deadline"] = deadline
+        return self.c.call(
+            "UpdateOnline0",
+            body,
+            **call_options,
+        )
 
-    def front_or_back(self, frontorback: str = "1") -> ApiResult:
+    def front_or_back(
+        self,
+        frontorback: str = "1",
+        *,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
+    ) -> ApiResult:
         s = self.c.session
+        call_options = {}
+        if timeout is not None:
+            call_options["timeout"] = timeout
+        if deadline is not None:
+            call_options["deadline"] = deadline
         return self.c.call_url(
             "https://redis.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=xiaobeifrontorback&m=rediscache",
             myid=s.uid,
             frontorback=frontorback,
             phonebrand=getattr(s, "phonebrand", None) or "Android",
             pushregid=getattr(s, "pushregid", None) or "bbw_protocol",
+            **call_options,
         )
 
     def check_age(self, cert_no: str) -> ApiResult:

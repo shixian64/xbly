@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional
 
 from redis import Redis
-from rq import Queue
+from rq import Queue, Retry
 from rq.exceptions import InvalidJobOperation
 from sqlalchemy import and_, func, literal, or_, select, text, union_all
 from sqlalchemy.orm import aliased
@@ -53,10 +53,12 @@ from bbw_prod.services import (
 )
 from bbw_web.match_history import load_match_history, record_match_history_response
 from bbw_web.dependency_health import (
+    DependencyCircuitBreakerRegistry,
     DependencyErrorKind,
     DependencyFailure,
     DependencyStatusRegistry,
 )
+from bbw_web.interactive import PresenceCoordinator, ProfileLookupCoordinator
 from bbw_web.providers import (
     ProviderApiResult,
     ProviderApplication,
@@ -470,6 +472,7 @@ class RuntimePersistence:
     PENDING_LOGIN_SECONDS = 5 * 60
     WEB_PRESENCE_TTL_SECONDS = 120
     PRESENCE_REST_FAILURE_TTL_SECONDS = 10 * 60
+    TIM_READ_STATE_TTL_SECONDS = 24 * 60 * 60
     MOMENT_VIDEO_GRANT_SECONDS = 2 * 60 * 60
     FLASH_REVEAL_TTL_SECONDS = 5 * 60
     FLASH_REVEALED_TTL_SECONDS = 10 * 60
@@ -535,6 +538,18 @@ return 1
             )
         )
         self.dependency_status = DependencyStatusRegistry()
+        self.dependency_breakers = DependencyCircuitBreakerRegistry(
+            failure_threshold=settings.dependency_breaker_failure_threshold,
+            failure_window_seconds=settings.dependency_breaker_window_seconds,
+            cooldown_seconds=settings.dependency_breaker_cooldown_seconds,
+        )
+        self.profile_lookup_coordinator = ProfileLookupCoordinator(
+            max_workers=settings.profile_lookup_workers,
+            max_pending=settings.profile_lookup_pending,
+        )
+        self.presence_coordinator = PresenceCoordinator(
+            max_workers=settings.presence_workers,
+        )
         self.redis = Redis.from_url(settings.redis_url, decode_responses=False)
         self.cipher = CredentialCipher.from_settings(settings)
         self.phone_hmac_key = settings.load_phone_hmac_key()
@@ -586,6 +601,14 @@ return 1
         self._start_raw_response_worker()
 
     def close(self) -> None:
+        for coordinator_name in (
+            "presence_coordinator",
+            "profile_lookup_coordinator",
+        ):
+            coordinator = getattr(self, coordinator_name, None)
+            close = getattr(coordinator, "close", None)
+            if callable(close):
+                close()
         self._stop_history_response_worker()
         self._stop_product_event_worker()
         self._stop_raw_response_worker()
@@ -1055,6 +1078,151 @@ return 1
     def presence_rest_retry_after(self) -> int:
         ttl = int(self.redis.ttl(self._presence_rest_failure_key()) or 0)
         return max(0, ttl)
+
+    def _tim_read_state_key(self, account_uid: str, peer_uid: str) -> str:
+        identity = hashlib.sha256(
+            f"{str(account_uid or '').strip()}\0{str(peer_uid or '').strip()}".encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        return f"{self.settings.redis_prefix}:im-read:{identity}"
+
+    def _tim_read_job_is_durable(
+        self,
+        *,
+        job_id: str,
+        state_key: str,
+        version: str,
+    ) -> bool:
+        synced = self.redis.get(f"{state_key}:synced")
+        if synced is not None:
+            synced_version = (
+                bytes(synced).decode("ascii", errors="ignore")
+                if isinstance(synced, (bytes, bytearray, memoryview))
+                else str(synced or "")
+            )
+            if synced_version == version:
+                return True
+        fetch_job = getattr(self.default_queue, "fetch_job", None)
+        if not callable(fetch_job):
+            return False
+        try:
+            job = fetch_job(job_id)
+            if job is None:
+                return False
+            get_status = getattr(job, "get_status", None)
+            if not callable(get_status):
+                return False
+            try:
+                status = get_status(refresh=True)
+            except TypeError:
+                status = get_status()
+        except Exception:
+            return False
+        normalized = str(getattr(status, "value", status) or "").strip().lower()
+        if "." in normalized:
+            normalized = normalized.rsplit(".", 1)[-1]
+        return normalized in {"queued", "started", "deferred", "scheduled"}
+
+    def enqueue_tim_read_sync(
+        self,
+        *,
+        account_uid: str,
+        peers: Iterable[str],
+        receipt_messages: Iterable[Mapping[str, Any]] = (),
+    ) -> Mapping[str, Any]:
+        """Persist latest desired TIM read state before returning HTTP 202."""
+
+        account = str(account_uid or "").strip()
+        normalized_peers = list(
+            dict.fromkeys(
+                str(peer or "").strip()
+                for peer in list(peers)[:100]
+                if str(peer or "").strip()
+                and str(peer or "").strip() != account
+            )
+        )
+        if not account or not normalized_peers:
+            raise ValueError("TIM read sync requires account and peers")
+        supplied_receipts = [
+            dict(item)
+            for item in list(receipt_messages)[:300]
+            if isinstance(item, Mapping)
+        ]
+        accepted: list[str] = []
+        job_ids: list[str] = []
+        for peer in normalized_peers:
+            receipts = supplied_receipts if len(normalized_peers) == 1 else []
+            canonical = json.dumps(
+                {
+                    "account_uid": account,
+                    "peer_uid": peer,
+                    "receipt_messages": receipts,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            version = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            state_key = self._tim_read_state_key(account, peer)
+            state = json.dumps(
+                {
+                    "version": version,
+                    "account_uid": account,
+                    "peer_uid": peer,
+                    "receipt_messages": receipts,
+                    "updated_at": time.time(),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            # The Redis state and RQ queue share one persistence service.  The
+            # state is written first; HTTP 202 is emitted only after enqueue is
+            # confirmed (or an identical durable job already exists).
+            self.redis.set(
+                state_key,
+                state,
+                ex=self.TIM_READ_STATE_TTL_SECONDS,
+            )
+            retry_slot = int(time.time() // 30)
+            job_id = (
+                f"sync-tim-read-{state_key.rsplit(':', 1)[-1]}-"
+                f"{version[:20]}-{retry_slot}"
+            )
+            try:
+                self.default_queue.enqueue(
+                    "bbw_web.jobs.sync_tim_conversation_read",
+                    state_key,
+                    job_id=job_id,
+                    job_timeout=210,
+                    result_ttl=300,
+                    failure_ttl=86400,
+                    retry=Retry(max=5, interval=[2, 5, 15, 30, 60]),
+                )
+            except InvalidJobOperation:
+                if not self._tim_read_job_is_durable(
+                    job_id=job_id,
+                    state_key=state_key,
+                    version=version,
+                ):
+                    raise
+            except Exception as exc:
+                if (
+                    "already exists" not in str(exc).lower()
+                    or not self._tim_read_job_is_durable(
+                        job_id=job_id,
+                        state_key=state_key,
+                        version=version,
+                    )
+                ):
+                    raise
+            accepted.append(peer)
+            job_ids.append(job_id)
+        return {
+            "accepted_peers": accepted,
+            "job_ids": job_ids,
+            "durable": True,
+        }
 
     def _flash_reveal_digest(self, upstream_uid: str, unique_id: str) -> str:
         return keyed_identifier_hash(
@@ -1920,8 +2088,13 @@ return 1
         client.response_hook = lambda meta, result: self.capture_upstream_response(
             identity=identity, request_meta=meta, result=result
         )
-        client.reauth_callback = lambda: self._reauthenticate(
-            identity=identity, app=web_user.app
+        client.reauth_callback = (
+            lambda *, timeout=None, deadline=None: self._reauthenticate(
+                identity=identity,
+                app=web_user.app,
+                timeout=timeout,
+                deadline=deadline,
+            )
         )
 
     def _reauthenticate(
@@ -1929,6 +2102,8 @@ return 1
         *,
         identity: UserIdentity,
         app: ProviderApplication,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
     ) -> bool:
         with session_scope() as db:
             account = ExternalAccountRepository(db).get_for_user(identity.user_id)
@@ -1937,7 +2112,12 @@ return 1
             login, password, _token = self._decrypt_account(account)
         if not login or not password:
             return False
-        result = app.auth.login_password(login, password)
+        result = app.auth.login_password(
+            login,
+            password,
+            timeout=timeout,
+            deadline=deadline,
+        )
         if not result.ok or not app.session.logged_in:
             app.session.password = ""
             return False

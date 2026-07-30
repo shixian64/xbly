@@ -236,6 +236,19 @@ class Settings:
     compatibility_mode: str
     upstream_auth_timeout_seconds: int
     local_password_auth_concurrency: int
+    im_interactive_budget_seconds: int
+    tim_interactive_timeout_seconds: int
+    provider_interactive_timeout_seconds: int
+    profile_interactive_budget_seconds: int
+    profile_interactive_timeout_seconds: int
+    profile_sync_fetch_limit: int
+    profile_lookup_workers: int
+    profile_lookup_pending: int
+    presence_interactive_timeout_seconds: int
+    presence_workers: int
+    dependency_breaker_failure_threshold: int
+    dependency_breaker_window_seconds: int
+    dependency_breaker_cooldown_seconds: int
     active_sync_seconds: int
     inactive_sync_seconds: int
     media_strip_metadata: bool
@@ -340,6 +353,84 @@ class Settings:
                 2,
                 minimum=1,
                 maximum=8,
+            ),
+            im_interactive_budget_seconds=_env_int(
+                "BBW_IM_INTERACTIVE_BUDGET_SECONDS",
+                6,
+                minimum=2,
+                maximum=15,
+            ),
+            tim_interactive_timeout_seconds=_env_int(
+                "BBW_TIM_INTERACTIVE_TIMEOUT_SECONDS",
+                3,
+                minimum=1,
+                maximum=10,
+            ),
+            provider_interactive_timeout_seconds=_env_int(
+                "BBW_PROVIDER_INTERACTIVE_TIMEOUT_SECONDS",
+                3,
+                minimum=1,
+                maximum=10,
+            ),
+            profile_interactive_budget_seconds=_env_int(
+                "BBW_PROFILE_INTERACTIVE_BUDGET_SECONDS",
+                5,
+                minimum=1,
+                maximum=15,
+            ),
+            profile_interactive_timeout_seconds=_env_int(
+                "BBW_PROFILE_INTERACTIVE_TIMEOUT_SECONDS",
+                3,
+                minimum=1,
+                maximum=10,
+            ),
+            profile_sync_fetch_limit=_env_int(
+                "BBW_PROFILE_SYNC_FETCH_LIMIT",
+                12,
+                minimum=1,
+                maximum=32,
+            ),
+            profile_lookup_workers=_env_int(
+                "BBW_PROFILE_LOOKUP_WORKERS",
+                8,
+                minimum=1,
+                maximum=16,
+            ),
+            profile_lookup_pending=_env_int(
+                "BBW_PROFILE_LOOKUP_PENDING",
+                32,
+                minimum=4,
+                maximum=128,
+            ),
+            presence_interactive_timeout_seconds=_env_int(
+                "BBW_PRESENCE_INTERACTIVE_TIMEOUT_SECONDS",
+                3,
+                minimum=1,
+                maximum=10,
+            ),
+            presence_workers=_env_int(
+                "BBW_PRESENCE_WORKERS",
+                4,
+                minimum=1,
+                maximum=8,
+            ),
+            dependency_breaker_failure_threshold=_env_int(
+                "BBW_DEPENDENCY_BREAKER_FAILURE_THRESHOLD",
+                3,
+                minimum=1,
+                maximum=20,
+            ),
+            dependency_breaker_window_seconds=_env_int(
+                "BBW_DEPENDENCY_BREAKER_WINDOW_SECONDS",
+                10,
+                minimum=1,
+                maximum=300,
+            ),
+            dependency_breaker_cooldown_seconds=_env_int(
+                "BBW_DEPENDENCY_BREAKER_COOLDOWN_SECONDS",
+                20,
+                minimum=1,
+                maximum=600,
             ),
             active_sync_seconds=_env_int("BBW_ACTIVE_SYNC_SECONDS", 300, minimum=60),
             inactive_sync_seconds=_env_int("BBW_INACTIVE_SYNC_SECONDS", 3600, minimum=300),

@@ -8,6 +8,7 @@ from typing import Any
 from .contracts import (
     MessageHistoryTransport,
     MessageMirrorTransport,
+    MessageReadTransport,
     MessageRecallLookupTransport,
     MessageSendTransport,
     MessageTransport,
@@ -17,6 +18,7 @@ from .contracts import (
 __all__ = [
     "MessageHistoryTransport",
     "MessageMirrorTransport",
+    "MessageReadTransport",
     "MessageRecallLookupTransport",
     "MessageSendTransport",
     "MessageTransport",

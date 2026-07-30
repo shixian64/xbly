@@ -39,7 +39,7 @@ from starlette.datastructures import Headers
 from starlette.requests import ClientDisconnect
 
 from bbw_web import bff_server as legacy
-from bbw_web.store import SessionStore
+from bbw_web.store import SessionStore, close_web_runtime
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -343,6 +343,12 @@ class CapturingHandler(legacy.Handler):
             Callable[[str, str], Mapping[str, Any]]
         ] = None,
         local_read_marker: Optional[Callable[[str], Optional[int]]] = None,
+        request_id: str = "",
+        budget_config: Optional[Mapping[str, Any]] = None,
+        dependency_breakers: Any = None,
+        profile_lookup_coordinator: Any = None,
+        presence_coordinator: Any = None,
+        read_sync_enqueuer: Optional[Callable[..., Mapping[str, Any]]] = None,
     ) -> None:
         # BaseHTTPRequestHandler.__init__ immediately starts reading a socket;
         # intentionally do not call it here.
@@ -373,9 +379,16 @@ class CapturingHandler(legacy.Handler):
         self._request_local_text_sender = local_text_sender
         self._request_local_text_revoker = local_text_revoker
         self._request_local_read_marker = local_read_marker
+        self._request_id = str(request_id or "")[:64]
+        self._request_budget_config = dict(budget_config or {})
+        self._request_dependency_breakers = dependency_breakers
+        self._request_profile_lookup_coordinator = profile_lookup_coordinator
+        self._request_presence_coordinator = presence_coordinator
+        self._request_read_sync_enqueuer = read_sync_enqueuer
         self.request_version = "HTTP/1.1"
         self.close_connection = True
         self._held_user_lock = None
+        self._held_peer_lock = None
         self.response_status = 500
         self.response_headers: list[tuple[str, str]] = []
 
@@ -392,6 +405,10 @@ class CapturingHandler(legacy.Handler):
         return
 
     def finish_capture(self) -> tuple[int, list[tuple[str, str]], bytes]:
+        peer_lock = self._held_peer_lock
+        self._held_peer_lock = None
+        if peer_lock is not None:
+            peer_lock.release()
         lock = self._held_user_lock
         self._held_user_lock = None
         if lock is not None:
@@ -777,10 +794,7 @@ def _logout_expired_pending_user(web_user: Any) -> None:
     except Exception:
         pass
     finally:
-        try:
-            web_user.app.client.close()
-        except Exception:
-            pass
+        close_web_runtime(web_user.app, web_user.native)
 
 
 def _discard_pending_runtime(raw_sid: str) -> None:
@@ -1700,6 +1714,85 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
             local_text_sender=None,
             local_text_revoker=None,
             local_read_marker=None,
+            request_id=str(getattr(request.state, "request_id", "") or ""),
+            budget_config={
+                "im_budget_seconds": float(
+                    getattr(
+                        request.app.state.settings,
+                        "im_interactive_budget_seconds",
+                        0,
+                    )
+                    or 0
+                ),
+                "tim_timeout_seconds": float(
+                    getattr(
+                        request.app.state.settings,
+                        "tim_interactive_timeout_seconds",
+                        0,
+                    )
+                    or 0
+                ),
+                "provider_timeout_seconds": float(
+                    getattr(
+                        request.app.state.settings,
+                        "provider_interactive_timeout_seconds",
+                        0,
+                    )
+                    or 0
+                ),
+                "profile_budget_seconds": float(
+                    getattr(
+                        request.app.state.settings,
+                        "profile_interactive_budget_seconds",
+                        0,
+                    )
+                    or 0
+                ),
+                "profile_timeout_seconds": float(
+                    getattr(
+                        request.app.state.settings,
+                        "profile_interactive_timeout_seconds",
+                        0,
+                    )
+                    or 0
+                ),
+                "profile_sync_limit": int(
+                    getattr(
+                        request.app.state.settings,
+                        "profile_sync_fetch_limit",
+                        12,
+                    )
+                    or 12
+                ),
+                "presence_timeout_seconds": float(
+                    getattr(
+                        request.app.state.settings,
+                        "presence_interactive_timeout_seconds",
+                        0,
+                    )
+                    or 0
+                ),
+            },
+            dependency_breakers=getattr(
+                persistence,
+                "dependency_breakers",
+                None,
+            ),
+            profile_lookup_coordinator=getattr(
+                persistence,
+                "profile_lookup_coordinator",
+                None,
+            ),
+            presence_coordinator=getattr(
+                persistence,
+                "presence_coordinator",
+                None,
+            ),
+            read_sync_enqueuer=(
+                getattr(persistence, "enqueue_tim_read_sync", None)
+                if identity is not None
+                else None
+            ),
         )
         try:
             if request.method == "GET":
@@ -1979,6 +2072,14 @@ async def lifespan(application: FastAPI):
         legacy.INVITE_LOGIN_ENABLED = False
         legacy.MOMENT_VIDEO_COMPAT_ENABLED = False
         legacy.PRESENCE_BACKEND = None
+        for coordinator_name in (
+            "presence_coordinator",
+            "profile_lookup_coordinator",
+        ):
+            coordinator = getattr(persistence, coordinator_name, None)
+            close = getattr(coordinator, "close", None)
+            if callable(close):
+                close()
         if legacy.STORE is not None:
             legacy.STORE.close()
         persistence.close()

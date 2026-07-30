@@ -85,6 +85,10 @@ const FLASH_ACK_RETRY_DELAYS_MS = [1000, 2500, 5000, 10000, 30000];
 const FLASH_ACK_RETRY_WINDOW_MS = 5 * 60 * 1000;
 const FLASH_ACK_LOCAL_RETENTION_MS = 10 * 60 * 1000;
 const FLASH_ACK_STORAGE_PREFIX = "bbw:im:flash-acks:";
+const TAB_COORDINATION_ID = window.crypto?.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+const TAB_OPERATION_STORAGE_PREFIX = "bbw:tab-operation:";
+const PRESENCE_TAB_STORAGE_PREFIX = "bbw:presence-tab:";
+const PRESENCE_TAB_LEASE_MS = 70 * 1000;
 const PAGE_CACHE_TTL_MS = 2 * 60 * 1000;
 const PAGE_CACHE_MAX_AGE_MS = 15 * 60 * 1000;
 const FAST_VIEW_CACHE_TTL_MS = 15 * 1000;
@@ -995,6 +999,23 @@ function responseRetryAfterMs(response) {
   return Math.min(5 * 60 * 1000, Math.max(0, retryAt - Date.now()));
 }
 
+function requireApiSuccess(result, fallback = "请求未成功") {
+  const response = result && typeof result === "object" ? result : {};
+  const data = response.data && typeof response.data === "object" ? response.data : {};
+  if (response.ok && data.ok !== false) return response;
+  const info = errorInfo(data, fallback);
+  throw new ApiRequestError(info.title || fallback, {
+    kind: "http-error",
+    status: response.status,
+    retryAfterMs: Math.max(
+      Number(response.retryAfterMs || 0),
+      Number(data.retry_after || 0) * 1000
+    ),
+    requestId: response.requestId,
+    retryable: data.retryable === true || response.status === 429 || response.status >= 500,
+  });
+}
+
 async function api(path, options = {}) {
   const requestStartedAt = performanceClockNow();
   const requestPath = performanceMetricPath(path);
@@ -1063,6 +1084,7 @@ async function api(path, options = {}) {
       S.sessionGeneration += 1;
       stopMatchStatusPolling();
       setAiAgentAccess(false, null, { redirect: false });
+      rememberVisiblePresenceTab(false);
       S.user = null;
       S.meStats = null;
       S.meStatsAt = 0;
@@ -1156,6 +1178,84 @@ function archiveHash(value) {
   first = Math.imul(first ^ (first >>> 16), 2246822507) ^ Math.imul(second ^ (second >>> 13), 3266489909);
   second = Math.imul(second ^ (second >>> 16), 2246822507) ^ Math.imul(first ^ (first >>> 13), 3266489909);
   return `${(second >>> 0).toString(36)}${(first >>> 0).toString(36)}`;
+}
+
+function tabCoordinationAccount() {
+  return archiveHash(String(S.user?.uid || S.user?.id || "anonymous"));
+}
+
+async function runCrossTabOperation(
+  scope,
+  task,
+  { leaseMs = 4000, retainLease = false } = {}
+) {
+  const operation = `${String(scope || "operation")}-${tabCoordinationAccount()}`;
+  if (navigator.locks?.request) {
+    return navigator.locks.request(
+      `bbw-${operation}`,
+      { ifAvailable: true, mode: "exclusive" },
+      (lock) => (lock ? task() : null)
+    );
+  }
+  const key = `${TAB_OPERATION_STORAGE_PREFIX}${archiveHash(operation)}`;
+  const now = Date.now();
+  try {
+    const existing = JSON.parse(localStorage.getItem(key) || "{}");
+    if (Number(existing.expiresAt || 0) > now) return null;
+    localStorage.setItem(
+      key,
+      JSON.stringify({ owner: TAB_COORDINATION_ID, expiresAt: now + Math.max(1000, Number(leaseMs || 0)) })
+    );
+  } catch {
+    return task();
+  }
+  try {
+    return await task();
+  } finally {
+    if (!retainLease) {
+      try {
+        const current = JSON.parse(localStorage.getItem(key) || "{}");
+        if (current.owner === TAB_COORDINATION_ID) localStorage.removeItem(key);
+      } catch {
+        // The lease naturally expires if storage cannot be updated.
+      }
+    }
+  }
+}
+
+function visiblePresenceTabKey() {
+  return `${PRESENCE_TAB_STORAGE_PREFIX}${tabCoordinationAccount()}:${TAB_COORDINATION_ID}`;
+}
+
+function rememberVisiblePresenceTab(active) {
+  const key = visiblePresenceTabKey();
+  try {
+    if (active) {
+      localStorage.setItem(key, JSON.stringify({ expiresAt: Date.now() + PRESENCE_TAB_LEASE_MS }));
+    } else {
+      localStorage.removeItem(key);
+    }
+  } catch {
+    // Storage may be unavailable; server-side coalescing remains authoritative.
+  }
+}
+
+function hasOtherVisiblePresenceTab() {
+  const prefix = `${PRESENCE_TAB_STORAGE_PREFIX}${tabCoordinationAccount()}:`;
+  const ownKey = visiblePresenceTabKey();
+  const now = Date.now();
+  try {
+    for (let index = localStorage.length - 1; index >= 0; index -= 1) {
+      const key = localStorage.key(index);
+      if (!key?.startsWith(prefix) || key === ownKey) continue;
+      const value = JSON.parse(localStorage.getItem(key) || "{}");
+      if (Number(value.expiresAt || 0) > now) return true;
+      localStorage.removeItem(key);
+    }
+  } catch {
+    return false;
+  }
+  return false;
 }
 
 function archiveTimestamp(value) {
@@ -2934,7 +3034,7 @@ async function loadConversationPreview(peer, activityTimestamp, { refreshList = 
     const around = Math.floor(activity / 1000);
     const { data } = await api(
       `/api/im/messages?peer=${encodeURIComponent(target)}&summary=1&at=${encodeURIComponent(around)}`,
-      { timeout: 20000 }
+      { timeout: 8000 }
     );
     const me = String(S.user?.uid || S.user?.id || "");
     const latest = itemsOf(data)
@@ -3061,8 +3161,9 @@ function refreshConversationSummary({ force = false } = {}) {
   if (!force && now - S.conversationLastRefreshAt < CONVERSATION_REFRESH_MIN_MS) {
     return Promise.resolve(S.conversations);
   }
-  const task = api("/api/im/conversations?page=1", { timeout: 15000 })
-    .then(({ data }) => {
+  const task = api("/api/im/conversations?page=1", { timeout: 8000 })
+    .then((result) => {
+      const { data } = requireApiSuccess(result, "聊天列表暂时不可用");
       S.conversationLastRefreshAt = Date.now();
       S.conversationNextRefreshAt = 0;
       return applyConversationSummaries(itemsOf(data), {
@@ -3071,8 +3172,11 @@ function refreshConversationSummary({ force = false } = {}) {
         broadcast: true,
       });
     })
-    .catch(() => {
-      S.conversationNextRefreshAt = Date.now() + CONVERSATION_REFRESH_ERROR_MS;
+    .catch((error) => {
+      S.conversationNextRefreshAt = Date.now() + Math.max(
+        CONVERSATION_REFRESH_ERROR_MS,
+        Number(error?.retryAfterMs || 0)
+      );
       return S.conversations.length
         ? S.conversations
         : loadArchivedConversationSummary({ force: true });
@@ -5214,15 +5318,31 @@ async function hydrateConversationProfiles() {
       try {
         const { data } = await api(
           `/api/profile/users?uids=${encodeURIComponent(batch.join(","))}`,
-          { timeout: 12000 }
+          { timeout: 8000 }
         );
         const profiles = itemsOf(data);
+        const pending = new Set(
+          (Array.isArray(data?.pending_uids) ? data.pending_uids : [])
+            .map((peer) => String(peer || "").trim())
+            .filter(Boolean)
+        );
         batch.forEach((peer) => {
           const profile = conversationProfileForPeer(profiles, peer);
           if (!rememberConversationProfile(peer, profile)) {
-            S.conversationProfileFetchedAt.set(peer, Date.now());
+            S.conversationProfileFetchedAt.set(
+              peer,
+              pending.has(peer)
+                ? Date.now() - CONVERSATION_PROFILE_ERROR_TTL_MS + Math.max(1000, Number(data?.retry_after || 2) * 1000)
+                : Date.now()
+            );
           }
         });
+        if (pending.size) {
+          setTimeout(
+            () => void hydrateConversationProfiles(),
+            Math.max(1000, Number(data?.retry_after || 2) * 1000)
+          );
+        }
       } catch {
         batch.forEach((peer) => S.conversationProfileFetchedAt.set(peer, Date.now()));
       }
@@ -9064,7 +9184,7 @@ async function loadConversationMessages(peer, { force = false } = {}) {
   if (!wasLoaded && S.activePeer === target) refreshChatLog();
   const me = String(S.user?.uid || S.user?.id || "");
   const tasks = [
-    api(`/api/im/messages?peer=${encodeURIComponent(target)}`, { timeout: 10000 }).then(({ data, ok }) => {
+    api(`/api/im/messages?peer=${encodeURIComponent(target)}`, { timeout: 8000 }).then(({ data, ok }) => {
       if (!ok || data?.ok === false) throw new Error("服务器聊天记录暂时不可用");
       return itemsOf(data).map((item) => timMessageEntry({ ...item, source: "http" }, target, me));
     }),
@@ -9202,7 +9322,7 @@ async function loadOlderConversationMessages(peer, log = $("im-log")) {
   const tasks = [
     api(
       `/api/im/messages?peer=${encodeURIComponent(target)}&before=${encodeURIComponent(beforeSeconds)}`,
-      { timeout: 12000 }
+      { timeout: 8000 }
     ).then(({ data, ok }) => {
       if (!ok || data?.ok === false) throw new Error("服务器聊天记录暂时不可用");
       const items = itemsOf(data);
@@ -11529,14 +11649,18 @@ function scheduleSdkMessageReadReceipts(peer, delay = 80) {
 function reportConversationRead(peer) {
   const target = String(peer || "").trim();
   if (!target) return Promise.resolve(false);
-  return api("/api/im/read", {
-    method: "POST",
-    body: JSON.stringify({
-      peer: target,
-      receipt_messages: conversationReadReceiptReports(target),
-    }),
-    timeout: 15000,
-  }).then(({ data }) => data?.ok === true);
+  return runCrossTabOperation(
+    `im-read-${archiveHash(target)}`,
+    () => api("/api/im/read", {
+      method: "POST",
+      body: JSON.stringify({
+        peer: target,
+        receipt_messages: conversationReadReceiptReports(target),
+      }),
+      timeout: 7000,
+    }).then((result) => requireApiSuccess(result, "消息已读状态暂时无法保存").data?.ok === true),
+    { leaseMs: 3000 }
+  );
 }
 
 async function reportConversationsRead(peers) {
@@ -11549,12 +11673,22 @@ async function reportConversationsRead(peers) {
   ];
   if (!targets.length) return true;
   for (let offset = 0; offset < targets.length; offset += 100) {
-    const { data } = await api("/api/im/read", {
-      method: "POST",
-      body: JSON.stringify({ peers: targets.slice(offset, offset + 100) }),
-      timeout: 15000,
-    });
-    if (data?.ok !== true) return false;
+    const batch = targets.slice(offset, offset + 100);
+    const handled = await runCrossTabOperation(
+      `im-read-batch-${archiveHash(batch.join("\u001f"))}`,
+      async () => {
+        const result = await api("/api/im/read", {
+          method: "POST",
+          body: JSON.stringify({ peers: batch }),
+          timeout: 7000,
+        });
+        const { data } = requireApiSuccess(result, "消息已读状态暂时无法保存");
+        return data?.ok === true;
+      },
+      { leaseMs: 3000 }
+    );
+    if (handled === null) continue;
+    if (handled !== true) return false;
   }
   return true;
 }
@@ -18514,6 +18648,8 @@ function stopPresenceTimer() {
 function updatePresence(active) {
   stopPresenceTimer();
   if (!S.authenticated) return;
+  rememberVisiblePresenceTab(active);
+  if (!active && hasOtherVisiblePresenceTab()) return;
   const post = (path, body = {}) =>
     api(path, {
       method: "POST",
@@ -18523,14 +18659,35 @@ function updatePresence(active) {
     }).catch(() => {});
   void post("/api/frontback", { frontorback: active ? "1" : "0" });
   if (!active) {
-    if (S.serverHeartbeat) void post("/api/heartbeat/stop");
+    if (S.serverHeartbeat) {
+      void runCrossTabOperation(
+        "presence-heartbeat-stop",
+        () => post("/api/heartbeat/stop"),
+        { leaseMs: 2500, retainLease: true }
+      );
+    }
     return;
   }
   if (S.serverHeartbeat) {
-    void post("/api/heartbeat/start", { interval_sec: 55 });
+    void runCrossTabOperation(
+      "presence-heartbeat-start",
+      () => post("/api/heartbeat/start", { interval_sec: 55 }),
+      { leaseMs: 2500, retainLease: true }
+    );
+    S.presenceTimer = setInterval(
+      () => rememberVisiblePresenceTab(true),
+      45000
+    );
     return;
   }
-  const once = () => void post("/api/heartbeat/once");
+  const once = () => {
+    rememberVisiblePresenceTab(true);
+    void runCrossTabOperation(
+      "presence-heartbeat",
+      () => post("/api/heartbeat/once"),
+      { leaseMs: 5000, retainLease: true }
+    );
+  };
   once();
   S.presenceTimer = setInterval(once, 45000);
 }
@@ -18557,6 +18714,7 @@ async function logout({ notifyServer = true } = {}) {
     S.sessionGeneration += 1;
     stopMatchStatusPolling();
     setAiAgentAccess(false, null, { redirect: false });
+    rememberVisiblePresenceTab(false);
     S.user = null;
     finishVoiceRecording(null, true);
     closeFlashViewer();
@@ -20930,6 +21088,7 @@ window.addEventListener("pageshow", (event) => {
 });
 
 window.addEventListener("pagehide", (event) => {
+  rememberVisiblePresenceTab(false);
   clearAgentApiKeyInputs(document);
   clearAiAgentPendingExecution();
   setAiAgentExecutionStatus(null);
@@ -20964,12 +21123,14 @@ window.addEventListener("pagehide", (event) => {
       keepalive: true,
       headers: { "Content-Type": "application/json" },
     };
-    void fetch("/api/frontback", {
-      ...options,
-      body: JSON.stringify({ frontorback: "0" }),
-    }).catch(() => {});
-    if (S.serverHeartbeat) {
-      void fetch("/api/heartbeat/stop", { ...options, body: "{}" }).catch(() => {});
+    if (!hasOtherVisiblePresenceTab()) {
+      void fetch("/api/frontback", {
+        ...options,
+        body: JSON.stringify({ frontorback: "0" }),
+      }).catch(() => {});
+      if (S.serverHeartbeat) {
+        void fetch("/api/heartbeat/stop", { ...options, body: "{}" }).catch(() => {});
+      }
     }
     if (!event.persisted && !VOICE_MATCH_ENABLED) {
       void fetch("/api/match/voice/cancel", {

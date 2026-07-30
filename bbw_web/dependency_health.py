@@ -10,8 +10,10 @@ boundary.
 from __future__ import annotations
 
 import json
+import math
 import re
 import socket
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -285,6 +287,202 @@ class DependencyCapabilityStatus:
 
 
 Clock = Callable[[], datetime]
+MonotonicClock = Callable[[], float]
+
+
+class DependencyDeadlineExceeded(TimeoutError):
+    """The interactive request budget was exhausted before another call."""
+
+
+class RequestDeadline:
+    """One monotonic deadline shared by every upstream call in a request.
+
+    Adapters receive this object as an optional call-level override.  Their
+    normal defaults remain unchanged for CLI and background jobs.
+    """
+
+    __slots__ = ("_clock", "_started_at", "_deadline")
+
+    def __init__(
+        self,
+        total_seconds: float,
+        *,
+        clock: MonotonicClock | None = None,
+    ) -> None:
+        total = float(total_seconds)
+        if not math.isfinite(total) or total <= 0:
+            raise ValueError("deadline total_seconds must be positive")
+        self._clock = clock or time.monotonic
+        self._started_at = float(self._clock())
+        self._deadline = self._started_at + total
+
+    @property
+    def started_at(self) -> float:
+        return self._started_at
+
+    @property
+    def deadline(self) -> float:
+        return self._deadline
+
+    def elapsed(self) -> float:
+        return max(0.0, float(self._clock()) - self._started_at)
+
+    def remaining(self, cap: float | None = None) -> float:
+        value = max(0.0, self._deadline - float(self._clock()))
+        if cap is None:
+            return value
+        normalized_cap = float(cap)
+        if not math.isfinite(normalized_cap) or normalized_cap <= 0:
+            return 0.0
+        return min(value, normalized_cap)
+
+    @property
+    def expired(self) -> bool:
+        return self.remaining() <= 0
+
+    def timeout(self, cap: float | None = None) -> float:
+        remaining = self.remaining(cap)
+        if remaining <= 0:
+            raise DependencyDeadlineExceeded("interactive dependency deadline exceeded")
+        return remaining
+
+
+class DependencyCircuitOpen(RuntimeError):
+    """A retryable dependency circuit is cooling down."""
+
+    retryable = True
+
+    def __init__(self, provider: str, domain: str, retry_after: int) -> None:
+        super().__init__(f"dependency circuit open: {provider}/{domain}")
+        self.provider = provider
+        self.domain = domain
+        self.retry_after = max(1, int(retry_after))
+
+
+@dataclass(slots=True)
+class _CircuitState:
+    failures: list[float]
+    opened_until: float = 0.0
+    probe_in_flight: bool = False
+
+
+class DependencyCircuitBreakerRegistry:
+    """Process-wide, thread-safe retryable-failure circuit breakers.
+
+    A single registry is injected into all per-account runtimes.  After the
+    cooldown, only one half-open probe is admitted so many browser tabs cannot
+    stampede a recovering provider.
+    """
+
+    def __init__(
+        self,
+        *,
+        failure_threshold: int = 3,
+        failure_window_seconds: float = 10.0,
+        cooldown_seconds: float = 20.0,
+        clock: MonotonicClock | None = None,
+    ) -> None:
+        threshold = int(failure_threshold)
+        window = float(failure_window_seconds)
+        cooldown = float(cooldown_seconds)
+        if threshold < 1:
+            raise ValueError("circuit breaker failure_threshold must be positive")
+        if not math.isfinite(window) or window <= 0:
+            raise ValueError("circuit breaker failure_window_seconds must be positive")
+        if not math.isfinite(cooldown) or cooldown <= 0:
+            raise ValueError("circuit breaker cooldown_seconds must be positive")
+        self.failure_threshold = threshold
+        self.failure_window_seconds = window
+        self.cooldown_seconds = cooldown
+        self._clock = clock or time.monotonic
+        self._lock = RLock()
+        self._states: dict[tuple[str, str], _CircuitState] = {}
+
+    @staticmethod
+    def _key(provider: str, domain: str) -> tuple[str, str]:
+        return (
+            _component(provider, field="provider"),
+            _component(domain, field="domain"),
+        )
+
+    def _prune(self, state: _CircuitState, now: float) -> None:
+        cutoff = now - self.failure_window_seconds
+        state.failures[:] = [stamp for stamp in state.failures if stamp > cutoff]
+
+    def before_call(self, provider: str, domain: str) -> None:
+        key = self._key(provider, domain)
+        now = float(self._clock())
+        with self._lock:
+            state = self._states.setdefault(key, _CircuitState([]))
+            self._prune(state, now)
+            if state.opened_until > now:
+                raise DependencyCircuitOpen(
+                    key[0],
+                    key[1],
+                    math.ceil(state.opened_until - now),
+                )
+            if state.opened_until > 0:
+                if state.probe_in_flight:
+                    raise DependencyCircuitOpen(key[0], key[1], 1)
+                state.probe_in_flight = True
+
+    def record_success(self, provider: str, domain: str) -> None:
+        key = self._key(provider, domain)
+        with self._lock:
+            state = self._states.setdefault(key, _CircuitState([]))
+            state.failures.clear()
+            state.opened_until = 0.0
+            state.probe_in_flight = False
+
+    def record_failure(
+        self,
+        provider: str,
+        domain: str,
+        *,
+        retryable: bool = True,
+    ) -> None:
+        key = self._key(provider, domain)
+        if not retryable:
+            # A reachable business/contract rejection must not poison the
+            # transport circuit and also completes a possible half-open probe.
+            self.record_success(*key)
+            return
+        now = float(self._clock())
+        with self._lock:
+            state = self._states.setdefault(key, _CircuitState([]))
+            self._prune(state, now)
+            state.failures.append(now)
+            if state.probe_in_flight or len(state.failures) >= self.failure_threshold:
+                state.opened_until = now + self.cooldown_seconds
+            state.probe_in_flight = False
+
+    def retry_after(self, provider: str, domain: str) -> int:
+        key = self._key(provider, domain)
+        now = float(self._clock())
+        with self._lock:
+            state = self._states.get(key)
+            if state is None or state.opened_until <= now:
+                return 0
+            return max(1, math.ceil(state.opened_until - now))
+
+    def snapshot(self) -> dict[tuple[str, str], dict[str, object]]:
+        now = float(self._clock())
+        with self._lock:
+            output: dict[tuple[str, str], dict[str, object]] = {}
+            for key, state in self._states.items():
+                self._prune(state, now)
+                retry_after = (
+                    max(1, math.ceil(state.opened_until - now))
+                    if state.opened_until > now
+                    else 0
+                )
+                output[key] = {
+                    "open": retry_after > 0,
+                    "retry_after": retry_after,
+                    "recent_failures": len(state.failures),
+                    "probe_in_flight": state.probe_in_flight,
+                }
+            return output
 
 
 class DependencyStatusRegistry:
@@ -442,4 +640,3 @@ class DependencyStatusRegistry:
 
     def public_snapshot(self) -> list[dict[str, object]]:
         return [status.to_public_dto() for status in self.snapshot()]
-

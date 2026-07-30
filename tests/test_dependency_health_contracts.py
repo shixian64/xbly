@@ -6,11 +6,15 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from bbw_web.dependency_health import (
+    DependencyCircuitBreakerRegistry,
+    DependencyCircuitOpen,
+    DependencyDeadlineExceeded,
     DependencyAvailability,
     DependencyCapabilityStatus,
     DependencyErrorKind,
     DependencyFailure,
     DependencyStatusRegistry,
+    RequestDeadline,
     classify_dependency_error,
 )
 
@@ -233,6 +237,54 @@ class DependencyStatusRegistryTests(unittest.TestCase):
         self.assertIs(late, current)
         self.assertIs(registry.get("banghua", "feed"), current)
         self.assertEqual(registry.get("BANGHUA", "FEED"), current)
+
+
+class InteractiveDependencyResilienceTests(unittest.TestCase):
+    def test_request_deadline_exposes_one_shared_monotonic_budget(self) -> None:
+        now = [100.0]
+        deadline = RequestDeadline(6, clock=lambda: now[0])
+
+        now[0] = 102.5
+        self.assertAlmostEqual(deadline.elapsed(), 2.5)
+        self.assertAlmostEqual(deadline.remaining(), 3.5)
+        self.assertAlmostEqual(deadline.timeout(2), 2.0)
+
+        now[0] = 106.0
+        self.assertTrue(deadline.expired)
+        with self.assertRaises(DependencyDeadlineExceeded):
+            deadline.timeout()
+
+    def test_retryable_failures_open_and_half_open_one_shared_circuit(self) -> None:
+        now = [0.0]
+        registry = DependencyCircuitBreakerRegistry(
+            failure_threshold=3,
+            failure_window_seconds=10,
+            cooldown_seconds=20,
+            clock=lambda: now[0],
+        )
+
+        for _ in range(3):
+            registry.before_call("tim", "im-read")
+            registry.record_failure("tim", "im-read", retryable=True)
+
+        with self.assertRaises(DependencyCircuitOpen) as opened:
+            registry.before_call("tim", "im-read")
+        self.assertEqual(opened.exception.retry_after, 20)
+
+        now[0] = 20.0
+        registry.before_call("tim", "im-read")
+        with self.assertRaises(DependencyCircuitOpen):
+            registry.before_call("tim", "im-read")
+        registry.record_success("tim", "im-read")
+        registry.before_call("tim", "im-read")
+
+    def test_nonretryable_rejection_does_not_poison_transport_circuit(self) -> None:
+        registry = DependencyCircuitBreakerRegistry(failure_threshold=1)
+        registry.before_call("beibeiwu", "profile")
+        registry.record_failure("beibeiwu", "profile", retryable=False)
+
+        registry.before_call("beibeiwu", "profile")
+        self.assertEqual(registry.retry_after("beibeiwu", "profile"), 0)
 
 
 if __name__ == "__main__":

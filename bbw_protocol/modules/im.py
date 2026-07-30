@@ -82,11 +82,32 @@ class ImAPI:
     def history_message_insert(self, **params: Any) -> ApiResult:
         return self.c.call("insertTencentHistoryMessage", params)
 
-    def history_conversations(self, page: str = "1") -> ApiResult:
+    def history_conversations(
+        self,
+        page: str = "1",
+        *,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
+    ) -> ApiResult:
         """Return the server-side conversation/history summary used by the APK."""
-        return self.c.call("getHistoryConversation", page=page)
+        call_options = {}
+        if timeout is not None:
+            call_options["timeout"] = timeout
+        if deadline is not None:
+            call_options["deadline"] = deadline
+        return self.c.call(
+            "getHistoryConversation",
+            page=page,
+            **call_options,
+        )
 
-    def history_messages(self, peer_id: str) -> ApiResult:
+    def history_messages(
+        self,
+        peer_id: str,
+        *,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
+    ) -> ApiResult:
         """Return the APK message-detail timeline for one C2C peer."""
         peer = str(peer_id or "").strip()
         if not peer:
@@ -97,7 +118,12 @@ class ImAPI:
             f"{APPLET}?i=888&c=entry&do=Message_detail&m=socialchat"
             f"&yourid={quote(peer, safe='')}"
         )
-        return self.c.request(url, method="GET")
+        call_options = {}
+        if timeout is not None:
+            call_options["timeout"] = timeout
+        if deadline is not None:
+            call_options["deadline"] = deadline
+        return self.c.request(url, method="GET", **call_options)
 
     def raw(self, action: str, **params: Any) -> ApiResult:
         return self.c.call(action, params)

@@ -36,6 +36,8 @@ class AuthAPI:
         phonebrand: Optional[str] = None,
         pushregid: Optional[str] = None,
         version_code: Optional[str] = None,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
     ) -> ApiResult:
         dev = self._device_fields(phonebrand, pushregid, version_code)
         body = {
@@ -44,8 +46,19 @@ class AuthAPI:
             "uniquelogintoken": sign.unique_login_token(self.c.session.uid or "0"),
             **dev,
         }
+        call_options: Dict[str, Any] = {}
+        if timeout is not None:
+            call_options["timeout"] = timeout
+        if deadline is not None:
+            call_options["deadline"] = deadline
         # login often without prior token
-        r = self.c.request(self.c.url("signin0"), body, uid="0", token="0")
+        r = self.c.request(
+            self.c.url("signin0"),
+            body,
+            uid="0",
+            token="0",
+            **call_options,
+        )
         self._apply_login_result(r, phone=phone, password=password)
         return r
 

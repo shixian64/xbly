@@ -30,6 +30,10 @@ from bbw_web.bff_server import (
     room_top_envelope,
     task_receive_envelope,
 )
+from bbw_web.dependency_health import (
+    DependencyCircuitBreakerRegistry,
+    DependencyDeadlineExceeded,
+)
 from bbw_web.normalize import (
     explain_error,
     normalize_comments,
@@ -38,6 +42,7 @@ from bbw_web.normalize import (
     resolve_media_url,
     session_user_dto,
 )
+from bbw_web.persistence import RuntimePersistence
 from bbw_web.store import RequestGate, WebUser, _session_path
 
 
@@ -63,8 +68,130 @@ class RequestGateTests(unittest.TestCase):
         thread.join(timeout=1)
         self.assertFalse(thread.is_alive())
 
+    def test_presence_and_read_routes_use_the_split_lock_modes(self) -> None:
+        self.assertEqual(
+            bff_server._request_lock_mode("POST", "/api/frontback"),
+            "none",
+        )
+        self.assertEqual(
+            bff_server._request_lock_mode("POST", "/api/heartbeat/once"),
+            "none",
+        )
+        self.assertEqual(
+            bff_server._request_lock_mode("POST", "/api/im/read"),
+            "peer",
+        )
+        self.assertEqual(
+            bff_server._request_lock_mode("POST", "/api/unknown-mutation"),
+            "write",
+        )
+
+    def test_deadline_failure_completes_a_half_open_probe(self) -> None:
+        now = [0.0]
+        breakers = DependencyCircuitBreakerRegistry(
+            failure_threshold=1,
+            failure_window_seconds=10,
+            cooldown_seconds=1,
+            clock=lambda: now[0],
+        )
+        breakers.before_call("tim", "im-read")
+        breakers.record_failure("tim", "im-read", retryable=True)
+        now[0] = 1.0
+
+        def deadline_failure(**_kwargs):
+            raise DependencyDeadlineExceeded("budget exhausted")
+
+        with self.assertRaises(DependencyDeadlineExceeded):
+            bff_server._dependency_call(
+                deadline_failure,
+                provider="tim",
+                domain="im-read",
+                breakers=breakers,
+            )
+
+        state = breakers.snapshot()[("tim", "im-read")]
+        self.assertTrue(state["open"])
+        self.assertFalse(state["probe_in_flight"])
+
+
+class ReadSyncPersistenceContractTests(unittest.TestCase):
+    class FakeRedis:
+        def __init__(self) -> None:
+            self.values = {}
+
+        def set(self, key, value, **_kwargs):
+            self.values[key] = value
+
+        def get(self, key):
+            return self.values.get(key)
+
+    class ExistingJobQueue:
+        def __init__(self, status: str) -> None:
+            self.status = status
+
+        def enqueue(self, *_args, **_kwargs):
+            raise RuntimeError("job already exists")
+
+        def fetch_job(self, _job_id):
+            return SimpleNamespace(get_status=lambda **_kwargs: self.status)
+
+    def persistence(self, status: str) -> RuntimePersistence:
+        persistence = RuntimePersistence.__new__(RuntimePersistence)
+        persistence.settings = SimpleNamespace(redis_prefix="test")
+        persistence.redis = self.FakeRedis()
+        persistence.default_queue = self.ExistingJobQueue(status)
+        return persistence
+
+    def test_failed_existing_read_job_is_not_accepted_as_durable(self) -> None:
+        persistence = self.persistence("failed")
+
+        with self.assertRaisesRegex(RuntimeError, "already exists"):
+            persistence.enqueue_tim_read_sync(
+                account_uid="42",
+                peers=["9"],
+            )
+
+    def test_queued_existing_read_job_is_accepted(self) -> None:
+        persistence = self.persistence("queued")
+
+        result = persistence.enqueue_tim_read_sync(
+            account_uid="42",
+            peers=["9"],
+        )
+
+        self.assertEqual(result["accepted_peers"], ["9"])
+        self.assertTrue(result["durable"])
+
 
 class BffEnvelopeTests(unittest.TestCase):
+    def test_profile_batch_fallback_obeys_the_sync_limit(self) -> None:
+        calls = []
+        app = SimpleNamespace(
+            session=SimpleNamespace(uid="42"),
+            profile=SimpleNamespace(
+                get_user=lambda uid: calls.append(uid)
+                or ApiResult(
+                    True,
+                    200,
+                    "[]",
+                    data=[{"id": uid, "nickname": f"用户 {uid}"}],
+                )
+            ),
+        )
+        details = {}
+
+        items = bff_server._batch_cached_profiles(
+            app,
+            ["1", "2", "3"],
+            {},
+            max_sync=2,
+            details=details,
+        )
+
+        self.assertCountEqual(calls, ["1", "2"])
+        self.assertEqual([item["id"] for item in items], ["1", "2"])
+        self.assertEqual(details["pending_uids"], ["3"])
+
     def test_local_web_server_rejects_a_second_listener_on_the_same_port(self) -> None:
         first = bff_server.ExclusiveThreadingHTTPServer(
             ("127.0.0.1", 0), bff_server.Handler
@@ -2655,6 +2782,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         receipt_ok=True,
         local_marker=None,
         authentication_source="provider",
+        read_enqueuer=None,
     ):
         conversation_calls = []
         receipt_calls = []
@@ -2698,6 +2826,8 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                 self._request_match_pool_online_list_enabled = False
                 if local_marker is not None:
                     self._request_local_read_marker = local_marker
+                if read_enqueuer is not None:
+                    self._request_read_sync_enqueuer = read_enqueuer
 
             def _check_api_origin(self):
                 return True
@@ -2855,6 +2985,39 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         self.assertEqual(response[0], 502)
         self.assertEqual(response[1]["conversation_read_peers"], ["9"])
         self.assertEqual(response[1]["receipt_failed_peers"], ["9"])
+
+    def test_production_read_report_is_durable_before_returning_accepted(self) -> None:
+        enqueued = []
+
+        def enqueue(**kwargs):
+            enqueued.append(kwargs)
+            return {"accepted_peers": list(kwargs["peers"]), "durable": True}
+
+        calls, receipt_calls, response = self._run_mark_read(
+            read_enqueuer=enqueue,
+        )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(receipt_calls, [])
+        self.assertEqual(response[0], 202)
+        self.assertTrue(response[1]["queued"])
+        self.assertTrue(response[1]["durable"])
+        self.assertEqual(enqueued[0]["account_uid"], "42")
+        self.assertEqual(enqueued[0]["peers"], ["9"])
+        self.assertEqual(enqueued[0]["receipt_messages"][0]["sequence"], 101)
+
+    def test_production_read_report_returns_503_when_enqueue_fails(self) -> None:
+        calls, receipt_calls, response = self._run_mark_read(
+            read_enqueuer=lambda **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("queue unavailable")
+            ),
+        )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(receipt_calls, [])
+        self.assertEqual(response[0], 503)
+        self.assertEqual(response[1]["code"], "IM_READ_QUEUE_UNAVAILABLE")
+        self.assertEqual(response[1]["retry_after"], 2)
 
     def test_local_read_remains_successful_when_tim_read_sync_is_unavailable(self) -> None:
         local_calls = []
@@ -5169,7 +5332,8 @@ if (merged.profile_resolved !== false) throw new Error("partial merged profile m
         self.assertIn("ensureTimConnected({ background: true })", background_sync)
         self.assertIn("return Promise.allSettled(tasks);", background_sync)
         self.assertNotIn('S.route === "msg" && !S.imConnected', background_sync)
-        self.assertIn("S.conversationNextRefreshAt = Date.now() + CONVERSATION_REFRESH_ERROR_MS", summary_refresh)
+        self.assertIn("S.conversationNextRefreshAt = Date.now() + Math.max(", summary_refresh)
+        self.assertIn("Number(error?.retryAfterMs || 0)", summary_refresh)
         self.assertIn('authority: "live"', summary_refresh)
         self.assertNotIn("loadArchivedConversationSummary()\n    .then", summary_refresh)
         self.assertIn("/api/archive/conversations?limit=100", app_js)
@@ -5408,6 +5572,42 @@ if (merged.profile_resolved !== false) throw new Error("partial merged profile m
         self.assertIn('"presence-compact",\n    true', chat_pane)
         self.assertNotIn('<strong>${esc(name)}</strong>${presence}', user_card)
         self.assertIn(".card-actions > .presence-badge", app_css)
+
+    def test_presence_tab_lease_uses_the_authenticated_account_until_cleanup(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        api_unauthorized = app_js.split(
+            "if (response.status === 401 && !authOptional",
+            1,
+        )[1].split("if (!response.ok)", 1)[0]
+        logout_cleanup = app_js.split("async function logout(", 1)[1].split(
+            "function clearAiAgentRuntimeState",
+            1,
+        )[0]
+
+        self.assertLess(
+            api_unauthorized.index("rememberVisiblePresenceTab(false);"),
+            api_unauthorized.index("S.user = null;"),
+        )
+        self.assertLess(
+            logout_cleanup.index("rememberVisiblePresenceTab(false);"),
+            logout_cleanup.index("S.user = null;"),
+        )
+        self.assertIn(
+            "S.presenceTimer = setInterval(\n      () => rememberVisiblePresenceTab(true)",
+            app_js,
+        )
+        update_presence = app_js.split("function updatePresence(active)", 1)[1].split(
+            "async function logout",
+            1,
+        )[0]
+        self.assertIn(
+            'post("/api/frontback", { frontorback: active ? "1" : "0" })',
+            update_presence,
+        )
+        self.assertNotIn('runCrossTabOperation(\n    "presence-state"', update_presence)
 
     def test_peer_presence_runtime_handles_sdk_shapes_and_all_subscription_chunks(self) -> None:
         node = shutil.which("node")

@@ -70,6 +70,28 @@ class MessageSendTransport(Protocol):
 
 
 @runtime_checkable
+class MessageReadTransport(Protocol):
+    """Server-side conversation and explicit receipt read operations."""
+
+    def mark_c2c_read(
+        self,
+        report_account: str,
+        peer_account: str,
+    ) -> MessageTransportResult: ...
+
+    def sync_c2c_message_read_receipts(
+        self,
+        operator_account: str,
+        peer_account: str,
+        *,
+        messages: list[dict[str, Any]] | None = None,
+        max_messages: int = 300,
+        batch_size: int = 30,
+        retention_days: int = 180,
+    ) -> MessageTransportResult: ...
+
+
+@runtime_checkable
 class MessageMirrorTransport(MessageSendTransport, Protocol):
     """Compatibility edge for text, hosted media elements and recalls."""
 
@@ -97,6 +119,7 @@ class MessageMirrorTransport(MessageSendTransport, Protocol):
 class MessageTransport(
     MessageHistoryTransport,
     MessageMirrorTransport,
+    MessageReadTransport,
     Protocol,
 ):
     """Complete TIM-compatible transport currently used by background jobs."""

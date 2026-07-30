@@ -39,10 +39,21 @@ class Heartbeat:
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def once(self, first: Optional[bool] = None) -> Dict[str, Any]:
+    def once(
+        self,
+        first: Optional[bool] = None,
+        *,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
+    ) -> Dict[str, Any]:
         use_first = self._first if first is None else first
         try:
-            r = self.app.misc.update_online(first=use_first)
+            call_options: Dict[str, Any] = {}
+            if timeout is not None:
+                call_options["timeout"] = timeout
+            if deadline is not None:
+                call_options["deadline"] = deadline
+            r = self.app.misc.update_online(first=use_first, **call_options)
             self._first = False
             self.last_ok = bool(r.ok)
             self.last_at = time.time()
