@@ -43,6 +43,8 @@ from bbw_agent.autonomous import (
     autonomy_reply_message_is_fresh,
 )
 from bbw_agent.contact_policy import (
+    DEFAULT_MAXIMUM_REPLY_AGE_SECONDS,
+    DEFAULT_MINIMUM_REPLY_DELAY_SECONDS,
     contact_policy_allows_auto_reply,
     reply_risk_boundary,
 )
@@ -3333,44 +3335,54 @@ def _schedule_autonomy_owner(
         # dispatched in the same scan when its action interval is due, instead
         # of building a database backlog faster than the worker can consume it.
         remaining = min(1, max(1, int(task_limit)))
-        if (
-            policy.auto_reply_enabled
-            and remaining > 0
-            and has_daily_budget(
-                AutonomyTaskType.REPLY_TO_MESSAGE,
-                SEND_PRIVATE_MESSAGE,
-            )
-            and setting.auto_reply_started_at is not None
-            and not tasks.has_open_task_type(
-                owner_user_id=owner_user_id,
-                task_type=AutonomyTaskType.REPLY_TO_MESSAGE.value,
-            )
-        ):
+        reply_candidates: list[_AutonomyReplyCandidate] = []
+        if policy.auto_reply_enabled and setting.auto_reply_started_at is not None:
             reply_not_before = max(
                 setting.auto_reply_started_at,
                 now - timedelta(seconds=AUTONOMY_REPLY_MAX_AGE_SECONDS),
             )
-            candidates = _unanswered_autonomy_reply_candidates(
+            reply_candidates = _unanswered_autonomy_reply_candidates(
                 db,
                 owner_user_id=owner_user_id,
                 not_before=reply_not_before,
                 now=now,
                 limit=20,
             )
+        pending_reply_attention = bool(reply_candidates)
+        if (
+            reply_candidates
+            and remaining > 0
+            and has_daily_budget(
+                AutonomyTaskType.REPLY_TO_MESSAGE,
+                SEND_PRIVATE_MESSAGE,
+            )
+            and not tasks.has_open_task_type(
+                owner_user_id=owner_user_id,
+                task_type=AutonomyTaskType.REPLY_TO_MESSAGE.value,
+            )
+        ):
             contact_policies = AgentContactPolicyRepository(db)
-            for candidate in candidates:
+            for candidate in reply_candidates:
                 contact_policy = contact_policies.get(
                     owner_user_id,
                     candidate.peer_upstream_uid,
                     for_update=True,
                 )
-                if contact_policy is None:
-                    continue
                 relationship_stage = contact_policies.relationship_stage(
                     owner_user_id=owner_user_id,
                     peer_upstream_uid=candidate.peer_upstream_uid,
                     policy=contact_policy,
                     now=now,
+                )
+                maximum_reply_age_seconds = int(
+                    contact_policy.maximum_reply_age_seconds
+                    if contact_policy is not None
+                    else DEFAULT_MAXIMUM_REPLY_AGE_SECONDS
+                )
+                minimum_reply_delay_seconds = int(
+                    contact_policy.minimum_reply_delay_seconds
+                    if contact_policy is not None
+                    else DEFAULT_MINIMUM_REPLY_DELAY_SECONDS
                 )
                 risk_boundary = reply_risk_boundary(
                     candidate.body,
@@ -3382,14 +3394,20 @@ def _schedule_autonomy_owner(
                         candidate.occurred_at,
                         now=now,
                         started_at=setting.auto_reply_started_at,
-                        max_age_seconds=int(
-                            contact_policy.maximum_reply_age_seconds
-                        ),
+                        max_age_seconds=maximum_reply_age_seconds,
                     )
                     or not contact_policy_allows_auto_reply(
-                        persisted=True,
-                        mode=str(contact_policy.mode or ""),
-                        paused=bool(contact_policy.paused),
+                        persisted=contact_policy is not None,
+                        mode=(
+                            str(contact_policy.mode or "")
+                            if contact_policy is not None
+                            else ""
+                        ),
+                        paused=(
+                            bool(contact_policy.paused)
+                            if contact_policy is not None
+                            else False
+                        ),
                         relationship_stage=relationship_stage,
                         risk_boundary=risk_boundary,
                     )
@@ -3407,7 +3425,11 @@ def _schedule_autonomy_owner(
                     action_type=SEND_PRIVATE_MESSAGE,
                     idempotency_key=key,
                     policy_version=policy.version,
-                    contact_policy_version=int(contact_policy.version),
+                    contact_policy_version=(
+                        int(contact_policy.version)
+                        if contact_policy is not None
+                        else None
+                    ),
                     relationship_stage=relationship_stage,
                     execution_setting_version=policy.execution_setting_version,
                     runner_setting_version=policy.runner_setting_version,
@@ -3422,9 +3444,7 @@ def _schedule_autonomy_owner(
                     not_before=autonomy_reply_not_before(
                         candidate.occurred_at,
                         now=now,
-                        delay_seconds=int(
-                            contact_policy.minimum_reply_delay_seconds
-                        ),
+                        delay_seconds=minimum_reply_delay_seconds,
                     ),
                 )
                 if was_created:
@@ -3442,6 +3462,7 @@ def _schedule_autonomy_owner(
         browse_due = bool(
             policy.discovery_enabled
             and remaining > 0
+            and not pending_reply_attention
             and has_daily_budget(
                 AutonomyTaskType.BROWSE_ONLINE,
                 BROWSE_ONLINE_USERS,
@@ -3491,6 +3512,7 @@ def _schedule_autonomy_owner(
         match_due = bool(
             policy.text_match_enabled
             and remaining > 0
+            and not pending_reply_attention
             and has_daily_budget(
                 AutonomyTaskType.REQUEST_MATCH,
                 REQUEST_TEXT_MATCH,
@@ -3633,6 +3655,7 @@ def _schedule_autonomy_owner(
 
         if (
             remaining > 0
+            and not pending_reply_attention
             and (
                 policy.follow_discovered_enabled
                 or policy.friend_request_enabled

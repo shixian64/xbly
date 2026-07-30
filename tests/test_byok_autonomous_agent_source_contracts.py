@@ -258,9 +258,16 @@ class ByokAutonomousAgentSourceContractTests(unittest.TestCase):
         self.assertIn("tasks.has_open_task_type(", owner_scheduler)
         self.assertIn("remaining = min(1, max(1, int(task_limit)))", owner_scheduler)
         self.assertIn("limit=20", owner_scheduler)
-        self.assertIn("if contact_policy is None:", owner_scheduler)
-        self.assertIn("contact_policy_version=int(contact_policy.version)", owner_scheduler)
+        self.assertNotIn(
+            "if contact_policy is None:\n                    continue",
+            owner_scheduler,
+        )
+        self.assertIn("persisted=contact_policy is not None", owner_scheduler)
+        self.assertIn("contact_policy_version=(", owner_scheduler)
         self.assertIn("relationship_stage=relationship_stage", owner_scheduler)
+        self.assertIn("pending_reply_attention = bool(reply_candidates)", owner_scheduler)
+        self.assertIn("not pending_reply_attention", owner_scheduler)
+        self.assertNotIn("setting.last_outreach_at", owner_scheduler)
 
     def test_agent_cadence_keeps_safe_lower_bounds_and_uses_natural_defaults(self) -> None:
         migration = self.read(

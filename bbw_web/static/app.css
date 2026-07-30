@@ -7259,37 +7259,6 @@ html.flash-viewing body {
   gap: 0.8rem;
 }
 
-.agent-contact-policy-card,
-#agent-contact-policy-manager {
-  display: grid;
-  min-width: 0;
-  gap: 0.8rem;
-}
-
-.agent-contact-policy-controls {
-  display: grid;
-  min-width: 0;
-  grid-template-columns: minmax(0, 1.25fr) minmax(220px, 0.75fr) auto;
-  align-items: end;
-  gap: 0.7rem;
-}
-
-.agent-contact-policy-controls > * {
-  min-width: 0;
-}
-
-.agent-contact-policy-controls .field {
-  margin: 0;
-}
-
-.agent-contact-policy-controls select {
-  width: 100%;
-}
-
-.agent-contact-policy-boundary {
-  margin-top: 0.1rem;
-}
-
 .agent-social-workspace {
   display: grid;
   min-width: 0;
@@ -7884,13 +7853,8 @@ html.flash-viewing body {
   .agent-social-capability-grid,
   .agent-form-actions,
   .agent-parameter-grid,
-  .agent-action-grid,
-  .agent-contact-policy-controls {
+  .agent-action-grid {
     grid-template-columns: 1fr;
-  }
-
-  .agent-contact-policy-controls > .btn {
-    width: 100%;
   }
 
   .agent-social-stats {

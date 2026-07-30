@@ -110,7 +110,6 @@ AUTONOMY_TASK_ACTIONS = {
 AUTONOMY_MESSAGE_PROVIDERS = frozenset({"web-local", "tim"})
 AUTONOMY_BROWSE_DAILY_LIMIT = 8
 AUTONOMY_MATCH_DAILY_LIMIT = 6
-AUTONOMY_OUTREACH_DAILY_LIMIT = 6
 AUTONOMY_DYNAMIC_CANDIDATE_TASKS = frozenset(
     {"proactive_message", "follow_discovered", "request_friend"}
 )
@@ -226,11 +225,7 @@ def _setting_category_limit(setting: Any, category: str) -> int:
     if category == "reply":
         return min(total, int(getattr(setting, "daily_reply_limit", 0) or 0))
     if category == "outreach":
-        return min(
-            total,
-            int(getattr(setting, "daily_reply_limit", 0) or 0),
-            AUTONOMY_OUTREACH_DAILY_LIMIT,
-        )
+        return min(total, int(getattr(setting, "daily_reply_limit", 0) or 0))
     if category == "post":
         return min(total, int(getattr(setting, "daily_post_limit", 0) or 0))
     if category == "relationship":
@@ -1420,7 +1415,7 @@ class AgentDiscoveryCandidateRepository:
 
 
 class AgentContactPolicyRepository:
-    """Owner-scoped contact authorization and relationship facts."""
+    """Owner-scoped contact overrides and relationship facts."""
 
     _UNAVAILABLE_TITLE_MARKERS = ("已注销", "已封禁", "注销或封禁")
 
@@ -2378,10 +2373,8 @@ class AgentAutonomyTaskRepository:
             raise ValueError("contact policy version must be positive")
         if normalized_stage and normalized_stage not in RELATIONSHIP_STAGES:
             raise ValueError("autonomous relationship stage is invalid")
-        if normalized_type == "reply_to_message" and (
-            contact_version is None or not normalized_stage
-        ):
-            raise ValueError("autonomous reply requires contact authorization")
+        if normalized_type == "reply_to_message" and not normalized_stage:
+            raise ValueError("autonomous reply requires a relationship stage")
         if int(runner_setting_version) < 1:
             raise ValueError("autonomous runner setting version must be positive")
         if not isinstance(model_connection_id, uuid.UUID):
@@ -3063,15 +3056,12 @@ class AgentAutonomyTaskRepository:
         if str(task.task_type or "") != "reply_to_message":
             return None
         contact_policy = snapshot.get("contact_policy")
-        if contact_policy is None:
-            return DispatchDecisionCode.ACTION_NOT_ALLOWED
         task_contact_version = getattr(task, "contact_policy_version", None)
         task_stage = str(getattr(task, "relationship_stage", "") or "").strip()
-        if (
-            task_contact_version is None
-            or int(task_contact_version) != int(contact_policy.version)
-            or not task_stage
-        ):
+        current_contact_version = (
+            int(contact_policy.version) if contact_policy is not None else None
+        )
+        if task_contact_version != current_contact_version or not task_stage:
             return DispatchDecisionCode.POLICY_CHANGED
         current_stage = AgentContactPolicyRepository(self.db).relationship_stage(
             owner_user_id=task.owner_user_id,
@@ -3084,9 +3074,17 @@ class AgentAutonomyTaskRepository:
         if current_stage != task_stage:
             return DispatchDecisionCode.POLICY_CHANGED
         if not contact_policy_allows_auto_reply(
-            persisted=True,
-            mode=str(contact_policy.mode or ""),
-            paused=bool(contact_policy.paused),
+            persisted=contact_policy is not None,
+            mode=(
+                str(contact_policy.mode or "")
+                if contact_policy is not None
+                else ""
+            ),
+            paused=(
+                bool(contact_policy.paused)
+                if contact_policy is not None
+                else False
+            ),
             relationship_stage=current_stage,
         ):
             return DispatchDecisionCode.ACTION_NOT_ALLOWED
@@ -3101,8 +3099,18 @@ class AgentAutonomyTaskRepository:
         autonomy_setting: AiAgentAutonomySetting,
         contact_policy: AiAgentContactPolicy | None,
     ) -> bool:
-        if contact_policy is None or head is None:
+        if head is None:
             return False
+        maximum_reply_age_seconds = int(
+            contact_policy.maximum_reply_age_seconds
+            if contact_policy is not None
+            else DEFAULT_MAXIMUM_REPLY_AGE_SECONDS
+        )
+        minimum_reply_delay_seconds = int(
+            contact_policy.minimum_reply_delay_seconds
+            if contact_policy is not None
+            else DEFAULT_MINIMUM_REPLY_DELAY_SECONDS
+        )
         return bool(
             head.message_identity == str(expected_identity or "")
             and head.direction == "incoming"
@@ -3123,16 +3131,12 @@ class AgentAutonomyTaskRepository:
                 head.occurred_at,
                 now=now,
                 started_at=autonomy_setting.auto_reply_started_at,
-                max_age_seconds=int(
-                    contact_policy.maximum_reply_age_seconds
-                ),
+                max_age_seconds=maximum_reply_age_seconds,
             )
             and autonomy_reply_not_before(
                 head.occurred_at,
                 now=now,
-                delay_seconds=int(
-                    contact_policy.minimum_reply_delay_seconds
-                ),
+                delay_seconds=minimum_reply_delay_seconds,
             )
             <= now
         )

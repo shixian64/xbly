@@ -547,10 +547,32 @@ class AgentAutonomyPolicyContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             policy(auto_reply_started_at=None)
 
+    def test_proactive_outreach_uses_the_configured_message_budget(self) -> None:
+        configured = policy()
+
+        self.assertEqual(
+            configured.action_daily_limit(
+                SEND_PRIVATE_MESSAGE,
+                task_type=AutonomyTaskType.REPLY_TO_MESSAGE,
+            ),
+            4,
+        )
+        self.assertEqual(
+            configured.action_daily_limit(
+                SEND_PRIVATE_MESSAGE,
+                task_type=AutonomyTaskType.PROACTIVE_MESSAGE,
+            ),
+            4,
+        )
+
     def test_reply_message_gate_skips_terminal_and_provider_messages(self) -> None:
         for body, options in (
             ("嗯", {}),
             ("😂谢谢", {}),
+            ("太远了", {}),
+            ("不感兴趣", {}),
+            ("别联系", {}),
+            ("有主了", {}),
             ("[TUIEmoji_Moon]", {}),
             ("我们已经是好友了，来聊天吧", {}),
             ("ㅤ 关注你了,快去看看吧！", {"peer_upstream_uid": "1"}),

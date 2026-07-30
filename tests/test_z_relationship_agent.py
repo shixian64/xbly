@@ -319,17 +319,25 @@ class ContactPolicyTests(unittest.TestCase):
             "inactive",
         )
 
-    def test_auto_reply_requires_a_persisted_contact_opt_in(self) -> None:
+    def test_auto_reply_inherits_global_policy_without_contact_opt_in(self) -> None:
         options = {
             "mode": "auto_low_risk",
             "paused": False,
             "relationship_stage": "engaged",
         }
-        self.assertFalse(
+        self.assertTrue(
             contact_policy_allows_auto_reply(persisted=False, **options)
         )
         self.assertTrue(
             contact_policy_allows_auto_reply(persisted=True, **options)
+        )
+        self.assertTrue(
+            contact_policy_allows_auto_reply(
+                persisted=False,
+                mode="suggest_only",
+                paused=False,
+                relationship_stage="new",
+            )
         )
         self.assertFalse(
             contact_policy_allows_auto_reply(
@@ -341,9 +349,9 @@ class ContactPolicyTests(unittest.TestCase):
         self.assertFalse(
             contact_policy_allows_auto_reply(
                 persisted=True,
-                mode="auto_low_risk",
+                mode="suggest_only",
                 paused=False,
-                relationship_stage="new",
+                relationship_stage="engaged",
             )
         )
         self.assertFalse(
@@ -492,7 +500,11 @@ class RelationshipAgentSourceContractTests(unittest.TestCase):
         self.assertIn("aiAgentChatSuggestionsEnabled: false", app)
         self.assertIn("在聊天界面显示聊天建议", app)
         self.assertIn("默认关闭；开启后可在当前会话中生成", app)
-        self.assertIn("联系人自动回复授权在“联系人回复”菜单中管理", app)
+        self.assertIn(
+            "自动回复由“能力与节奏”中的全局开关独立控制",
+            app,
+        )
+        self.assertNotIn("联系人自动回复授权", app)
         access = self.javascript_function_source(
             "bbw_web/static/app.js", "setAiAgentAccess"
         )
@@ -519,21 +531,13 @@ class RelationshipAgentSourceContractTests(unittest.TestCase):
         self.assertIn("聊天建议", content)
         self.assertNotIn("联系人自动回复", content)
         self.assertNotIn("data-chat-agent-mode", content)
-        contact_manager = self.javascript_function_source(
-            "bbw_web/static/app.js", "agentContactPolicyManagerContentHtml"
-        )
-        self.assertIn("联系人自动回复", contact_manager)
-        self.assertIn("data-agent-contact-policy-peer", contact_manager)
-        self.assertIn("data-agent-contact-policy-mode", contact_manager)
-        self.assertNotIn("chatAssistSuggestion(", contact_manager)
-        contact_section = self.javascript_function_source(
-            "bbw_web/static/app.js", "agentContactPoliciesSectionHtml"
-        )
-        self.assertIn("聊天界面不会显示这些设置", contact_section)
+        self.assertNotIn("agentContactPolicyManagerContentHtml", app)
+        self.assertNotIn("agentContactPoliciesSectionHtml", app)
+        self.assertNotIn("data-agent-contact-policy", app)
         page = self.javascript_function_source(
             "bbw_web/static/app.js", "pageAgent"
         )
-        self.assertIn("agentContactPoliciesSectionHtml()", page)
+        self.assertNotIn("ContactPolicies", page)
         generate = self.javascript_function_source(
             "bbw_web/static/app.js", "generateChatAgentSuggestion"
         )
@@ -543,23 +547,26 @@ class RelationshipAgentSourceContractTests(unittest.TestCase):
         )
         self.assertIn("chat_suggestions_enabled: Boolean(", forms)
 
-    def test_scheduler_requires_explicit_contact_authorization(self) -> None:
+    def test_scheduler_inherits_global_auto_reply_without_contact_authorization(self) -> None:
         scheduler = self.function_source("bbw_web/jobs.py", "_schedule_autonomy_owner")
         self.assertIn("limit=20", scheduler)
-        self.assertIn("if contact_policy is None:", scheduler)
+        self.assertNotIn("if contact_policy is None:\n                    continue", scheduler)
         self.assertIn("contact_policy_allows_auto_reply(", scheduler)
-        self.assertIn("persisted=True", scheduler)
+        self.assertIn("persisted=contact_policy is not None", scheduler)
         self.assertIn("risk_boundary=risk_boundary", scheduler)
-        self.assertIn("contact_policy_version=int(contact_policy.version)", scheduler)
+        self.assertIn("DEFAULT_MINIMUM_REPLY_DELAY_SECONDS", scheduler)
+        self.assertIn("DEFAULT_MAXIMUM_REPLY_AGE_SECONDS", scheduler)
+        self.assertIn("contact_policy_version=(", scheduler)
         self.assertIn("relationship_stage=relationship_stage", scheduler)
 
         enqueue = self.function_source(
             "bbw_agent/repositories.py",
             "enqueue",
-            containing="autonomous reply requires contact authorization",
+            containing="autonomous reply requires a relationship stage",
         )
         self.assertIn('normalized_type == "reply_to_message"', enqueue)
-        self.assertIn("autonomous reply requires contact authorization", enqueue)
+        self.assertIn("autonomous reply requires a relationship stage", enqueue)
+        self.assertNotIn("contact authorization", enqueue)
 
         configure = self.function_source(
             "bbw_agent/repositories.py",
@@ -576,6 +583,13 @@ class RelationshipAgentSourceContractTests(unittest.TestCase):
         self.assertIn("task_contact_version", final_gate)
         self.assertIn("current_stage != task_stage", final_gate)
         self.assertIn("contact_policy_allows_auto_reply(", final_gate)
+        self.assertIn("persisted=contact_policy is not None", final_gate)
+
+        public_policy = self.function_source(
+            "bbw_agent/services.py", "contact_policy_public"
+        )
+        self.assertIn('"inherited": True', public_policy)
+        self.assertIn('"mode": CONTACT_MODE_AUTO_LOW_RISK', public_policy)
 
     def test_conversation_routes_are_session_bound_and_stale_safe(self) -> None:
         status = self.function_source("bbw_agent/api.py", "conversation_assist_status")
@@ -610,12 +624,10 @@ class RelationshipAgentSourceContractTests(unittest.TestCase):
             "换一种表达",
             "采用",
             "不回复",
-            "始终人工处理",
-            "不自动回复",
-            "允许低风险自动回复",
             "称呼白名单",
         ):
             self.assertIn(text, app)
+        self.assertNotIn("data-agent-contact-policy", app)
         generate = self.javascript_function_source(
             "bbw_web/static/app.js", "generateChatAgentSuggestion"
         )
@@ -629,7 +641,8 @@ class RelationshipAgentSourceContractTests(unittest.TestCase):
         self.assertLess(generate.index("const previousDraft"), generate.index("await api("))
 
         css = self.read("bbw_web/static/app.css")
-        self.assertIn(".agent-contact-policy-controls", css)
+        self.assertNotIn(".agent-contact-policy-controls", css)
+        self.assertNotIn("#agent-contact-policy-manager", css)
         self.assertNotIn(".chat-agent-contact-policy", css)
         self.assertIn(".chat-agent-assist-head", css)
         self.assertIn(".chat-agent-assist-actions", css)

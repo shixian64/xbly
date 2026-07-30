@@ -53,7 +53,6 @@ MAX_INSTRUCTION_LENGTH = 4_000
 MAX_IDEMPOTENCY_LENGTH = 160
 AUTONOMOUS_BROWSE_DAILY_LIMIT = 8
 AUTONOMOUS_MATCH_DAILY_LIMIT = 6
-AUTONOMOUS_OUTREACH_DAILY_LIMIT = 6
 AUTONOMY_REPLY_MAX_AGE_SECONDS = 2 * 60 * 60
 AUTONOMY_REPLY_CLOCK_SKEW_SECONDS = 5 * 60
 AUTONOMY_REPLY_SESSION_GAP_SECONDS = 6 * 60 * 60
@@ -134,6 +133,17 @@ _AUTONOMY_TERMINAL_MESSAGE_TOKENS = frozenset(
         "哈哈",
         "哈哈哈",
         "哈哈哈哈",
+        "太远了",
+        "不感兴趣",
+        "不想聊",
+        "不聊了",
+        "别联系",
+        "不要联系",
+        "不用联系",
+        "不找主",
+        "有主了",
+        "已有主",
+        "不找主有主了",
     }
 )
 AUTONOMY_RELATIONSHIP_ADDRESS_TERMS = tuple(
@@ -1001,10 +1011,7 @@ class AgentAutonomyPolicy:
         task_type: AutonomyTaskType | None = None,
     ) -> int:
         configured = dict(self.daily_action_limits)
-        limit = int(configured.get(action_type, self.daily_total_limit))
-        if task_type == AutonomyTaskType.PROACTIVE_MESSAGE:
-            limit = min(limit, AUTONOMOUS_OUTREACH_DAILY_LIMIT)
-        return limit
+        return int(configured.get(action_type, self.daily_total_limit))
 
 
 @dataclass(frozen=True, slots=True)

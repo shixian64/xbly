@@ -41,6 +41,7 @@ from .autonomous import (
     sanitize_social_style_profile,
 )
 from .contact_policy import (
+    CONTACT_MODE_AUTO_LOW_RISK,
     CONTACT_MODE_SUGGEST_ONLY,
     DEFAULT_MAXIMUM_REPLY_AGE_SECONDS,
     DEFAULT_MINIMUM_REPLY_DELAY_SECONDS,
@@ -500,7 +501,8 @@ def contact_policy_public(
     if row is None:
         return {
             "persisted": False,
-            "mode": CONTACT_MODE_SUGGEST_ONLY,
+            "inherited": True,
+            "mode": CONTACT_MODE_AUTO_LOW_RISK,
             "stage_override": None,
             "paused": False,
             "minimum_reply_delay_seconds": (
@@ -515,6 +517,7 @@ def contact_policy_public(
         }
     return {
         "persisted": True,
+        "inherited": False,
         "mode": str(row.mode or CONTACT_MODE_SUGGEST_ONLY),
         "stage_override": str(row.stage_override or "") or None,
         "paused": bool(row.paused),
@@ -731,6 +734,7 @@ def autonomy_public(
         "user_enabled": False,
         "effective_enabled": False,
         "auto_reply_enabled": False,
+        "auto_reply_effective": False,
         "auto_reply_started_at": None,
         "scheduled_post_enabled": False,
         "managed_relationships_enabled": False,
@@ -855,6 +859,11 @@ def autonomy_public(
         and not defaults["halted"]
         and defaults["available"]
         and defaults["allowed_actions"]
+    )
+    defaults["auto_reply_effective"] = bool(
+        defaults["effective_enabled"]
+        and defaults["auto_reply_enabled"]
+        and SEND_PRIVATE_MESSAGE in defaults["allowed_actions"]
     )
     defaults["recent_tasks"] = [
         autonomy_task_public(task) for task in recent_tasks

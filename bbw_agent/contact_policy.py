@@ -1,8 +1,9 @@
 """Pure contact-level policy and relationship-stage decisions.
 
 This module intentionally has no database or provider dependencies.  The
-autonomous scheduler and the conversation UI use the same fail-closed rules so
-that a missing policy row can never be interpreted as permission to send.
+autonomous scheduler and the conversation UI use the same inheritance rules:
+global low-risk auto-reply applies when no contact override exists, while a
+persisted contact policy can pause or restrict unattended replies.
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ RELATIONSHIP_STAGES: Final = frozenset(
 )
 AUTO_REPLY_RELATIONSHIP_STAGES: Final = frozenset(
     {
+        RELATIONSHIP_STAGE_NEW,
         RELATIONSHIP_STAGE_ENGAGED,
         RELATIONSHIP_STAGE_ESTABLISHED,
         RELATIONSHIP_STAGE_CLOSE,
@@ -212,7 +214,8 @@ _RISK_BOUNDARIES: Final = (
     (
         "explicit_or_consent",
         re.compile(
-            r"(?:做爱|性交|约炮|裸照|成人视频|安全词|身体边界|同意状态|强迫|拒绝还|轻度\s*sm|s[/\\]?m)",
+            r"(?:做爱|性交|约炮|裸照|成人视频|安全词|身体边界|同意状态|强迫|拒绝还|"
+            r"轻度\s*sm|s[/\\]?m|不找主|有主了|已有主|有主人|主奴|调教)",
             re.IGNORECASE,
         ),
     ),
@@ -242,11 +245,21 @@ def contact_policy_allows_auto_reply(
     relationship_stage: str,
     risk_boundary: str = "",
 ) -> bool:
-    """Return whether explicit contact authorization permits one auto reply."""
+    """Return whether global auto-reply and optional contact overrides allow it.
+
+    Missing contact policy rows inherit the user's global low-risk auto-reply
+    setting.  Persisted rows remain useful as explicit per-contact exceptions:
+    ``suggest_only``, ``manual_only`` and ``paused`` all stop unattended sends.
+    """
+
+    effective_mode = (
+        str(mode or "").strip().lower()
+        if persisted
+        else CONTACT_MODE_AUTO_LOW_RISK
+    )
 
     return bool(
-        persisted
-        and str(mode or "").strip().lower() == CONTACT_MODE_AUTO_LOW_RISK
+        effective_mode == CONTACT_MODE_AUTO_LOW_RISK
         and not paused
         and str(relationship_stage or "").strip().lower()
         in AUTO_REPLY_RELATIONSHIP_STAGES
