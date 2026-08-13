@@ -202,6 +202,7 @@ MAX_JSON_BODY_BYTES = 256 * 1024
 COOKIE_SECURE = False
 PROFILE_CACHE_TTL_SEC = 15 * 60.0
 PROFILE_CACHE_ERROR_TTL_SEC = 30.0
+PROFILE_CACHE_REFRESH_MIN_AGE_SEC = 60.0
 MESSAGE_BLOCK_SNAPSHOT_TTL_SEC = 60.0
 MESSAGE_BLOCK_SNAPSHOT_RETRY_SEC = 10.0
 SYSTEM_CUSTOMER_SERVICE_UID = "1"
@@ -2024,6 +2025,7 @@ def _batch_cached_profiles(
     budget_seconds: float = 0.0,
     call_timeout: Optional[float] = None,
     max_sync: int = 12,
+    force_refresh: bool = False,
     breakers: Any = None,
     request_id: str = "",
     details: Optional[Dict[str, Any]] = None,
@@ -2041,7 +2043,11 @@ def _batch_cached_profiles(
         if cached:
             cached_at, profile = cached
             ttl = PROFILE_CACHE_TTL_SEC if profile else PROFILE_CACHE_ERROR_TTL_SEC
-            if now - cached_at < ttl:
+            age = max(0.0, now - cached_at)
+            refresh_allowed = bool(
+                force_refresh and age >= PROFILE_CACHE_REFRESH_MIN_AGE_SEC
+            )
+            if age < ttl and not refresh_allowed:
                 resolved[uid] = dict(profile) if profile else None
                 continue
         missing.append(uid)
@@ -3140,6 +3146,7 @@ class Handler(BaseHTTPRequestHandler):
                     else None
                 ),
                 max_sync=int(budget_config.get("profile_sync_limit") or 12),
+                force_refresh=_as_bool(q("refresh", "0")),
                 breakers=getattr(
                     self,
                     "_request_dependency_breakers",
@@ -3157,6 +3164,7 @@ class Handler(BaseHTTPRequestHandler):
                     "list": items,
                     "count": len(items),
                     "requested_count": len(requested),
+                    "refresh_requested": _as_bool(q("refresh", "0")),
                     "pending_uids": pending_uids,
                     "retry_after": 2 if pending_uids else 0,
                 }

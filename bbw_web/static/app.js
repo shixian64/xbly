@@ -64,6 +64,8 @@ const CONVERSATION_REFRESH_ERROR_MS = 30 * 1000;
 const ARCHIVED_CONVERSATION_TTL_MS = 30 * 1000;
 const CONVERSATION_PROFILE_TTL_MS = 15 * 60 * 1000;
 const CONVERSATION_PROFILE_ERROR_TTL_MS = 60 * 1000;
+const AVATAR_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
+const AVATAR_FAILURE_CACHE_LIMIT = 512;
 const CONVERSATION_PROFILE_SDK_WAIT_MS = 1200;
 const CONVERSATION_PROFILE_REST_BATCH_SIZE = 12;
 const CONVERSATION_PROFILE_CACHE_LIMIT = 200;
@@ -249,6 +251,11 @@ const S = {
   conversationProfilesByUid: new Map(),
   conversationProfileFetchedAt: new Map(),
   conversationProfileLoadingUids: new Set(),
+  failedAvatarUrls: new Map(),
+  conversationFailedAvatarSources: new Map(),
+  conversationAvatarRetryAt: new Map(),
+  conversationAvatarRetryTimers: new Map(),
+  conversationProfileForceRefreshUids: new Set(),
   conversationProfileCacheAccount: "",
   conversationPreviewFetchedAt: new Map(),
   conversationPreviewLoadingPeers: new Set(),
@@ -702,12 +709,54 @@ function mediaUrl(value) {
   return "";
 }
 
+function avatarFailureSource(value) {
+  return mediaUrl(value);
+}
+
+function pruneFailedAvatarUrls(now = Date.now()) {
+  for (const [source, expiresAt] of S.failedAvatarUrls.entries()) {
+    if (Number(expiresAt || 0) <= now) S.failedAvatarUrls.delete(source);
+  }
+  while (S.failedAvatarUrls.size > AVATAR_FAILURE_CACHE_LIMIT) {
+    const oldest = S.failedAvatarUrls.keys().next().value;
+    if (!oldest) break;
+    S.failedAvatarUrls.delete(oldest);
+  }
+}
+
+function avatarUrlCoolingDown(value, now = Date.now()) {
+  const source = avatarFailureSource(value);
+  if (!source) return false;
+  const expiresAt = Number(S.failedAvatarUrls.get(source) || 0);
+  if (!expiresAt) return false;
+  if (expiresAt <= now) {
+    S.failedAvatarUrls.delete(source);
+    return false;
+  }
+  return true;
+}
+
+function rememberFailedAvatarUrl(value, now = Date.now()) {
+  const source = avatarFailureSource(value);
+  if (!source || /^(?:blob:|data:)/i.test(source)) return "";
+  S.failedAvatarUrls.delete(source);
+  S.failedAvatarUrls.set(source, now + AVATAR_FAILURE_COOLDOWN_MS);
+  pruneFailedAvatarUrls(now);
+  return source;
+}
+
 function validAvatarValue(...values) {
   for (const value of values) {
     const raw = String(value || "").trim();
     if (!raw || INVALID_AVATAR_VALUES.has(raw.toLowerCase())) continue;
     const src = mediaUrl(raw);
-    if (!src || (/^data:/i.test(src) && !/^data:image\//i.test(src))) continue;
+    if (
+      !src ||
+      avatarUrlCoolingDown(src) ||
+      (/^data:/i.test(src) && !/^data:image\//i.test(src))
+    ) {
+      continue;
+    }
     return raw;
   }
   return "";
@@ -2842,6 +2891,7 @@ function persistConversationProfiles() {
 function syncConversationProfileAccount() {
   const account = messageSyncAccountId();
   if (account === S.conversationProfileCacheAccount) return;
+  resetConversationAvatarFailures();
   S.conversationProfilesByUid.clear();
   S.conversationProfileFetchedAt.clear();
   S.conversationProfileLoadingUids.clear();
@@ -4116,9 +4166,114 @@ function conversationAvatarHtml(url) {
 function revealLoadedAvatar(image) {
   const avatar = image?.closest?.(".avatar");
   if (avatar) avatar.classList.remove("avatar-loading");
+  const conversationItem = image?.closest?.("[data-conversation-item][data-uid]");
+  const peer = String(conversationItem?.dataset?.uid || "").trim();
+  const source = avatarFailureSource(image?.currentSrc || image?.src || "");
+  confirmConversationAvatar(peer, source);
+}
+
+function confirmConversationAvatar(peer, source) {
+  const target = String(peer || "").trim();
+  if (!target || !source) return;
+  const conversation = S.conversations.find((item) => conversationPeer(item) === target);
+  const profile = S.conversationProfilesByUid.get(target);
+  const profileSource = avatarFailureSource(profile?.avatar || profile?.portrait || "");
+  const conversationSource = avatarFailureSource(
+    conversation?.avatar || conversation?.portrait || conversation?.user?.avatar || ""
+  );
+  if (profileSource !== source && conversationSource !== source) return;
+  S.failedAvatarUrls.delete(source);
+  S.conversationFailedAvatarSources.delete(target);
+  S.conversationProfileForceRefreshUids.delete(target);
+  S.conversationAvatarRetryAt.delete(target);
+  const timer = S.conversationAvatarRetryTimers.get(target);
+  if (timer) clearTimeout(timer);
+  S.conversationAvatarRetryTimers.delete(target);
+}
+
+function avatarSourcesMatch(value, source) {
+  const candidate = avatarFailureSource(value);
+  return Boolean(candidate && source && candidate === source);
+}
+
+function resetConversationAvatarFailures() {
+  S.conversationAvatarRetryTimers.forEach((timer) => clearTimeout(timer));
+  S.failedAvatarUrls.clear();
+  S.conversationFailedAvatarSources.clear();
+  S.conversationAvatarRetryAt.clear();
+  S.conversationAvatarRetryTimers.clear();
+  S.conversationProfileForceRefreshUids.clear();
+}
+
+function scheduleConversationAvatarRetry(peer, retryAt) {
+  const target = String(peer || "").trim();
+  if (!target) return;
+  const previous = S.conversationAvatarRetryTimers.get(target);
+  if (previous) clearTimeout(previous);
+  const delay = Math.max(0, Number(retryAt || 0) - Date.now());
+  const timer = setTimeout(() => {
+    S.conversationAvatarRetryTimers.delete(target);
+    if (Number(S.conversationAvatarRetryAt.get(target) || 0) > Date.now()) return;
+    S.conversationAvatarRetryAt.delete(target);
+    S.conversationProfileFetchedAt.delete(target);
+    void hydrateConversationProfiles();
+  }, delay);
+  S.conversationAvatarRetryTimers.set(target, timer);
+}
+
+function invalidateConversationAvatar(peer, failedSource) {
+  const target = String(peer || "").trim();
+  const source = avatarFailureSource(failedSource);
+  if (!target || !source) return;
+  const retryAt = Date.now() + AVATAR_FAILURE_COOLDOWN_MS;
+  S.conversationFailedAvatarSources.set(target, source);
+  S.conversationAvatarRetryAt.set(target, retryAt);
+  S.conversationProfileForceRefreshUids.add(target);
+  S.conversationProfileFetchedAt.set(target, Date.now());
+
+  const profile = S.conversationProfilesByUid.get(target);
+  if (profile) {
+    const avatar = avatarSourcesMatch(profile.avatar, source) ? "" : profile.avatar || "";
+    const portrait = avatarSourcesMatch(profile.portrait, source) ? "" : profile.portrait || "";
+    S.conversationProfilesByUid.set(target, {
+      ...profile,
+      avatar,
+      portrait,
+      _resolved: false,
+    });
+  }
+
+  S.conversations = S.conversations.map((item) => {
+    if (conversationPeer(item) !== target) return item;
+    const nestedUser = item?.user && typeof item.user === "object" ? item.user : {};
+    const userAvatar = avatarSourcesMatch(nestedUser.avatar, source) ? "" : nestedUser.avatar;
+    const userPortrait = avatarSourcesMatch(nestedUser.portrait, source) ? "" : nestedUser.portrait;
+    return {
+      ...item,
+      avatar: avatarSourcesMatch(item.avatar, source) ? "" : item.avatar,
+      portrait: avatarSourcesMatch(item.portrait, source) ? "" : item.portrait,
+      profile_resolved: false,
+      user: { ...nestedUser, avatar: userAvatar, portrait: userPortrait },
+    };
+  });
+  persistConversationProfiles();
+  scheduleConversationAvatarRetry(target, retryAt);
 }
 
 function discardFailedAvatar(image) {
+  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    const conversationList = image?.closest?.(".conversation-list");
+    if (conversationList) CONVERSATION_LIST_RENDER_HTML.delete(conversationList);
+    const avatar = image?.closest?.(".avatar");
+    const card = avatar?.parentElement?.classList?.contains("user-card") ? avatar.parentElement : null;
+    avatar?.remove();
+    if (card && !card.querySelector(".avatar")) card.classList.remove("has-avatar");
+    return;
+  }
+  const source = rememberFailedAvatarUrl(image?.currentSrc || image?.src || "");
+  const conversationItem = image?.closest?.("[data-conversation-item][data-uid]");
+  const peer = String(conversationItem?.dataset?.uid || "").trim();
+  if (peer && source) invalidateConversationAvatar(peer, source);
   const avatar = image?.closest?.(".avatar");
   const card = avatar?.parentElement?.classList?.contains("user-card") ? avatar.parentElement : null;
   avatar?.remove();
@@ -4666,12 +4821,14 @@ function conversationAvatar(item) {
       : conversation.user_info && typeof conversation.user_info === "object"
         ? conversation.user_info
         : {};
-  return validAvatarValue(
+  const avatar = validAvatarValue(
     conversation.avatar,
     conversation.portrait,
     nestedUser.avatar,
     nestedUser.portrait
   );
+  const failedSource = S.conversationFailedAvatarSources.get(conversationPeer(conversation));
+  return avatarSourcesMatch(avatar, failedSource) ? "" : avatar;
 }
 
 function conversationDisplayName(item) {
@@ -4773,13 +4930,43 @@ function normalizedConversationProfile(profile, peer) {
   };
 }
 
-function rememberConversationProfile(peer, profile) {
+function rememberConversationProfile(
+  peer,
+  profile,
+  { allowPreviouslyFailedAvatar = false } = {}
+) {
   const target = String(peer || "").trim();
-  const incoming = normalizedConversationProfile(profile, target);
+  let incoming = normalizedConversationProfile(profile, target);
   if (!target || !incoming) return false;
+  const reportedAvatarSource = avatarFailureSource(
+    profile?.avatar || profile?.portrait || profile?.faceUrl || profile?.face_url || ""
+  );
+  const failedAvatarSource = S.conversationFailedAvatarSources.get(target) || "";
+  if (
+    reportedAvatarSource &&
+    reportedAvatarSource === failedAvatarSource &&
+    !allowPreviouslyFailedAvatar
+  ) {
+    incoming = { ...incoming, avatar: "", portrait: "", _resolved: false };
+    if (Number(S.conversationAvatarRetryAt.get(target) || 0) <= Date.now()) {
+      const retryAt = Date.now() + AVATAR_FAILURE_COOLDOWN_MS;
+      S.conversationAvatarRetryAt.set(target, retryAt);
+      scheduleConversationAvatarRetry(target, retryAt);
+    }
+  }
   const previous = S.conversationProfilesByUid.get(target) || {};
   const nickname = incoming.nickname || previous.nickname || previous.name || "";
   const avatar = validAvatarValue(incoming.avatar, incoming.portrait, previous.avatar, previous.portrait);
+  const previousAvatarSource = avatarFailureSource(previous.avatar || previous.portrait || "");
+  const incomingAvatarSource = avatarFailureSource(avatar);
+  if (incomingAvatarSource && incomingAvatarSource !== previousAvatarSource) {
+    S.conversationFailedAvatarSources.delete(target);
+    S.conversationProfileForceRefreshUids.delete(target);
+    S.conversationAvatarRetryAt.delete(target);
+    const timer = S.conversationAvatarRetryTimers.get(target);
+    if (timer) clearTimeout(timer);
+    S.conversationAvatarRetryTimers.delete(target);
+  }
   S.conversationProfilesByUid.set(target, {
     ...previous,
     ...incoming,
@@ -5283,6 +5470,8 @@ async function hydrateConversationProfiles() {
       .map(conversationPeer)
       .filter(
         (peer) => {
+          const avatarRetryAt = Number(S.conversationAvatarRetryAt.get(peer) || 0);
+          if (avatarRetryAt > now) return false;
           const fetchedAt = Number(S.conversationProfileFetchedAt.get(peer) || 0);
           const ttl = conversationPeerNeedsHydration(peer)
             ? CONVERSATION_PROFILE_ERROR_TTL_MS
@@ -5313,11 +5502,24 @@ async function hydrateConversationProfiles() {
     }
 
     const unresolved = peers.filter(conversationPeerNeedsHydration);
-    for (let index = 0; index < unresolved.length; index += CONVERSATION_PROFILE_REST_BATCH_SIZE) {
-      const batch = unresolved.slice(index, index + CONVERSATION_PROFILE_REST_BATCH_SIZE);
+    const restBatches = [];
+    for (const forceRefresh of [true, false]) {
+      const group = unresolved.filter(
+        (peer) => S.conversationProfileForceRefreshUids.has(peer) === forceRefresh
+      );
+      for (let index = 0; index < group.length; index += CONVERSATION_PROFILE_REST_BATCH_SIZE) {
+        restBatches.push({
+          batch: group.slice(index, index + CONVERSATION_PROFILE_REST_BATCH_SIZE),
+          forceRefresh,
+        });
+      }
+    }
+    for (const { batch, forceRefresh } of restBatches) {
       try {
         const { data } = await api(
-          `/api/profile/users?uids=${encodeURIComponent(batch.join(","))}`,
+          `/api/profile/users?uids=${encodeURIComponent(batch.join(","))}${
+            forceRefresh ? "&refresh=1" : ""
+          }`,
           { timeout: 8000 }
         );
         const profiles = itemsOf(data);
@@ -5328,7 +5530,13 @@ async function hydrateConversationProfiles() {
         );
         batch.forEach((peer) => {
           const profile = conversationProfileForPeer(profiles, peer);
-          if (!rememberConversationProfile(peer, profile)) {
+          const allowPreviouslyFailedAvatar =
+            S.conversationProfileForceRefreshUids.has(peer);
+          if (
+            !rememberConversationProfile(peer, profile, {
+              allowPreviouslyFailedAvatar,
+            })
+          ) {
             S.conversationProfileFetchedAt.set(
               peer,
               pending.has(peer)
@@ -11313,6 +11521,9 @@ function renderConversationList(list) {
 
 function scheduleConversationAvatarSwap({ currentAvatar, nextAvatar, nextImage, nextSrc }) {
   const loader = new Image();
+  const peer = String(
+    currentAvatar.closest?.("[data-conversation-item][data-uid]")?.dataset?.uid || ""
+  ).trim();
   let settled = false;
   const finish = () => {
     if (settled) return;
@@ -11328,6 +11539,7 @@ function scheduleConversationAvatarSwap({ currentAvatar, nextAvatar, nextImage, 
       nextImage.replaceWith(loader);
       delete currentAvatar.dataset.pendingAvatarSrc;
       currentAvatar.replaceWith(nextAvatar);
+      confirmConversationAvatar(peer, nextSrc);
     };
     if (typeof loader.decode === "function") {
       void loader.decode().catch(() => {}).then(reveal);
@@ -11341,6 +11553,8 @@ function scheduleConversationAvatarSwap({ currentAvatar, nextAvatar, nextImage, 
     if (currentAvatar.dataset.pendingAvatarSrc === nextSrc) {
       delete currentAvatar.dataset.pendingAvatarSrc;
     }
+    const source = rememberFailedAvatarUrl(nextSrc);
+    if (peer && source) invalidateConversationAvatar(peer, source);
   };
   loader.alt = "";
   loader.loading = "eager";
@@ -18798,6 +19012,7 @@ async function logout({ notifyServer = true } = {}) {
     S.conversationProfilesByUid.clear();
     S.conversationProfileFetchedAt.clear();
     S.conversationProfileLoadingUids.clear();
+    resetConversationAvatarFailures();
     S.conversationPreviewFetchedAt.clear();
     S.conversationPreviewLoadingPeers.clear();
     S.conversationPreviewHydrationPromise = null;
@@ -20385,6 +20600,7 @@ async function completeBrowserLogin(data) {
   S.conversationArchiveLoadedAt = 0;
   S.conversationProfilesByUid.clear();
   S.conversationProfileFetchedAt.clear();
+  resetConversationAvatarFailures();
   S.presenceByUid.clear();
   S.presenceWarningShown = false;
   S.meStats = null;
@@ -21022,6 +21238,10 @@ window.visualViewport?.addEventListener("scroll", syncVisualViewport, { passive:
 window.addEventListener("online", () => {
   if (S.authenticated) restorePendingFlashAcknowledgements();
   if (!S.authenticated || document.hidden) return;
+  S.failedAvatarUrls.clear();
+  S.conversationAvatarRetryAt.clear();
+  S.conversationProfileFetchedAt.clear();
+  void hydrateConversationProfiles();
   retryMomentVideoCompatibilityAfterOnline();
   if (!VOICE_MATCH_ENABLED) void cleanupDisabledVoiceMatchQueue();
   S.imNextReconnectAt = 0;

@@ -192,6 +192,42 @@ class BffEnvelopeTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in items], ["1", "2"])
         self.assertEqual(details["pending_uids"], ["3"])
 
+    def test_profile_batch_force_refresh_is_rate_limited_by_cache_age(self) -> None:
+        calls = []
+        app = SimpleNamespace(
+            session=SimpleNamespace(uid="42"),
+            profile=SimpleNamespace(
+                get_user=lambda uid: calls.append(uid)
+                or ApiResult(
+                    True,
+                    200,
+                    "[]",
+                    data=[{"id": uid, "nickname": "新昵称"}],
+                )
+            ),
+        )
+        cached = {"9": (100.0, {"id": "9", "nickname": "旧昵称"})}
+
+        with patch.object(bff_server.time, "monotonic", return_value=130.0):
+            recent = bff_server._batch_cached_profiles(
+                app,
+                ["9"],
+                cached,
+                force_refresh=True,
+            )
+        self.assertEqual(calls, [])
+        self.assertEqual(recent[0]["nickname"], "旧昵称")
+
+        with patch.object(bff_server.time, "monotonic", return_value=161.0):
+            refreshed = bff_server._batch_cached_profiles(
+                app,
+                ["9"],
+                cached,
+                force_refresh=True,
+            )
+        self.assertEqual(calls, ["9"])
+        self.assertEqual(refreshed[0]["nickname"], "新昵称")
+
     def test_local_web_server_rejects_a_second_listener_on_the_same_port(self) -> None:
         first = bff_server.ExclusiveThreadingHTTPServer(
             ("127.0.0.1", 0), bff_server.Handler
@@ -4993,6 +5029,123 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
         self.assertIn('id="side-avatar" aria-hidden="true" hidden></div>', index_html)
         self.assertIn("avatar.hidden = true", app_js)
         self.assertIn("禁止使用数字、字符串首个字符", agents_md)
+
+    def test_failed_conversation_avatar_is_cooled_down_and_refetched(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        failure_handler = app_js.split(
+            "function discardFailedAvatar(image)", 1
+        )[1].split("const PEER_PRESENCE_TTL_MS", 1)[0]
+        swap_loader = app_js.split(
+            "function scheduleConversationAvatarSwap", 1
+        )[1].split("function refreshMessageConversationRegion", 1)[0]
+        hydration = app_js.split(
+            "async function hydrateConversationProfiles()", 1
+        )[1].split("function conversationCard", 1)[0]
+
+        self.assertIn("AVATAR_FAILURE_COOLDOWN_MS = 5 * 60 * 1000", app_js)
+        self.assertIn("failedAvatarUrls: new Map()", app_js)
+        self.assertIn("avatarUrlCoolingDown(src)", app_js)
+        self.assertIn("rememberFailedAvatarUrl", failure_handler)
+        self.assertIn("invalidateConversationAvatar(peer, source)", failure_handler)
+        self.assertIn("profile_resolved: false", app_js)
+        self.assertIn("scheduleConversationAvatarRetry(target, retryAt)", app_js)
+        self.assertIn("rememberFailedAvatarUrl(nextSrc)", swap_loader)
+        self.assertIn('forceRefresh ? "&refresh=1" : ""', hydration)
+        self.assertNotIn("thumbnail_album", failure_handler)
+        self.assertNotIn("album", failure_handler)
+
+    def test_failed_conversation_avatar_state_recovers_only_with_a_valid_candidate(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for the avatar recovery test")
+
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        media_functions = "function mediaUrl(value)" + app_js.split(
+            "function mediaUrl(value)", 1
+        )[1].split("function resolveTimApi", 1)[0]
+        match_function = "function avatarSourcesMatch" + app_js.split(
+            "function avatarSourcesMatch", 1
+        )[1].split("function resetConversationAvatarFailures", 1)[0]
+        invalidation_function = "function invalidateConversationAvatar" + app_js.split(
+            "function invalidateConversationAvatar", 1
+        )[1].split("function discardFailedAvatar", 1)[0]
+        profile_functions = "function normalizedConversationProfile" + app_js.split(
+            "function normalizedConversationProfile", 1
+        )[1].split("function preserveConversationDisplayName", 1)[0]
+        script = (
+            r"""
+const MEDIA_BASE = "https://oss.banghua.xin";
+const APK_MEDIA_ORIGIN_RE = /^(?:https?:)?\/\/(?:oss\.banghua\.xin|moyuanoss\.oss-cn-shanghai\.aliyuncs\.com|appletattachment\.oss-cn-beijing\.aliyuncs\.com)(?=[/?#]|$)/i;
+const INVALID_AVATAR_VALUES = new Set(["0", "false", "nil", "none", "null", "undefined", "[]", "{}", "[object object]"]);
+const LOCAL_PRIVATE_MEDIA_PATH_RE = /^\/api\/media\/(?:native\/)?[0-9a-f-]+\/content(?:[?#].*)?$/i;
+const AVATAR_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
+const AVATAR_FAILURE_CACHE_LIMIT = 512;
+let now = 1000;
+Date.now = () => now;
+const oldAvatar = "https://oss.banghua.xin/images/missing.jpg";
+const newAvatar = "https://oss.banghua.xin/images/replaced.jpg";
+const S = {
+  failedAvatarUrls: new Map(),
+  conversationFailedAvatarSources: new Map(),
+  conversationAvatarRetryAt: new Map(),
+  conversationAvatarRetryTimers: new Map(),
+  conversationProfileForceRefreshUids: new Set(),
+  conversationProfileFetchedAt: new Map(),
+  conversationProfilesByUid: new Map([["9", {
+    id: "9", nickname: "青栀", name: "青栀", avatar: oldAvatar, portrait: oldAvatar, _resolved: true,
+  }]]),
+  conversations: [{
+    peer_id: "9", nickname: "青栀", avatar: oldAvatar, profile_resolved: true,
+    user: { nickname: "青栀", avatar: oldAvatar, portrait: oldAvatar },
+  }],
+};
+function conversationPeer(item) { return String(item?.peer_id || ""); }
+function conversationNameIsPlaceholder(value, peer) {
+  const name = String(value || "").trim();
+  return !name || name === "用户" || name === "游客" || name === peer || name === `用户 ${peer}`;
+}
+function persistConversationProfiles() {}
+const scheduled = [];
+function scheduleConversationAvatarRetry(peer, retryAt) { scheduled.push([peer, retryAt]); }
+"""
+            + media_functions
+            + match_function
+            + invalidation_function
+            + profile_functions
+            + r"""
+rememberFailedAvatarUrl(oldAvatar, now);
+invalidateConversationAvatar("9", oldAvatar);
+const failedProfile = S.conversationProfilesByUid.get("9");
+const failedConversation = S.conversations[0];
+if (failedProfile.avatar || failedProfile.portrait || failedProfile._resolved) throw new Error("failed profile retained avatar");
+if (failedProfile.nickname !== "青栀") throw new Error("failed profile lost nickname");
+if (failedConversation.avatar || failedConversation.user.avatar || failedConversation.profile_resolved) throw new Error("failed conversation retained avatar");
+if (S.conversationFailedAvatarSources.get("9") !== oldAvatar) throw new Error("failed source was not recorded");
+rememberConversationProfile("9", { id: "9", nickname: "青栀", avatar: oldAvatar });
+if (S.conversationProfilesByUid.get("9").avatar) throw new Error("failed avatar re-entered during cooldown");
+now += AVATAR_FAILURE_COOLDOWN_MS + 1;
+rememberConversationProfile("9", { id: "9", nickname: "青栀", avatar: newAvatar });
+const recovered = S.conversationProfilesByUid.get("9");
+if (recovered.avatar !== newAvatar || recovered._resolved !== true) throw new Error("new avatar did not recover");
+if (S.conversationFailedAvatarSources.has("9")) throw new Error("failed source survived recovery");
+if (S.conversationProfileForceRefreshUids.has("9")) throw new Error("forced refresh survived recovery");
+"""
+        )
+        result = subprocess.run(
+            [node, "-e", script],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_relationship_center_and_parented_navigation_are_first_class(self) -> None:
         root = Path(__file__).resolve().parents[1]
