@@ -611,7 +611,11 @@ def _deduplicate_archived_message_items(
 
 
 @router.get("/conversations")
-def archived_conversations(request: Request, limit: int = 100) -> dict[str, Any]:
+def archived_conversations(
+    request: Request,
+    limit: int = 100,
+    since: datetime | None = None,
+) -> dict[str, Any]:
     persistence = request.app.state.persistence
     identity = persistence.require_identity(_sid(request))
     if identity is None:
@@ -622,9 +626,16 @@ def archived_conversations(request: Request, limit: int = 100) -> dict[str, Any]
         raise HTTPException(status_code=429, detail="会话缓存读取过于频繁")
 
     bounded_limit = min(max(1, int(limit)), 200)
+    activity_since = since
+    if activity_since is not None and activity_since.tzinfo is None:
+        activity_since = activity_since.replace(tzinfo=UTC)
     with session_scope() as db:
-        conversations = ConversationRepository(db).list_for_owner(
-            identity.user_id, limit=min(500, bounded_limit * 3)
+        conversation_repository = ConversationRepository(db)
+        list_options: dict[str, Any] = {"limit": min(500, bounded_limit * 3)}
+        if activity_since is not None:
+            list_options["activity_since"] = activity_since
+        conversations = conversation_repository.list_for_owner(
+            identity.user_id, **list_options
         )
         latest = MessageRepository(db).latest_for_conversations(
             identity.user_id, [conversation.id for conversation in conversations]

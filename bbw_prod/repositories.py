@@ -353,12 +353,21 @@ class ConversationRepository(Repository[Conversation]):
         )
 
     def list_for_owner(
-        self, owner_user_id: uuid.UUID, *, offset: int = 0, limit: int = 100
+        self,
+        owner_user_id: uuid.UUID,
+        *,
+        offset: int = 0,
+        limit: int = 100,
+        activity_since: datetime | None = None,
     ) -> list[Conversation]:
         stmt = (
             select(Conversation)
             .where(Conversation.owner_user_id == owner_user_id)
-            .order_by(
+        )
+        if activity_since is not None:
+            stmt = stmt.where(Conversation.last_message_at >= activity_since)
+        stmt = (
+            stmt.order_by(
                 Conversation.last_message_at.desc().nullslast(),
                 Conversation.updated_at.desc(),
             )

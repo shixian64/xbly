@@ -211,6 +211,57 @@ class CanonicalImReadDispatchTests(unittest.TestCase):
             _payload(response)["code"], "UPSTREAM_CONVERSATIONS_UNAVAILABLE"
         )
 
+    def test_conversation_range_filter_preserves_captured_response_headers(self) -> None:
+        request, _persistence = _request(
+            "/api/im/conversations",
+            query="page=1&since=100",
+        )
+
+        class SuccessfulHandler(_CapturedHandler):
+            response_payload = {
+                "ok": True,
+                "items": [
+                    {"peer_id": "9", "timestamp": 100},
+                    {"peer_id": "10", "timestamp": 99},
+                ],
+                "list": [],
+            }
+
+            def finish_capture(self) -> tuple[int, list[tuple[str, str]], bytes]:
+                body = json.dumps(self.response_payload).encode("utf-8")
+                return (
+                    200,
+                    [
+                        ("Content-Type", "application/json; charset=utf-8"),
+                        ("Content-Length", str(len(body))),
+                        ("Set-Cookie", f"{bff_server.COOKIE_NAME}=renewed; Path=/"),
+                        ("X-Captured-Policy", "preserved"),
+                    ],
+                    body,
+                )
+
+        with patch.object(web_api, "CapturingHandler", SuccessfulHandler):
+            response = web_api._legacy_dispatch_sync(request, b"")
+
+        self.assertEqual(
+            [item["peer_id"] for item in _payload(response)["items"]],
+            ["9"],
+        )
+        self.assertEqual(_persistence.product_responses[0]["sid"], "renewed")
+        raw_headers = [
+            (name.decode("latin-1"), value.decode("latin-1"))
+            for name, value in response.raw_headers
+        ]
+        self.assertIn(
+            ("Set-Cookie", f"{bff_server.COOKIE_NAME}=renewed; Path=/"),
+            raw_headers,
+        )
+        self.assertIn(("X-Captured-Policy", "preserved"), raw_headers)
+        content_lengths = [
+            value for name, value in raw_headers if name.lower() == "content-length"
+        ]
+        self.assertEqual(content_lengths, [str(len(bytes(response.body)))])
+
     def test_provider_exception_is_not_hidden_by_archive_history(self) -> None:
         request, _persistence = _request("/api/im/messages", query="peer=9")
 

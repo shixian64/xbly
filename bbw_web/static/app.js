@@ -17,6 +17,7 @@ const PRIMARY_NAV = [
       { id: "social", name: "关系中心", desc: "好友、关注、访客与黑名单" },
       { id: "wallet", name: "资产与权益", desc: "余额、提现、礼物背包与会员权益" },
       { id: "tasks", name: "任务与奖励", desc: "完成任务领取奖励" },
+      { id: "settings", name: "设置", desc: "聊天列表与使用偏好" },
     ],
   },
 ];
@@ -70,6 +71,8 @@ const CONVERSATION_PROFILE_SDK_WAIT_MS = 1200;
 const CONVERSATION_PROFILE_REST_BATCH_SIZE = 12;
 const CONVERSATION_PROFILE_CACHE_LIMIT = 200;
 const CONVERSATION_PREVIEW_REFRESH_MS = 10 * 1000;
+const CONVERSATION_RECENT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const CONVERSATION_SHOW_ALL_STORAGE_PREFIX = "bbw:im:show-all-conversations:";
 const CONVERSATION_SWIPE_THRESHOLD_PX = 42;
 const CONVERSATION_SWIPE_LOCK_PX = 8;
 const CONVERSATION_DELETE_CONFIRM_DELAY_MS = 500;
@@ -242,6 +245,8 @@ const S = {
   activePeer: "",
   activePeerName: "",
   conversationListCollapsed: false,
+  showAllConversations: true,
+  conversationPreferenceAccount: "",
   conversations: [],
   conversationRefreshPromise: null,
   conversationLastRefreshAt: 0,
@@ -1847,8 +1852,8 @@ function deleteOriginDatabase(name) {
 
 function clearLocalStoragePreservingFlashAcknowledgements() {
   // Pending flash ACKs are one-time-consumption tombstones, not reusable
-  // media credentials. Preserve only validated, short-lived records while
-  // removing every other localStorage entry during logout/auth cleanup.
+  // media credentials. The conversation visibility flag is a non-sensitive
+  // account preference and remains available after logout.
   const keys = [];
   for (let index = 0; index < localStorage.length; index += 1) {
     const key = localStorage.key(index);
@@ -1856,6 +1861,7 @@ function clearLocalStoragePreservingFlashAcknowledgements() {
   }
   const now = Date.now();
   keys.forEach((key) => {
+    if (key.startsWith(CONVERSATION_SHOW_ALL_STORAGE_PREFIX)) return;
     if (!key.startsWith(FLASH_ACK_STORAGE_PREFIX)) {
       localStorage.removeItem(key);
       return;
@@ -1948,6 +1954,7 @@ function applyDependencyMode(data) {
 
 function applyUser(user) {
   S.user = user || null;
+  syncConversationPreferenceAccount();
   syncDismissedConversationAccount();
   syncConversationProfileAccount();
   const avatar = $("side-avatar");
@@ -2863,6 +2870,51 @@ function messageSyncAccountId() {
   return String(S.user?.uid || S.user?.id || "").trim();
 }
 
+function conversationPreferenceStorageKey(account = messageSyncAccountId()) {
+  const normalized = String(account || "").trim();
+  return normalized ? `${CONVERSATION_SHOW_ALL_STORAGE_PREFIX}${normalized}` : "";
+}
+
+function syncConversationPreferenceAccount() {
+  const account = messageSyncAccountId();
+  if (account && account === S.conversationPreferenceAccount) return;
+  S.conversationPreferenceAccount = account;
+  S.showAllConversations = true;
+  const key = conversationPreferenceStorageKey(account);
+  if (!key) return;
+  try {
+    S.showAllConversations = localStorage.getItem(key) !== "false";
+  } catch {
+    // Storage can be unavailable; the documented default remains enabled.
+  }
+}
+
+function persistConversationPreference() {
+  const key = conversationPreferenceStorageKey(S.conversationPreferenceAccount);
+  if (!key) return;
+  try {
+    if (S.showAllConversations) localStorage.removeItem(key);
+    else localStorage.setItem(key, "false");
+  } catch {
+    // Keep the in-memory preference for this session when storage is unavailable.
+  }
+}
+
+function conversationActivityCutoff(now = Date.now()) {
+  return Math.max(0, Number(now || Date.now()) - CONVERSATION_RECENT_WINDOW_MS);
+}
+
+function conversationSummaryQuery(prefix = "&") {
+  if (S.showAllConversations) return "";
+  return `${prefix}since=${encodeURIComponent(new Date(conversationActivityCutoff()).toISOString())}`;
+}
+
+function conversationInSelectedRange(item) {
+  if (S.showAllConversations) return true;
+  const timestamp = conversationTimestamp(item);
+  return timestamp > 0 && timestamp >= conversationActivityCutoff();
+}
+
 function conversationProfileStorageKey(account = messageSyncAccountId()) {
   const normalized = String(account || "").trim();
   return normalized ? `bbw:im:conversation-profiles:${normalized}` : "";
@@ -2993,6 +3045,7 @@ function ensureMessageSyncChannel() {
       !payload ||
       payload.type !== "conversations" ||
       String(payload.account || "") !== messageSyncAccountId() ||
+      Boolean(payload.showAll) !== S.showAllConversations ||
       !Array.isArray(payload.items)
     ) {
       return;
@@ -3036,9 +3089,9 @@ function applyConversationSummaries(
     ? S.conversations.find((item) => conversationPeer(item) === activePeer)
     : null;
   const previousRevision = conversationMessageRevision(previousActive);
-  const prepared = (Array.isArray(items) ? items : []).map((item) =>
-    normalizeConversationSummary(item, { authority, observedAt })
-  );
+  const prepared = (Array.isArray(items) ? items : [])
+    .map((item) => normalizeConversationSummary(item, { authority, observedAt }))
+    .filter(conversationInSelectedRange);
   S.conversations = mergeConversationSources(prepared, S.conversations);
   const nextActive = activePeer
     ? S.conversations.find((item) => conversationPeer(item) === activePeer)
@@ -3064,6 +3117,7 @@ function applyConversationSummaries(
       channel?.postMessage({
         type: "conversations",
         account: messageSyncAccountId(),
+        showAll: S.showAllConversations,
         updatedAt: Date.now(),
         items: S.conversations.slice(0, 200),
       });
@@ -3151,6 +3205,7 @@ async function hydrateStaleConversationPreviews() {
       const available = Math.max(0, 2 - S.conversationPreviewLoadingPeers.size);
       if (!available) break;
       const candidates = S.conversations
+        .filter(conversationInSelectedRange)
         .filter((item) => {
           const peer = conversationPeer(item);
           return (
@@ -3191,8 +3246,10 @@ function loadArchivedConversationSummary({ force = false } = {}) {
   if (!force && now - S.conversationArchiveLoadedAt < ARCHIVED_CONVERSATION_TTL_MS) {
     return Promise.resolve(S.conversations);
   }
-  const task = api("/api/archive/conversations?limit=100", { timeout: 5000 })
+  const showAllAtRequest = S.showAllConversations;
+  const task = api(`/api/archive/conversations?limit=100${conversationSummaryQuery("&")}`, { timeout: 5000 })
     .then(({ data }) => {
+      if (showAllAtRequest !== S.showAllConversations) return S.conversations;
       S.conversationArchiveLoadedAt = Date.now();
       return applyConversationSummaries(itemsOf(data), { authority: "archive" });
     })
@@ -3211,8 +3268,10 @@ function refreshConversationSummary({ force = false } = {}) {
   if (!force && now - S.conversationLastRefreshAt < CONVERSATION_REFRESH_MIN_MS) {
     return Promise.resolve(S.conversations);
   }
-  const task = api("/api/im/conversations?page=1", { timeout: 8000 })
+  const showAllAtRequest = S.showAllConversations;
+  const task = api(`/api/im/conversations?page=1${conversationSummaryQuery("&")}`, { timeout: 8000 })
     .then((result) => {
+      if (showAllAtRequest !== S.showAllConversations) return S.conversations;
       const { data } = requireApiSuccess(result, "聊天列表暂时不可用");
       S.conversationLastRefreshAt = Date.now();
       S.conversationNextRefreshAt = 0;
@@ -3223,6 +3282,7 @@ function refreshConversationSummary({ force = false } = {}) {
       });
     })
     .catch((error) => {
+      if (showAllAtRequest !== S.showAllConversations) return S.conversations;
       S.conversationNextRefreshAt = Date.now() + Math.max(
         CONVERSATION_REFRESH_ERROR_MS,
         Number(error?.retryAfterMs || 0)
@@ -5316,7 +5376,7 @@ function mergeConversationPair(preferred, fallback) {
 
 function mergeConversationSources(history, cached) {
   const byPeer = new Map();
-  history.filter(isC2CConversation).forEach((item) => {
+  history.filter(isC2CConversation).filter(conversationInSelectedRange).forEach((item) => {
     const peer = conversationPeer(item);
     if (peer) {
       const normalized = normalizeConversationSummary(item, {
@@ -5326,7 +5386,7 @@ function mergeConversationSources(history, cached) {
       byPeer.set(peer, current ? mergeConversationPair(normalized, current) : applyConversationReadOverride(peer, normalized));
     }
   });
-  cached.filter(isC2CConversation).forEach((item) => {
+  cached.filter(isC2CConversation).filter(conversationInSelectedRange).forEach((item) => {
     const peer = conversationPeer(item);
     if (!peer) return;
     const normalized = normalizeConversationSummary(item, {
@@ -5560,6 +5620,44 @@ async function hydrateConversationProfiles() {
   } finally {
     peers.forEach((peer) => S.conversationProfileLoadingUids.delete(peer));
   }
+}
+
+async function setShowAllConversations(enabled) {
+  const next = Boolean(enabled);
+  if (next === S.showAllConversations) return;
+  S.showAllConversations = next;
+  persistConversationPreference();
+  clearViewCacheKey("settings");
+  if (S.route === "settings") {
+    const checkbox = document.querySelector('input[data-setting="show-all-conversations"]');
+    if (checkbox) checkbox.checked = next;
+  }
+  S.conversationLastRefreshAt = 0;
+  S.conversationNextRefreshAt = 0;
+  S.conversationArchiveLoadedAt = 0;
+  S.messageLastSummarySyncAt = 0;
+  if (!next) {
+    S.conversations = S.conversations.filter(conversationInSelectedRange);
+    if (S.activePeer && !S.conversations.some((item) => conversationPeer(item) === S.activePeer)) {
+      closeActiveConversationForRemoval();
+    }
+    recalculateUnreadTotal();
+    refreshMessageConversationRegion({ refreshList: true, refreshPane: true });
+  }
+  const pendingRequests = [
+    S.conversationRefreshPromise,
+    S.conversationArchivePromise,
+  ].filter(Boolean);
+  if (pendingRequests.length) await Promise.allSettled(pendingRequests);
+  if (S.showAllConversations !== next) return;
+  await Promise.allSettled([
+    refreshConversationSummary({ force: true }),
+    loadArchivedConversationSummary({ force: true }),
+  ]);
+  if (S.showAllConversations !== next) return;
+  const checkbox = document.querySelector('input[data-setting="show-all-conversations"]');
+  if (checkbox) checkbox.checked = S.showAllConversations;
+  toast(next ? "已显示全部会话" : "已隐藏一周前未联系的会话");
 }
 
 function conversationCard(item) {
@@ -16107,6 +16205,14 @@ async function pageMe(signal) {
     <section class="section"><div class="surface-card profile-service-card"><div class="section-head"><div><h2>资料与礼仪</h2><p>查看账号认证、礼仪分和推荐码</p></div></div><div class="button-row profile-query-actions"><button type="button" class="btn secondary" data-action="face-status" aria-controls="me-result" aria-pressed="false">查看实名状态</button><button type="button" class="btn secondary" data-action="etiquette" aria-controls="me-result" aria-pressed="false">查看礼仪分</button><button type="button" class="btn secondary" data-action="referral-get" aria-controls="me-result" aria-pressed="false">查看推荐码</button></div><div id="me-result" class="result-panel profile-query-result-panel" aria-live="polite"></div><form class="inline-form profile-referral-form" data-form="referral-set"><div class="field"><label for="referral-value">设置推荐码</label><input id="referral-value" name="referral" placeholder="输入推荐码" required /></div><button type="submit" class="btn secondary">保存</button></form></div></section>`;
 }
 
+async function pageSettings() {
+  return `<section class="section"><div class="surface-card"><div class="section-head"><div><h2>聊天列表</h2><p>控制联系人会话的加载范围</p></div></div>
+    <label class="check-line"><input type="checkbox" data-setting="show-all-conversations" ${
+      S.showAllConversations ? "checked" : ""
+    } /><span><strong>显示全部会话</strong><small class="field-help">默认开启；关闭后只请求并显示最近一周内发送或接收过消息的会话</small></span></label>
+  </div></section>`;
+}
+
 function agentConnectionStatusText(connection) {
   if (!connection) return "尚未配置";
   if (connection.last_test_status === "ok") return "连接测试通过";
@@ -16922,6 +17028,7 @@ const PAGE_RENDERERS = {
   social: pageSocial,
   wallet: pageWallet,
   tasks: pageTasks,
+  settings: pageSettings,
   agent: pageAgent,
   lab: pageLab,
 };
@@ -18352,7 +18459,8 @@ function attachTimHandlers(chat, TIM, credential) {
     S.imConversationHandler = (event) => {
       const updated = (event.data || [])
         .map(normalizeTimConversation)
-        .filter((item) => item.peer_id && isC2CConversation(item));
+        .filter((item) => item.peer_id && isC2CConversation(item))
+        .filter(conversationInSelectedRange);
       S.conversations = mergeConversationSources(S.conversations, updated);
       recalculateUnreadTotal();
       refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
@@ -18530,6 +18638,7 @@ async function connectTIM(
 
     // Background conversation sync — never block connected UI.
     void (async () => {
+      if (!S.showAllConversations) return;
       if (typeof chat.getConversationList !== "function") return;
       try {
         const listResult = await withTimeout(chat.getConversationList(), 8000, "拉取会话列表");
@@ -20832,6 +20941,19 @@ document.addEventListener("focusout", (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  const conversationSetting =
+    event.target.closest && event.target.closest('input[data-setting="show-all-conversations"]');
+  if (conversationSetting) {
+    conversationSetting.disabled = true;
+    void setShowAllConversations(conversationSetting.checked)
+      .catch((error) => {
+        toast(error?.message || "聊天列表设置未保存", "error", 4200);
+      })
+      .finally(() => {
+        if (conversationSetting.isConnected) conversationSetting.disabled = false;
+      });
+    return;
+  }
   const agentAutonomySetting =
     event.target.closest &&
     event.target.closest('form[data-form="agent-autonomy-settings"] input[type="checkbox"]');
@@ -21251,7 +21373,16 @@ window.addEventListener("online", () => {
 });
 
 window.addEventListener("storage", (event) => {
-  if (!S.authenticated || !event.key?.startsWith(FLASH_ACK_STORAGE_PREFIX)) return;
+  if (!S.authenticated || !event.key) return;
+  const preferenceKey = conversationPreferenceStorageKey();
+  if (preferenceKey && event.key === preferenceKey) {
+    const enabled = event.newValue !== "false";
+    if (enabled !== S.showAllConversations) {
+      void setShowAllConversations(enabled).catch(() => {});
+    }
+    return;
+  }
+  if (!event.key.startsWith(FLASH_ACK_STORAGE_PREFIX)) return;
   const key = flashAckStorageKey();
   if (!key || event.key !== key) return;
   syncFlashAckAccount({ forceReload: true });
@@ -21494,6 +21625,12 @@ async function completeRestoredSession(data) {
   S.sessionGeneration += 1;
   S.authenticated = true;
   S.messagePolicyRefreshPromise = null;
+  S.conversations = [];
+  S.conversationRefreshPromise = null;
+  S.conversationLastRefreshAt = 0;
+  S.conversationNextRefreshAt = 0;
+  S.conversationArchivePromise = null;
+  S.conversationArchiveLoadedAt = 0;
   applyFeatureEnvelope(data);
   applyUser(data.user);
   if (!VOICE_MATCH_ENABLED) void cleanupDisabledVoiceMatchQueue();

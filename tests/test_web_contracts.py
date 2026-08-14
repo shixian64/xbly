@@ -1000,6 +1000,31 @@ class ProtocolRoutingTests(unittest.TestCase):
         self.assertEqual(calls[8][1]["pageindex"], "987654321012345678")
 
 
+class ConversationVisibilityWebContractTests(unittest.TestCase):
+    def test_show_all_conversations_defaults_on_and_limits_all_data_sources(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('{ id: "settings", name: "设置",', app_js)
+        self.assertIn("showAllConversations: true", app_js)
+        self.assertIn("if (account && account === S.conversationPreferenceAccount) return;", app_js)
+        self.assertIn("CONVERSATION_RECENT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000", app_js)
+        self.assertIn('data-setting="show-all-conversations"', app_js)
+        self.assertIn("/api/archive/conversations?limit=100${conversationSummaryQuery", app_js)
+        self.assertIn("/api/im/conversations?page=1${conversationSummaryQuery", app_js)
+        self.assertIn("if (!S.showAllConversations) return;", app_js)
+        self.assertIn(".filter(conversationInSelectedRange)", app_js)
+        self.assertIn("function conversationInSelectedRange(item) {", app_js)
+        self.assertIn(
+            "return timestamp > 0 && timestamp >= conversationActivityCutoff();",
+            app_js,
+        )
+        self.assertIn("const pendingRequests = [", app_js)
+        self.assertIn('if (S.route === "settings")', app_js)
+
+
 class TimRestHistoryEnvelopeTests(unittest.TestCase):
     def test_recent_contacts_filter_non_c2c_self_and_duplicates(self) -> None:
         calls = []
@@ -1104,6 +1129,60 @@ class TimRestHistoryEnvelopeTests(unittest.TestCase):
             },
         )
         self.assertTrue(one_second_old[0]["preview_stale"])
+
+    def test_recent_contacts_stop_after_the_one_week_boundary(self) -> None:
+        calls = []
+
+        class Client:
+            def recent_contacts(self, account_uid, **kwargs):
+                calls.append((account_uid, kwargs))
+                if len(calls) == 1:
+                    return SimpleNamespace(
+                        ok=True,
+                        data={
+                            "SessionItem": [
+                                {"Type": 1, "To_Account": "9", "MsgTime": 200},
+                                {"Type": 1, "To_Account": "10", "MsgTime": 99},
+                            ],
+                            "CompleteFlag": 0,
+                            "TimeStamp": 90,
+                            "StartIndex": 2,
+                        },
+                    )
+                return SimpleNamespace(
+                    ok=True,
+                    data={
+                        "SessionItem": [
+                            {"Type": 1, "To_Account": "11", "MsgTime": 98},
+                            {"Type": 1, "To_Account": "12", "MsgTime": 97},
+                        ],
+                        "CompleteFlag": 0,
+                        "TimeStamp": 80,
+                        "StartIndex": 4,
+                    },
+                )
+
+            def c2c_unread_counts(self, _account_uid, peers):
+                return SimpleNamespace(
+                    ok=True,
+                    data={
+                        "C2CUnreadMsgNumList": [
+                            {"Peer_Account": peer, "C2CUnreadMsgNum": 0}
+                            for peer in peers
+                        ]
+                    },
+                )
+
+        payload = bff_server._tim_recent_conversation_envelope(
+            SimpleNamespace(), Client(), "42", {}, activity_since=100
+        )
+
+        # A mixed first page can contain an old pinned contact before newer
+        # contacts on the next page, so it must not end pagination by itself.
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([item["peer_id"] for item in payload["items"]], ["9"])
+        self.assertFalse(payload["snapshot_complete"])
+
 
     def test_roaming_history_merges_deduplicates_and_sorts_both_directions(self) -> None:
         calls = []

@@ -496,6 +496,28 @@ def _im_item_time(item: Mapping[str, Any]) -> float:
     return parsed.timestamp() if parsed is not None else 0.0
 
 
+def _filter_im_conversations_since(
+    payload: Mapping[str, Any],
+    since: datetime | None,
+) -> dict[str, Any]:
+    result = dict(payload)
+    if since is None:
+        return result
+    boundary = since.timestamp()
+    items = [
+        dict(item)
+        for item in payload.get("items", [])
+        if isinstance(item, Mapping) and _im_item_time(item) >= boundary
+    ]
+    result.update(
+        items=items,
+        list=items,
+        count=len(items),
+        snapshot_complete=False,
+    )
+    return result
+
+
 def _local_im_read_mode(
     *,
     identity: Any,
@@ -514,7 +536,11 @@ def _main_im_archive_payload(request: Request, path: str) -> dict[str, Any]:
     from bbw_web import archive_api
 
     if path == "/api/im/conversations":
-        payload = archive_api.archived_conversations(request, limit=100)
+        payload = archive_api.archived_conversations(
+            request,
+            limit=100,
+            since=_im_epoch_datetime(request.query_params.get("since")),
+        )
         payload.setdefault("entity", "conversation")
         payload.setdefault("status", 200)
         return payload
@@ -690,6 +716,25 @@ def _captured_json(payload: Mapping[str, Any]) -> tuple[list[tuple[str, str]], b
         ],
         body,
     )
+
+
+def _replace_captured_json(
+    headers: Iterable[tuple[str, str]],
+    payload: Mapping[str, Any],
+) -> tuple[list[tuple[str, str]], bytes]:
+    """Replace a captured JSON body without dropping cookies or policy headers."""
+
+    body = json.dumps(dict(payload), ensure_ascii=False).encode("utf-8")
+    replaced = [
+        (name, value)
+        for name, value in headers
+        if name.lower() not in {"content-type", "content-length"}
+    ]
+    replaced.insert(0, ("Content-Type", "application/json; charset=utf-8"))
+    replaced.append(("Content-Length", str(len(body))))
+    if not any(name.lower() == "cache-control" for name, _value in replaced):
+        replaced.append(("Cache-Control", "no-store"))
+    return replaced, body
 
 
 def _response_json(headers: Iterable[tuple[str, str]], body: bytes) -> dict[str, Any]:
@@ -1818,6 +1863,22 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
             status, response_headers, response_body = handler.finish_capture()
 
     response_data = _response_json(response_headers, response_body)
+    if (
+        request.method == "GET"
+        and path == "/api/im/conversations"
+        and status < 400
+        and response_data.get("ok") is not False
+    ):
+        activity_since = _im_epoch_datetime(request.query_params.get("since"))
+        if activity_since is not None:
+            response_data = _filter_im_conversations_since(
+                response_data,
+                activity_since,
+            )
+            response_headers, response_body = _replace_captured_json(
+                response_headers,
+                response_data,
+            )
     new_sid = _cookie_value(response_headers, cookie_name)
 
     message_policy_paths = {

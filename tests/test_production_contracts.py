@@ -12,7 +12,7 @@ import uuid
 from contextlib import contextmanager
 from html.parser import HTMLParser
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -2137,6 +2137,65 @@ class ProductionContractTests(unittest.TestCase):
             "https://example.invalid/current-12.jpg",
         )
         self.assertFalse(partial_avatar_item["profile_resolved"])
+
+    def test_archived_conversations_pass_activity_boundary_to_repository(self) -> None:
+        from datetime import UTC, datetime
+
+        try:
+            from bbw_web import archive_api
+            from bbw_web.persistence import UserIdentity
+        except ImportError as exc:
+            self.skipTest(f"production dependencies are not installed: {exc}")
+
+        owner_id = uuid.uuid4()
+        identity = UserIdentity(
+            user_id=owner_id,
+            external_account_id=uuid.uuid4(),
+            upstream_uid="42",
+        )
+        persistence = types.SimpleNamespace(
+            require_identity=lambda sid: identity if sid == "sid" else None,
+            rate_limit=lambda *_args, **_kwargs: True,
+        )
+        request = types.SimpleNamespace(
+            cookies={archive_api.legacy.COOKIE_NAME: "sid"},
+            app=types.SimpleNamespace(
+                state=types.SimpleNamespace(persistence=persistence)
+            ),
+        )
+        boundary = datetime(2026, 8, 6, tzinfo=UTC)
+        repository = Mock()
+        repository.list_for_owner.return_value = []
+
+        @contextmanager
+        def fake_session_scope():
+            yield object()
+
+        with (
+            patch("bbw_web.archive_api.session_scope", fake_session_scope),
+            patch(
+                "bbw_web.archive_api.ConversationRepository",
+                return_value=repository,
+            ),
+            patch("bbw_web.archive_api.MessageRepository") as messages,
+            patch(
+                "bbw_web.archive_api._local_public_profile_map",
+                return_value={},
+            ),
+        ):
+            messages.return_value.latest_for_conversations.return_value = {}
+            payload = archive_api.archived_conversations(
+                request,
+                limit=100,
+                since=boundary,
+            )
+
+        repository.list_for_owner.assert_called_once_with(
+            owner_id,
+            limit=300,
+            activity_since=boundary,
+        )
+        self.assertEqual(payload["items"], [])
 
     def test_admin_user_detail_race_and_sensitive_field_contracts(self) -> None:
         js = self.read("bbw_web/static/admin.js")

@@ -1771,7 +1771,19 @@ def _tim_recent_conversation_envelope(
     call_timeout: Optional[float] = None,
     breakers: Any = None,
     request_id: str = "",
+    activity_since: Optional[float] = None,
 ) -> Dict[str, Any]:
+    normalized_activity_since: Optional[float] = None
+    if activity_since is not None:
+        try:
+            normalized_activity_since = float(activity_since)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("invalid conversation activity boundary") from None
+        if (
+            not math.isfinite(normalized_activity_since)
+            or normalized_activity_since <= 0
+        ):
+            raise ValueError("invalid conversation activity boundary")
     timestamp = 0
     start_index = 0
     top_timestamp = 0
@@ -1802,12 +1814,21 @@ def _tim_recent_conversation_envelope(
         data = data if isinstance(data, Mapping) else {}
         session_items = data.get("SessionItem")
         session_items = session_items if isinstance(session_items, list) else []
+        page_activity_times: List[float] = []
         for raw in session_items:
             if not isinstance(raw, Mapping):
                 continue
             if str(raw.get("Type") or "").strip().lower() not in {"1", "c2c"}:
                 continue
             peer = str(raw.get("To_Account") or "").strip()
+            activity_time = _tim_epoch_sort_value(raw.get("MsgTime"))
+            if activity_time:
+                page_activity_times.append(activity_time)
+            if (
+                normalized_activity_since is not None
+                and activity_time < normalized_activity_since
+            ):
+                continue
             if (
                 not peer
                 or peer == account_uid
@@ -1831,8 +1852,14 @@ def _tim_recent_conversation_envelope(
                 }
             )
         if int(data.get("CompleteFlag") or 0) == 1:
-            snapshot_complete = True
+            snapshot_complete = normalized_activity_since is None
             break
+        if normalized_activity_since is not None and page_activity_times:
+            # Pinned contacts can make the final row older than rows on the
+            # following page. Stop only after the whole page is older than the
+            # boundary; a mixed page cannot prove that later pages are stale.
+            if max(page_activity_times) < normalized_activity_since:
+                break
         cursor = (
             max(0, int(data.get("TimeStamp") or timestamp)),
             max(0, int(data.get("StartIndex") or start_index)),
@@ -3811,6 +3838,33 @@ class Handler(BaseHTTPRequestHandler):
             deadline = RequestDeadline(im_budget) if im_budget > 0 else None
             breakers = getattr(self, "_request_dependency_breakers", None)
             request_id = str(getattr(self, "_request_id", "") or "")
+            raw_activity_since = str(q("since", "") or "").strip()
+            activity_since: Optional[float] = None
+            if raw_activity_since:
+                try:
+                    activity_since = float(raw_activity_since)
+                except (TypeError, ValueError, OverflowError):
+                    try:
+                        parsed_since = datetime.fromisoformat(
+                            raw_activity_since.replace("Z", "+00:00")
+                        )
+                        activity_since = parsed_since.timestamp()
+                    except (TypeError, ValueError, OverflowError, OSError):
+                        return self.ok(
+                            {"ok": False, "error": "会话时间范围无效"},
+                            400,
+                        )
+                if activity_since is not None and abs(activity_since) >= 10**12:
+                    activity_since /= 1000
+                if (
+                    activity_since is None
+                    or not math.isfinite(activity_since)
+                    or activity_since <= 0
+                ):
+                    return self.ok(
+                        {"ok": False, "error": "会话时间范围无效"},
+                        400,
+                    )
             try:
                 payload = _tim_recent_conversation_envelope(
                     app,
@@ -3821,6 +3875,7 @@ class Handler(BaseHTTPRequestHandler):
                     call_timeout=tim_timeout or None,
                     breakers=breakers,
                     request_id=request_id,
+                    activity_since=activity_since,
                 )
             except Exception:
                 if deadline is not None and deadline.expired:
@@ -3902,6 +3957,20 @@ class Handler(BaseHTTPRequestHandler):
                         ),
                     )
                 payload = conversation_envelope(app, result, u.profile_cache)
+                if activity_since is not None:
+                    filtered_items = [
+                        item
+                        for item in payload.get("items", [])
+                        if isinstance(item, Mapping)
+                        and _conversation_summary_time(item.get("timestamp"))
+                        >= activity_since
+                    ]
+                    payload.update(
+                        items=filtered_items,
+                        list=filtered_items,
+                        count=len(filtered_items),
+                        snapshot_complete=False,
+                    )
             summary_loader = getattr(self, "_request_conversation_summary_loader", None)
             if callable(summary_loader):
                 try:
@@ -3917,6 +3986,22 @@ class Handler(BaseHTTPRequestHandler):
                     payload["list"] = payload.get("items", [])
                 except Exception:
                     pass
+            if activity_since is not None:
+                # Cached summaries only enrich previews; filtering again after
+                # enrichment keeps the activity boundary authoritative.
+                filtered_items = [
+                    item
+                    for item in payload.get("items", [])
+                    if isinstance(item, Mapping)
+                    and _conversation_summary_time(item.get("timestamp"))
+                    >= activity_since
+                ]
+                payload.update(
+                    items=filtered_items,
+                    list=filtered_items,
+                    count=len(filtered_items),
+                    snapshot_complete=False,
+                )
             conversation_peers = getattr(u, "conversation_message_peers", None)
             if conversation_peers is None:
                 conversation_peers = set()
