@@ -273,6 +273,74 @@ def _first(d: Dict[str, Any], keys: List[str], default: Any = "") -> Any:
     return default
 
 
+def _public_avatar_fallback(item: Dict[str, Any], primary: str = "") -> str:
+    """Return an explicitly public image that may stand in for a broken portrait.
+
+    The legacy profile API can keep a portrait path after the underlying OSS
+    object has been removed.  It also exposes a separate album image list.  A
+    fallback is only safe when the API explicitly marks the album as public;
+    an omitted/unknown anonymity flag must never turn a private album into an
+    avatar.  ``thumbnail_portrait`` remains an avatar-specific fallback and is
+    therefore preferred regardless of the album flag.
+    """
+
+    primary_source = str(primary or "").strip()
+    thumbnail = resolve_media_url(
+        _first(item, ["thumbnail_portrait", "thumbnailPortrait"], "")
+    )
+    if thumbnail and thumbnail != primary_source:
+        return thumbnail
+
+    album_value = _first(
+        item,
+        [
+            "album_pictures",
+            "albumPictures",
+            "album_images",
+            "albumImages",
+            "album_photos",
+            "albumPhotos",
+            "album_picture",
+            "albumPicture",
+            "album_pic",
+            "albumPic",
+            "thumbnail_album",
+            "thumbnailAlbum",
+            "album",
+        ],
+        "",
+    )
+    anonymity = _first(item, ["album_anonymity", "albumAnonymity"], None)
+    if anonymity is None:
+        nested_album = _as_dict(album_value)
+        if nested_album:
+            anonymity = _first(
+                nested_album,
+                [
+                    "album_anonymity",
+                    "albumAnonymity",
+                    "anonymity",
+                    "is_private",
+                    "private",
+                ],
+                None,
+            )
+    if anonymity is None or str(anonymity).strip() == "":
+        return ""
+    public_album = str(anonymity).strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if not public_album:
+        return ""
+    for candidate in _media_list(album_value):
+        if candidate and candidate != primary_source:
+            return candidate
+    return ""
+
+
 def _num(v: Any, default: int = 0) -> int:
     try:
         if v is None or v == "":
@@ -364,6 +432,7 @@ def normalize_user(item: Any) -> Optional[Dict[str, Any]]:
                 "id": "",
                 "nickname": item[:32],
                 "avatar": "",
+                "avatar_fallback": "",
                 "subtitle": "",
                 "raw": item,
             }
@@ -409,6 +478,7 @@ def normalize_user(item: Any) -> Optional[Dict[str, Any]]:
             "",
         )
     )
+    avatar_fallback = _public_avatar_fallback(item, avatar)
     role = str(_first(item, ["user_role", "role", "identity"], ""))
     city = str(_first(item, ["city", "region", "real_region", "area", "address"], ""))
     sign = str(_first(item, ["signature", "sign", "desc", "description"], ""))
@@ -446,6 +516,7 @@ def normalize_user(item: Any) -> Optional[Dict[str, Any]]:
         "id": uid,
         "nickname": nick,
         "avatar": avatar,
+        "avatar_fallback": avatar_fallback,
         "subtitle": " · ".join(sub_parts) if sub_parts else "",
         "role": role,
         "city": city,
@@ -632,12 +703,29 @@ def normalize_social_user(item: Any, current_uid: str = "") -> Optional[Dict[str
             profile.get("avatar") or "",
         )
     )
+    avatar_fallback = resolve_media_url(
+        _first(
+            d,
+            [
+                "yourportrait_fallback",
+                "yourPortraitFallback",
+                "friendportrait_fallback",
+                "friendPortraitFallback",
+                "target_avatar_fallback",
+                "targetAvatarFallback",
+                "thumbnail_portrait",
+                "thumbnailPortrait",
+            ],
+            profile.get("avatar_fallback") or profile.get("avatarFallback") or "",
+        )
+    ) or _public_avatar_fallback(d, avatar)
     base = dict(profile or {})
     base.update(
         {
             "id": peer_id,
             "nickname": nickname or f"用户 {peer_id}",
             "avatar": avatar,
+            "avatar_fallback": avatar_fallback,
             "_needs_profile": not bool(nickname),
             "subtitle": " · ".join(
                 part
@@ -827,12 +915,32 @@ def normalize_friend_application(item: Any, current_uid: str = "") -> Optional[D
             "",
         )
     )
+    avatar_fallback = resolve_media_url(
+        _first(
+            d,
+            [
+                "friendportrait_fallback",
+                "friendPortraitFallback",
+                "yourportrait_fallback",
+                "yourPortraitFallback",
+                "thumbnail_portrait",
+                "thumbnailPortrait",
+            ],
+            (nested_user or {}).get("avatar_fallback")
+            or (generic or {}).get("avatar_fallback")
+            or "",
+        )
+    ) or _public_avatar_fallback(d, avatar)
     if nested_user and (not nested_id or nested_id == peer_id):
         nickname = nickname or str(nested_user.get("nickname") or "")
         avatar = avatar or str(nested_user.get("avatar") or "")
+        avatar_fallback = avatar_fallback or str(
+            nested_user.get("avatar_fallback") or ""
+        )
     if generic_id == peer_id:
         nickname = nickname or str(generic.get("nickname") or "")
         avatar = avatar or str(generic.get("avatar") or "")
+        avatar_fallback = avatar_fallback or str(generic.get("avatar_fallback") or "")
 
     if not peer_id:
         return None
@@ -893,6 +1001,7 @@ def normalize_friend_application(item: Any, current_uid: str = "") -> Optional[D
         "id": peer_id,
         "nickname": nickname or str(profile.get("nickname") or f"用户 {peer_id}"),
         "avatar": avatar,
+        "avatar_fallback": avatar_fallback,
         "online": peer_online,
         "hide_online": peer_hide_online,
         "subtitle": " · ".join(
@@ -1023,6 +1132,20 @@ def normalize_conversation(item: Any) -> Optional[Dict[str, Any]]:
             (peer_user or {}).get("avatar") or "",
         )
     )
+    peer_avatar_fallback = resolve_media_url(
+        _first(
+            d,
+            [
+                "conversation_avatar_fallback",
+                "conversationAvatarFallback",
+                "peer_avatar_fallback",
+                "peerAvatarFallback",
+                "peer_portrait_fallback",
+                "peerPortraitFallback",
+            ],
+            (peer_user or {}).get("avatar_fallback") or "",
+        )
+    ) or _public_avatar_fallback(d, peer_avatar)
     record_id = str(_first(d, ["id", "conversation_id", "conversationId"], ""))
     content = str(_first(d, ["content", "last_message", "message", "text"], ""))
     timestamp = str(
@@ -1057,6 +1180,7 @@ def normalize_conversation(item: Any) -> Optional[Dict[str, Any]]:
         "peer_id": peer_id,
         "nickname": peer_nickname or peer_id or "用户",
         "avatar": peer_avatar,
+        "avatar_fallback": peer_avatar_fallback,
         "content": content,
         "last_message": content,
         "timestamp": timestamp,
@@ -1706,15 +1830,93 @@ def normalize_topics(data: Any) -> List[Dict[str, Any]]:
 
 
 def _media_list(value: Any) -> List[str]:
-    if isinstance(value, list):
-        values = value
-    else:
-        values = str(value or "").split(",")
     out: List[str] = []
-    for item in values:
-        url = resolve_media_url(item)
-        if url and not url.endswith("/0") and url not in out:
-            out.append(url)
+
+    # Album fields have appeared as comma-separated strings, JSON arrays, and
+    # arrays of small objects (usually ``{"url": ...}``).  Normalize all of
+    # those shapes without stringifying a dict into a bogus URL.  Keep an
+    # absolute URL intact: OSS processing parameters legitimately contain
+    # commas in the query string.
+    media_keys = (
+        "url",
+        "image",
+        "img",
+        "picture",
+        "pic",
+        "path",
+        "src",
+        "original",
+        "thumbnail",
+        "thumb",
+        "cover",
+        "image_url",
+        "imageUrl",
+        "photo",
+        "photo_url",
+        "photoUrl",
+        "file",
+        "file_url",
+        "fileUrl",
+        "resource",
+    )
+    collection_keys = (
+        "items",
+        "list",
+        "data",
+        "pictures",
+        "images",
+        "photos",
+        "album",
+    )
+
+    def visit(raw: Any, depth: int = 0) -> None:
+        if raw is None or depth > 4:
+            return
+        if isinstance(raw, dict):
+            found = False
+            for key in media_keys:
+                if key in raw and raw[key] not in (None, ""):
+                    found = True
+                    visit(raw[key], depth + 1)
+            if found:
+                return
+            for key in collection_keys:
+                if key in raw and raw[key] not in (None, ""):
+                    visit(raw[key], depth + 1)
+                    found = True
+            if not found and raw and all(str(key).isdigit() for key in raw):
+                # Some legacy payloads use numeric keys for album entries.
+                for nested in raw.values():
+                    if isinstance(nested, (dict, list, tuple, set, str)):
+                        visit(nested, depth + 1)
+            return
+        if isinstance(raw, (list, tuple, set)):
+            for item in raw:
+                visit(item, depth + 1)
+            return
+        text = str(raw or "").strip()
+        if not text:
+            return
+        if text[:1] in "[{":
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if parsed is not None and parsed is not raw:
+                visit(parsed, depth + 1)
+                return
+        # A complete absolute URL is one media item even when its query has
+        # comma-separated OSS processing parameters.
+        if re.match(r"^(?:https?:)?//", text, re.I):
+            candidates = re.split(r",(?=(?:https?:)?//)", text, flags=re.I)
+        else:
+            candidates = text.split(",")
+        for candidate in candidates:
+            url = resolve_media_url(candidate)
+            if url and not url.endswith("/0") and url not in out:
+                out.append(url)
+
+    visit(value)
     return out
 
 
@@ -1749,10 +1951,18 @@ def normalize_post(item: Any) -> Optional[Dict[str, Any]]:
     avatar = resolve_media_url(
         _first(d, ["authportrait", "portrait", "avatar", "myportrait"], "")
     )
+    avatar_fallback = resolve_media_url(
+        _first(
+            d,
+            ["authportrait_fallback", "avatar_fallback", "thumbnail_portrait", "thumbnailPortrait"],
+            "",
+        )
+    ) or _public_avatar_fallback(d, avatar)
     if author:
         author_id = author_id or str(author.get("id") or "")
         nickname = nickname or str(author.get("nickname") or "")
         avatar = avatar or str(author.get("avatar") or "")
+        avatar_fallback = avatar_fallback or str(author.get("avatar_fallback") or "")
     content = str(_first(d, ["posttext", "content", "context", "text", "body"], ""))
     pictures = _media_list(_first(d, ["postpicture", "pictures", "picture", "images"], ""))
     video = resolve_media_url(_first(d, ["postvideo", "video", "video_url"], ""))
@@ -1766,6 +1976,7 @@ def normalize_post(item: Any) -> Optional[Dict[str, Any]]:
         "author_id": author_id,
         "nickname": nickname or (f"用户 {author_id}" if author_id else "用户"),
         "avatar": avatar,
+        "avatar_fallback": avatar_fallback,
         "title": str(_first(d, ["posttitle", "title"], "")),
         "content": content.replace("\\n", "\n"),
         "pictures": pictures,
@@ -1802,6 +2013,19 @@ def normalize_comment(item: Any) -> Optional[Dict[str, Any]]:
     content = str(_first(d, ["comment_text", "content", "text", "body"], ""))
     nickname = str(_first(d, ["nickname", "authnickname", "name"], ""))
     avatar = resolve_media_url(_first(d, ["portrait", "authportrait", "avatar"], ""))
+    avatar_fallback = resolve_media_url(
+        _first(
+            d,
+            ["avatar_fallback", "authportrait_fallback", "thumbnail_portrait", "thumbnailPortrait"],
+            "",
+        )
+    ) or _public_avatar_fallback(d, avatar)
+    comment_user = normalize_user(_first(d, ["user", "userinfo", "userInfo", "author"], None))
+    if comment_user:
+        author_id = author_id or str(comment_user.get("id") or "")
+        nickname = nickname or str(comment_user.get("nickname") or "")
+        avatar = avatar or str(comment_user.get("avatar") or "")
+        avatar_fallback = avatar_fallback or str(comment_user.get("avatar_fallback") or "")
     if not any((comment_id, author_id, content, nickname)):
         return None
     return {
@@ -1810,6 +2034,7 @@ def normalize_comment(item: Any) -> Optional[Dict[str, Any]]:
         "author_id": author_id,
         "nickname": nickname or (f"用户 {author_id}" if author_id else "用户"),
         "avatar": avatar,
+        "avatar_fallback": avatar_fallback,
         "content": content.replace("\\n", "\n"),
         "time": str(_first(d, ["time", "created_at", "create_time"], "")),
         "like_count": _num(_first(d, ["like", "like_count", "likes"], 0)),
@@ -2409,12 +2634,23 @@ def session_user_dto(
         or (profile_user or {}).get("avatar")
         or ""
     )
+    avatar_fallback = resolve_media_url(
+        who.get("avatar_fallback")
+        or who.get("avatarFallback")
+        or (profile_user or {}).get("avatar_fallback")
+        or (profile_user or {}).get("avatarFallback")
+        or ""
+    ) or _public_avatar_fallback(
+        profile if isinstance(profile, dict) else {},
+        avatar,
+    )
     return {
         "id": str(who.get("uid") or ""),
         "uid": str(who.get("uid") or ""),
         "nickname": str(who.get("nickname") or (profile_user or {}).get("nickname") or "游客"),
         "avatar": avatar,
         "portrait": avatar,
+        "avatar_fallback": avatar_fallback,
         "phone": phone,
         "is_realname": bool(who.get("is_realname")),
         "money": str(who.get("money") or "0"),

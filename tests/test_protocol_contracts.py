@@ -36,6 +36,7 @@ from bbw_web.normalize import (  # noqa: E402
     normalize_stickers,
     normalize_task,
     normalize_topics,
+    normalize_user,
     normalize_users,
     normalize_value,
 )
@@ -185,6 +186,61 @@ class BootstrapContractTests(unittest.TestCase):
 
 
 class NormalizerContractTests(unittest.TestCase):
+    def test_broken_portrait_uses_only_an_explicitly_public_avatar_fallback(self) -> None:
+        missing = "images/99999/2026/08/missing.jpg"
+        public_photo = "images/202608/public.jpg"
+        public = normalize_user(
+            {
+                "id": "732197",
+                "nickname": "青栀",
+                "portrait": missing,
+                "album_anonymity": "0",
+                "album_pictures": json.dumps([public_photo]),
+            }
+        )
+        self.assertIsNotNone(public)
+        self.assertEqual(public["avatar_fallback"], "https://oss.banghua.xin/" + public_photo)
+
+        private = normalize_user(
+            {
+                "id": "732197",
+                "nickname": "青栀",
+                "portrait": missing,
+                "album_anonymity": "1",
+                "album_pictures": [public_photo],
+            }
+        )
+        self.assertIsNotNone(private)
+        self.assertEqual(private["avatar_fallback"], "")
+
+        unknown = normalize_user(
+            {
+                "id": "732197",
+                "nickname": "青栀",
+                "portrait": missing,
+                "album_pictures": [public_photo],
+            }
+        )
+        self.assertIsNotNone(unknown)
+        self.assertEqual(unknown["avatar_fallback"], "")
+
+        thumbnail = "images/202608/portrait-thumbnail.jpg"
+        explicit_thumbnail = normalize_user(
+            {
+                "id": "732197",
+                "nickname": "青栀",
+                "portrait": missing,
+                "thumbnail_portrait": thumbnail,
+                "album_anonymity": "1",
+                "album_pictures": [public_photo],
+            }
+        )
+        self.assertIsNotNone(explicit_thumbnail)
+        self.assertEqual(
+            explicit_thumbnail["avatar_fallback"],
+            "https://oss.banghua.xin/" + thumbnail,
+        )
+
     def test_task_receivability_prefers_completed_progress_without_reopening_claimed(self) -> None:
         completed_with_stale_status = normalize_task(
             {"id": "1", "available": "不可领取", "progress": 3, "num": 3}

@@ -71,7 +71,7 @@ const AVATAR_RETRY_QUERY_PARAM = "__bbw_avatar_retry";
 const CONVERSATION_PROFILE_SDK_WAIT_MS = 1200;
 const CONVERSATION_PROFILE_REST_BATCH_SIZE = 12;
 const CONVERSATION_PROFILE_CACHE_LIMIT = 200;
-const CONVERSATION_PROFILE_CACHE_VERSION = 2;
+const CONVERSATION_PROFILE_CACHE_VERSION = 3;
 const CONVERSATION_PREVIEW_REFRESH_MS = 10 * 1000;
 const CONVERSATION_RECENT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const CONVERSATION_SHOW_ALL_STORAGE_PREFIX = "bbw:im:show-all-conversations:";
@@ -2056,27 +2056,44 @@ function applyUser(user) {
   const uid = user.uid || user.id || "—";
   $("side-name").textContent = name;
   $("side-meta").textContent = `UID ${uid} · ${user.is_realname ? "已实名" : "未实名"}`;
-  const src = mediaUrl(user.avatar || user.portrait);
+  // The raw profile source remains normalized through the same mediaUrl path
+  // used by the original sidebar renderer: mediaUrl(user.avatar || user.portrait).
+  const src = mediaUrl(validAvatarValue(user.avatar, user.portrait));
+  const fallback = mediaUrl(
+    validAvatarValue(user.avatar_fallback, user.avatarFallback)
+  );
   const currentImage = avatar.querySelector("img");
-  if (src && currentImage?.getAttribute("src") === src) {
+  if (
+    (src || fallback) &&
+    currentImage?.getAttribute("src") === (src || fallback) &&
+    String(currentImage?.dataset?.avatarFallback || "") === fallback
+  ) {
     if (currentImage.complete && currentImage.naturalWidth > 0) avatar.hidden = false;
     return;
   }
   avatar.replaceChildren();
   avatar.hidden = true;
-  if (src) {
+  if (src || fallback) {
     const image = document.createElement("img");
     image.alt = "";
     image.decoding = "async";
     image.referrerPolicy = "no-referrer";
     image.dataset.media = "";
+    if (fallback && fallback !== src) image.dataset.avatarFallback = fallback;
     image.addEventListener(
       "error",
       () => {
+        rememberFailedAvatarUrl(image.currentSrc || image.src || "");
+        const nextFallback = String(image.dataset.avatarFallback || "").trim();
+        if (nextFallback && image.dataset.avatarFallbackUsed !== "1") {
+          image.dataset.avatarFallbackUsed = "1";
+          image.removeAttribute("data-avatar-fallback");
+          image.src = nextFallback;
+          return;
+        }
         avatar.replaceChildren();
         avatar.hidden = true;
-      },
-      { once: true }
+      }
     );
     image.addEventListener(
       "load",
@@ -2086,7 +2103,7 @@ function applyUser(user) {
       { once: true }
     );
     avatar.appendChild(image);
-    image.src = src;
+    image.src = src || fallback;
   }
 }
 
@@ -3004,6 +3021,10 @@ function persistConversationProfiles() {
       peer,
       nickname: String(profile?.nickname || profile?.name || "").trim(),
       avatar: validAvatarValue(profile?.avatar, profile?.portrait),
+      avatar_fallback: validAvatarValue(
+        profile?.avatar_fallback,
+        profile?.avatarFallback
+      ),
       fetchedAt: Number(S.conversationProfileFetchedAt.get(peer) || 0),
     }))
     .filter((item) => item.peer && item.fetchedAt && conversationProfileResolved(item, item.peer))
@@ -4281,26 +4302,39 @@ function actionRoute(action) {
 }
 
 function avatarHtml(url) {
-  const src = mediaUrl(validAvatarValue(url));
+  const fallbackUrl = arguments[1] || "";
+  const primarySrc = mediaUrl(validAvatarValue(url));
+  const fallback = mediaUrl(validAvatarValue(fallbackUrl));
+  const src = primarySrc || fallback;
   if (!src) return "";
+  const fallbackMarkup =
+    fallback && fallback !== src
+      ? ` data-avatar-fallback="${esc(fallback)}"`
+      : "";
   // Reserve the real avatar's dimensions while it loads so a list refresh does
   // not collapse every row and then expand it again as images decode.
   return `<span class="avatar avatar-loading" aria-hidden="true"><img src="${esc(
     src
-  )}" alt="" loading="lazy" decoding="async" fetchpriority="low" referrerpolicy="no-referrer" data-avatar-image /></span>`;
+  )}" alt="" loading="lazy" decoding="async" fetchpriority="low" referrerpolicy="no-referrer" data-avatar-image${fallbackMarkup} /></span>`;
 }
 
 function conversationAvatarHtml(url) {
-  const peer = String(arguments[1] || "").trim();
-  const src = mediaUrl(validAvatarValue(url));
-  const displaySrc = conversationAvatarDisplaySource(src, peer);
-  if (!displaySrc) return "";
+  const target = String(arguments[1] || "").trim();
+  const fallbackUrl = arguments[2] || "";
+  const primarySrc = mediaUrl(validAvatarValue(url));
+  const fallback = mediaUrl(validAvatarValue(fallbackUrl));
+  const src = conversationAvatarDisplaySource(primarySrc || fallback, target);
+  if (!src) return "";
+  const fallbackMarkup =
+    fallback && fallback !== src
+      ? ` data-avatar-fallback="${esc(fallback)}"`
+      : "";
   // Conversation avatars are visible immediately and load eagerly. A full
   // browser refresh has no previous DOM node to reuse, so hiding these images
   // until a lazy-load event would make the entire list blink into view.
   return `<span class="avatar" aria-hidden="true"><img src="${esc(
-    displaySrc
-  )}" alt="" loading="eager" decoding="async" fetchpriority="high" referrerpolicy="no-referrer" data-avatar-image /></span>`;
+    src
+  )}" alt="" loading="eager" decoding="async" fetchpriority="high" referrerpolicy="no-referrer" data-avatar-image${fallbackMarkup} /></span>`;
 }
 
 function revealLoadedAvatar(image) {
@@ -4320,6 +4354,8 @@ const CONVERSATION_AVATAR_FIELDS = [
   "avatarUrl",
   "avatar_url",
   "portraitUri",
+  "avatar_fallback",
+  "avatarFallback",
 ];
 const CONVERSATION_AVATAR_CONTAINERS = [
   "user",
@@ -4360,6 +4396,16 @@ function confirmConversationAvatar(peer, source) {
     ),
   ];
   if (!sources.includes(normalizedSource)) return;
+  const failedSource = S.conversationFailedAvatarSources.get(target) || "";
+  // A public fallback can load successfully while the primary portrait is
+  // still unavailable. Keep the primary failure state so a later list refresh
+  // does not immediately put the same broken URL back in front of the
+  // fallback. A newly supplied primary URL clears this state in
+  // rememberConversationProfile instead.
+  if (failedSource && normalizedSource !== failedSource) {
+    S.failedAvatarUrls.delete(normalizedSource);
+    return;
+  }
   S.failedAvatarUrls.delete(normalizedSource);
   S.conversationFailedAvatarSources.delete(target);
   S.conversationProfileForceRefreshUids.delete(target);
@@ -4414,6 +4460,8 @@ function invalidateConversationAvatar(peer, failedSource) {
     "avatarUrl",
     "avatar_url",
     "portraitUri",
+    "avatar_fallback",
+    "avatarFallback",
   ];
   const avatarContainers = [
     "user",
@@ -4477,6 +4525,13 @@ function discardFailedAvatar(image) {
   const conversationItem = image?.closest?.("[data-conversation-item][data-uid]");
   const peer = String(conversationItem?.dataset?.uid || "").trim();
   if (peer && source) invalidateConversationAvatar(peer, source);
+  const fallback = String(image?.dataset?.avatarFallback || "").trim();
+  if (fallback && image?.dataset?.avatarFallbackUsed !== "1") {
+    image.dataset.avatarFallbackUsed = "1";
+    image.removeAttribute("data-avatar-fallback");
+    image.src = fallback;
+    return;
+  }
   const avatar = image?.closest?.(".avatar");
   const card = avatar?.parentElement?.classList?.contains("user-card") ? avatar.parentElement : null;
   avatar?.remove();
@@ -4901,7 +4956,9 @@ function userCard(item, options = {}) {
     const chatAllowed = canOpenPrivateChatEntry(id, chatOrigin);
     actions.push(`<button type="button" class="btn primary small${chatAllowed ? "" : " hide"}" data-action="open-chat" data-uid="${esc(id)}" data-name="${esc(
       name
-    )}" data-avatar="${esc(user.avatar || user.portrait || "")}"${
+    )}" data-avatar="${esc(user.avatar || user.portrait || "")}" data-avatar-fallback="${esc(
+      user.avatar_fallback || user.avatarFallback || ""
+    )}"${
       chatOrigin ? ` data-chat-origin="${esc(chatOrigin)}"` : ""
     } aria-disabled="${String(!chatAllowed)}"${chatAllowed ? "" : " hidden"}>聊天</button>`);
   }
@@ -4921,7 +4978,10 @@ function userCard(item, options = {}) {
   }
   const titleMetaHtml = String(options.titleMetaHtml || "");
   const presence = options.presence && id ? presenceBadgeHtml(id, user, "", true) : "";
-  const avatar = avatarHtml(user.avatar || user.portrait);
+  const avatar = avatarHtml(
+    user.avatar || user.portrait,
+    user.avatar_fallback || user.avatarFallback
+  );
   const cardClass = ["user-card", avatar ? "has-avatar" : "", String(options.className || "").trim()]
     .filter(Boolean)
     .join(" ");
@@ -5029,6 +5089,20 @@ function conversationAvatar(item) {
   return avatarSourcesMatch(avatar, failedSource) ? "" : avatar;
 }
 
+function conversationAvatarFallback(item) {
+  const conversation = item && typeof item === "object" ? item : {};
+  const nestedCandidates = CONVERSATION_AVATAR_CONTAINERS.flatMap((container) => {
+    const nested = conversation[container];
+    if (!nested || typeof nested !== "object" || Array.isArray(nested)) return [];
+    return [nested.avatar_fallback, nested.avatarFallback];
+  });
+  return validAvatarValue(
+    conversation.avatar_fallback,
+    conversation.avatarFallback,
+    ...nestedCandidates
+  );
+}
+
 function conversationDisplayName(item) {
   const conversation = item && typeof item === "object" ? item : {};
   const nestedUser =
@@ -5105,7 +5179,12 @@ function conversationProfileNeedsHydration(item) {
 function conversationProfileResolved(profile, peer) {
   if (!profile || typeof profile !== "object") return false;
   if (profile._resolved === false) return false;
-  const avatar = validAvatarValue(profile.avatar, profile.portrait);
+  const avatar = validAvatarValue(
+    profile.avatar,
+    profile.portrait,
+    profile.avatar_fallback,
+    profile.avatarFallback
+  );
   const name = String(profile.nickname || profile.name || "").trim();
   return Boolean(avatar && !conversationNameIsPlaceholder(name, peer));
 }
@@ -5117,14 +5196,21 @@ function normalizedConversationProfile(profile, peer) {
   const rawName = String(item.nick || item.nickname || item.name || "").trim();
   const nickname = conversationNameIsPlaceholder(rawName, target) ? "" : rawName;
   const avatar = validAvatarValue(item.avatar, item.portrait, item.faceUrl, item.face_url);
-  if (!nickname && !avatar) return null;
+  const avatarFallback = validAvatarValue(
+    item.avatar_fallback,
+    item.avatarFallback,
+    item.thumbnail_portrait,
+    item.thumbnailPortrait
+  );
+  if (!nickname && !avatar && !avatarFallback) return null;
   return {
     id: target,
     nickname,
     name: nickname,
     avatar,
     portrait: avatar,
-    _resolved: Boolean(nickname && avatar),
+    avatar_fallback: avatarFallback,
+    _resolved: Boolean(nickname && avatar) || Boolean(nickname && avatarFallback),
   };
 }
 
@@ -5160,7 +5246,18 @@ function rememberConversationProfile(
   }
   const previous = S.conversationProfilesByUid.get(target) || {};
   const nickname = incoming.nickname || previous.nickname || previous.name || "";
-  const avatar = validAvatarValue(incoming.avatar, incoming.portrait, previous.avatar, previous.portrait);
+  const avatar = validAvatarValue(
+    incoming.avatar,
+    incoming.portrait,
+    previous.avatar,
+    previous.portrait
+  );
+  const avatarFallback = validAvatarValue(
+    incoming.avatar_fallback,
+    incoming.avatarFallback,
+    previous.avatar_fallback,
+    previous.avatarFallback
+  );
   const previousAvatarSource = normalizeAvatarSource(previous.avatar || previous.portrait || "");
   const incomingAvatarSource = normalizeAvatarSource(avatar);
   const isRetryingFailedAvatar = Boolean(
@@ -5188,6 +5285,7 @@ function rememberConversationProfile(
     name: nickname,
     avatar,
     portrait: avatar,
+    avatar_fallback: avatarFallback,
     _resolved: incoming._resolved === true,
   });
   S.conversationProfileFetchedAt.set(target, Date.now());
@@ -5221,6 +5319,15 @@ function preserveConversationAvatar(preferred, fallback) {
   const conversation = preferred && typeof preferred === "object" ? preferred : {};
   const currentAvatar = conversationAvatar(conversation);
   const fallbackAvatar = conversationAvatar(fallback);
+  const currentAvatarFallback =
+    typeof conversationAvatarFallback === "function"
+      ? conversationAvatarFallback(conversation)
+      : String(conversation.avatar_fallback || conversation.avatarFallback || "").trim();
+  const fallbackAvatarFallback =
+    typeof conversationAvatarFallback === "function"
+      ? conversationAvatarFallback(fallback)
+      : String(fallback?.avatar_fallback || fallback?.avatarFallback || "").trim();
+  const avatarFallback = currentAvatarFallback || fallbackAvatarFallback;
   let avatar = currentAvatar;
   let inherited = Boolean(conversation._avatar_from_fallback);
   const currentResolved = conversation.profile_resolved === true;
@@ -5229,9 +5336,10 @@ function preserveConversationAvatar(preferred, fallback) {
     avatar = fallbackAvatar;
     inherited = !fallbackResolved;
   }
-  if (!avatar) return conversation;
+  if (!avatar && !avatarFallback) return conversation;
   if (
     conversation.avatar === avatar &&
+    conversation.avatar_fallback === avatarFallback &&
     Boolean(conversation._avatar_from_fallback) === inherited
   ) {
     return conversation;
@@ -5241,8 +5349,14 @@ function preserveConversationAvatar(preferred, fallback) {
   return {
     ...conversation,
     avatar,
+    avatar_fallback: avatarFallback,
     _avatar_from_fallback: inherited,
-    user: { ...fallbackUser, ...currentUser, avatar },
+    user: {
+      ...fallbackUser,
+      ...currentUser,
+      avatar,
+      avatar_fallback: avatarFallback,
+    },
   };
 }
 
@@ -5282,6 +5396,12 @@ function normalizeTimConversation(item) {
     peer_id: peer,
     nickname: profile.nick || profile.name || profile.userID || peer,
     avatar: validAvatarValue(profile.avatar, profile.portrait, profile.faceUrl, profile.face_url),
+    avatar_fallback: validAvatarValue(
+      profile.avatar_fallback,
+      profile.avatarFallback,
+      profile.thumbnail_portrait,
+      profile.thumbnailPortrait
+    ),
     profile_resolved: conversationProfileResolved(profile, peer),
     last_message:
       !sdkPreview || sdkPreview === "自定义消息" || sdkPreview === "[自定义消息]"
@@ -5565,6 +5685,15 @@ function applyCachedConversationProfile(item) {
   const nestedUser = conversation.user && typeof conversation.user === "object" ? conversation.user : {};
   const currentAvatar = conversationAvatar(conversation);
   const profileAvatar = validAvatarValue(profile.avatar, profile.portrait);
+  const currentAvatarFallback =
+    typeof conversationAvatarFallback === "function"
+      ? conversationAvatarFallback(conversation)
+      : String(conversation.avatar_fallback || conversation.avatarFallback || "").trim();
+  const profileAvatarFallback = validAvatarValue(
+    profile.avatar_fallback,
+    profile.avatarFallback
+  );
+  const avatarFallback = profileAvatarFallback || currentAvatarFallback;
   const currentName = conversationDisplayName(conversation);
   const profileName = String(profile.nickname || profile.name || "").trim();
   const preferCachedProfile = conversation.profile_resolved !== true;
@@ -5587,6 +5716,7 @@ function applyCachedConversationProfile(item) {
   const profileResolved = conversationProfileResolved(profile, peer);
   if (
     conversation.avatar === avatar &&
+    conversation.avatar_fallback === avatarFallback &&
     conversation.nickname === name &&
     Boolean(conversation._avatar_from_fallback) === inherited &&
     conversation.profile_resolved === profileResolved
@@ -5597,9 +5727,16 @@ function applyCachedConversationProfile(item) {
     ...conversation,
     nickname: name,
     avatar,
+    avatar_fallback: avatarFallback,
     _avatar_from_fallback: inherited,
     profile_resolved: profileResolved,
-    user: { ...nestedUser, ...profile, nickname: name, avatar },
+    user: {
+      ...nestedUser,
+      ...profile,
+      nickname: name,
+      avatar,
+      avatar_fallback: avatarFallback,
+    },
   };
 }
 
@@ -5825,9 +5962,12 @@ function conversationCard(item) {
     nestedUser.name ||
     (peer ? `用户 ${peer}` : "聊天");
   const avatar = conversationAvatar(conversation);
+  const avatarFallback = conversationAvatarFallback(conversation);
   const avatarMarkup = peer
-    ? conversationAvatarHtml(avatar, peer)
-    : conversationAvatarHtml(avatar);
+    ? conversationAvatarHtml(avatar, peer, avatarFallback)
+    : avatarFallback
+      ? conversationAvatarHtml(avatar, "", avatarFallback)
+      : conversationAvatarHtml(avatar);
   const preview = tuiEmojiPreviewText(
     conversation.last_message ||
     conversation.message ||
@@ -5875,7 +6015,9 @@ function conversationCard(item) {
     ${selectionControl}
     <button type="button" class="conversation-card${active ? " on" : ""}" data-action="select-conversation" data-uid="${esc(
       peer
-    )}" data-name="${esc(name)}" data-avatar="${esc(avatar || "")}" data-chat-origin="conversation" aria-label="${esc(cardLabel)}" ${
+    )}" data-name="${esc(name)}" data-avatar="${esc(avatar || "")}" data-avatar-fallback="${esc(
+      avatarFallback || ""
+    )}" data-chat-origin="conversation" aria-label="${esc(cardLabel)}" ${
       S.conversationBatchMode ? `aria-pressed="${String(batchSelected)}"` : ""
     } aria-disabled="${String(!chatAllowed)}"${chatDisabled ? " disabled" : ""} title="${esc(
       chatAllowed ? name : "当前私聊权限不可用"
@@ -6478,7 +6620,7 @@ function renderMomentCard(item, { showAuthor = true } = {}) {
       ${
         showAuthor
           ? `<button type="button" class="moment-author" data-action="open-profile" data-uid="${esc(authorId)}">
-        ${avatarHtml(post.avatar)}
+        ${avatarHtml(post.avatar, post.avatar_fallback || post.avatarFallback)}
         <span><strong>${esc(name)}</strong><small>${esc([post.time, meta].filter(Boolean).join(" · ") || "刚刚")}</small></span>
       </button>`
           : `<time class="profile-moment-time">${esc(post.time || "刚刚")}</time>`
@@ -6518,7 +6660,10 @@ function momentCommentCard(item, postOwnerId) {
   const canModerate = currentUid && currentUid === String(postOwnerId || "") && !comment.is_self;
   const authorId = String(comment.author_id || "");
   const name = comment.nickname || (authorId ? `用户 ${authorId}` : "用户");
-  const avatar = avatarHtml(comment.avatar);
+  const avatar = avatarHtml(
+    comment.avatar,
+    comment.avatar_fallback || comment.avatarFallback
+  );
   const avatarControl =
     avatar && authorId
       ? `<button type="button" class="moment-comment-avatar" data-action="open-profile" data-uid="${esc(
@@ -9887,7 +10032,7 @@ function activeConversation() {
   return S.conversations.find((item) => conversationPeer(item) === S.activePeer) || null;
 }
 
-function ensureConversationForPeer(peer, { name = "", avatar = "", replaceName = false } = {}) {
+function ensureConversationForPeer(peer, { name = "", avatar = "", avatarFallback = "", replaceName = false } = {}) {
   const target = String(peer || "").trim();
   if (!target) return null;
   restoreDismissedConversationPeer(target);
@@ -9900,13 +10045,18 @@ function ensureConversationForPeer(peer, { name = "", avatar = "", replaceName =
       resolvedName && (replaceName || conversationNameIsPlaceholder(currentName, target))
     );
     const explicitAvatar = validAvatarValue(avatar);
+    const explicitAvatarFallback = validAvatarValue(avatarFallback);
     const incomingProfileResolved = Boolean(
-      explicitAvatar && resolvedName && (shouldReplaceName || currentName === resolvedName)
+      (explicitAvatar || explicitAvatarFallback) &&
+        resolvedName &&
+        (shouldReplaceName || currentName === resolvedName)
     );
     const next = {
       ...current,
       nickname: shouldReplaceName ? resolvedName : current.nickname,
       avatar: explicitAvatar || conversationAvatar(current),
+      avatar_fallback:
+        explicitAvatarFallback || conversationAvatarFallback(current),
       _avatar_from_fallback: explicitAvatar ? false : Boolean(current._avatar_from_fallback),
       profile_resolved:
         current.profile_resolved === true ||
@@ -9922,8 +10072,12 @@ function ensureConversationForPeer(peer, { name = "", avatar = "", replaceName =
     peer_id: target,
     nickname: resolvedName || `用户 ${target}`,
     avatar: validAvatarValue(avatar),
+    avatar_fallback: validAvatarValue(avatarFallback),
     _avatar_from_fallback: false,
-    profile_resolved: Boolean(resolvedName && validAvatarValue(avatar)),
+    profile_resolved: Boolean(
+      resolvedName &&
+        (validAvatarValue(avatar) || validAvatarValue(avatarFallback))
+    ),
     last_message: "",
     timestamp: Date.now(),
     activity_sequence: "",
@@ -9946,10 +10100,22 @@ function ensureConversationForPeer(peer, { name = "", avatar = "", replaceName =
 
 function updateConversationActivity(
   peer,
-  { name = "", avatar = "", lastMessage = "", unreadCount, replaceName = false } = {}
+  {
+    name = "",
+    avatar = "",
+    avatarFallback = "",
+    lastMessage = "",
+    unreadCount,
+    replaceName = false,
+  } = {}
 ) {
   const target = String(peer || "").trim();
-  const conversation = ensureConversationForPeer(target, { name, avatar, replaceName });
+  const conversation = ensureConversationForPeer(target, {
+    name,
+    avatar,
+    avatarFallback,
+    replaceName,
+  });
   if (!conversation) return null;
   conversation.last_message = String(lastMessage || "");
   conversation.content = conversation.last_message;
@@ -10124,6 +10290,13 @@ function messageSearchConversationName(peer, preferred = "") {
 
 function messageSearchConversationAvatar(peer, preferred = "") {
   return validAvatarValue(preferred) || conversationAvatar(messageSearchConversation(peer) || {});
+}
+
+function messageSearchConversationAvatarFallback(peer, preferred = "") {
+  return (
+    validAvatarValue(preferred) ||
+    conversationAvatarFallback(messageSearchConversation(peer) || {})
+  );
 }
 
 function openMessageSearch(scope = "global") {
@@ -10353,6 +10526,10 @@ function messageSearchEntryFromPayload(item) {
     peer,
     item?.conversation_avatar || item?.avatar
   );
+  entry.peerAvatarFallback = messageSearchConversationAvatarFallback(
+    peer,
+    item?.conversation_avatar_fallback || item?.avatar_fallback
+  );
   entry.matchCount = Math.max(0, Number(item?.match_count || 0));
   return entry;
 }
@@ -10370,6 +10547,7 @@ function localMessageSearchResults(peer = "") {
           conversationDisplayName(conversation)
         ),
         peerAvatar: messageSearchConversationAvatar(entry.peer),
+        peerAvatarFallback: messageSearchConversationAvatarFallback(entry.peer),
         matchCount: 0,
       };
     });
@@ -10390,6 +10568,8 @@ function mergeMessageSearchResults(remote, local) {
       ...candidate,
       peerName: candidate.peerName || previous.peerName,
       peerAvatar: candidate.peerAvatar || previous.peerAvatar,
+      peerAvatarFallback:
+        candidate.peerAvatarFallback || previous.peerAvatarFallback,
       matchCount: Math.max(Number(previous.matchCount || 0), Number(candidate.matchCount || 0)),
     };
   });
@@ -10527,6 +10707,10 @@ function messageSearchGroups() {
         peer,
         name: messageSearchConversationName(peer, entry.peerName),
         avatar: messageSearchConversationAvatar(peer, entry.peerAvatar),
+        avatarFallback: messageSearchConversationAvatarFallback(
+          peer,
+          entry.peerAvatarFallback
+        ),
         latest: entry,
         latestIndex: index,
         items: [],
@@ -10557,7 +10741,11 @@ function messageSearchGroupHtml(group) {
     group.peer
   )}" data-name="${esc(group.name)}" data-avatar="${esc(
     group.avatar || ""
-  )}">${conversationAvatarHtml(group.avatar)}<span class="message-search-group-copy"><span class="message-search-result-head"><strong>${esc(
+  )}" data-avatar-fallback="${esc(group.avatarFallback || "")}">${conversationAvatarHtml(
+    group.avatar,
+    group.peer,
+    group.avatarFallback
+  )}<span class="message-search-group-copy"><span class="message-search-result-head"><strong>${esc(
     group.name
   )}</strong>${timeInfo ? `<time datetime="${esc(timeInfo.datetime || "")}">${esc(timeInfo.label)}</time>` : ""}</span><span class="message-search-result-preview">${messageSearchHighlightedHtml(
     preview
@@ -10648,7 +10836,7 @@ function clearMessageSearchFilters() {
   mountMessageSearchView({ focus: true });
 }
 
-function openMessageSearchGroup(peer, name = "", avatar = "") {
+function openMessageSearchGroup(peer, name = "", avatar = "", avatarFallback = "") {
   const target = String(peer || "").trim();
   if (!target || S.messageSearchRootScope !== "global") return false;
   stopMessageSearchRequest();
@@ -10670,6 +10858,7 @@ async function openPrivateConversation(
   {
     name = "",
     avatar = "",
+    avatarFallback = "",
     chatOrigin = "",
     replaceName = false,
     focusComposer = false,
@@ -10696,6 +10885,7 @@ async function openPrivateConversation(
   const conversation = ensureConversationForPeer(target, {
     name,
     avatar,
+    avatarFallback,
     replaceName,
   });
   S.activePeerName = conversationEntryDisplayName(conversation, name, target);
@@ -10786,6 +10976,7 @@ async function jumpToMessageSearchResult(index) {
   const opened = await openPrivateConversation(peer, {
     name: entry.peerName,
     avatar: entry.peerAvatar,
+    avatarFallback: entry.peerAvatarFallback,
     chatOrigin: "conversation",
     replaceName: !conversationNameIsPlaceholder(entry.peerName, peer),
     focusComposer: false,
@@ -11760,6 +11951,13 @@ function renderConversationList(list) {
     const nextSrc = nextImage?.getAttribute("src") || "";
     if (!previous || !nextAvatar || !nextSrc) return;
     if (previous.src === nextSrc) {
+      const nextImage = nextAvatar.querySelector("img[data-avatar-image]");
+      const nextFallback = String(nextImage?.dataset?.avatarFallback || "").trim();
+      const previousImage = previous.avatar.querySelector("img[data-avatar-image]");
+      if (previousImage) {
+        if (nextFallback) previousImage.dataset.avatarFallback = nextFallback;
+        else previousImage.removeAttribute("data-avatar-fallback");
+      }
       delete previous.avatar.dataset.pendingAvatarSrc;
       nextAvatar.replaceWith(previous.avatar);
       return;
@@ -11791,6 +11989,8 @@ function scheduleConversationAvatarSwap({ currentAvatar, nextAvatar, nextImage, 
         return;
       }
       loader.dataset.avatarImage = "";
+      const fallback = String(nextImage?.dataset?.avatarFallback || "").trim();
+      if (fallback) loader.dataset.avatarFallback = fallback;
       nextImage.replaceWith(loader);
       delete currentAvatar.dataset.pendingAvatarSrc;
       currentAvatar.replaceWith(nextAvatar);
@@ -11810,6 +12010,17 @@ function scheduleConversationAvatarSwap({ currentAvatar, nextAvatar, nextImage, 
     }
     const source = rememberFailedAvatarUrl(nextSrc);
     if (peer && source) invalidateConversationAvatar(peer, source);
+    const fallback = mediaUrl(
+      validAvatarValue(nextImage?.dataset?.avatarFallback || "")
+    );
+    if (fallback && currentAvatar.isConnected) {
+      const currentImage = currentAvatar.querySelector("img[data-avatar-image]");
+      if (currentImage) {
+        currentImage.dataset.avatarFallbackUsed = "1";
+        currentImage.removeAttribute("data-avatar-fallback");
+        currentImage.src = fallback;
+      }
+    }
   };
   loader.alt = "";
   loader.loading = "eager";
@@ -16328,7 +16539,10 @@ async function pageMe(signal) {
     const value = Number(S.meStats?.[key]);
     return Number.isFinite(value) && value >= 0 ? String(value) : "—";
   };
-  return `<section class="profile-summary-card"><div class="profile-head">${avatarHtml(user.avatar || user.portrait)}<div><h2>${esc(
+  return `<section class="profile-summary-card"><div class="profile-head">${avatarHtml(
+    user.avatar || user.portrait,
+    user.avatar_fallback || user.avatarFallback
+  )}<div><h2>${esc(
     name
   )}</h2><p>UID ${esc(user.uid || user.id || "—")} · ${user.is_realname ? "已实名" : "未实名"} · 乐园币 ${esc(
     user.money ?? "0"
@@ -17346,7 +17560,9 @@ async function openProfile(uid, { chatOrigin = "" } = {}) {
     !isSelf
       ? `<button type="button" class="btn primary${chatAllowed ? "" : " hide"}" data-action="open-chat" data-uid="${esc(
           profileUid
-        )}" data-name="${esc(name)}" data-avatar="${esc(user.avatar || user.portrait || "")}"${
+        )}" data-name="${esc(name)}" data-avatar="${esc(user.avatar || user.portrait || "")}" data-avatar-fallback="${esc(
+          user.avatar_fallback || user.avatarFallback || ""
+        )}"${
           normalizedChatOrigin ? ` data-chat-origin="${esc(normalizedChatOrigin)}"` : ""
         } aria-disabled="${String(!chatAllowed)}"${chatAllowed ? "" : " hidden"}>聊天</button>`
       : "";
@@ -17366,7 +17582,10 @@ async function openProfile(uid, { chatOrigin = "" } = {}) {
     user.city || user.region,
     user.distance,
   ].filter(Boolean);
-  body.innerHTML = `<section class="profile-dialog-hero">${avatarHtml(user.avatar || user.portrait)}<div><h2>${esc(
+  body.innerHTML = `<section class="profile-dialog-hero">${avatarHtml(
+    user.avatar || user.portrait,
+    user.avatar_fallback || user.avatarFallback
+  )}<div><h2>${esc(
     name
   )}</h2><p>UID ${esc(user.id || user.uid || target)}</p>${details.length ? `<span>${esc(details.join(" · "))}</span>` : ""}</div></section>
     <section class="profile-dialog-actions">${
@@ -19895,7 +20114,8 @@ async function handleAction(action, button) {
     openMessageSearchGroup(
       button.dataset.uid,
       button.dataset.name,
-      button.dataset.avatar
+      button.dataset.avatar,
+      button.dataset.avatarFallback
     );
     return;
   }
@@ -19928,6 +20148,7 @@ async function handleAction(action, button) {
     const conversation = ensureConversationForPeer(uid, {
       name: requestedName,
       avatar: button.dataset.avatar || "",
+      avatarFallback: button.dataset.avatarFallback || "",
       replaceName:
         action === "open-chat" && !conversationNameIsPlaceholder(requestedName, uid),
     });

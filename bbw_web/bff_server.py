@@ -525,6 +525,9 @@ def _enrich_social_profiles(
             continue
         item["nickname"] = profile.get("nickname") or item.get("nickname")
         item["avatar"] = profile.get("avatar") or item.get("avatar")
+        item["avatar_fallback"] = profile.get("avatar_fallback") or item.get(
+            "avatar_fallback"
+        )
         item["city"] = profile.get("city") or item.get("city")
         item["signature"] = profile.get("signature") or item.get("signature")
         item["subtitle"] = profile.get("subtitle") or item.get("subtitle")
@@ -1613,8 +1616,15 @@ def _attach_cached_conversation_profiles(
         if not profile:
             continue
         avatar = str(profile.get("avatar") or profile.get("portrait") or "")
+        avatar_fallback = str(
+            profile.get("avatar_fallback")
+            or profile.get("avatarFallback")
+            or ""
+        )
         if avatar:
             item["avatar"] = avatar
+        if avatar_fallback:
+            item["avatar_fallback"] = avatar_fallback
         current_name = str(item.get("nickname") or "").strip()
         profile_name = str(profile.get("nickname") or profile.get("name") or "").strip()
         profile_name_resolved = bool(
@@ -1627,7 +1637,9 @@ def _attach_cached_conversation_profiles(
             item["nickname"] = peer
         existing_user = item.get("user") if isinstance(item.get("user"), dict) else {}
         item["user"] = {**existing_user, **profile}
-        item["profile_resolved"] = bool(avatar and profile_name_resolved)
+        item["profile_resolved"] = bool(
+            (avatar or avatar_fallback) and profile_name_resolved
+        )
 
 
 def _conversation_summary_time(value: Any) -> float:
