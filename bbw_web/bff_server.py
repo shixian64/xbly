@@ -393,6 +393,56 @@ def RL(r: Any) -> Dict[str, Any]:
     return d
 
 
+def _profile_for_uid(
+    profiles: Any,
+    uid: str,
+) -> Optional[Dict[str, Any]]:
+    """Select only the profile that belongs to the requested peer.
+
+    A few upstream responses contain a list even for a single-user request.
+    Falling back to the first row in that shape can attach another person's
+    nickname/avatar to the current conversation.  An id-less singleton is
+    still accepted because some legacy responses omit the id entirely.
+    """
+
+    target = str(uid or "").strip()
+    rows = [
+        item
+        for item in (profiles if isinstance(profiles, list) else [])
+        if isinstance(item, Mapping)
+    ]
+    if not target or not rows:
+        return None
+    exact = next(
+        (
+            item
+            for item in rows
+            if str(
+                item.get("id")
+                or item.get("uid")
+                or item.get("userID")
+                or item.get("userId")
+                or ""
+            ).strip()
+            == target
+        ),
+        None,
+    )
+    if exact is not None:
+        return dict(exact)
+    if len(rows) == 1:
+        identifier = str(
+            rows[0].get("id")
+            or rows[0].get("uid")
+            or rows[0].get("userID")
+            or rows[0].get("userId")
+            or ""
+        ).strip()
+        if not identifier:
+            return dict(rows[0])
+    return None
+
+
 def _fetch_social_profile(
     app: Any,
     uid: str,
@@ -421,11 +471,10 @@ def _fetch_social_profile(
             raise _InteractiveDependencyFailure(
                 "profile provider temporarily unavailable"
             )
+        if not getattr(result, "ok", False):
+            return None
         profiles = N.normalize_users(result.data)
-        return next(
-            (value for value in profiles if str(value.get("id") or "") == uid),
-            profiles[0] if profiles else None,
-        )
+        return _profile_for_uid(profiles, uid)
     except (
         DependencyCircuitOpen,
         DependencyDeadlineExceeded,
@@ -1517,24 +1566,7 @@ def _cached_profile(
         result = app.profile.get_user(target)
         if getattr(result, "ok", False):
             profiles = N.normalize_users(getattr(result, "data", None))
-            profile = next(
-                (item for item in profiles if str(item.get("id") or "") == target),
-                None,
-            )
-            if profile is None:
-                # Some payloads omit an id for a single requested profile. That
-                # shape is safe to use, but an explicit different id must never
-                # be attached to this conversation as the peer's avatar.
-                idless = [
-                    item
-                    for item in profiles
-                    if not str(item.get("id") or "").strip()
-                ]
-                profile = (
-                    idless[0]
-                    if len(profiles) == 1 and len(idless) == 1
-                    else None
-                )
+            profile = _profile_for_uid(profiles, target)
     except Exception:
         profile = None
     cache[target] = (now, dict(profile) if profile else None)

@@ -228,6 +228,36 @@ class BffEnvelopeTests(unittest.TestCase):
         self.assertEqual(calls, ["9"])
         self.assertEqual(refreshed[0]["nickname"], "新昵称")
 
+    def test_social_profile_fetch_does_not_attach_another_uid(self) -> None:
+        app = SimpleNamespace(
+            profile=SimpleNamespace(
+                get_user=lambda _uid, **_kwargs: ApiResult(
+                    True,
+                    200,
+                    "[]",
+                    data=[{"id": "77", "nickname": "其他用户", "avatar": "/other.jpg"}],
+                )
+            )
+        )
+
+        self.assertIsNone(bff_server._fetch_social_profile(app, "9"))
+
+    def test_social_profile_fetch_accepts_an_idless_singleton_only(self) -> None:
+        app = SimpleNamespace(
+            profile=SimpleNamespace(
+                get_user=lambda _uid, **_kwargs: ApiResult(
+                    True,
+                    200,
+                    "[]",
+                    data=[{"nickname": "无 ID 用户", "avatar": "/profile.jpg"}],
+                )
+            )
+        )
+
+        profile = bff_server._fetch_social_profile(app, "9")
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile["nickname"], "无 ID 用户")
+
     def test_local_web_server_rejects_a_second_listener_on_the_same_port(self) -> None:
         first = bff_server.ExclusiveThreadingHTTPServer(
             ("127.0.0.1", 0), bff_server.Handler
@@ -5125,11 +5155,15 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
         )[1].split("function conversationCard", 1)[0]
 
         self.assertIn("AVATAR_FAILURE_COOLDOWN_MS = 5 * 60 * 1000", app_js)
+        self.assertIn('AVATAR_RETRY_QUERY_PARAM = "__bbw_avatar_retry"', app_js)
         self.assertIn("failedAvatarUrls: new Map()", app_js)
         self.assertIn("avatarUrlCoolingDown(src)", app_js)
+        self.assertIn("conversationAvatarDisplaySource", app_js)
+        self.assertIn("armConversationAvatarRetry(target)", app_js)
         self.assertIn("rememberFailedAvatarUrl", failure_handler)
         self.assertIn("invalidateConversationAvatar(peer, source)", failure_handler)
         self.assertIn("profile_resolved: false", app_js)
+        self.assertIn('"user_info"', app_js)
         self.assertIn("scheduleConversationAvatarRetry(target, retryAt)", app_js)
         self.assertIn("rememberFailedAvatarUrl(nextSrc)", swap_loader)
         self.assertIn('forceRefresh ? "&refresh=1" : ""', hydration)
@@ -5215,6 +5249,81 @@ if (recovered.avatar !== newAvatar || recovered._resolved !== true) throw new Er
 if (S.conversationFailedAvatarSources.has("9")) throw new Error("failed source survived recovery");
 if (S.conversationProfileForceRefreshUids.has("9")) throw new Error("forced refresh survived recovery");
 """
+        )
+        result = subprocess.run(
+            [node, "-e", script],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_same_conversation_avatar_url_gets_a_cache_busting_retry(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for the avatar recovery test")
+
+        root = Path(__file__).resolve().parents[1]
+        app_js = (root / "bbw_web" / "static" / "app.js").read_text(
+            encoding="utf-8"
+        )
+        media_functions = "function mediaUrl(value)" + app_js.split(
+            "function mediaUrl(value)", 1
+        )[1].split("function resolveTimApi", 1)[0]
+        profile_functions = "function normalizedConversationProfile" + app_js.split(
+            "function normalizedConversationProfile", 1
+        )[1].split("function preserveConversationDisplayName", 1)[0]
+        script = (
+            r'''
+const MEDIA_BASE = "https://oss.banghua.xin";
+const APK_MEDIA_ORIGIN_RE = /^(?:https?:)?\/\/(?:oss\.banghua\.xin|moyuanoss\.oss-cn-shanghai\.aliyuncs\.com|appletattachment\.oss-cn-beijing\.aliyuncs\.com)(?=[/?#]|$)/i;
+const INVALID_AVATAR_VALUES = new Set(["0", "false", "nil", "none", "null", "undefined", "[]", "{}", "[object object]"]);
+const LOCAL_PRIVATE_MEDIA_PATH_RE = /^\/api\/media\/(?:native\/)?[0-9a-f-]+\/content(?:[?#].*)?$/i;
+const AVATAR_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
+const AVATAR_FAILURE_CACHE_LIMIT = 512;
+const AVATAR_RETRY_QUERY_PARAM = "__bbw_avatar_retry";
+let now = 1000;
+Date.now = () => now;
+const oldAvatar = "https://oss.banghua.xin/images/missing.jpg?x-oss-process=image/resize,w_96";
+const S = {
+  failedAvatarUrls: new Map(),
+  conversationFailedAvatarSources: new Map(),
+  conversationAvatarRetryAt: new Map(),
+  conversationAvatarRetryTimers: new Map(),
+  conversationAvatarRetryTokens: new Map(),
+  conversationProfileForceRefreshUids: new Set(["9"]),
+  conversationProfileFetchedAt: new Map(),
+  conversationProfilesByUid: new Map(),
+  conversations: [],
+};
+function conversationNameIsPlaceholder(value, peer) {
+  const name = String(value || "").trim();
+  return !name || name === "用户" || name === "游客" || name === peer || name === `用户 ${peer}`;
+}
+function persistConversationProfiles() {}
+function scheduleConversationAvatarRetry() {}
+'''
+            + media_functions
+            + profile_functions
+            + r'''
+S.conversationFailedAvatarSources.set("9", avatarFailureSource(oldAvatar));
+armConversationAvatarRetry("9");
+rememberConversationProfile("9", {
+  id: "9",
+  nickname: "青栀",
+  avatar: oldAvatar,
+}, { allowPreviouslyFailedAvatar: true });
+const displayed = conversationAvatarDisplaySource(
+  S.conversationProfilesByUid.get("9").avatar,
+  "9"
+);
+if (!displayed.includes("__bbw_avatar_retry=")) throw new Error("retry query missing");
+if (avatarFailureSource(displayed) !== avatarFailureSource(oldAvatar)) {
+  throw new Error("retry query changed the failure identity");
+}
+'''
         )
         result = subprocess.run(
             [node, "-e", script],

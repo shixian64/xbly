@@ -67,9 +67,11 @@ const CONVERSATION_PROFILE_TTL_MS = 15 * 60 * 1000;
 const CONVERSATION_PROFILE_ERROR_TTL_MS = 60 * 1000;
 const AVATAR_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
 const AVATAR_FAILURE_CACHE_LIMIT = 512;
+const AVATAR_RETRY_QUERY_PARAM = "__bbw_avatar_retry";
 const CONVERSATION_PROFILE_SDK_WAIT_MS = 1200;
 const CONVERSATION_PROFILE_REST_BATCH_SIZE = 12;
 const CONVERSATION_PROFILE_CACHE_LIMIT = 200;
+const CONVERSATION_PROFILE_CACHE_VERSION = 2;
 const CONVERSATION_PREVIEW_REFRESH_MS = 10 * 1000;
 const CONVERSATION_RECENT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const CONVERSATION_SHOW_ALL_STORAGE_PREFIX = "bbw:im:show-all-conversations:";
@@ -260,6 +262,7 @@ const S = {
   conversationFailedAvatarSources: new Map(),
   conversationAvatarRetryAt: new Map(),
   conversationAvatarRetryTimers: new Map(),
+  conversationAvatarRetryTokens: new Map(),
   conversationProfileForceRefreshUids: new Set(),
   conversationProfileCacheAccount: "",
   conversationPreviewFetchedAt: new Map(),
@@ -714,8 +717,81 @@ function mediaUrl(value) {
   return "";
 }
 
+function stripAvatarRetryQuery(value) {
+  const source = String(value || "");
+  const hashIndex = source.indexOf("#");
+  const hash = hashIndex >= 0 ? source.slice(hashIndex) : "";
+  const withoutHash = hashIndex >= 0 ? source.slice(0, hashIndex) : source;
+  const queryIndex = withoutHash.indexOf("?");
+  if (queryIndex < 0) return source;
+  const path = withoutHash.slice(0, queryIndex);
+  const query = withoutHash.slice(queryIndex + 1);
+  const parts = query.split("&");
+  let changed = false;
+  const kept = parts.filter((part) => {
+    if (!part) return true;
+    const rawKey = part.split("=", 1)[0].replace(/\+/g, " ");
+    let key = rawKey;
+    try {
+      key = decodeURIComponent(rawKey);
+    } catch {
+      // Keep malformed third-party query keys untouched.
+    }
+    if (key !== AVATAR_RETRY_QUERY_PARAM) return true;
+    changed = true;
+    return false;
+  });
+  return changed
+    ? `${path}${kept.length ? `?${kept.join("&")}` : ""}${hash}`
+    : source;
+}
+
 function avatarFailureSource(value) {
-  return mediaUrl(value);
+  return stripAvatarRetryQuery(mediaUrl(value));
+}
+
+function avatarRetryUrlIsSafe(source) {
+  const value = String(source || "");
+  if (LOCAL_PRIVATE_MEDIA_PATH_RE.test(value)) return true;
+  if (!value.toLowerCase().startsWith(`${MEDIA_BASE}/`.toLowerCase())) return false;
+  const query = value.split("?", 2)[1]?.split("#", 1)[0] || "";
+  // Adding a query parameter to a signed URL can invalidate its signature.
+  return !/(?:^|&)(?:signature|sig|sign|token|auth|auth_key|authorization|expires|policy|credential|x-oss-signature|x-oss-credential|x-oss-security-token|x-oss-expires|x-oss-date)=/i.test(
+    query
+  );
+}
+
+function armConversationAvatarRetry(peer) {
+  const target = String(peer || "").trim();
+  const source = S.conversationFailedAvatarSources.get(target) || "";
+  if (!target || !source) return;
+  const previous = S.conversationAvatarRetryTokens.get(target);
+  const sequence = Number(previous?.sequence || 0) + 1;
+  S.conversationAvatarRetryTokens.set(target, {
+    source,
+    sequence,
+    token: `${Date.now()}-${sequence}`,
+  });
+}
+
+function conversationAvatarDisplaySource(url, peer = "") {
+  const source = mediaUrl(url);
+  const target = String(peer || "").trim();
+  if (!source || !target) return source;
+  const retry = S.conversationAvatarRetryTokens.get(target);
+  if (!retry || avatarFailureSource(source) !== String(retry.source || "")) {
+    return source;
+  }
+  if (!avatarRetryUrlIsSafe(source) || stripAvatarRetryQuery(source) !== source) {
+    return source;
+  }
+  const hashIndex = source.indexOf("#");
+  const hash = hashIndex >= 0 ? source.slice(hashIndex) : "";
+  const withoutHash = hashIndex >= 0 ? source.slice(0, hashIndex) : source;
+  const separator = withoutHash.includes("?") ? "&" : "?";
+  return `${withoutHash}${separator}${AVATAR_RETRY_QUERY_PARAM}=${encodeURIComponent(
+    String(retry.token || Date.now())
+  )}${hash}`;
 }
 
 function pruneFailedAvatarUrls(now = Date.now()) {
@@ -2934,7 +3010,8 @@ function persistConversationProfiles() {
     .sort((left, right) => left.fetchedAt - right.fetchedAt)
     .slice(-CONVERSATION_PROFILE_CACHE_LIMIT);
   try {
-    sessionStorage.setItem(key, JSON.stringify({ version: 1, items }));
+    const payload = { version: CONVERSATION_PROFILE_CACHE_VERSION, items };
+    sessionStorage.setItem(key, JSON.stringify(payload));
   } catch {
     // Private browsing can disable sessionStorage; memory caching still works.
   }
@@ -2952,6 +3029,7 @@ function syncConversationProfileAccount() {
   if (!key) return;
   try {
     const payload = JSON.parse(sessionStorage.getItem(key) || "{}");
+    if (Number(payload?.version || 0) !== CONVERSATION_PROFILE_CACHE_VERSION) return;
     const items = Array.isArray(payload?.items) ? payload.items : [];
     const now = Date.now();
     items.slice(-CONVERSATION_PROFILE_CACHE_LIMIT).forEach((item) => {
@@ -4213,13 +4291,15 @@ function avatarHtml(url) {
 }
 
 function conversationAvatarHtml(url) {
+  const peer = String(arguments[1] || "").trim();
   const src = mediaUrl(validAvatarValue(url));
-  if (!src) return "";
+  const displaySrc = conversationAvatarDisplaySource(src, peer);
+  if (!displaySrc) return "";
   // Conversation avatars are visible immediately and load eagerly. A full
   // browser refresh has no previous DOM node to reuse, so hiding these images
   // until a lazy-load event would make the entire list blink into view.
   return `<span class="avatar" aria-hidden="true"><img src="${esc(
-    src
+    displaySrc
   )}" alt="" loading="eager" decoding="async" fetchpriority="high" referrerpolicy="no-referrer" data-avatar-image /></span>`;
 }
 
@@ -4232,20 +4312,59 @@ function revealLoadedAvatar(image) {
   confirmConversationAvatar(peer, source);
 }
 
+const CONVERSATION_AVATAR_FIELDS = [
+  "avatar",
+  "portrait",
+  "faceUrl",
+  "face_url",
+  "avatarUrl",
+  "avatar_url",
+  "portraitUri",
+];
+const CONVERSATION_AVATAR_CONTAINERS = [
+  "user",
+  "user_info",
+  "userInfo",
+  "userProfile",
+  "groupProfile",
+  "profile",
+  "peer_profile",
+  "peerProfile",
+];
+
+function avatarSourcesFromObject(value) {
+  if (!value || typeof value !== "object") return [];
+  return CONVERSATION_AVATAR_FIELDS.map((key) => avatarFailureSource(value[key])).filter(Boolean);
+}
+
+function clearConversationAvatarSource(value, source) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const next = { ...value };
+  CONVERSATION_AVATAR_FIELDS.forEach((key) => {
+    if (avatarSourcesMatch(next[key], source)) next[key] = "";
+  });
+  return next;
+}
+
 function confirmConversationAvatar(peer, source) {
   const target = String(peer || "").trim();
-  if (!target || !source) return;
+  const normalizedSource = avatarFailureSource(source);
+  if (!target || !normalizedSource) return;
   const conversation = S.conversations.find((item) => conversationPeer(item) === target);
   const profile = S.conversationProfilesByUid.get(target);
-  const profileSource = avatarFailureSource(profile?.avatar || profile?.portrait || "");
-  const conversationSource = avatarFailureSource(
-    conversation?.avatar || conversation?.portrait || conversation?.user?.avatar || ""
-  );
-  if (profileSource !== source && conversationSource !== source) return;
-  S.failedAvatarUrls.delete(source);
+  const sources = [
+    ...avatarSourcesFromObject(profile),
+    ...avatarSourcesFromObject(conversation),
+    ...CONVERSATION_AVATAR_CONTAINERS.flatMap((key) =>
+      avatarSourcesFromObject(conversation?.[key])
+    ),
+  ];
+  if (!sources.includes(normalizedSource)) return;
+  S.failedAvatarUrls.delete(normalizedSource);
   S.conversationFailedAvatarSources.delete(target);
   S.conversationProfileForceRefreshUids.delete(target);
   S.conversationAvatarRetryAt.delete(target);
+  S.conversationAvatarRetryTokens.delete(target);
   const timer = S.conversationAvatarRetryTimers.get(target);
   if (timer) clearTimeout(timer);
   S.conversationAvatarRetryTimers.delete(target);
@@ -4262,6 +4381,7 @@ function resetConversationAvatarFailures() {
   S.conversationFailedAvatarSources.clear();
   S.conversationAvatarRetryAt.clear();
   S.conversationAvatarRetryTimers.clear();
+  S.conversationAvatarRetryTokens.clear();
   S.conversationProfileForceRefreshUids.clear();
 }
 
@@ -4275,6 +4395,7 @@ function scheduleConversationAvatarRetry(peer, retryAt) {
     S.conversationAvatarRetryTimers.delete(target);
     if (Number(S.conversationAvatarRetryAt.get(target) || 0) > Date.now()) return;
     S.conversationAvatarRetryAt.delete(target);
+    armConversationAvatarRetry(target);
     S.conversationProfileFetchedAt.delete(target);
     void hydrateConversationProfiles();
   }, delay);
@@ -4285,36 +4406,58 @@ function invalidateConversationAvatar(peer, failedSource) {
   const target = String(peer || "").trim();
   const source = avatarFailureSource(failedSource);
   if (!target || !source) return;
+  const avatarFields = [
+    "avatar",
+    "portrait",
+    "faceUrl",
+    "face_url",
+    "avatarUrl",
+    "avatar_url",
+    "portraitUri",
+  ];
+  const avatarContainers = [
+    "user",
+    "user_info",
+    "userInfo",
+    "userProfile",
+    "groupProfile",
+    "profile",
+    "peer_profile",
+    "peerProfile",
+  ];
+  const clearSource = (value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+    const next = { ...value };
+    avatarFields.forEach((key) => {
+      if (avatarSourcesMatch(next[key], source)) next[key] = "";
+    });
+    return next;
+  };
   const retryAt = Date.now() + AVATAR_FAILURE_COOLDOWN_MS;
   S.conversationFailedAvatarSources.set(target, source);
+  S.conversationAvatarRetryTokens?.delete?.(target);
   S.conversationAvatarRetryAt.set(target, retryAt);
   S.conversationProfileForceRefreshUids.add(target);
   S.conversationProfileFetchedAt.set(target, Date.now());
 
   const profile = S.conversationProfilesByUid.get(target);
   if (profile) {
-    const avatar = avatarSourcesMatch(profile.avatar, source) ? "" : profile.avatar || "";
-    const portrait = avatarSourcesMatch(profile.portrait, source) ? "" : profile.portrait || "";
     S.conversationProfilesByUid.set(target, {
       ...profile,
-      avatar,
-      portrait,
+      ...clearSource(profile),
       _resolved: false,
     });
   }
 
   S.conversations = S.conversations.map((item) => {
     if (conversationPeer(item) !== target) return item;
-    const nestedUser = item?.user && typeof item.user === "object" ? item.user : {};
-    const userAvatar = avatarSourcesMatch(nestedUser.avatar, source) ? "" : nestedUser.avatar;
-    const userPortrait = avatarSourcesMatch(nestedUser.portrait, source) ? "" : nestedUser.portrait;
-    return {
-      ...item,
-      avatar: avatarSourcesMatch(item.avatar, source) ? "" : item.avatar,
-      portrait: avatarSourcesMatch(item.portrait, source) ? "" : item.portrait,
-      profile_resolved: false,
-      user: { ...nestedUser, avatar: userAvatar, portrait: userPortrait },
-    };
+    const next = clearSource(item);
+    avatarContainers.forEach((key) => {
+      if (next[key] && typeof next[key] === "object" && !Array.isArray(next[key])) {
+        next[key] = clearSource(next[key]);
+      }
+    });
+    return { ...next, profile_resolved: false, _avatar_from_fallback: false };
   });
   persistConversationProfiles();
   scheduleConversationAvatarRetry(target, retryAt);
@@ -4875,18 +5018,13 @@ function conversationPeer(item) {
 
 function conversationAvatar(item) {
   const conversation = item && typeof item === "object" ? item : {};
-  const nestedUser =
-    conversation.user && typeof conversation.user === "object"
-      ? conversation.user
-      : conversation.user_info && typeof conversation.user_info === "object"
-        ? conversation.user_info
-        : {};
-  const avatar = validAvatarValue(
-    conversation.avatar,
-    conversation.portrait,
-    nestedUser.avatar,
-    nestedUser.portrait
-  );
+  const candidates = [...CONVERSATION_AVATAR_FIELDS.map((key) => conversation[key])];
+  CONVERSATION_AVATAR_CONTAINERS.forEach((container) => {
+    const nested = conversation[container];
+    if (!nested || typeof nested !== "object" || Array.isArray(nested)) return;
+    CONVERSATION_AVATAR_FIELDS.forEach((key) => candidates.push(nested[key]));
+  });
+  const avatar = validAvatarValue(...candidates);
   const failedSource = S.conversationFailedAvatarSources.get(conversationPeer(conversation));
   return avatarSourcesMatch(avatar, failedSource) ? "" : avatar;
 }
@@ -4998,34 +5136,50 @@ function rememberConversationProfile(
   const target = String(peer || "").trim();
   let incoming = normalizedConversationProfile(profile, target);
   if (!target || !incoming) return false;
-  const reportedAvatarSource = avatarFailureSource(
+  const normalizeAvatarSource = (value) =>
+    typeof avatarFailureSource === "function"
+      ? avatarFailureSource(value)
+      : String(value || "").trim();
+  const reportedAvatarSource = normalizeAvatarSource(
     profile?.avatar || profile?.portrait || profile?.faceUrl || profile?.face_url || ""
   );
-  const failedAvatarSource = S.conversationFailedAvatarSources.get(target) || "";
+  const failedAvatarSource = S.conversationFailedAvatarSources?.get?.(target) || "";
   if (
     reportedAvatarSource &&
     reportedAvatarSource === failedAvatarSource &&
     !allowPreviouslyFailedAvatar
   ) {
     incoming = { ...incoming, avatar: "", portrait: "", _resolved: false };
-    if (Number(S.conversationAvatarRetryAt.get(target) || 0) <= Date.now()) {
+    if (Number(S.conversationAvatarRetryAt?.get?.(target) || 0) <= Date.now()) {
       const retryAt = Date.now() + AVATAR_FAILURE_COOLDOWN_MS;
-      S.conversationAvatarRetryAt.set(target, retryAt);
-      scheduleConversationAvatarRetry(target, retryAt);
+      S.conversationAvatarRetryAt?.set?.(target, retryAt);
+      if (typeof scheduleConversationAvatarRetry === "function") {
+        scheduleConversationAvatarRetry(target, retryAt);
+      }
     }
   }
   const previous = S.conversationProfilesByUid.get(target) || {};
   const nickname = incoming.nickname || previous.nickname || previous.name || "";
   const avatar = validAvatarValue(incoming.avatar, incoming.portrait, previous.avatar, previous.portrait);
-  const previousAvatarSource = avatarFailureSource(previous.avatar || previous.portrait || "");
-  const incomingAvatarSource = avatarFailureSource(avatar);
-  if (incomingAvatarSource && incomingAvatarSource !== previousAvatarSource) {
-    S.conversationFailedAvatarSources.delete(target);
-    S.conversationProfileForceRefreshUids.delete(target);
-    S.conversationAvatarRetryAt.delete(target);
-    const timer = S.conversationAvatarRetryTimers.get(target);
+  const previousAvatarSource = normalizeAvatarSource(previous.avatar || previous.portrait || "");
+  const incomingAvatarSource = normalizeAvatarSource(avatar);
+  const isRetryingFailedAvatar = Boolean(
+    incomingAvatarSource &&
+      failedAvatarSource &&
+      incomingAvatarSource === failedAvatarSource
+  );
+  if (
+    incomingAvatarSource &&
+    incomingAvatarSource !== previousAvatarSource &&
+    !isRetryingFailedAvatar
+  ) {
+    S.conversationFailedAvatarSources?.delete?.(target);
+    S.conversationProfileForceRefreshUids?.delete?.(target);
+    S.conversationAvatarRetryAt?.delete?.(target);
+    S.conversationAvatarRetryTokens?.delete?.(target);
+    const timer = S.conversationAvatarRetryTimers?.get?.(target);
     if (timer) clearTimeout(timer);
-    S.conversationAvatarRetryTimers.delete(target);
+    S.conversationAvatarRetryTimers?.delete?.(target);
   }
   S.conversationProfilesByUid.set(target, {
     ...previous,
@@ -5671,6 +5825,9 @@ function conversationCard(item) {
     nestedUser.name ||
     (peer ? `用户 ${peer}` : "聊天");
   const avatar = conversationAvatar(conversation);
+  const avatarMarkup = peer
+    ? conversationAvatarHtml(avatar, peer)
+    : conversationAvatarHtml(avatar);
   const preview = tuiEmojiPreviewText(
     conversation.last_message ||
     conversation.message ||
@@ -5723,7 +5880,7 @@ function conversationCard(item) {
     } aria-disabled="${String(!chatAllowed)}"${chatDisabled ? " disabled" : ""} title="${esc(
       chatAllowed ? name : "当前私聊权限不可用"
     )}">
-      ${conversationAvatarHtml(avatar)}
+      ${avatarMarkup}
       <span class="conversation-copy"><span class="conversation-title-line"><strong>${esc(name)}</strong>${presence}</span><span class="conversation-preview">${esc(
         preview
       )}</span></span>
@@ -21362,6 +21519,9 @@ window.addEventListener("online", () => {
   if (!S.authenticated || document.hidden) return;
   S.failedAvatarUrls.clear();
   S.conversationAvatarRetryAt.clear();
+  S.conversationFailedAvatarSources.forEach((_source, peer) => {
+    armConversationAvatarRetry(peer);
+  });
   S.conversationProfileFetchedAt.clear();
   void hydrateConversationProfiles();
   retryMomentVideoCompatibilityAfterOnline();
