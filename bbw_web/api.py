@@ -34,6 +34,7 @@ from urllib.parse import urlencode, urlparse
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, StrictBool
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers
 from starlette.requests import ClientDisconnect
@@ -2458,6 +2459,58 @@ def resume_after_drain(request: Request) -> dict[str, bool]:
 def public_health() -> dict[str, Any]:
     # Do not expose active session counts, persistence mode or Lab state.
     return {"ok": True, "service": "bbw-web", "version": 1}
+
+
+class ConversationPreferencesBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    show_all_conversations: StrictBool
+
+
+def _conversation_preferences_identity(request: Request) -> Any:
+    persistence = request.app.state.persistence
+    sid = str(request.cookies.get(legacy.COOKIE_NAME) or "")
+    identity = persistence.require_identity(sid)
+    if identity is None:
+        raise HTTPException(status_code=401, detail="请先登录")
+    if not persistence.rate_limit(
+        f"conversation-preferences:user:{identity.user_id}",
+        limit=120,
+        window_seconds=60,
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="聊天列表设置操作过于频繁，请稍后重试",
+            headers={"Retry-After": "60"},
+        )
+    return identity
+
+
+@app.get("/api/preferences/conversations", include_in_schema=False)
+def conversation_preferences(request: Request) -> dict[str, Any]:
+    persistence = request.app.state.persistence
+    identity = _conversation_preferences_identity(request)
+    return {
+        "ok": True,
+        "show_all_conversations": persistence.get_show_all_conversations(identity),
+    }
+
+
+@app.put("/api/preferences/conversations", include_in_schema=False)
+def update_conversation_preferences(
+    request: Request,
+    body: ConversationPreferencesBody,
+) -> JSONResponse:
+    request_error = _auth_json_request_error(request)
+    if request_error is not None:
+        return request_error
+    persistence = request.app.state.persistence
+    identity = _conversation_preferences_identity(request)
+    enabled = persistence.set_show_all_conversations(
+        identity,
+        enabled=body.show_all_conversations,
+    )
+    return JSONResponse({"ok": True, "show_all_conversations": enabled})
 
 
 @app.get("/api/auth/security", include_in_schema=False)

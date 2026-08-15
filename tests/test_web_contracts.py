@@ -1031,15 +1031,50 @@ class ProtocolRoutingTests(unittest.TestCase):
 
 
 class ConversationVisibilityWebContractTests(unittest.TestCase):
-    def test_show_all_conversations_defaults_on_and_limits_all_data_sources(self) -> None:
+    def test_show_all_conversations_defaults_off_and_syncs_across_devices(self) -> None:
         root = Path(__file__).resolve().parents[1]
         app_js = (root / "bbw_web" / "static" / "app.js").read_text(
             encoding="utf-8"
         )
+        api_py = (root / "bbw_web" / "api.py").read_text(encoding="utf-8")
+        persistence_py = (root / "bbw_web" / "persistence.py").read_text(
+            encoding="utf-8"
+        )
+        models_py = (root / "bbw_prod" / "models.py").read_text(encoding="utf-8")
+        migration = (
+            root
+            / "migrations"
+            / "versions"
+            / "20260815_0027_conversation_visibility_preference.py"
+        ).read_text(encoding="utf-8")
 
         self.assertIn('{ id: "settings", name: "设置",', app_js)
-        self.assertIn("showAllConversations: true", app_js)
+        self.assertIn("showAllConversations: false", app_js)
+        self.assertIn("S.showAllConversations = false;", app_js)
+        self.assertIn('localStorage.getItem(key) === "true"', app_js)
+        self.assertIn(
+            'localStorage.setItem(key, S.showAllConversations ? "true" : "false")',
+            app_js,
+        )
+        self.assertIn("默认关闭；开启后请求并显示全部会话", app_js)
         self.assertIn("if (account && account === S.conversationPreferenceAccount) return;", app_js)
+        self.assertGreaterEqual(app_js.count("await loadConversationPreference();"), 2)
+        self.assertIn('api("/api/preferences/conversations"', app_js)
+        self.assertIn('method: "PUT"', app_js)
+        self.assertIn(
+            '@app.get("/api/preferences/conversations", include_in_schema=False)',
+            api_py,
+        )
+        self.assertIn(
+            '@app.put("/api/preferences/conversations", include_in_schema=False)',
+            api_py,
+        )
+        self.assertIn("def get_show_all_conversations", persistence_py)
+        self.assertIn("def set_show_all_conversations", persistence_py)
+        self.assertIn("show_all_conversations: Mapped[bool]", models_py)
+        self.assertIn('server_default=text("false")', models_py)
+        self.assertIn('revision: str = "20260815_0027"', migration)
+        self.assertIn('server_default=sa.text("false")', migration)
         self.assertIn("CONVERSATION_RECENT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000", app_js)
         self.assertIn('data-setting="show-all-conversations"', app_js)
         self.assertIn("/api/archive/conversations?limit=100${conversationSummaryQuery", app_js)

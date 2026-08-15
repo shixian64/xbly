@@ -111,6 +111,9 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, SerializableMixin, Base):
     chat_retention_days: Mapped[int] = mapped_column(
         SmallInteger, nullable=False, default=180, server_default="180"
     )
+    show_all_conversations: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     match_pool_online_list_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )

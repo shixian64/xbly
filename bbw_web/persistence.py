@@ -2269,6 +2269,30 @@ return 1
                 auth_source="provider",
             )
 
+    def get_show_all_conversations(self, identity: UserIdentity) -> bool:
+        """Read the account-scoped conversation visibility preference."""
+
+        with session_scope() as db:
+            user = UserRepository(db).get(identity.user_id)
+            if user is None or user.status != "active":
+                raise PermissionDenied("账号当前不可用")
+            return bool(user.show_all_conversations)
+
+    def set_show_all_conversations(
+        self,
+        identity: UserIdentity,
+        *,
+        enabled: bool,
+    ) -> bool:
+        """Persist the conversation visibility preference for every device."""
+
+        with session_scope() as db:
+            user = UserRepository(db).get(identity.user_id, for_update=True)
+            if user is None or user.status != "active":
+                raise PermissionDenied("账号当前不可用")
+            user.show_all_conversations = bool(enabled)
+            return user.show_all_conversations
+
     def grant_message_peers(
         self,
         *,

@@ -247,7 +247,7 @@ const S = {
   activePeer: "",
   activePeerName: "",
   conversationListCollapsed: false,
-  showAllConversations: true,
+  showAllConversations: false,
   conversationPreferenceAccount: "",
   conversations: [],
   conversationRefreshPromise: null,
@@ -2972,13 +2972,13 @@ function syncConversationPreferenceAccount() {
   const account = messageSyncAccountId();
   if (account && account === S.conversationPreferenceAccount) return;
   S.conversationPreferenceAccount = account;
-  S.showAllConversations = true;
+  S.showAllConversations = false;
   const key = conversationPreferenceStorageKey(account);
   if (!key) return;
   try {
-    S.showAllConversations = localStorage.getItem(key) !== "false";
+    S.showAllConversations = localStorage.getItem(key) === "true";
   } catch {
-    // Storage can be unavailable; the documented default remains enabled.
+    // Storage can be unavailable; the documented default remains disabled.
   }
 }
 
@@ -2986,11 +2986,38 @@ function persistConversationPreference() {
   const key = conversationPreferenceStorageKey(S.conversationPreferenceAccount);
   if (!key) return;
   try {
-    if (S.showAllConversations) localStorage.removeItem(key);
-    else localStorage.setItem(key, "false");
+    localStorage.setItem(key, S.showAllConversations ? "true" : "false");
   } catch {
     // Keep the in-memory preference for this session when storage is unavailable.
   }
+}
+
+async function loadConversationPreference() {
+  const account = messageSyncAccountId();
+  const sessionGeneration = S.sessionGeneration;
+  if (!S.authenticated || !account) return S.showAllConversations;
+  try {
+    const { status, data } = await api("/api/preferences/conversations", {
+      timeout: 5000,
+    });
+    if (
+      sessionGeneration !== S.sessionGeneration ||
+      account !== messageSyncAccountId()
+    ) {
+      return S.showAllConversations;
+    }
+    if (
+      status === 200 &&
+      data?.ok === true &&
+      typeof data.show_all_conversations === "boolean"
+    ) {
+      S.showAllConversations = data.show_all_conversations;
+      persistConversationPreference();
+    }
+  } catch {
+    // The account-scoped local value is only a fallback while the server is unavailable.
+  }
+  return S.showAllConversations;
 }
 
 function conversationActivityCutoff(now = Date.now()) {
@@ -5913,9 +5940,35 @@ async function hydrateConversationProfiles() {
   }
 }
 
-async function setShowAllConversations(enabled) {
+async function setShowAllConversations(
+  enabled,
+  { persistRemote = true, notify = true } = {}
+) {
   const next = Boolean(enabled);
   if (next === S.showAllConversations) return;
+  if (persistRemote) {
+    const account = messageSyncAccountId();
+    const sessionGeneration = S.sessionGeneration;
+    if (!S.authenticated || !account) throw new Error("登录状态已失效，请重新登录");
+    const { status, data } = await api("/api/preferences/conversations", {
+      method: "PUT",
+      body: JSON.stringify({ show_all_conversations: next }),
+      timeout: 7000,
+    });
+    if (
+      sessionGeneration !== S.sessionGeneration ||
+      account !== messageSyncAccountId()
+    ) {
+      return;
+    }
+    if (
+      status !== 200 ||
+      data?.ok !== true ||
+      data.show_all_conversations !== next
+    ) {
+      throw new Error(errorInfo(data, "聊天列表设置未保存").title);
+    }
+  }
   S.showAllConversations = next;
   persistConversationPreference();
   clearViewCacheKey("settings");
@@ -5948,7 +6001,7 @@ async function setShowAllConversations(enabled) {
   if (S.showAllConversations !== next) return;
   const checkbox = document.querySelector('input[data-setting="show-all-conversations"]');
   if (checkbox) checkbox.checked = S.showAllConversations;
-  toast(next ? "已显示全部会话" : "已隐藏一周前未联系的会话");
+  if (notify) toast(next ? "已显示全部会话" : "已隐藏一周前未联系的会话");
 }
 
 function conversationCard(item) {
@@ -16580,7 +16633,7 @@ async function pageSettings() {
   return `<section class="section"><div class="surface-card"><div class="section-head"><div><h2>聊天列表</h2><p>控制联系人会话的加载范围</p></div></div>
     <label class="check-line"><input type="checkbox" data-setting="show-all-conversations" ${
       S.showAllConversations ? "checked" : ""
-    } /><span><strong>显示全部会话</strong><small class="field-help">默认开启；关闭后只请求并显示最近一周内发送或接收过消息的会话</small></span></label>
+    } /><span><strong>显示全部会话</strong><small class="field-help">默认关闭；开启后请求并显示全部会话，关闭时只显示最近一周内发送或接收过消息的会话</small></span></label>
   </div></section>`;
 }
 
@@ -21060,6 +21113,7 @@ $("send-sms").addEventListener("click", (event) => {
 async function completeBrowserLogin(data) {
   resetTurnstileChallenge({ hide: true });
   S.sessionGeneration += 1;
+  const sessionGeneration = S.sessionGeneration;
   S.authenticated = true;
   S.messagePolicyReady = false;
   S.messagePolicyGeneration += 1;
@@ -21095,6 +21149,8 @@ async function completeBrowserLogin(data) {
   applyDependencyMode(data);
   applyCapabilities(data.capabilities);
   applyUser(data.user);
+  await loadConversationPreference();
+  if (!isCurrentAuthenticatedSession(sessionGeneration)) return;
   if (!VOICE_MATCH_ENABLED) void cleanupDisabledVoiceMatchQueue();
   showLogin(false, true);
   await refreshAiAgentAccess({ redirect: false });
@@ -21328,7 +21384,10 @@ document.addEventListener("change", (event) => {
         toast(error?.message || "聊天列表设置未保存", "error", 4200);
       })
       .finally(() => {
-        if (conversationSetting.isConnected) conversationSetting.disabled = false;
+        if (conversationSetting.isConnected) {
+          conversationSetting.checked = S.showAllConversations;
+          conversationSetting.disabled = false;
+        }
       });
     return;
   }
@@ -21757,9 +21816,12 @@ window.addEventListener("storage", (event) => {
   if (!S.authenticated || !event.key) return;
   const preferenceKey = conversationPreferenceStorageKey();
   if (preferenceKey && event.key === preferenceKey) {
-    const enabled = event.newValue !== "false";
+    const enabled = event.newValue === "true";
     if (enabled !== S.showAllConversations) {
-      void setShowAllConversations(enabled).catch(() => {});
+      void setShowAllConversations(enabled, {
+        persistRemote: false,
+        notify: false,
+      }).catch(() => {});
     }
     return;
   }
@@ -22004,6 +22066,7 @@ function classifyBootSessionAttempt(result, error, transientFailures = 0) {
 async function completeRestoredSession(data) {
   cancelBootSessionRecovery();
   S.sessionGeneration += 1;
+  const sessionGeneration = S.sessionGeneration;
   S.authenticated = true;
   S.messagePolicyRefreshPromise = null;
   S.conversations = [];
@@ -22014,6 +22077,8 @@ async function completeRestoredSession(data) {
   S.conversationArchiveLoadedAt = 0;
   applyFeatureEnvelope(data);
   applyUser(data.user);
+  await loadConversationPreference();
+  if (!isCurrentAuthenticatedSession(sessionGeneration)) return;
   if (!VOICE_MATCH_ENABLED) void cleanupDisabledVoiceMatchQueue();
   showLogin(false);
   await refreshAiAgentAccess({ redirect: false });
