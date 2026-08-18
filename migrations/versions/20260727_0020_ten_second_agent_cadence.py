@@ -20,14 +20,14 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 _TABLE = "ai_agent_autonomy_settings"
-_CONSTRAINT = op.f(
+_CONSTRAINT = (
     "ck_ai_agent_autonomy_settings_"
     "ai_agent_autonomy_minimum_interval_valid"
 )
 
 
 def upgrade() -> None:
-    op.drop_constraint(_CONSTRAINT, _TABLE, type_="check")
+    op.drop_constraint(op.f(_CONSTRAINT), _TABLE, type_="check")
     op.alter_column(
         _TABLE,
         "minimum_action_interval_seconds",
@@ -44,7 +44,7 @@ def upgrade() -> None:
         "WHERE minimum_action_interval_seconds = 300"
     )
     op.create_check_constraint(
-        _CONSTRAINT,
+        op.f(_CONSTRAINT),
         _TABLE,
         "minimum_action_interval_seconds BETWEEN 10 AND 86400",
     )
@@ -56,7 +56,7 @@ def downgrade() -> None:
         "SET minimum_action_interval_seconds = 60 "
         "WHERE minimum_action_interval_seconds < 60"
     )
-    op.drop_constraint(_CONSTRAINT, _TABLE, type_="check")
+    op.drop_constraint(op.f(_CONSTRAINT), _TABLE, type_="check")
     op.alter_column(
         _TABLE,
         "minimum_action_interval_seconds",
@@ -65,7 +65,7 @@ def downgrade() -> None:
         server_default=sa.text("300"),
     )
     op.create_check_constraint(
-        _CONSTRAINT,
+        op.f(_CONSTRAINT),
         _TABLE,
         "minimum_action_interval_seconds BETWEEN 60 AND 86400",
     )

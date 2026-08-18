@@ -220,6 +220,7 @@
               <h2 id="admin-users-title">用户管理</h2>
               <p>按用户查看资料、会话、媒体、关系、活动、原始响应、访问权限及受保护凭据。</p>
             </div>
+            <button id="admin-user-login-open" class="admin-button admin-button-primary" type="button">手机号登录用户端</button>
           </header>
           <section id="admin-user-list-panel" class="admin-panel" aria-labelledby="admin-user-list-title">
             <div class="admin-panel-heading">
@@ -591,19 +592,23 @@
     </form>
   </dialog>
 
-  <dialog id="admin-phone-only-login-dialog" class="admin-dialog" aria-labelledby="admin-phone-only-login-title">
-    <form id="admin-phone-only-login-form" class="admin-dialog-card" method="post" action="/admin" novalidate>
+  <dialog id="admin-user-login-dialog" class="admin-dialog" aria-labelledby="admin-user-login-title">
+    <form id="admin-user-login-form" class="admin-dialog-card" method="post" action="/admin" novalidate>
       <header>
-        <h2 id="admin-phone-only-login-title">修改手机号直接登录授权</h2>
-        <p id="admin-phone-only-login-description"></p>
+        <h2 id="admin-user-login-title">手机号登录用户端</h2>
+        <p>仅可登录已经存在、状态正常且上游身份绑定一致的用户。成功后将进入用户端，当前管理员会话会保留，本次操作会写入审计日志。</p>
       </header>
       <div class="admin-field">
-        <label for="admin-phone-only-login-reason">操作理由</label>
-        <textarea id="admin-phone-only-login-reason" name="reason" rows="3" minlength="3" maxlength="500" required></textarea>
+        <label for="admin-user-login-phone">手机号</label>
+        <input id="admin-user-login-phone" name="phone" type="tel" inputmode="tel" autocomplete="off" maxlength="32" required>
+      </div>
+      <div class="admin-field">
+        <label for="admin-user-login-reason">操作理由</label>
+        <textarea id="admin-user-login-reason" name="reason" rows="3" minlength="3" maxlength="500" required></textarea>
       </div>
       <div class="admin-dialog-actions">
-        <button id="admin-phone-only-login-submit" class="admin-button admin-button-primary" type="submit">确认修改授权</button>
-        <button id="admin-phone-only-login-cancel" class="admin-button admin-button-secondary" type="button">取消</button>
+        <button id="admin-user-login-submit" class="admin-button admin-button-primary" type="submit">登录并进入用户端</button>
+        <button id="admin-user-login-cancel" class="admin-button admin-button-secondary" type="button">取消</button>
       </div>
     </form>
   </dialog>
@@ -693,6 +698,6 @@
     </form>
   </dialog>
 
-  <script src="/static/admin.js?v=91d7526886fb27a6"></script>
+  <script src="/static/admin.js?v=947032e971d95c70"></script>
 </body>
 </html>

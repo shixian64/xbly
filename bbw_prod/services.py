@@ -646,7 +646,7 @@ class LoginPrecheck:
     invite_code_id: uuid.UUID | None
     requires_invite: bool
     local_password_available: bool = False
-    phone_only_login_enabled: bool = False
+    existing_upstream_uid: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -928,8 +928,7 @@ class LoginAccountService:
                 None,
                 False,
                 self.user_credentials.available_for_user(user.id),
-                bool(user.phone_only_login_enabled)
-                and bool(str(existing.upstream_uid or "").strip()),
+                str(existing.upstream_uid or "").strip() or None,
             )
         return LoginPrecheck(
             digest,
@@ -958,7 +957,7 @@ class LoginAccountService:
             invite.id,
             True,
             context.local_password_available,
-            context.phone_only_login_enabled,
+            context.existing_upstream_uid,
         )
 
     @staticmethod
@@ -1043,19 +1042,19 @@ class LoginAccountService:
         profile: Mapping[str, Any] | None = None,
         device_data: Mapping[str, Any] | None = None,
         require_invite: bool = True,
-        phone_only_login: bool = False,
+        require_existing_upstream_binding: bool = False,
     ) -> LoginCompletion:
         normalized = normalize_phone(phone)
         digest = phone_lookup_hmac(normalized, self.phone_hmac_key)
         by_phone = self.accounts.get_by_phone_hmac(digest, provider=provider, for_update=True)
         by_uid = self.accounts.get_by_upstream_uid(upstream_uid, provider=provider, for_update=True)
         if by_phone is not None:
-            if phone_only_login and (
+            if require_existing_upstream_binding and (
                 not str(by_phone.upstream_uid or "").strip()
                 or by_phone.upstream_uid != upstream_uid
             ):
                 raise PermissionDenied(
-                    "phone-only login upstream identity does not match"
+                    "administrator phone login upstream identity does not match"
                 )
             if by_uid is not None and by_uid.id != by_phone.id:
                 raise ConflictError("upstream account is already bound to another user")
@@ -1064,8 +1063,6 @@ class LoginAccountService:
             user = self.users.get(by_phone.user_id, for_update=True)
             if user is None or user.status != "active":
                 raise PermissionDenied("user account is not active")
-            if phone_only_login and not bool(user.phone_only_login_enabled):
-                raise PermissionDenied("phone-only login is not enabled")
             by_phone.upstream_uid = upstream_uid
             by_phone.phone_hmac = digest
             by_phone.device_data = dict(device_data or by_phone.device_data or {})
@@ -1110,8 +1107,10 @@ class LoginAccountService:
 
         if by_uid is not None:
             raise ConflictError("upstream account is already bound to another phone")
-        if phone_only_login:
-            raise PermissionDenied("phone-only login is not enabled")
+        if require_existing_upstream_binding:
+            raise PermissionDenied(
+                "administrator phone login requires an existing account binding"
+            )
         if require_invite and self.settings.invite_required and not invite_code:
             raise InviteInvalid("an invitation code is required")
         invite = (

@@ -1605,8 +1605,8 @@ return 1
         if not raw_sid or not upstream_uid:
             raise ValueError("pending login requires an authenticated upstream session")
         normalized_mode = str(mode or "").strip().lower()
-        if normalized_mode not in {"password", "sms", "onekey"}:
-            normalized_mode = "password"
+        if normalized_mode not in {"password", "sms"}:
+            raise ValueError("unsupported pending login mode")
         payload = {
             "phone": normalize_phone(phone),
             "password": password,
@@ -1660,14 +1660,13 @@ return 1
             upstream_uid = str(payload.get("upstream_uid") or "").strip()
             if not upstream_uid:
                 raise ValueError("pending login has no upstream identity")
+            mode = str(payload.get("mode") or "").strip().lower()
+            if mode not in {"password", "sms"}:
+                raise ValueError("pending login mode is no longer supported")
             return PendingLogin(
                 phone=phone,
                 password=str(payload.get("password") or ""),
-                mode=(
-                    str(payload.get("mode"))
-                    if payload.get("mode") in {"password", "sms", "onekey"}
-                    else "password"
-                ),
+                mode=mode,
                 upstream_uid=upstream_uid,
             )
         except PendingLoginExpired:
@@ -1737,7 +1736,6 @@ return 1
                 invite_code=invite_code,
                 password=pending.password,
                 password_verified=pending.mode == "password",
-                phone_only_login=pending.mode == "onekey",
                 login_context=None,
                 old_sid=old_sid,
                 client_ip=client_ip,
@@ -1774,11 +1772,21 @@ return 1
         client_ip: str,
         user_agent: str,
         password_verified: bool = False,
-        phone_only_login: bool = False,
+        require_existing_upstream_binding: bool = False,
+        clear_login_failures: bool = True,
     ) -> UserIdentity:
         upstream = web_user.app.session
         if not upstream.logged_in:
             raise RuntimeError("upstream login did not produce a usable session")
+        if require_existing_upstream_binding and (
+            login_context is None
+            or login_context.existing_user_id is None
+            or login_context.existing_external_account_id is None
+            or not str(login_context.existing_upstream_uid or "").strip()
+        ):
+            raise PermissionDenied(
+                "administrator phone login requires a prechecked account binding"
+            )
         with session_scope() as db:
             account_service = LoginAccountService(
                 db, self.settings, self.cipher, self.phone_hmac_key
@@ -1799,8 +1807,20 @@ return 1
                     if login_context is not None
                     else True
                 ),
-                phone_only_login=bool(phone_only_login),
+                require_existing_upstream_binding=bool(
+                    require_existing_upstream_binding
+                ),
             )
+            if require_existing_upstream_binding and (
+                completion.user.id != login_context.existing_user_id
+                or completion.external_account.id
+                != login_context.existing_external_account_id
+                or str(completion.external_account.upstream_uid or "").strip()
+                != str(login_context.existing_upstream_uid or "").strip()
+            ):
+                raise ConflictError(
+                    "administrator phone login account binding changed"
+                )
             sessions = UserSessionService(
                 db, self.redis, self.settings, self.session_hmac_key
             )
@@ -1813,7 +1833,8 @@ return 1
             )
         if old_sid and old_sid != web_user.web_sid:
             self.revoke_session(old_sid, reason="rotated")
-        self._clear_login_failures(phone=phone, client_ip=client_ip)
+        if clear_login_failures:
+            self._clear_login_failures(phone=phone, client_ip=client_ip)
         identity = UserIdentity(
             user_id=completion.user.id,
             external_account_id=completion.external_account.id,

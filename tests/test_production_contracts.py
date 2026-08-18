@@ -148,7 +148,7 @@ class ProductionContractTests(unittest.TestCase):
         repositories = self.read("bbw_prod/repositories.py")
         jobs = self.read("bbw_web/jobs.py")
         require_identity = persistence.split("def require_identity", 1)[1].split(
-            "def grant_message_peers", 1
+            "def get_show_all_conversations", 1
         )[0]
         owner_binding = jobs.split("def _load_owner_binding", 1)[1].split(
             "def _merge_dict", 1
@@ -396,10 +396,10 @@ class ProductionContractTests(unittest.TestCase):
             "/password",
             "/invites",
             "/invites/{invite_id}/disable",
+            "/user-login",
             "/users",
             "/users/{user_id}",
             "/users/{user_id}/status",
-            "/users/{user_id}/phone-only-login",
             "/users/{user_id}/media-quota",
             "/users/{user_id}/match-pool-online-list",
             "/users/{user_id}/nearby-custom-city",
@@ -451,10 +451,15 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn("在线用户列表、资料、动态和好友申请始终可用", js)
         self.assertIn("user.nearby_custom_city_changed", api)
         self.assertIn("附近的人自定义城市", js)
-        self.assertIn("ADMIN_ENDPOINTS.userPhoneOnlyLogin", js)
-        self.assertIn('id="admin-phone-only-login-dialog"', html)
-        self.assertIn("user.phone_only_login_changed", api)
-        self.assertIn("手机号直接登录", js)
+        self.assertIn("ADMIN_ENDPOINTS.userLogin", js)
+        self.assertIn('id="admin-user-login-open"', html)
+        self.assertIn('id="admin-user-login-dialog"', html)
+        self.assertIn('id="admin-user-login-phone"', html)
+        self.assertIn("user.admin_phone_login", api)
+        self.assertIn("手机号登录用户端", html)
+        self.assertNotIn("ADMIN_ENDPOINTS.userPhoneOnlyLogin", js)
+        self.assertNotIn('id="admin-phone-only-login-dialog"', html)
+        self.assertNotIn("user.phone_only_login_changed", api)
 
     def test_admin_media_quota_is_account_authoritative_and_audited(self) -> None:
         admin_api = self.read("bbw_web/admin_api.py")

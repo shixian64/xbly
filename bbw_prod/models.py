@@ -120,9 +120,8 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, SerializableMixin, Base):
     nearby_custom_city_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
-    phone_only_login_enabled: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default=text("false")
-    )
+    # 20260818_0028 的历史列可能已存在于数据库，但运行时不再映射或读取该
+    # 逐用户开关；仅管理员工作台可以发起受审计的即时手机号登录。
     byok_model_runner_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )

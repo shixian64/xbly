@@ -452,48 +452,12 @@ class OpportunityEnrollmentTests(unittest.TestCase):
         self.assertEqual(len(recorder.calls), 1)
         self.assertIs(account.password_encrypted, saved_ciphertext)
 
-    def test_phone_only_login_rechecks_user_permission_during_completion(self) -> None:
+    def test_admin_phone_login_requires_a_prebound_matching_upstream_uid(self) -> None:
         service, account, _recorder = self.make_service()
-        user = service.users.get(account.user_id)
-        assert user is not None
-        user.phone_only_login_enabled = False
-
-        with self.assertRaises(PermissionDenied):
-            service.complete_login(
-                phone="13800138000",
-                invite_code=None,
-                upstream_uid="42",
-                login_account="13800138000",
-                password="",
-                token="onekey-token",
-                password_verified=False,
-                require_invite=False,
-                phone_only_login=True,
-            )
-
-        user.phone_only_login_enabled = True
-        completion = service.complete_login(
-            phone="13800138000",
-            invite_code=None,
-            upstream_uid="42",
-            login_account="13800138000",
-            password="",
-            token="onekey-token",
-            password_verified=False,
-            require_invite=False,
-            phone_only_login=True,
-        )
-        self.assertIs(completion.user, user)
-
-    def test_phone_only_login_requires_a_prebound_matching_upstream_uid(self) -> None:
-        service, account, _recorder = self.make_service()
-        user = service.users.get(account.user_id)
-        assert user is not None
-        user.phone_only_login_enabled = True
 
         account.upstream_uid = None
         context = service.precheck_credentials(phone="13800138000")
-        self.assertFalse(context.phone_only_login_enabled)
+        self.assertIsNone(context.existing_upstream_uid)
 
         for saved_uid in (None, "different-upstream-user"):
             with self.subTest(saved_uid=saved_uid):
@@ -508,13 +472,13 @@ class OpportunityEnrollmentTests(unittest.TestCase):
                         token="onekey-token",
                         password_verified=False,
                         require_invite=False,
-                        phone_only_login=True,
+                        require_existing_upstream_binding=True,
                     )
                 self.assertEqual(account.upstream_uid, saved_uid)
 
         account.upstream_uid = "42"
         context = service.precheck_credentials(phone="13800138000")
-        self.assertTrue(context.phone_only_login_enabled)
+        self.assertEqual(context.existing_upstream_uid, "42")
         completion = service.complete_login(
             phone="13800138000",
             invite_code=None,
@@ -524,7 +488,7 @@ class OpportunityEnrollmentTests(unittest.TestCase):
             token="onekey-token",
             password_verified=False,
             require_invite=False,
-            phone_only_login=True,
+            require_existing_upstream_binding=True,
         )
         self.assertIs(completion.external_account, account)
 

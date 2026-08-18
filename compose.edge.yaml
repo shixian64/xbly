@@ -24,6 +24,8 @@ services:
       ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
       APP_UPSTREAM: ${APP_UPSTREAM:?set APP_UPSTREAM}
       APP_STANDBY_UPSTREAM: ${APP_STANDBY_UPSTREAM:-127.0.0.1:9}
+      WXAI_DOMAIN: ${WXAI_DOMAIN:-wxai.shixinn.com}
+      WXAI_UPSTREAM: ${WXAI_UPSTREAM:-100.83.127.12:8787}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ${BBW_DATA_ROOT:-/var/lib/bbw}/caddy/data:/data

@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 from sqlalchemy import func, or_, select, text as sql_text
 
 from bbw_agent import repositories as agent_repositories
+from bbw_prod.crypto import normalize_phone, phone_lookup_hmac
 from bbw_prod.db import session_scope
 from bbw_prod import models as prod_models
 from bbw_prod.models import (
@@ -85,6 +86,12 @@ from bbw_prod.services import (
     RawResponseService,
     ServiceError,
     UserSessionService,
+)
+from bbw_web import bff_server as legacy
+from bbw_web.providers import (
+    ProviderAuthenticationRejected,
+    ProviderUnavailable,
+    ProviderUpstreamInterrupted,
 )
 
 
@@ -268,13 +275,13 @@ class UserNearbyCustomCityBody(_StrictBody):
         return value.strip()
 
 
-class UserPhoneOnlyLoginBody(_StrictBody):
-    enabled: StrictBool
+class AdminUserLoginBody(_StrictBody):
+    phone: str = Field(min_length=6, max_length=32)
     reason: str = Field(min_length=3, max_length=500)
 
-    @field_validator("reason", mode="before")
+    @field_validator("phone", "reason", mode="before")
     @classmethod
-    def strip_reason(cls, value: str) -> str:
+    def strip_fields(cls, value: str) -> str:
         return value.strip()
 
 
@@ -738,6 +745,69 @@ def _clear_admin_cookie(response: Response, request: Request) -> None:
     )
 
 
+def _user_cookie_name(request: Request) -> str:
+    settings = _settings(request)
+    name = str(settings.user_cookie_name or "").strip()
+    if not name:
+        raise RuntimeError("user cookie name is not configured")
+    if name == str(settings.admin_cookie_name or "").strip():
+        raise RuntimeError("user and administrator cookie names must be distinct")
+    if _is_production(settings) and not name.startswith("__Host-"):
+        raise RuntimeError("production user cookie must use the __Host- prefix")
+    return name
+
+
+def _pending_user_cookie_name(user_cookie_name: str) -> str:
+    if user_cookie_name.startswith("__Host-"):
+        suffix = user_cookie_name[len("__Host-") :]
+        return f"__Host-{suffix}-pending-login"
+    return f"{user_cookie_name}_pending_login"
+
+
+def _set_user_cookie(response: Response, request: Request, sid: str) -> None:
+    settings = _settings(request)
+    response.set_cookie(
+        key=_user_cookie_name(request),
+        value=sid,
+        path="/",
+        secure=bool(settings.cookie_secure),
+        httponly=True,
+        samesite="strict",
+    )
+
+
+def _clear_pending_user_cookie(response: Response, request: Request) -> None:
+    settings = _settings(request)
+    response.delete_cookie(
+        key=_pending_user_cookie_name(_user_cookie_name(request)),
+        path="/",
+        secure=bool(settings.cookie_secure),
+        httponly=True,
+        samesite="strict",
+    )
+
+
+def _discard_admin_user_login(request: Request, web_user: Any | None) -> None:
+    if web_user is None:
+        return
+    sid = str(getattr(web_user, "web_sid", "") or "")
+    if not sid:
+        return
+    try:
+        _persistence(request).revoke_session(
+            sid,
+            reason="administrator_phone_login_failed",
+        )
+    except Exception:
+        pass
+    store = legacy.STORE
+    if store is not None:
+        try:
+            store.drop(sid)
+        except Exception:
+            pass
+
+
 def _raise_service_error(exc: Exception) -> NoReturn:
     if isinstance(exc, AuthenticationFailed):
         raise HTTPException(status_code=401, detail="administrator authentication failed") from exc
@@ -1126,9 +1196,6 @@ def _user_public(user: User, account: ExternalAccount | None) -> dict[str, Any]:
             user.match_pool_online_list_enabled
         ),
         "nearby_custom_city_enabled": bool(user.nearby_custom_city_enabled),
-        "phone_only_login_enabled": bool(
-            getattr(user, "phone_only_login_enabled", False)
-        ),
         "byok_model_runner_enabled": bool(user.byok_model_runner_enabled),
         "byok_account_actions_enabled": bool(user.byok_account_actions_enabled),
         "byok_autonomous_agent_enabled": bool(
@@ -1704,6 +1771,164 @@ def admin_me(
             "idle_expires_at": _iso(context.idle_expires_at),
             "absolute_expires_at": _iso(context.absolute_expires_at),
         },
+    }
+
+
+@router.post("/user-login")
+def admin_user_login(
+    body: AdminUserLoginBody,
+    request: Request,
+    response: Response,
+    context: AdminContext = Depends(_admin_context),
+) -> dict[str, Any]:
+    persistence = _persistence(request)
+    try:
+        phone = normalize_phone(body.phone)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="手机号格式无效") from exc
+
+    phone_key = phone_lookup_hmac(phone, persistence.phone_hmac_key)
+    limits = (
+        (f"admin-user-login-admin:{context.admin_user_id}", 12, 5 * 60),
+        (f"admin-user-login-phone:{phone_key}", 5, 15 * 60),
+        (f"admin-user-login-ip:{context.client_ip}", 20, 10 * 60),
+    )
+    failed_windows = [
+        window
+        for key, limit, window in limits
+        if not persistence.rate_limit(
+            key,
+            limit=limit,
+            window_seconds=window,
+        )
+    ]
+    if failed_windows:
+        raise HTTPException(
+            status_code=429,
+            detail="管理员手机号登录操作过于频繁，请稍后重试",
+            headers={"Retry-After": str(max(failed_windows))},
+        )
+
+    try:
+        login_context = persistence.precheck_account(phone=phone)
+    except (PermissionError, ValueError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="该手机号没有可用于管理员登录的正常账号",
+        ) from exc
+    expected_uid = str(
+        getattr(login_context, "existing_upstream_uid", "") or ""
+    ).strip()
+    if (
+        getattr(login_context, "existing_user_id", None) is None
+        or getattr(login_context, "existing_external_account_id", None) is None
+        or not expected_uid
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="该手机号尚未绑定可确认身份的上游账号",
+        )
+
+    store = legacy.STORE
+    if store is None:
+        raise HTTPException(status_code=503, detail="用户登录服务暂时不可用")
+
+    user_cookie_name = _user_cookie_name(request)
+    old_sid = str(request.cookies.get(user_cookie_name) or "")
+    pending_cookie_name = _pending_user_cookie_name(user_cookie_name)
+    pending_sid = str(request.cookies.get(pending_cookie_name) or "")
+    web_user: Any | None = None
+    try:
+        web_user = store.login_onekey(
+            None,
+            phone,
+            label="administrator-user-login",
+            request_authorized=True,
+        )
+        authenticated_uid = str(web_user.app.session.uid or "").strip()
+        if authenticated_uid != expected_uid:
+            raise PermissionDenied(
+                "administrator phone login upstream identity does not match"
+            )
+        identity = persistence.complete_login(
+            web_user=web_user,
+            phone=phone,
+            invite_code=None,
+            password="",
+            password_verified=False,
+            require_existing_upstream_binding=True,
+            clear_login_failures=False,
+            login_context=login_context,
+            old_sid=None,
+            client_ip=context.client_ip,
+            user_agent=str(request.headers.get("User-Agent") or "")[:512],
+        )
+        with session_scope() as db:
+            _audit_service(db, request).record(
+                actor_type="admin",
+                action="user.admin_phone_login",
+                admin_user_id=context.admin_user_id,
+                target_user_id=identity.user_id,
+                resource_type="user",
+                resource_id=str(identity.user_id),
+                reason=body.reason,
+                client_ip=context.client_ip,
+                details={
+                    "authentication_method": "provider_administrator_phone_login",
+                    "had_existing_user_cookie": bool(old_sid),
+                },
+            )
+        if old_sid and old_sid != web_user.web_sid:
+            persistence.revoke_session(old_sid, reason="rotated")
+    except ProviderUnavailable as exc:
+        _discard_admin_user_login(request, web_user)
+        raise HTTPException(
+            status_code=503,
+            detail="上游手机号登录暂时不可用，请稍后重试",
+            headers={"Retry-After": "5"},
+        ) from exc
+    except ProviderUpstreamInterrupted as exc:
+        _discard_admin_user_login(request, web_user)
+        raise HTTPException(
+            status_code=503,
+            detail="上游手机号登录连接中断，请稍后重试",
+            headers={"Retry-After": "3"},
+        ) from exc
+    except ProviderAuthenticationRejected as exc:
+        _discard_admin_user_login(request, web_user)
+        raise HTTPException(
+            status_code=409,
+            detail="上游未接受该手机号登录",
+        ) from exc
+    except (PermissionDenied, ConflictError) as exc:
+        _discard_admin_user_login(request, web_user)
+        raise HTTPException(
+            status_code=409,
+            detail="手机号认证结果与现有用户绑定不一致",
+        ) from exc
+    except Exception:
+        _discard_admin_user_login(request, web_user)
+        raise
+
+    if old_sid and old_sid != web_user.web_sid:
+        try:
+            store.drop(old_sid)
+        except Exception:
+            pass
+    if pending_sid and pending_sid != web_user.web_sid:
+        try:
+            persistence.cancel_pending_login(pending_sid)
+        except Exception:
+            pass
+        try:
+            store.drop(pending_sid)
+        except Exception:
+            pass
+    _set_user_cookie(response, request, web_user.web_sid)
+    _clear_pending_user_cookie(response, request)
+    return {
+        "ok": True,
+        "redirect": "/",
     }
 
 
@@ -2864,11 +3089,7 @@ def set_user_status(
             autonomy_grant_revoked = False
             autonomy_setting_disabled = False
             cancelled_autonomy_tasks = 0
-            phone_only_login_revoked = False
             if body.status == "disabled":
-                if bool(getattr(user, "phone_only_login_enabled", False)):
-                    user.phone_only_login_enabled = False
-                    phone_only_login_revoked = True
                 revoked = UserSessionService(
                     db,
                     _persistence(request).redis,
@@ -2926,26 +3147,8 @@ def set_user_status(
                     "autonomy_grant_revoked": autonomy_grant_revoked,
                     "autonomy_setting_disabled": autonomy_setting_disabled,
                     "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
-                    "phone_only_login_revoked": phone_only_login_revoked,
                 },
             )
-            if phone_only_login_revoked:
-                audit.record(
-                    actor_type="admin",
-                    action="user.phone_only_login_changed",
-                    admin_user_id=context.admin_user_id,
-                    target_user_id=user_id,
-                    resource_type="user_feature",
-                    resource_id="phone_only_login",
-                    reason=body.reason,
-                    client_ip=context.client_ip,
-                    details={
-                        "old_enabled": True,
-                        "new_enabled": False,
-                        "changed": True,
-                        "cascade_source": "user_disabled",
-                    },
-                )
             if execution_grant_revoked:
                 audit.record(
                     actor_type="admin",
@@ -3004,61 +3207,7 @@ def set_user_status(
         "autonomy_grant_revoked": autonomy_grant_revoked,
         "autonomy_setting_disabled": autonomy_setting_disabled,
         "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
-        "phone_only_login_revoked": phone_only_login_revoked,
     }
-
-
-@router.post("/users/{user_id}/phone-only-login")
-def set_user_phone_only_login(
-    user_id: uuid.UUID,
-    body: UserPhoneOnlyLoginBody,
-    request: Request,
-    context: AdminContext = Depends(_admin_context),
-) -> dict[str, Any]:
-    try:
-        with session_scope() as db:
-            account = ExternalAccountRepository(db).get_for_user(
-                user_id,
-                for_update=True,
-            )
-            # 登录落库同样先锁外部账号、再锁用户，保持统一顺序避免死锁。
-            user = _require_user(db, user_id, for_update=True)
-            new_enabled = bool(body.enabled)
-            if new_enabled and (
-                account is None
-                or not str(account.upstream_uid or "").strip()
-                or user.status != "active"
-                or user.disabled_at is not None
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="只有已绑定上游账号的正常用户才能开通手机号直接登录",
-                )
-            old_enabled = bool(getattr(user, "phone_only_login_enabled", False))
-            changed = old_enabled != new_enabled
-            user.phone_only_login_enabled = new_enabled
-            _audit_service(db, request).record(
-                actor_type="admin",
-                action="user.phone_only_login_changed",
-                admin_user_id=context.admin_user_id,
-                target_user_id=user_id,
-                resource_type="user_feature",
-                resource_id="phone_only_login",
-                reason=body.reason,
-                client_ip=context.client_ip,
-                details={
-                    "old_enabled": old_enabled,
-                    "new_enabled": new_enabled,
-                    "changed": changed,
-                    "authentication_method": "provider_phone_only",
-                },
-            )
-            item = _user_public(user, account)
-    except Exception as exc:
-        if isinstance(exc, ServiceError):
-            _raise_service_error(exc)
-        raise
-    return {"ok": True, "user": item, "changed": changed}
 
 
 @router.post("/users/{user_id}/match-pool-online-list")

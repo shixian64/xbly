@@ -20,8 +20,7 @@ const ADMIN_ENDPOINTS = Object.freeze({
   users: `${ADMIN_API_ROOT}/users`,
   user: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}`,
   userStatus: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/status`,
-  userPhoneOnlyLogin: (userId) =>
-    `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/phone-only-login`,
+  userLogin: `${ADMIN_API_ROOT}/user-login`,
   userMediaQuota: (userId) => `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/media-quota`,
   userMatchPoolOnlineList: (userId) =>
     `${ADMIN_API_ROOT}/users/${encodeURIComponent(userId)}/match-pool-online-list`,
@@ -161,7 +160,6 @@ const ADMIN_STATE = {
   rawDetailVisible: false,
   pendingUserStatus: null,
   pendingUserMediaQuota: null,
-  pendingPhoneOnlyLogin: null,
   pendingMatchPoolOnlineList: null,
   pendingNearbyCustomCity: null,
   pendingByokModelRunnerGlobal: null,
@@ -197,7 +195,6 @@ const ADMIN_FIELD_LABELS = Object.freeze({
   chat_retention_days: "聊天保存天数",
   match_pool_online_list_enabled: "非匹配主动私信权限",
   nearby_custom_city_enabled: "自定义城市筛选权限",
-  phone_only_login_enabled: "手机号直接登录权限",
   byok_model_runner_enabled: "BYOK 模型运行器权限",
   byok_account_actions_enabled: "模型账号动作执行权限",
   byok_autonomous_agent_enabled: "无人值守运营 Agent 权限",
@@ -848,10 +845,9 @@ function closeUserMediaQuotaDialog() {
   if (dialog.open) dialog.close();
 }
 
-function closePhoneOnlyLoginDialog() {
-  ADMIN_STATE.pendingPhoneOnlyLogin = null;
-  clearInputValues($("admin-phone-only-login-form"));
-  const dialog = $("admin-phone-only-login-dialog");
+function closeAdminUserLoginDialog() {
+  clearInputValues($("admin-user-login-form"));
+  const dialog = $("admin-user-login-dialog");
   if (dialog.open) dialog.close();
 }
 
@@ -970,7 +966,7 @@ function clearSensitiveDom({ clearData = true } = {}) {
   closeMediaDialog();
   closeUserStatusDialog();
   closeUserMediaQuotaDialog();
-  closePhoneOnlyLoginDialog();
+  closeAdminUserLoginDialog();
   closeMatchPoolOnlineListDialog();
   closeNearbyCustomCityDialog();
   closeByokModelRunnerGlobalDialog();
@@ -1517,7 +1513,6 @@ function userUpstreamUid(user) {
 
 function userPermissionCell(user) {
   const permissions = [];
-  if (user?.phone_only_login_enabled) permissions.push("手机号直接登录");
   if (user?.match_pool_online_list_enabled) permissions.push("非匹配主动私信");
   if (user?.nearby_custom_city_enabled) permissions.push("自定义城市筛选");
   if (user?.byok_model_runner_enabled) permissions.push("BYOK 模型运行器");
@@ -1799,45 +1794,6 @@ function renderUserProfile() {
   permissionsSection.appendChild(element("h4", "", "功能权限"));
   const accountActive = user.status !== "disabled" && !user.disabled_at;
 
-  const phoneOnlyLoginEnabled = Boolean(user.phone_only_login_enabled);
-  const phoneOnlyLoginPanel = element("section", "admin-feature-panel");
-  const phoneOnlyLoginCopy = element("div", "admin-feature-panel-copy");
-  phoneOnlyLoginCopy.appendChild(element("h4", "", "手机号直接登录"));
-  phoneOnlyLoginCopy.appendChild(
-    element(
-      "p",
-      "",
-      "这是高风险登录授权。开启后，该用户可以只输入已绑定手机号，通过上游一键登录接口进入系统，不需要密码或短信验证码；默认关闭，停用用户时会自动撤销。"
-    )
-  );
-  const phoneOnlyLoginToggle = element("label", "admin-feature-switch");
-  const phoneOnlyLoginInput = document.createElement("input");
-  phoneOnlyLoginInput.type = "checkbox";
-  phoneOnlyLoginInput.checked = phoneOnlyLoginEnabled;
-  phoneOnlyLoginInput.disabled =
-    !ADMIN_STATE.selectedUserId || (!accountActive && !phoneOnlyLoginEnabled);
-  phoneOnlyLoginInput.setAttribute("role", "switch");
-  phoneOnlyLoginInput.setAttribute("aria-label", "允许该用户只输入手机号直接登录");
-  const phoneOnlyLoginTrack = element("span", "admin-feature-switch-track");
-  phoneOnlyLoginTrack.setAttribute("aria-hidden", "true");
-  const phoneOnlyLoginLabel = element(
-    "span",
-    "admin-feature-switch-label",
-    phoneOnlyLoginEnabled ? "已授权" : accountActive ? "未授权" : "用户已停用"
-  );
-  phoneOnlyLoginInput.addEventListener("change", () => {
-    const targetEnabled = phoneOnlyLoginInput.checked;
-    phoneOnlyLoginInput.checked = !targetEnabled;
-    openPhoneOnlyLoginDialog(targetEnabled);
-  });
-  phoneOnlyLoginToggle.append(
-    phoneOnlyLoginInput,
-    phoneOnlyLoginTrack,
-    phoneOnlyLoginLabel
-  );
-  phoneOnlyLoginPanel.append(phoneOnlyLoginCopy, phoneOnlyLoginToggle);
-  permissionsSection.appendChild(phoneOnlyLoginPanel);
-
   const onlineListEnabled = Boolean(user.match_pool_online_list_enabled);
   const featurePanel = element("section", "admin-feature-panel");
   const featureCopy = element("div", "admin-feature-panel-copy");
@@ -2048,7 +2004,7 @@ function renderUserProfile() {
       "p",
       "",
       targetStatus === "disabled"
-        ? "停用后会立即撤销该用户的本站会话和手机号直接登录授权并暂停后台同步，同时关闭个人模型、账号执行与无人值守设置，并取消相关未开始任务。"
+        ? "停用后会立即撤销该用户的本站会话并暂停后台同步，同时关闭个人模型、账号执行与无人值守设置，并取消相关未开始任务。"
         : "重新启用后，用户可以再次登录，后台同步也会恢复。"
     )
   );
@@ -2077,7 +2033,7 @@ function openUserStatusDialog(targetStatus) {
   const disabling = targetStatus === "disabled";
   $("admin-user-status-title").textContent = disabling ? "停用用户" : "重新启用用户";
   $("admin-user-status-description").textContent = disabling
-    ? "该用户的本站会话和手机号直接登录授权会被撤销，后台同步会暂停。已有归档数据不会由此操作删除。"
+    ? "该用户的本站会话会被撤销，后台同步会暂停。已有归档数据不会由此操作删除。"
     : "该用户将恢复登录和后台同步能力。";
   const submit = $("admin-user-status-submit");
   submit.textContent = disabling ? "确认停用用户" : "确认重新启用用户";
@@ -2156,30 +2112,11 @@ function openNearbyCustomCityDialog(enabled) {
   setTimeout(() => $("admin-nearby-custom-city-reason").focus(), 0);
 }
 
-function openPhoneOnlyLoginDialog(enabled) {
-  if (!ADMIN_STATE.selectedUserId) return;
-  const user = ADMIN_STATE.selectedUser || {};
-  if (enabled && (user.status === "disabled" || user.disabled_at)) {
-    toast("已停用用户不能获得手机号直接登录授权", "error", 4200);
-    return;
-  }
-  ADMIN_STATE.pendingPhoneOnlyLogin = {
-    userId: ADMIN_STATE.selectedUserId,
-    enabled: Boolean(enabled),
-  };
-  clearInputValues($("admin-phone-only-login-form"));
-  $("admin-phone-only-login-title").textContent = enabled
-    ? "授权手机号直接登录"
-    : "撤销手机号直接登录授权";
-  $("admin-phone-only-login-description").textContent = enabled
-    ? "授权后，该用户只需输入已绑定手机号即可调用上游一键登录，不再校验密码或短信验证码。请确认已评估账号接管风险。"
-    : "撤销后，服务端会立即拒绝该用户新的手机号直接登录请求；已经建立的会话不会由本操作撤销。";
-  $("admin-phone-only-login-submit").textContent = enabled
-    ? "确认授权手机号登录"
-    : "确认撤销登录授权";
-  const dialog = $("admin-phone-only-login-dialog");
+function openAdminUserLoginDialog() {
+  clearInputValues($("admin-user-login-form"));
+  const dialog = $("admin-user-login-dialog");
   if (!dialog.open) dialog.showModal();
-  setTimeout(() => $("admin-phone-only-login-reason").focus(), 0);
+  setTimeout(() => $("admin-user-login-phone").focus(), 0);
 }
 
 function openByokModelRunnerGlobalDialog(enabled) {
@@ -3181,7 +3118,7 @@ const AUDIT_ACTION_LABELS = {
   "user.view": "查看用户详情",
   "user.status_changed": "修改用户状态",
   "user.media_quota_changed": "调整用户媒体额度",
-  "user.phone_only_login_changed": "修改手机号直接登录授权",
+  "user.admin_phone_login": "管理员通过手机号登录用户端",
   "user.match_pool_online_list_changed": "修改主动私信授权",
   "user.nearby_custom_city_changed": "修改自定义城市授权",
   "user.byok_model_runner_changed": "修改用户 BYOK 模型运行器授权",
@@ -4169,40 +4106,30 @@ $("admin-user-media-quota-dialog").addEventListener("cancel", (event) => {
   closeUserMediaQuotaDialog();
 });
 
-$("admin-phone-only-login-form").addEventListener("submit", (event) => {
+$("admin-user-login-open").addEventListener("click", openAdminUserLoginDialog);
+
+$("admin-user-login-form").addEventListener("submit", (event) => {
   event.preventDefault();
-  const button = $("admin-phone-only-login-submit");
+  const button = $("admin-user-login-submit");
   void withPending(button, async () => {
-    const pending = ADMIN_STATE.pendingPhoneOnlyLogin;
-    const requestState = captureUserDetailRequest("profile");
-    const reason = $("admin-phone-only-login-reason").value.trim();
-    if (!pending?.userId || typeof pending.enabled !== "boolean") {
-      throw new AdminApiError("手机号直接登录授权操作已经失效，请重新打开用户详情");
-    }
+    const phone = $("admin-user-login-phone").value.trim();
+    const reason = $("admin-user-login-reason").value.trim();
+    if (!phone) throw new AdminApiError("请输入手机号");
     if (reason.length < 3) throw new AdminApiError("请填写至少三个字符的操作理由");
-    const data = await adminApi(ADMIN_ENDPOINTS.userPhoneOnlyLogin(pending.userId), {
+    const data = await adminApi(ADMIN_ENDPOINTS.userLogin, {
       method: "POST",
-      body: JSON.stringify({ enabled: pending.enabled, reason }),
+      body: JSON.stringify({ phone, reason }),
     });
-    const updated = data.user || data.data?.user || data.data || {};
-    closePhoneOnlyLoginDialog();
-    if (isCurrentUserDetailRequest(requestState) && requestState.userId === pending.userId) {
-      ADMIN_STATE.selectedUser = { ...(ADMIN_STATE.selectedUser || {}), ...updated };
-      renderUserProfile();
-    }
-    ADMIN_STATE.needsRefresh = true;
-    toast(
-      pending.enabled ? "已授权用户使用手机号直接登录" : "已撤销手机号直接登录授权",
-      "success",
-      4200
-    );
+    if (!data?.ok) throw new AdminApiError("服务未能建立用户会话");
+    closeAdminUserLoginDialog();
+    window.location.assign("/");
   });
 });
 
-$("admin-phone-only-login-cancel").addEventListener("click", closePhoneOnlyLoginDialog);
-$("admin-phone-only-login-dialog").addEventListener("cancel", (event) => {
+$("admin-user-login-cancel").addEventListener("click", closeAdminUserLoginDialog);
+$("admin-user-login-dialog").addEventListener("cancel", (event) => {
   event.preventDefault();
-  closePhoneOnlyLoginDialog();
+  closeAdminUserLoginDialog();
 });
 
 $("admin-match-pool-online-list-form").addEventListener("submit", (event) => {

@@ -4243,6 +4243,8 @@ class Handler(BaseHTTPRequestHandler):
             phone = str(data.get("phone") or "").strip()
             password = str(data.get("password") or "")
             mode = str(data.get("mode") or "password").strip().lower()
+            if mode != "password":
+                return self.ok({"ok": False, "error": "不支持的登录方式"}, 400)
             if not phone:
                 return self.ok({"ok": False, "error": "请输入手机号"}, 400)
             if not self._allow_sensitive_action(
@@ -4250,36 +4252,11 @@ class Handler(BaseHTTPRequestHandler):
             ):
                 return
             try:
-                if mode == "onekey":
-                    request_authorized = bool(
-                        LAB_ENABLED
-                        or getattr(
-                            self,
-                            "_request_phone_only_login_authorized",
-                            False,
-                        )
-                    )
-                    if not request_authorized:
-                        return self.ok(
-                            {
-                                "ok": False,
-                                "code": "PHONE_ONLY_LOGIN_NOT_ENABLED",
-                                "error": "当前账号未开通手机号直接登录",
-                            },
-                            403,
-                        )
-                    user = STORE.login_onekey(
-                        sid,
-                        phone,
-                        label=str(data.get("label") or ""),
-                        request_authorized=request_authorized,
-                    )
-                else:
-                    if not password:
-                        return self.ok({"ok": False, "error": "请输入密码"}, 400)
-                    user = STORE.login_password(
-                        sid, phone, password, label=str(data.get("label") or "")
-                    )
+                if not password:
+                    return self.ok({"ok": False, "error": "请输入密码"}, 400)
+                user = STORE.login_password(
+                    sid, phone, password, label=str(data.get("label") or "")
+                )
             except ProviderUnavailable as e:
                 return self.ok(
                     {
@@ -6461,7 +6438,7 @@ def main(argv=None) -> int:
         ttl_sec=args.ttl_days * 86400,
         auto_heartbeat=bool(args.auto_heartbeat and not args.no_heartbeat),
         persist_sessions=args.persist_sessions,
-        allow_weak_onekey=args.enable_lab,
+        allow_weak_onekey=False,
     )
     try:
         httpd = ExclusiveThreadingHTTPServer((args.host, args.port), Handler)

@@ -311,7 +311,7 @@ class SessionStoreProviderIntegrationTests(unittest.TestCase):
 
         self.assertEqual(provider.created_runtime.app.client.close_calls, 1)
 
-    def test_phone_only_login_requires_an_explicit_request_grant(self) -> None:
+    def test_onekey_login_requires_explicit_internal_authorization(self) -> None:
         provider = _RecordingProvider()
         store = SessionStore(runtime_provider=provider, auto_heartbeat=False)
         self.addCleanup(store.close)
@@ -328,7 +328,7 @@ class SessionStoreProviderIntegrationTests(unittest.TestCase):
         self.assertTrue(user.app.session.logged_in)
         self.assertEqual(user.app.auth.onekey_calls, ["13800138000"])
 
-    def test_phone_only_login_cleans_up_a_failed_provisional_runtime(self) -> None:
+    def test_authorized_onekey_login_cleans_up_a_failed_provisional_runtime(self) -> None:
         provider = _RecordingProvider()
         provider.onekey_error = RuntimeError("one-key unavailable")
         store = SessionStore(runtime_provider=provider, auto_heartbeat=False)
