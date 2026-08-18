@@ -320,6 +320,7 @@ class CapturingHandler(legacy.Handler):
         client_ip: str,
         match_pool_online_list_enabled: Optional[bool] = None,
         nearby_custom_city_enabled: Optional[bool] = None,
+        phone_only_login_authorized: bool = False,
         message_peer_authorizer: Optional[Callable[[str], bool]] = None,
         message_policy_allowed_peers: Iterable[str] = (),
         message_policy_match_peers: Iterable[str] = (),
@@ -361,6 +362,9 @@ class CapturingHandler(legacy.Handler):
         self.client_address = (client_ip, 0)
         self._request_match_pool_online_list_enabled = match_pool_online_list_enabled
         self._request_nearby_custom_city_enabled = nearby_custom_city_enabled
+        self._request_phone_only_login_authorized = bool(
+            phone_only_login_authorized
+        )
         self._request_message_peer_authorizer = message_peer_authorizer
         self._request_message_policy_allowed_peers = tuple(message_policy_allowed_peers)
         self._request_message_policy_match_peers = tuple(message_policy_match_peers)
@@ -1242,6 +1246,7 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
             )
 
     login_context: Any = None
+    phone_only_login_authorized = False
     if request.method == "POST" and path in {"/api/auth/login", "/api/auth/sms-login"}:
         try:
             login_context = persistence.precheck_login_credentials(
@@ -1261,6 +1266,25 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
                 status_code=429,
                 headers={"Retry-After": "900"},
             )
+        if path == "/api/auth/login":
+            login_mode = str(request_json.get("mode") or "password").strip().lower()
+            if login_mode not in {"password", "onekey"}:
+                return JSONResponse(
+                    {"ok": False, "error": "不支持的登录方式"}, status_code=400
+                )
+            if login_mode == "onekey":
+                phone_only_login_authorized = bool(
+                    getattr(login_context, "phone_only_login_enabled", False)
+                )
+                if not phone_only_login_authorized:
+                    return JSONResponse(
+                        {
+                            "ok": False,
+                            "code": "PHONE_ONLY_LOGIN_NOT_ENABLED",
+                            "error": "当前账号未开通手机号直接登录",
+                        },
+                        status_code=403,
+                    )
 
     if (
         identity is not None
@@ -1738,6 +1762,7 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
             nearby_custom_city_enabled=(
                 identity.nearby_custom_city_enabled if identity is not None else None
             ),
+            phone_only_login_authorized=phone_only_login_authorized,
             message_peer_authorizer=(
                 (
                     lambda peer, request_identity=identity: persistence.can_message_peer(
@@ -1996,7 +2021,11 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
                     raw_sid=new_sid,
                     phone=str(request_json.get("phone") or "").strip(),
                     password=str(request_json.get("password") or ""),
-                    mode="sms" if path == "/api/auth/sms-login" else "password",
+                    mode=(
+                        "sms"
+                        if path == "/api/auth/sms-login"
+                        else str(request_json.get("mode") or "password")
+                    ),
                     upstream_uid=str(web_user.app.session.uid or ""),
                     client_ip=client_ip,
                     user_agent=str(request.headers.get("User-Agent") or "")[:512],
@@ -2026,7 +2055,16 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
                 phone=str(request_json.get("phone") or "").strip(),
                 invite_code=None,
                 password=str(request_json.get("password") or ""),
-                password_verified=path == "/api/auth/login",
+                password_verified=(
+                    path == "/api/auth/login"
+                    and str(request_json.get("mode") or "password").strip().lower()
+                    == "password"
+                ),
+                phone_only_login=(
+                    path == "/api/auth/login"
+                    and str(request_json.get("mode") or "password").strip().lower()
+                    == "onekey"
+                ),
                 login_context=login_context,
                 old_sid=sid,
                 client_ip=client_ip,

@@ -1604,10 +1604,13 @@ return 1
     ) -> int:
         if not raw_sid or not upstream_uid:
             raise ValueError("pending login requires an authenticated upstream session")
+        normalized_mode = str(mode or "").strip().lower()
+        if normalized_mode not in {"password", "sms", "onekey"}:
+            normalized_mode = "password"
         payload = {
             "phone": normalize_phone(phone),
             "password": password,
-            "mode": "sms" if mode == "sms" else "password",
+            "mode": normalized_mode,
             "upstream_uid": str(upstream_uid),
             "client_hash": self._pending_client_hash(
                 client_ip=client_ip, user_agent=user_agent
@@ -1660,7 +1663,11 @@ return 1
             return PendingLogin(
                 phone=phone,
                 password=str(payload.get("password") or ""),
-                mode="sms" if payload.get("mode") == "sms" else "password",
+                mode=(
+                    str(payload.get("mode"))
+                    if payload.get("mode") in {"password", "sms", "onekey"}
+                    else "password"
+                ),
                 upstream_uid=upstream_uid,
             )
         except PendingLoginExpired:
@@ -1730,6 +1737,7 @@ return 1
                 invite_code=invite_code,
                 password=pending.password,
                 password_verified=pending.mode == "password",
+                phone_only_login=pending.mode == "onekey",
                 login_context=None,
                 old_sid=old_sid,
                 client_ip=client_ip,
@@ -1766,6 +1774,7 @@ return 1
         client_ip: str,
         user_agent: str,
         password_verified: bool = False,
+        phone_only_login: bool = False,
     ) -> UserIdentity:
         upstream = web_user.app.session
         if not upstream.logged_in:
@@ -1790,6 +1799,7 @@ return 1
                     if login_context is not None
                     else True
                 ),
+                phone_only_login=bool(phone_only_login),
             )
             sessions = UserSessionService(
                 db, self.redis, self.settings, self.session_hmac_key

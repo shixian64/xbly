@@ -120,6 +120,9 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, SerializableMixin, Base):
     nearby_custom_city_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
+    phone_only_login_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     byok_model_runner_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )

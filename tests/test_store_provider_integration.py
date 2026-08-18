@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -65,7 +66,7 @@ class _FakeApplication:
     def __init__(self, session: _FakeSession) -> None:
         self.session = session
         self.client = _FakeClient()
-        self.auth = _FakeAuth()
+        self.auth = _FakeAuth(session)
         self.device_seeds: list[str | None] = []
         self.heartbeat_intervals: list[float] = []
         self.device_error: Exception | None = None
@@ -95,15 +96,26 @@ class _FakeClient:
 
 
 class _FakeAuth:
-    def __init__(self) -> None:
+    def __init__(self, session: _FakeSession) -> None:
+        self.session = session
         self.sms_calls: list[str] = []
         self.sms_error: Exception | None = None
+        self.onekey_calls: list[str] = []
+        self.onekey_error: Exception | None = None
 
     def send_sms(self, phone: str) -> dict[str, str]:
         self.sms_calls.append(phone)
         if self.sms_error is not None:
             raise self.sms_error
         return {"phone": phone}
+
+    def login_onekey(self, phone: str) -> object:
+        self.onekey_calls.append(phone)
+        if self.onekey_error is not None:
+            raise self.onekey_error
+        self.session.uid = "42"
+        self.session.token = "onekey-token-42"
+        return SimpleNamespace(ok=True, code="", message="", raw="")
 
 
 class _FakeNativeBundle:
@@ -119,6 +131,7 @@ class _RecordingProvider:
         self.created_runtime: ProviderRuntime | None = None
         self.loaded_runtime: ProviderRuntime | None = None
         self.sms_error: Exception | None = None
+        self.onekey_error: Exception | None = None
         self.device_error: Exception | None = None
         self.load_logged_in = True
 
@@ -136,6 +149,7 @@ class _RecordingProvider:
         self.calls.append(("create", session))
         runtime = self._runtime(_FakeSession())
         runtime.app.auth.sms_error = self.sms_error
+        runtime.app.auth.onekey_error = self.onekey_error
         runtime.app.device_error = self.device_error
         self.created_runtime = runtime
         return runtime
@@ -295,6 +309,38 @@ class SessionStoreProviderIntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "sms unavailable"):
             store.send_sms("13800138000")
 
+        self.assertEqual(provider.created_runtime.app.client.close_calls, 1)
+
+    def test_phone_only_login_requires_an_explicit_request_grant(self) -> None:
+        provider = _RecordingProvider()
+        store = SessionStore(runtime_provider=provider, auto_heartbeat=False)
+        self.addCleanup(store.close)
+
+        with self.assertRaises(PermissionError):
+            store.login_onekey(None, "13800138000")
+        self.assertEqual(provider.calls, [])
+
+        user = store.login_onekey(
+            None,
+            "13800138000",
+            request_authorized=True,
+        )
+        self.assertTrue(user.app.session.logged_in)
+        self.assertEqual(user.app.auth.onekey_calls, ["13800138000"])
+
+    def test_phone_only_login_cleans_up_a_failed_provisional_runtime(self) -> None:
+        provider = _RecordingProvider()
+        provider.onekey_error = RuntimeError("one-key unavailable")
+        store = SessionStore(runtime_provider=provider, auto_heartbeat=False)
+
+        with self.assertRaisesRegex(RuntimeError, "one-key unavailable"):
+            store.login_onekey(
+                None,
+                "13800138000",
+                request_authorized=True,
+            )
+
+        self.assertEqual(store.users, {})
         self.assertEqual(provider.created_runtime.app.client.close_calls, 1)
 
     def test_web_user_heartbeat_delegates_to_the_provider_application(self) -> None:

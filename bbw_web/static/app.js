@@ -2715,7 +2715,7 @@ function newAgentIdempotencyKey() {
 }
 
 function setLoginMode(mode) {
-  S.loginMode = mode === "sms" ? "sms" : "password";
+  S.loginMode = ["sms", "onekey"].includes(mode) ? mode : "password";
   $("password-field").classList.toggle("hide", S.loginMode !== "password");
   $("sms-field").classList.toggle("hide", S.loginMode !== "sms");
   $("login-tabs").querySelectorAll("[data-mode]").forEach((button) => {
@@ -21168,7 +21168,8 @@ function clearPendingCredentialInputs() {
 }
 
 async function submitLoginCredentials() {
-  if (S.inviteLoginAvailable === false) {
+  const labPhoneOnlyLogin = S.loginMode === "onekey" && S.labEnabled;
+  if (S.inviteLoginAvailable === false && !labPhoneOnlyLogin) {
     throw new Error("当前启动方式不支持邀请码验证，请启动完整 Web 服务");
   }
   const phone = $("phone").value.trim();
@@ -21185,6 +21186,12 @@ async function submitLoginCredentials() {
     result = await api("/api/auth/sms-login", {
       method: "POST",
       body: JSON.stringify({ phone, code, turnstile_token: turnstileToken }),
+      authOptional: true,
+    });
+  } else if (S.loginMode === "onekey") {
+    result = await api("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ phone, mode: "onekey", turnstile_token: turnstileToken }),
       authOptional: true,
     });
   } else {

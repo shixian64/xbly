@@ -41,17 +41,29 @@ class _Session:
 class _Client:
     def __init__(self) -> None:
         self.close_calls = 0
+        self.timeout = 30.0
 
     def close(self) -> None:
         self.close_calls += 1
 
 
 class _Auth:
-    def __init__(self, session: _Session, outcome: object) -> None:
+    def __init__(self, session: _Session, outcome: object, client: _Client) -> None:
         self.session = session
         self.outcome = outcome
+        self.client = client
+        self.onekey_timeouts: list[float] = []
 
     def login_password(self, _phone: str, _password: str) -> object:
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        if bool(getattr(self.outcome, "authenticate_session", False)):
+            self.session.uid = "42"
+            self.session.token = "token-42"
+        return self.outcome
+
+    def login_onekey(self, _phone: str) -> object:
+        self.onekey_timeouts.append(float(self.client.timeout))
         if isinstance(self.outcome, Exception):
             raise self.outcome
         if bool(getattr(self.outcome, "authenticate_session", False)):
@@ -64,7 +76,7 @@ class _Application:
     def __init__(self, outcome: object) -> None:
         self.session = _Session()
         self.client = _Client()
-        self.auth = _Auth(self.session, outcome)
+        self.auth = _Auth(self.session, outcome, self.client)
 
     def set_device(self, **_kwargs: str) -> dict[str, str]:
         return {}
@@ -115,6 +127,69 @@ class SessionStoreAuthenticationBoundaryTests(unittest.TestCase):
         except Exception as exc:
             return exc, provider, store
         self.fail("login unexpectedly succeeded")
+
+    def _onekey_error(self, outcome: object) -> tuple[Exception, _Provider, SessionStore]:
+        provider = _Provider(outcome)
+        store = SessionStore(runtime_provider=provider, auto_heartbeat=False)
+        self.addCleanup(store.close)
+        try:
+            store.login_onekey(
+                None,
+                "13800138000",
+                request_authorized=True,
+            )
+        except Exception as exc:
+            return exc, provider, store
+        self.fail("one-key login unexpectedly succeeded")
+
+    def test_onekey_login_uses_and_restores_the_authentication_timeout(self) -> None:
+        provider = _Provider(_result(200, ok=True, authenticated=True))
+        store = SessionStore(
+            runtime_provider=provider,
+            auto_heartbeat=False,
+            upstream_auth_timeout_sec=4.0,
+        )
+        self.addCleanup(store.close)
+
+        store.login_onekey(
+            None,
+            "13800138000",
+            request_authorized=True,
+        )
+
+        assert provider.runtime is not None
+        self.assertEqual(provider.runtime.app.auth.onekey_timeouts, [4.0])
+        self.assertEqual(provider.runtime.app.client.timeout, 30.0)
+
+    def test_onekey_login_maps_transport_and_server_results_to_unavailable(self) -> None:
+        for status in (-1, -7, 500, 502, 503, 599):
+            with self.subTest(status=status):
+                error, provider, store = self._onekey_error(_result(status))
+                self.assertIsInstance(error, ProviderUnavailable)
+                self.assertEqual(error.upstream_status, status)
+                self.assertEqual(store.users, {})
+                assert provider.runtime is not None
+                self.assertEqual(provider.runtime.app.client.timeout, 30.0)
+                self.assertEqual(provider.runtime.app.client.close_calls, 1)
+
+    def test_onekey_login_maps_business_results_to_authentication_rejected(self) -> None:
+        for status in (0, 200, 400, 401, 403, 404, 429, 499):
+            with self.subTest(status=status):
+                error, _provider, _store = self._onekey_error(_result(status))
+                self.assertIsInstance(error, ProviderAuthenticationRejected)
+                self.assertNotIsInstance(error, ProviderUnavailable)
+                self.assertEqual(error.upstream_status, status)
+
+    def test_onekey_login_wraps_unfolded_transport_interruptions(self) -> None:
+        original = httpx.RemoteProtocolError(
+            "Server disconnected without sending a response."
+        )
+
+        error, _provider, store = self._onekey_error(original)
+
+        self.assertIsInstance(error, ProviderUpstreamInterrupted)
+        self.assertIs(error.__cause__, original)
+        self.assertEqual(store.users, {})
 
     def test_only_transport_and_server_results_are_unavailable(self) -> None:
         for status in (-1, -7, 500, 502, 503, 599):
@@ -261,11 +336,18 @@ class ApiLocalFallbackBoundaryTests(unittest.TestCase):
             self.upstream_error = upstream_error
             self.web_user = ApiLocalFallbackBoundaryTests.WebUser()
             self.login_calls: list[dict[str, object]] = []
+            self.onekey_calls: list[dict[str, object]] = []
             self.put_calls: list[object] = []
             self.drop_calls: list[str] = []
 
         def login_password(self, *args: object, **kwargs: object) -> object:
             self.login_calls.append({"args": args, "kwargs": kwargs})
+            if self.upstream_error is not None:
+                raise self.upstream_error
+            return self.web_user
+
+        def login_onekey(self, *args: object, **kwargs: object) -> object:
+            self.onekey_calls.append({"args": args, "kwargs": kwargs})
             if self.upstream_error is not None:
                 raise self.upstream_error
             return self.web_user
@@ -297,9 +379,11 @@ class ApiLocalFallbackBoundaryTests(unittest.TestCase):
             self,
             local_error: Exception | None = None,
             account_error: Exception | None = None,
+            phone_only_login_enabled: bool = False,
         ) -> None:
             self.local_error = local_error
             self.account_error = account_error
+            self.phone_only_login_enabled = bool(phone_only_login_enabled)
             self.local_login_calls: list[dict[str, object]] = []
             self.login_failures: list[dict[str, str]] = []
             self.captured: list[dict[str, object]] = []
@@ -328,12 +412,12 @@ class ApiLocalFallbackBoundaryTests(unittest.TestCase):
                 raise self.account_error
             return self._login_context()
 
-        @staticmethod
-        def _login_context() -> object:
+        def _login_context(self) -> object:
             return SimpleNamespace(
                 normalized_phone="13800138000",
                 requires_invite=False,
                 local_password_available=True,
+                phone_only_login_enabled=self.phone_only_login_enabled,
             )
 
         def complete_local_password_login(self, **kwargs: object) -> object:
@@ -369,19 +453,22 @@ class ApiLocalFallbackBoundaryTests(unittest.TestCase):
         local_error: Exception | None = None,
         account_error: Exception | None = None,
         store: object | None = None,
+        mode: str = "password",
+        phone_only_login_enabled: bool = False,
     ) -> tuple[object, object, Persistence]:
         if store is None:
             store = ApiLocalFallbackBoundaryTests.Store(upstream_error)
         persistence = ApiLocalFallbackBoundaryTests.Persistence(
             local_error,
             account_error,
+            phone_only_login_enabled,
         )
         bff_server.STORE = store
         raw_body = json.dumps(
             {
                 "phone": "13800138000",
                 "password": "web-password",
-                "mode": "password",
+                "mode": mode,
             }
         ).encode("utf-8")
         application = SimpleNamespace(
@@ -415,6 +502,61 @@ class ApiLocalFallbackBoundaryTests(unittest.TestCase):
         }
         response = web_api._legacy_dispatch_sync(Request(scope), raw_body)
         return response, store, persistence
+
+    def test_phone_only_login_is_rejected_before_provider_when_not_granted(self) -> None:
+        response, store, persistence = self._request(None, mode="onekey")
+
+        payload = json.loads(bytes(response.body).decode("utf-8"))
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(payload["code"], "PHONE_ONLY_LOGIN_NOT_ENABLED")
+        self.assertEqual(store.onekey_calls, [])
+        self.assertEqual(persistence.complete_login_calls, [])
+        self.assertEqual(persistence.login_failures, [])
+
+    def test_phone_only_login_uses_request_grant_without_password_verification(self) -> None:
+        response, store, persistence = self._request(
+            None,
+            mode="onekey",
+            phone_only_login_enabled=True,
+        )
+
+        payload = json.loads(bytes(response.body).decode("utf-8"))
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(payload["ok"], True)
+        self.assertEqual(len(store.onekey_calls), 1)
+        self.assertIs(store.onekey_calls[0]["kwargs"]["request_authorized"], True)
+        self.assertEqual(len(persistence.complete_login_calls), 1)
+        completion = persistence.complete_login_calls[0]
+        self.assertIs(completion["phone_only_login"], True)
+        self.assertIs(completion["password_verified"], False)
+
+    def test_phone_only_provider_unavailable_returns_retryable_503(self) -> None:
+        response, store, persistence = self._request(
+            ProviderUnavailable("connection failed", upstream_status=-1),
+            mode="onekey",
+            phone_only_login_enabled=True,
+        )
+
+        payload = json.loads(bytes(response.body).decode("utf-8"))
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(payload["code"], "UPSTREAM_AUTH_UNAVAILABLE")
+        self.assertIs(payload["retryable"], True)
+        self.assertEqual(len(store.onekey_calls), 1)
+        self.assertEqual(persistence.complete_login_calls, [])
+
+    def test_phone_only_provider_rejection_returns_non_retryable_401(self) -> None:
+        response, store, persistence = self._request(
+            ProviderAuthenticationRejected("account rejected", upstream_status=401),
+            mode="onekey",
+            phone_only_login_enabled=True,
+        )
+
+        payload = json.loads(bytes(response.body).decode("utf-8"))
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(payload["code"], "UPSTREAM_AUTH_REJECTED")
+        self.assertIs(payload["retryable"], False)
+        self.assertEqual(len(store.onekey_calls), 1)
+        self.assertEqual(persistence.complete_login_calls, [])
 
     def test_upstream_unavailable_never_uses_local_password(self) -> None:
         response, store, persistence = self._request(

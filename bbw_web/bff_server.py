@@ -4242,7 +4242,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/auth/login":
             phone = str(data.get("phone") or "").strip()
             password = str(data.get("password") or "")
-            mode = str(data.get("mode") or "password")
+            mode = str(data.get("mode") or "password").strip().lower()
             if not phone:
                 return self.ok({"ok": False, "error": "请输入手机号"}, 400)
             if not self._allow_sensitive_action(
@@ -4251,12 +4251,29 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 if mode == "onekey":
-                    if not LAB_ENABLED:
+                    request_authorized = bool(
+                        LAB_ENABLED
+                        or getattr(
+                            self,
+                            "_request_phone_only_login_authorized",
+                            False,
+                        )
+                    )
+                    if not request_authorized:
                         return self.ok(
-                            {"ok": False, "error": "弱一键登录在产品模式下已禁用"},
+                            {
+                                "ok": False,
+                                "code": "PHONE_ONLY_LOGIN_NOT_ENABLED",
+                                "error": "当前账号未开通手机号直接登录",
+                            },
                             403,
                         )
-                    user = STORE.login_onekey(sid, phone, label=str(data.get("label") or ""))
+                    user = STORE.login_onekey(
+                        sid,
+                        phone,
+                        label=str(data.get("label") or ""),
+                        request_authorized=request_authorized,
+                    )
                 else:
                     if not password:
                         return self.ok({"ok": False, "error": "请输入密码"}, 400)

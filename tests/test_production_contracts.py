@@ -399,6 +399,7 @@ class ProductionContractTests(unittest.TestCase):
             "/users",
             "/users/{user_id}",
             "/users/{user_id}/status",
+            "/users/{user_id}/phone-only-login",
             "/users/{user_id}/media-quota",
             "/users/{user_id}/match-pool-online-list",
             "/users/{user_id}/nearby-custom-city",
@@ -450,6 +451,10 @@ class ProductionContractTests(unittest.TestCase):
         self.assertIn("在线用户列表、资料、动态和好友申请始终可用", js)
         self.assertIn("user.nearby_custom_city_changed", api)
         self.assertIn("附近的人自定义城市", js)
+        self.assertIn("ADMIN_ENDPOINTS.userPhoneOnlyLogin", js)
+        self.assertIn('id="admin-phone-only-login-dialog"', html)
+        self.assertIn("user.phone_only_login_changed", api)
+        self.assertIn("手机号直接登录", js)
 
     def test_admin_media_quota_is_account_authoritative_and_audited(self) -> None:
         admin_api = self.read("bbw_web/admin_api.py")

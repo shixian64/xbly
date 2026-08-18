@@ -27,7 +27,7 @@ python -m bbw_web --port 8765
 默认行为：
 
 - Cookie-only 会话，不把 SID 写入 `localStorage`、URL 或 JSON。
-- CORS 关闭；协议台、任意 action、浏览器会话枚举、弱一键登录关闭。
+- CORS 关闭；协议台、任意 action、浏览器会话枚举关闭。手机号直接登录默认关闭，完整生产入口仅允许管理端已逐用户授权的正常账号使用；memory-only 研究入口仍需 `--enable-lab` 才能绕过逐用户授权。
 - Web session 仅保存在内存，不落盘保存密码或原始登录响应。
 - 在线心跳跟随可见浏览器页面按需发送，不默认创建长期后台线程。
 

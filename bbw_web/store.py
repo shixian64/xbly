@@ -657,8 +657,9 @@ class SessionStore:
         *,
         label: str = "",
         start_hb: Optional[bool] = None,
+        request_authorized: bool = False,
     ) -> WebUser:
-        if not self.allow_weak_onekey:
+        if not (self.allow_weak_onekey or request_authorized):
             raise PermissionError("weak one-key login is disabled")
         user = self.get(web_sid) if web_sid else None
         created = user is None
@@ -667,13 +668,68 @@ class SessionStore:
         elif label:
             user.label = label
         with user.lock:
-            user.app.set_device(seed=phone)
-            r = user.app.auth.login_onekey(phone)
-            if not r.ok or not user.app.session.logged_in:
+            try:
+                user.app.set_device(seed=phone)
+                client = getattr(user.app, "client", None)
+                previous_timeout = getattr(client, "timeout", None)
+                timeout_changed = False
+                if previous_timeout is not None:
+                    try:
+                        client.timeout = min(
+                            float(previous_timeout),
+                            self.upstream_auth_timeout_sec,
+                        )
+                        timeout_changed = True
+                    except (TypeError, ValueError, OverflowError, AttributeError):
+                        timeout_changed = False
+                try:
+                    r = user.app.auth.login_onekey(phone)
+                finally:
+                    if timeout_changed:
+                        client.timeout = previous_timeout
+                authenticated = bool(r.ok) and bool(user.app.session.logged_in)
+            except httpx.TransportError as e:
+                try:
+                    user.app.session.password = ""
+                except Exception:
+                    pass
                 if created:
                     self.drop(user.web_sid)
-                raise RuntimeError(
-                    r.message or r.code or r.raw[:200] or "onekey login failed"
+                raise ProviderUpstreamInterrupted(
+                    str(e) or "upstream connection interrupted"
+                ) from e
+            except Exception:
+                try:
+                    user.app.session.password = ""
+                except Exception:
+                    pass
+                if created:
+                    self.drop(user.web_sid)
+                raise
+            if not authenticated:
+                user.app.session.password = ""
+                if created:
+                    self.drop(user.web_sid)
+                try:
+                    upstream_status = int(getattr(r, "status", 0) or 0)
+                except (TypeError, ValueError, OverflowError):
+                    upstream_status = 0
+                upstream_code = str(getattr(r, "code", "") or "")
+                message = str(
+                    getattr(r, "message", "")
+                    or upstream_code
+                    or str(getattr(r, "raw", "") or "")[:200]
+                    or "onekey login failed"
+                )
+                error_type = (
+                    ProviderUnavailable
+                    if upstream_status < 0 or 500 <= upstream_status < 600
+                    else ProviderAuthenticationRejected
+                )
+                raise error_type(
+                    message,
+                    upstream_status=upstream_status,
+                    upstream_code=upstream_code,
                 )
             user.app.session.password = ""
             self.rotate_sid(user)

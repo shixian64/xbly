@@ -268,6 +268,16 @@ class UserNearbyCustomCityBody(_StrictBody):
         return value.strip()
 
 
+class UserPhoneOnlyLoginBody(_StrictBody):
+    enabled: StrictBool
+    reason: str = Field(min_length=3, max_length=500)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def strip_reason(cls, value: str) -> str:
+        return value.strip()
+
+
 class UserByokModelRunnerBody(_StrictBody):
     enabled: StrictBool
     reason: str = Field(min_length=3, max_length=500)
@@ -1116,6 +1126,9 @@ def _user_public(user: User, account: ExternalAccount | None) -> dict[str, Any]:
             user.match_pool_online_list_enabled
         ),
         "nearby_custom_city_enabled": bool(user.nearby_custom_city_enabled),
+        "phone_only_login_enabled": bool(
+            getattr(user, "phone_only_login_enabled", False)
+        ),
         "byok_model_runner_enabled": bool(user.byok_model_runner_enabled),
         "byok_account_actions_enabled": bool(user.byok_account_actions_enabled),
         "byok_autonomous_agent_enabled": bool(
@@ -2851,7 +2864,11 @@ def set_user_status(
             autonomy_grant_revoked = False
             autonomy_setting_disabled = False
             cancelled_autonomy_tasks = 0
+            phone_only_login_revoked = False
             if body.status == "disabled":
+                if bool(getattr(user, "phone_only_login_enabled", False)):
+                    user.phone_only_login_enabled = False
+                    phone_only_login_revoked = True
                 revoked = UserSessionService(
                     db,
                     _persistence(request).redis,
@@ -2909,8 +2926,26 @@ def set_user_status(
                     "autonomy_grant_revoked": autonomy_grant_revoked,
                     "autonomy_setting_disabled": autonomy_setting_disabled,
                     "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+                    "phone_only_login_revoked": phone_only_login_revoked,
                 },
             )
+            if phone_only_login_revoked:
+                audit.record(
+                    actor_type="admin",
+                    action="user.phone_only_login_changed",
+                    admin_user_id=context.admin_user_id,
+                    target_user_id=user_id,
+                    resource_type="user_feature",
+                    resource_id="phone_only_login",
+                    reason=body.reason,
+                    client_ip=context.client_ip,
+                    details={
+                        "old_enabled": True,
+                        "new_enabled": False,
+                        "changed": True,
+                        "cascade_source": "user_disabled",
+                    },
+                )
             if execution_grant_revoked:
                 audit.record(
                     actor_type="admin",
@@ -2969,7 +3004,61 @@ def set_user_status(
         "autonomy_grant_revoked": autonomy_grant_revoked,
         "autonomy_setting_disabled": autonomy_setting_disabled,
         "cancelled_autonomy_tasks": cancelled_autonomy_tasks,
+        "phone_only_login_revoked": phone_only_login_revoked,
     }
+
+
+@router.post("/users/{user_id}/phone-only-login")
+def set_user_phone_only_login(
+    user_id: uuid.UUID,
+    body: UserPhoneOnlyLoginBody,
+    request: Request,
+    context: AdminContext = Depends(_admin_context),
+) -> dict[str, Any]:
+    try:
+        with session_scope() as db:
+            account = ExternalAccountRepository(db).get_for_user(
+                user_id,
+                for_update=True,
+            )
+            # 登录落库同样先锁外部账号、再锁用户，保持统一顺序避免死锁。
+            user = _require_user(db, user_id, for_update=True)
+            new_enabled = bool(body.enabled)
+            if new_enabled and (
+                account is None
+                or not str(account.upstream_uid or "").strip()
+                or user.status != "active"
+                or user.disabled_at is not None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="只有已绑定上游账号的正常用户才能开通手机号直接登录",
+                )
+            old_enabled = bool(getattr(user, "phone_only_login_enabled", False))
+            changed = old_enabled != new_enabled
+            user.phone_only_login_enabled = new_enabled
+            _audit_service(db, request).record(
+                actor_type="admin",
+                action="user.phone_only_login_changed",
+                admin_user_id=context.admin_user_id,
+                target_user_id=user_id,
+                resource_type="user_feature",
+                resource_id="phone_only_login",
+                reason=body.reason,
+                client_ip=context.client_ip,
+                details={
+                    "old_enabled": old_enabled,
+                    "new_enabled": new_enabled,
+                    "changed": changed,
+                    "authentication_method": "provider_phone_only",
+                },
+            )
+            item = _user_public(user, account)
+    except Exception as exc:
+        if isinstance(exc, ServiceError):
+            _raise_service_error(exc)
+        raise
+    return {"ok": True, "user": item, "changed": changed}
 
 
 @router.post("/users/{user_id}/match-pool-online-list")

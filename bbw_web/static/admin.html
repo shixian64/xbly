@@ -591,6 +591,23 @@
     </form>
   </dialog>
 
+  <dialog id="admin-phone-only-login-dialog" class="admin-dialog" aria-labelledby="admin-phone-only-login-title">
+    <form id="admin-phone-only-login-form" class="admin-dialog-card" method="post" action="/admin" novalidate>
+      <header>
+        <h2 id="admin-phone-only-login-title">修改手机号直接登录授权</h2>
+        <p id="admin-phone-only-login-description"></p>
+      </header>
+      <div class="admin-field">
+        <label for="admin-phone-only-login-reason">操作理由</label>
+        <textarea id="admin-phone-only-login-reason" name="reason" rows="3" minlength="3" maxlength="500" required></textarea>
+      </div>
+      <div class="admin-dialog-actions">
+        <button id="admin-phone-only-login-submit" class="admin-button admin-button-primary" type="submit">确认修改授权</button>
+        <button id="admin-phone-only-login-cancel" class="admin-button admin-button-secondary" type="button">取消</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="admin-match-pool-online-list-dialog" class="admin-dialog" aria-labelledby="admin-match-pool-online-list-title">
     <form id="admin-match-pool-online-list-form" class="admin-dialog-card" method="post" action="/admin" novalidate>
       <header>
@@ -676,6 +693,6 @@
     </form>
   </dialog>
 
-  <script src="/static/admin.js?v=98019ae8457987b4a"></script>
+  <script src="/static/admin.js?v=91d7526886fb27a6"></script>
 </body>
 </html>
