@@ -72,8 +72,12 @@ if [[ "$dependencies_ready" != true ]]; then
 fi
 
 cd "$PROJECT_DIR"
+# Docker may auto-restore a container before tailscaled has assigned the
+# published host address.  In that case the container can be healthy while its
+# port/network endpoint was never created; force reconciliation now that the
+# Tailscale address is confirmed to be available.
 if ! /usr/bin/docker compose "${COMPOSE_ARGS[@]}" \
-    up -d --no-deps --no-build app >/dev/null 2>&1; then
+    up -d --no-deps --no-build --force-recreate app >/dev/null 2>&1; then
     log "failed to start the app container"
     exit 1
 fi
