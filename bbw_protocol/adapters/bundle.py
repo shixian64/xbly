@@ -8,6 +8,7 @@ from ..app import BeibeiwuApp
 from .face import FaceAdapter
 from .im import ImAdapter
 from .tim_rest import TimRestClient
+from .jd_chat import JdChatClient
 
 if TYPE_CHECKING:
     from .roomkit import RoomKitAdapter
@@ -22,6 +23,8 @@ class NativeBundle:
         self.face = FaceAdapter(app)
         self._roomkit: RoomKitAdapter | None = None
         self.tim_rest = TimRestClient()
+        # v162 APK chat API (Bearer user token), independent from Tencent TIM.
+        self.jd_chat = JdChatClient(str(getattr(app.session, "token", "") or ""), session=app.session)
 
     @property
     def roomkit(self) -> RoomKitAdapter:
@@ -48,6 +51,7 @@ class NativeBundle:
                 "rong": "userregister.php + APP_KEY",
                 "realtime": "needs TIM/Rong Web or App SDK",
                 "rest_fallback": "openim/sendmsg via BFF when Web SDK login hangs",
+                "jd_chat": "test.banghua.xin/api/im/messages/send",
             },
             "face": {
                 "http": "InitFaceVerify0 / DescribeFaceVerify0 / SaveRPVerifyInfo",

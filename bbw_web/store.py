@@ -55,6 +55,13 @@ def close_web_runtime(app: Any, native: Any = None) -> None:
             close_tim()
         except Exception:
             pass
+    jd_chat = getattr(native, "jd_chat", None)
+    close_jd = getattr(jd_chat, "close", None)
+    if callable(close_jd):
+        try:
+            close_jd()
+        except Exception:
+            pass
 
 
 class _RequestGateLease:

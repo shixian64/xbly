@@ -4980,6 +4980,42 @@ class Handler(BaseHTTPRequestHandler):
                         409,
                     )
 
+                # APK v162 switched to the independent JD Chat OpenAPI.  Try
+                # it before the legacy Tencent TIM REST fallback (which may be
+                # suspended while the new service remains healthy).
+                jd_chat = getattr(u.native, "jd_chat", None)
+                if jd_chat is not None and callable(getattr(jd_chat, "send_text", None)):
+                    try:
+                        jd_result = jd_chat.send_text(from_uid, to_uid, text)
+                    except Exception as exc:
+                        jd_result = None
+                    if jd_result is not None and getattr(jd_result, "ok", False):
+                        payload = jd_result.to_dict()
+                        body = payload.get("data")
+                        if isinstance(body, dict):
+                            msg_key = str(body.get("messageId") or body.get("message_id") or "").strip()
+                            if msg_key:
+                                payload["msg_key"] = msg_key
+                                payload["message_id"] = msg_key
+                        payload.update({"from": from_uid, "to": to_uid, "message": "已发送"})
+                        try:
+                            payload["history_mirror"] = R(
+                                app.im.history_message_insert(
+                                    from_id=from_uid,
+                                    to_id=to_uid,
+                                    content=text,
+                                    type="text",
+                                )
+                            )
+                        except Exception:
+                            pass
+                        conversation_peers = getattr(u, "conversation_message_peers", None)
+                        if conversation_peers is None:
+                            conversation_peers = set()
+                            setattr(u, "conversation_message_peers", conversation_peers)
+                        conversation_peers.add(to_uid)
+                        return self.ok(payload, 200)
+
                 quote_cloud_data = encode_message_quote(quote)
                 send_options = (
                     {"cloud_custom_data": quote_cloud_data}
@@ -4991,6 +5027,7 @@ class Handler(BaseHTTPRequestHandler):
                     to_uid,
                     text,
                     **send_options,
+                    idempotency_key=client_message_id,
                 )
                 # Best-effort: also mirror into banghua history if action exists.
                 hist = None

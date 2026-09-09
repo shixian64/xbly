@@ -28,6 +28,8 @@ __all__ = [
     "FaceSession",
     "RoomKitAdapter",
     "RoomKitCredentials",
+    "JdChatClient",
+    "JdChatResult",
 ]
 
 _EXPORT_MODULES = {
@@ -39,6 +41,8 @@ _EXPORT_MODULES = {
     "TimCredentials": ".im",
     "RoomKitAdapter": ".roomkit",
     "RoomKitCredentials": ".roomkit",
+    "JdChatClient": ".jd_chat",
+    "JdChatResult": ".jd_chat",
 }
 
 
