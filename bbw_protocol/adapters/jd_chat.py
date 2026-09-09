@@ -55,7 +55,7 @@ class JdChatClient:
         self._http.close()
 
     def _request(self, method: str, path: str, *, json_body: Any = None, params: Any = None) -> JdChatResult:
-        token = str(getattr(self.session, "token", "") or self.token).strip()
+        token = self._access_token()
         if not token:
             return JdChatResult(False, error_info="当前会话缺少聊天 token")
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
@@ -108,7 +108,7 @@ class JdChatClient:
 
     def send_text_ws(self, sender_id: str, receiver_id: str, content: str, *, device_id: str = "") -> JdChatResult:
         """Send through the same WebSocket path used by APK v162."""
-        token = str(getattr(self.session, "token", "") or self.token).strip()
+        token = self._access_token()
         try:
             sender, receiver = int(str(sender_id)), int(str(receiver_id))
         except (TypeError, ValueError):
@@ -199,6 +199,16 @@ class JdChatClient:
         except (TypeError, ValueError):
             return JdChatResult(False, error_info="聊天用户 ID 必须是数字")
         return self._request("GET", "/api/messages/history", params=params)
+
+    def _access_token(self) -> str:
+        session = self.session
+        raw = getattr(session, "raw_user", {}) if session is not None else {}
+        if isinstance(raw, dict):
+            for key in ("accessToken", "access_token", "user_token", "userToken"):
+                value = str(raw.get(key) or "").strip()
+                if value:
+                    return value
+        return str(getattr(session, "token", "") or self.token).strip()
 
 
 __all__ = ["JD_CHAT_BASE", "JdChatClient", "JdChatResult"]
