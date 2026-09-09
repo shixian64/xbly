@@ -106,7 +106,7 @@ class JdChatClient:
             json_body={"senderId": sender, "receiverId": receiver, "content": text},
         )
 
-    def send_text_ws(self, sender_id: str, receiver_id: str, content: str, *, device_id: str = "web") -> JdChatResult:
+    def send_text_ws(self, sender_id: str, receiver_id: str, content: str, *, device_id: str = "") -> JdChatResult:
         """Send through the same WebSocket path used by APK v162."""
         token = str(getattr(self.session, "token", "") or self.token).strip()
         try:
