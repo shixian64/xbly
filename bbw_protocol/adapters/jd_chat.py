@@ -96,8 +96,12 @@ class JdChatClient:
             json_body={"senderId": sender, "receiverId": receiver, "content": text},
         )
 
-    def history(self, *, peer_id: Optional[str] = None, limit: int = 50) -> JdChatResult:
-        params = {"userId": peer_id, "limit": limit} if peer_id else {"limit": limit}
+    def history(self, *, user_id: str, peer_id: str, limit: int = 50) -> JdChatResult:
+        """Fetch a C2C history page (the API requires both userId/partnerId)."""
+        try:
+            params = {"userId": int(str(user_id)), "partnerId": int(str(peer_id)), "limit": int(limit)}
+        except (TypeError, ValueError):
+            return JdChatResult(False, error_info="聊天用户 ID 必须是数字")
         return self._request("GET", "/api/messages/history", params=params)
 
 

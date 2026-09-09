@@ -1964,6 +1964,44 @@ def _tim_message_sort_key(item: Mapping[str, Any]) -> Tuple[float, int, str]:
     )
 
 
+def _jd_message_envelope(result: Any, account_uid: str, peer_uid: str) -> Dict[str, Any]:
+    """Normalize v162 JD Chat history rows to the Web message envelope."""
+    payload = getattr(result, "data", None)
+    if isinstance(payload, Mapping):
+        rows = payload.get("data", payload.get("items", payload.get("list", [])))
+    else:
+        rows = payload
+    if isinstance(rows, Mapping):
+        rows = rows.get("items", rows.get("list", []))
+    rows = rows if isinstance(rows, list) else []
+    items: List[Dict[str, Any]] = []
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            continue
+        sender = str(raw.get("fromUserId") or raw.get("senderId") or "")
+        receiver = str(raw.get("toUserId") or raw.get("receiverId") or "")
+        if sender not in {account_uid, peer_uid} and receiver not in {account_uid, peer_uid}:
+            continue
+        mid = str(raw.get("messageId") or raw.get("id") or "").strip()
+        if not mid:
+            continue
+        items.append({
+            "id": mid, "msg_key": mid, "message_id": mid,
+            "from": sender, "to": receiver,
+            "from_account": sender, "to_account": receiver,
+            "text": str(raw.get("content") or raw.get("text") or ""),
+            "timestamp": raw.get("timestamp") or raw.get("createdAt") or 0,
+            "type": "mine" if sender == account_uid else "other",
+            "direction": "out" if sender == account_uid else "in",
+            "source": "jd_chat", "provider": "jd-chat",
+            "object_name": "TIMTextElem", "message_type": "text",
+        })
+    items.sort(key=lambda x: _tim_epoch_sort_value(x.get("timestamp")))
+    return {"ok": True, "items": items, "list": items, "count": len(items),
+            "entity": "message", "status": 200, "source": "jd_chat",
+            "has_more": False, "next_before": ""}
+
+
 def _tim_roaming_message_envelope(
     client: Any,
     account_uid: str,
@@ -4086,6 +4124,14 @@ class Handler(BaseHTTPRequestHandler):
             breakers = getattr(self, "_request_dependency_breakers", None)
             request_id = str(getattr(self, "_request_id", "") or "")
             try:
+                jd_chat = getattr(u.native, "jd_chat", None)
+                if jd_chat is not None and callable(getattr(jd_chat, "history", None)):
+                    jd_result = jd_chat.history(
+                        user_id=str(app.session.uid or ""), peer_id=str(peer),
+                        limit=200 if not summary_only else 50,
+                    )
+                    if getattr(jd_result, "ok", False):
+                        return self.ok(_jd_message_envelope(jd_result, str(app.session.uid or ""), str(peer)))
                 payload = _tim_roaming_message_envelope(
                     u.native.tim_rest,
                     str(app.session.uid or ""),
@@ -5059,7 +5105,7 @@ class Handler(BaseHTTPRequestHandler):
                 if hist is not None:
                     out["history_mirror"] = hist
                 if r.ok:
-                    out["message"] = "已通过文本备用通道发送"
+                    out["message"] = "已发送"
                     conversation_peers = getattr(u, "conversation_message_peers", None)
                     if conversation_peers is None:
                         conversation_peers = set()

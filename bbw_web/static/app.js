@@ -637,7 +637,10 @@ const esc = (value) =>
 const UI_TERM_REPLACEMENTS = [
   [/\bTIM SDK\b/gi, "实时消息组件"],
   [/\bTIM\b/g, "实时消息"],
-  [/\bREST\b/g, "文本备用通道"],
+  // Provider names are implementation details; keep them out of user-facing
+  // status/error text so compatibility transports are not presented as a
+  // separate message channel.
+  [/\bREST\b/g, "消息服务"],
   [/\bBFF\b/g, "网页服务"],
   [/\bRoomKit\b/gi, "房间服务"],
   [/\bUserSig\b/gi, "登录签名"],
@@ -1004,7 +1007,7 @@ function ensureTimUploadPluginLoaded() {
 function imConnectionStatusText() {
   if (S.imConnecting) return "正在连接消息服务…";
   if (S.imConnected && S.imMode === "sdk") return "实时消息已连接";
-  if (S.imConnected && S.imMode === "rest") return "文本备用通道（会话约每 8 秒同步）";
+  if (S.imConnected && S.imMode === "rest") return "消息服务已连接";
   return localizedUiText(S.imLastError || "消息服务尚未连接");
 }
 
@@ -13017,7 +13020,7 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
       });
       const response = data && typeof data === "object" ? data : {};
       if (!ok || response.ok === false) {
-        const info = errorInfo(response, wasDisconnected ? "发送失败" : "文本备用通道发送失败");
+        const info = errorInfo(response, "发送失败");
         throw new Error([info.title, info.detail || response.error_info].filter(Boolean).join(" · "));
       }
       if (wasDisconnected) {
@@ -13026,7 +13029,6 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
         S.imLastError = "";
         S.messageLastPeerSyncAt = 0;
         updateImConnectionStatus();
-        toast("已通过文本备用通道发送");
       }
       sentEntry = {
         id: String(response.message_id || response.msg_uid || pendingID),
@@ -19337,7 +19339,6 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
       // Degraded mode: keep HTTP conversation history usable without realtime TIM.
       // Enables send without browser TIM.login; receive still via history refresh.
       try {
-        addImMessage("实时消息连接失败，尝试启用文本备用通道…", "system");
         const { data: h } = await api("/api/im/rest/health", { timeout: 12000 });
         if (!policyIsCurrent()) return false;
         if (h && (h.ok === true || Number(h.error_code) === 0)) {
@@ -19345,21 +19346,18 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
           S.imMode = "rest";
           S.imLastError = "";
           S.messageLastPeerSyncAt = 0;
-          addImMessage(
-            "已启用 REST 发送通道（BFF → 腾讯 openim/sendmsg），新消息将自动同步。",
-            "system"
-          );
-          notifyConnection("已启用文本备用通道", "info", 4200);
+          // Keep the compatibility transport invisible to the user.  The
+          // connection indicator remains a provider-neutral status.
+          updateImConnectionStatus();
           return true;
         }
-        addImMessage(`REST 健康检查未通过：${(h && (h.error_info || h.error_code)) || "unknown"}`, "system");
       } catch (restErr) {
-        addImMessage(`REST 回退失败：${restErr?.message || restErr}`, "system");
+        // Diagnostics are intentionally kept in the console only; showing a
+        // fallback-channel notice confuses users about message delivery.
+        console.debug("message service health check failed", restErr);
       }
 
-      S.imLastError =
-        localizedUiText(lastErr || "实时消息登录失败") +
-        " · 文本备用通道也未成功。历史会话仍可用。";
+      S.imLastError = localizedUiText(lastErr || "实时消息暂不可用");
       addImMessage(S.imLastError, "system");
       notifyConnection("实时消息暂不可用，历史会话仍可用", "error", 5200);
       return false;
