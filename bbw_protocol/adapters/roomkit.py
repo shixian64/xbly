@@ -15,6 +15,7 @@ from urllib import error, parse, request
 
 from ..app import BeibeiwuApp
 from ..client import ApiResult
+from .. import sign
 from ..secrets import read_protocol_secret
 
 ROOMKIT_BASE_URL = "https://redis.banghua.xin:8080/"
@@ -131,7 +132,7 @@ class RoomKitAdapter:
             "platform": "mobile",
             "platformType": "android",
             "channel": ROOMKIT_CHANNEL,
-            "version": str(getattr(session, "version_code", "") or "154"),
+            "version": str(getattr(session, "version_code", "") or sign.VERSION_CODE),
         }
 
     @staticmethod
@@ -205,7 +206,7 @@ class RoomKitAdapter:
             "BusinessToken": ROOMKIT_BUSINESS_TOKEN,
             "User-Agent": str(
                 getattr(self.app.session, "user_agent", "")
-                or "okhttp/4.9.3 beibeiwu/154"
+                or f"okhttp/4.9.3 beibeiwu/{sign.VERSION_CODE}"
             ),
         }
         if body is not None:

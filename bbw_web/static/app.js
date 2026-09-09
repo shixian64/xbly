@@ -9086,6 +9086,76 @@ function chatLogHtml() {
   return `${chatHistoryStatusHtml(hiddenCount)}${visibleEntries.map(chatMessageRowHtml).join("")}`;
 }
 
+/* APK 162 parity: export the currently loaded conversation as CSV. */
+async function exportActiveChatRecord() {
+  const peer = String(S.activePeer || "").trim();
+  if (!peer) throw new Error("请先选择聊天");
+  // Prefer the APK 162 server export so records beyond the rendered window
+  // are included; retain the local exporter as an offline/provider fallback.
+  const exportController = new AbortController();
+  const exportTimeout = setTimeout(() => exportController.abort(), 15000);
+  try {
+    const response = await fetch("/api/im/export", {
+      method: "POST",
+      credentials: "include",
+      headers: { Accept: "text/csv, application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({ peer }),
+      signal: exportController.signal,
+    });
+    if (response.status === 401 || response.status === 403) {
+      const denied = new Error("当前无权导出聊天记录");
+      denied.permission = true;
+      throw denied;
+    }
+    const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+    if (response.ok && contentType.includes("text/csv")) {
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `chat_export_${peer.replace(/[^a-zA-Z0-9._-]/g, "_")}_${Date.now()}.csv`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+      toast("已导出聊天记录（最多100条）");
+      return;
+    }
+  } catch (error) {
+    // Fall through to the locally cached transcript below.
+    if (error?.permission) throw error;
+  } finally {
+    clearTimeout(exportTimeout);
+  }
+  const entries = peerChatMessageEntries(peer);
+  if (!entries.length) throw new Error("当前聊天没有可导出的消息");
+  const csvCell = (value) => {
+    const text = String(value ?? "").replace(/\r?\n/g, "\\n");
+    return `"${text.replace(/"/g, '""')}"`;
+  };
+  const rows = [
+    ["时间", "发送者", "消息类型", "内容"],
+    ...entries.map((entry) => [
+      chatMessageTimeInfo(entry.timestamp || entry.sentTime)?.datetime || "",
+      entry.sender_name || entry.senderName || entry.sender_uid || entry.senderUid ||
+        (entry.type === "mine" ? String(S.user?.uid || S.user?.id || "我") : peer),
+      entry.kind || entry.type || "text",
+      entry.text || entry.content || entry.message || "",
+    ]),
+  ];
+  const csv = "\ufeff" + rows.map((row) => row.map(csvCell).join(",")).join("\r\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `chat-${peer}-${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+  toast(`已导出 ${entries.length} 条聊天记录`);
+}
+
 function chatMediaNodeIdentity(image) {
   if (!image) return "";
   const row = image.closest?.(".chat-message-row");
@@ -11966,7 +12036,7 @@ function chatPaneHtml() {
     { ...(conversation.user || {}), ...conversation },
     "presence-compact",
     true
-  )}</p></div><div class="chat-head-actions"><button type="button" class="utility-btn" data-action="open-conversation-message-search">查找聊天记录</button><button type="button" class="utility-btn chat-profile" data-action="open-profile" data-uid="${esc(
+  )}</p></div><div class="chat-head-actions"><button type="button" class="utility-btn" data-action="open-conversation-message-search">查找聊天记录</button><button type="button" class="utility-btn" data-action="export-chat-record">导出聊天记录</button><button type="button" class="utility-btn chat-profile" data-action="open-profile" data-uid="${esc(
     S.activePeer
   )}">资料</button></div></div>
     <div class="chat-log ui-scrollbar" id="im-log" aria-live="polite">${chatLogHtml()}</div>
@@ -19943,6 +20013,10 @@ async function handleAction(action, button) {
   if (action === "retry-chat-message") {
     await retryFailedChatMessage(button.dataset.messageId);
     toast("已重新发送");
+    return;
+  }
+  if (action === "export-chat-record") {
+    await exportActiveChatRecord();
     return;
   }
   if (action === "pick-chat-file") {

@@ -17,7 +17,7 @@
 | ✅ APK RoomKit 房间列表 | `adapters.roomkit` 独立登录并读取 `/mic/room/list`；Authorization 与主协议会话隔离 |
 | ⚠️ 阿里云刷脸 | `adapters.face` 编排 Init/Describe；活体 metaInfo 仍靠 ZIM |
 
-完整 action 目录：`../docs/api_catalog.json`（v154 活跃 **398**；历史并集 **405**，含 7 个已下线小说 action）。
+完整 action 目录：`../docs/api_catalog.json`（v162 活跃 **399**；历史并集 **406**，含 7 个已下线小说 action）。
 
 原生边车：`adapters/` + Web BFF：`../bbw_web/`。
 

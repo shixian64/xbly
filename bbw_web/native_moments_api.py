@@ -17,7 +17,7 @@ from fastapi import APIRouter, Body, HTTPException, Request
 from sqlalchemy import select
 
 from bbw_prod.db import session_scope
-from bbw_prod.models import SocialReaction, User, UserDiscoveryProfile
+from bbw_prod.models import SocialReaction, SocialReport, User, UserDiscoveryProfile
 from bbw_prod.repositories import OperationOutboxRepository
 from bbw_web.legacy_media_reference import (
     projected_profile_avatar,
@@ -1232,14 +1232,21 @@ def post_pin(
 
 
 @router.post("/api/social/report")
+@router.post("/api/report")
 def report(
     request: Request, body: dict[str, Any] = Body(...)
 ) -> dict[str, Any]:
     identity = _write_context(request, "report")
-    raw_type = str(body.get("target_type") or body.get("type") or "post").strip().lower()
+    raw_type = str(
+        body.get("target_type")
+        or body.get("targetType")
+        or body.get("type")
+        or "post"
+    ).strip().lower()
     target_type = "comment" if raw_type in {"comment", "评论"} else "post"
     target_id = str(
         body.get("target_id")
+        or body.get("targetId")
         or body.get("itemid")
         or body.get("post_id")
         or body.get("comment_id")
@@ -1253,8 +1260,17 @@ def report(
                 target_type=target_type,
                 target_public_id=target_id,
                 idempotency_key=_request_key(request, body, "report"),
-                reason_code=body.get("reason_code") or raw_type or "other",
-                reason_text=body.get("reason") or body.get("reason_text") or "",
+                reason_code=(
+                    body.get("reason_code")
+                    or body.get("reason")
+                    or raw_type
+                    or "other"
+                ),
+                reason_text=(
+                    body.get("description")
+                    or body.get("reason_text")
+                    or ""
+                ),
             )
             mirror_status = _enqueue_mirror(
                 db, principal=principal, intent=result.mirror
@@ -1271,3 +1287,91 @@ def report(
             )
     except SocialContentError as exc:
         raise _social_error(exc) from exc
+
+
+@router.get("/api/report/my")
+def my_reports(request: Request, page: int = 1, size: int = 20) -> dict[str, Any]:
+    """Return reports submitted by the current user (APK v162 moderation API).
+
+    The Android moderation module uses a dedicated ``/api/report/my`` resource,
+    while the web client historically only exposed ``/api/social/report`` for
+    creating a report.  Read directly from the canonical table and expose a
+    compact, stable projection suitable for the native ``ReportItem`` model.
+    """
+    identity = _identity(request)
+    page = max(1, min(int(page or 1), 10000))
+    size = max(1, min(int(size or 20), 100))
+    with session_scope() as db:
+        rows = list(
+            db.scalars(
+                select(SocialReport)
+                .where(SocialReport.reporter_user_id == identity.user_id)
+                .order_by(SocialReport.created_at.desc())
+                .offset((page - 1) * size)
+                .limit(size)
+            )
+        )
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            target_type = "post" if row.post_id is not None else "comment"
+            items.append(
+                {
+                    "id": row.public_id,
+                    "reportId": row.public_id,
+                    "targetType": target_type,
+                    "targetId": str(
+                        (row.extra_data or {}).get("target_public_id")
+                        or row.post_id
+                        or row.comment_id
+                    ),
+                    "reasonCode": row.reason_code,
+                    "reasonText": row.reason_text or "",
+                    "status": row.status,
+                    "createdAt": row.created_at.isoformat() if row.created_at else None,
+                    "updatedAt": row.updated_at.isoformat() if row.updated_at else None,
+                    "resolution": row.resolution,
+                }
+            )
+    return {"ok": True, "data": items, "items": items, "page": page, "size": size}
+
+
+@router.get("/api/report/{report_id}")
+def report_detail(request: Request, report_id: str) -> dict[str, Any]:
+    """Fetch one of the caller's reports by its public id (APK v162)."""
+    identity = _identity(request)
+    with session_scope() as db:
+        row = db.scalar(
+            select(SocialReport).where(
+                SocialReport.public_id == str(report_id),
+                SocialReport.reporter_user_id == identity.user_id,
+            )
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="举报记录不存在")
+        target_type = "post" if row.post_id is not None else "comment"
+        item = {
+            "id": row.public_id,
+            "reportId": row.public_id,
+            "targetType": target_type,
+            "targetId": str(
+                (row.extra_data or {}).get("target_public_id")
+                or row.post_id
+                or row.comment_id
+            ),
+            "reasonCode": row.reason_code,
+            "reasonText": row.reason_text or "",
+            "status": row.status,
+            "createdAt": row.created_at.isoformat() if row.created_at else None,
+            "updatedAt": row.updated_at.isoformat() if row.updated_at else None,
+            "resolution": row.resolution,
+        }
+    return {"ok": True, "data": item}
+
+
+# Only the moderation routes are mounted by the production FastAPI app.  The
+# broader native moments router remains opt-in because legacy BFF routes are
+# still authoritative for product traffic.
+moderation_router = APIRouter(tags=["moderation"])
+moderation_router.add_api_route("/api/report", report, methods=["POST"])
+moderation_router.add_api_route("/api/report/my", my_reports, methods=["GET"])
+moderation_router.add_api_route("/api/report/{report_id}", report_detail, methods=["GET"])

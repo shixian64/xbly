@@ -2,7 +2,7 @@
 
 **最后更新：** 2026-07-15  
 **包路径：** `bbw_protocol/`  
-**Action 目录：** `docs/api_catalog.json`（v154 活跃 **398**；历史并集 **405**）
+**Action 目录：** `docs/api_catalog.json`（v162 活跃 **398**；历史并集 **405**）
 
 ---
 
@@ -10,7 +10,7 @@
 
 | 目标 | 状态 |
 |---|---|
-| 枚举客户端 HTTP 功能面 | ✅ v154 活跃 398 actions / 328 full URLs；catalog 另保留 7 个 v148 下线 action |
+| 枚举客户端 HTTP 功能面 | ✅ v162 活跃 398 actions / 328 full URLs；catalog 另保留 7 个 v148 下线 action |
 | 统一签名与会话 | ✅ `sign.py` + `session.json` |
 | 语义化业务 API | ✅ auth/social/profile/content/economy/room/match/im/misc |
 | **action 名称面与调用器** | ✅ 默认 `app.call`；另有 `call_i888` / Redis / URL / multipart |
@@ -174,7 +174,7 @@ python -m bbw_protocol.cli call <ActionName> k=v k2=v2
 | withdraw | 403 未实名（门禁正常） |
 | room create | no（条件不足） |
 | local UserSig | ✅ |
-| catalog size | 405（其中 v154 活跃 398） |
+| catalog size | 405（其中 v162 活跃 398） |
 
 ---
 
@@ -211,4 +211,4 @@ python -m bbw_protocol.cli call <ActionName> k=v k2=v2
 - 本文：`10_PROTOCOL_CLIENT.md`  
 - 目录：`api_catalog.json`  
 - 会话：`session.json`（登录后生成）  
-- 测试日志 / Findings / 总索引已更新  
+- 测试日志 / Findings / 总索引已更新

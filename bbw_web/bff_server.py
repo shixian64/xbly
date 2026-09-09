@@ -5512,16 +5512,98 @@ class Handler(BaseHTTPRequestHandler):
                         empty_ok=True,
                     )
                 )
-            if path == "/api/social/report":
+            if path in {"/api/social/report", "/api/report"}:
                 return self.ok(
                     R(
                         app.social.report(
-                            str(data.get("type") or "user"),
-                            str(data.get("itemid") or ""),
-                            str(data.get("reason") or "web report"),
+                            str(data.get("type") or data.get("target_type") or data.get("targetType") or "user"),
+                            str(data.get("itemid") or data.get("targetId") or data.get("target_id") or ""),
+                            str(data.get("reason") or data.get("reason_text") or "web report"),
                         )
                     )
                 )
+
+            # APK 162 exposes ExportChatRecord for exporting one C2C
+            # conversation.  Keep this as a deliberately narrow semantic
+            # wrapper rather than forwarding arbitrary protocol parameters:
+            # the browser may select a peer and optional paging/time filters,
+            # while identity fields are always bound to the current session.
+            if path == "/api/im/export":
+                peer = str(
+                    data.get("peer")
+                    or data.get("uid")
+                    or data.get("yourid")
+                    or data.get("targetId")
+                    or ""
+                ).strip()
+                if not peer or len(peer) > 128 or any(ord(ch) < 33 for ch in peer):
+                    return self.ok({"ok": False, "error": "缺少有效的对方 UID"}, 400)
+                if not Handler.can_view_message_peer(self, u, peer):
+                    return self.ok({"ok": False, "error": "当前无权查看该会话"}, 403)
+                # These names cover the v162 client request while keeping
+                # unknown fields out of the upstream call.  Values are capped
+                # to prevent oversized export/filter payloads.
+                export_params: dict[str, str] = {
+                    "to_account": peer,
+                    "page": "1",
+                    "page_size": "100",
+                    "export": "1",
+                }
+                for key in (
+                    "page", "page_size", "export",
+                ):
+                    value = data.get(key)
+                    if value is None:
+                        continue
+                    text = str(value).strip()
+                    if text and len(text) <= 128 and not any(ord(ch) < 32 for ch in text):
+                        export_params[key] = text
+                try:
+                    export_params["page"] = str(max(1, min(int(export_params["page"]), 10000)))
+                    export_params["page_size"] = str(max(1, min(int(export_params["page_size"]), 500)))
+                    export_params["export"] = "1" if str(export_params["export"]).lower() in {"1", "true", "yes"} else "0"
+                except (TypeError, ValueError):
+                    return self.ok({"ok": False, "error": "分页参数无效"}, 400)
+                try:
+                    result = app.im.export_chat_record(**export_params)
+                except Exception as exc:
+                    return self.ok(
+                        {"ok": False, "error": _safe_error(exc, "聊天记录导出失败")},
+                        502,
+                    )
+                # ExportChatRecord returns a UTF-8 CSV body (often prefixed
+                # with BOM), not the usual JSON envelope.  Preserve it as a
+                # downloadable response so browsers can save the transcript.
+                raw_export = str(getattr(result, "raw", "") or "")
+                content_type = str(
+                    (getattr(result, "headers", {}) or {}).get("content-type", "")
+                ).lower()
+                if getattr(result, "ok", False) and raw_export and (
+                    "csv" in content_type
+                    or str(getattr(result, "kind", "")) == "text"
+                    or raw_export.lstrip("\ufeff").startswith(("时间,", '"时间"'))
+                ):
+                    filename_peer = "".join(
+                        ch if (ch in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") else "_"
+                        for ch in peer
+                    )
+                    filename = f"chat_export_{filename_peer}_{int(time.time() * 1000)}.csv"
+                    body_bytes = raw_export.encode("utf-8")
+                    self._send(
+                        200,
+                        body_bytes,
+                        "text/csv; charset=utf-8",
+                        extra_headers={
+                            "Content-Disposition": f'attachment; filename="{filename}"'
+                        },
+                    )
+                    return
+                payload = R(result)
+                if isinstance(payload, Mapping):
+                    payload = dict(payload)
+                    payload.setdefault("peer", peer)
+                    payload.setdefault("format", "csv")
+                return self.ok(payload)
 
             # profile
             if path == "/api/profile/nick":

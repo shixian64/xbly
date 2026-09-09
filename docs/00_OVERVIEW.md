@@ -10,9 +10,9 @@
 
 | 项 | 值 |
 |---|---|
-| APK | `xbly.apk`（当前 v154）/ `beibeiwu.apk`（v148 基线） |
+| APK | `xbly.apk`（当前 v162）/ `beibeiwu.apk`（v148 基线） |
 | 包名 | `xin.banghua.beiyuan0` |
-| versionCode | **154**（旧 148） |
+| versionCode | **162**（旧 148） |
 | Application | v154 直接 `App`；v148 基线曾使用 Sophix 壳 |
 | 后端 | 微擎 `do=` + `m=socialchat` |
 | 主域名 | `applet.banghua.xin` / `redis.banghua.xin` / `oss.banghua.xin` |
@@ -43,7 +43,7 @@ xbly/  (repo root)
 | 游客能力矩阵 | ✅ |
 | 协议客户端 `bbw_protocol` | ✅ |
 | 原生 adapters + 多用户 `bbw_web` | ✅ |
-| 跟版 v154 | ✅ |
+| 跟版 v162 | ✅ |
 | 用户自行实名后改昵称 | ⏳ |
 | 支付/越权深测 | ⏳ |
 
@@ -55,4 +55,4 @@ xbly/  (repo root)
 
 1. 文档为 CTF / 安全研究记录。  
 2. 实名由用户本人在官方客户端完成，不伪造刷脸/支付。  
-3. 协议核与 Web 分模块；Web 不反向污染核。  
+3. 协议核与 Web 分模块；Web 不反向污染核。

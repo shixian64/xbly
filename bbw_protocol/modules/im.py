@@ -112,7 +112,7 @@ class ImAPI:
         peer = str(peer_id or "").strip()
         if not peer:
             raise ValueError("peer_id is required")
-        # APK v154 uses the i=888 Message_detail URL with yourid in the query
+        # APK v162 uses the i=888 Message_detail URL with yourid in the query
         # string and without the usual a=webapp parameter.
         url = (
             f"{APPLET}?i=888&c=entry&do=Message_detail&m=socialchat"
@@ -124,6 +124,33 @@ class ImAPI:
         if deadline is not None:
             call_options["deadline"] = deadline
         return self.c.request(url, method="GET", **call_options)
+
+    def export_chat_record(
+        self,
+        to_account: str = "",
+        *,
+        page: int = 1,
+        page_size: int = 100,
+        export: int = 1,
+        **params: Any,
+    ) -> ApiResult:
+        """Export a chat transcript (APK 162).
+
+        Version 162 adds the ``ExportChatRecord`` webapp action.  The mobile
+        client posts ``to_account``, ``page=1``, ``page_size=100`` and
+        ``export=1`` as a form body.  The response is UTF-8 BOM CSV.  Extra
+        fields are retained for forward compatibility and signed normally.
+        """
+        body = {
+            "to_account": str(to_account or "").strip(),
+            "page": page,
+            "page_size": page_size,
+            "export": export,
+            **params,
+        }
+        if not body["to_account"]:
+            raise ValueError("to_account is required")
+        return self.c.call("ExportChatRecord", body)
 
     def raw(self, action: str, **params: Any) -> ApiResult:
         return self.c.call(action, params)

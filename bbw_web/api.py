@@ -2843,6 +2843,7 @@ from bbw_web.admin_api import router as admin_router  # noqa: E402
 from bbw_agent.api import router as agent_router  # noqa: E402
 from bbw_web.archive_api import router as archive_router  # noqa: E402
 from bbw_web.media_api import router as media_router  # noqa: E402
+from bbw_web.native_moments_api import moderation_router  # noqa: E402
 from bbw_web.native_media_api import router as native_media_router  # noqa: E402
 from bbw_web.moment_media_api import (  # noqa: E402
     MomentVideoServiceError,
@@ -2888,6 +2889,7 @@ app.include_router(admin_router)
 app.include_router(agent_router)
 app.include_router(archive_router)
 app.include_router(media_router)
+app.include_router(moderation_router)
 app.include_router(native_media_router)
 app.include_router(moment_media_router)
 

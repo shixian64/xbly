@@ -52,7 +52,7 @@ Body:
   uniquelogintoken   # sha1("xiaobei"+uid) 或未登录时用 0
   phonebrand
   pushregid
-  version_code       # 154（xbly.apk；旧客户端 148 服务端仍可能接受）
+  version_code       # 162（xbly.apk；旧客户端 148 服务端仍可能接受）
 ```
 
 成功：`code=200`，`json` 内嵌用户对象字符串（需再 `json.loads`），含 `token`、`userSign` 等。

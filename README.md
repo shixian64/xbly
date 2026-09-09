@@ -5,7 +5,7 @@
 | | |
 |---|---|
 | 包名 | `xin.banghua.beiyuan0` |
-| 客户端版本 | **154**（`xbly.apk`）· 基线 148（`beibeiwu.apk`） |
+| 客户端版本 | **162**（`xbly.apk`）· 基线 148（`beibeiwu.apk`） |
 | 后端 | 微擎 `do=` · `applet.banghua.xin` / `redis.banghua.xin` |
 | 依赖 | 协议核为 Python 3 标准库；生产 Web 依赖 FastAPI、PostgreSQL、Redis、R2 等 |
 
@@ -19,11 +19,12 @@
 |---|---|---|
 | 签名与会话（SIGN / EXPIRE / AUTHOR） | ✅ 可本地复现 | `bbw_protocol.sign` |
 | 登录 / 短信 / 改密 / 一键登录 | ✅ | `cli login` · `auth` |
-| v154 action catalog（历史分析保留） | ✅ 非商业 action 可调用 | `app.call*` · `call_url` · multipart；商业 action 统一停用 |
+| v162 action catalog（历史分析保留） | ✅ 非商业 action 可调用 | `app.call*` · `call_url` · multipart；商业 action 统一停用 |
 | 匹配 / 任务 / 资料 / 社交 / 房间 | ✅ HTTP | 各 `modules/*` |
 | IM 凭证（腾讯 UserSig / 融云） | ✅ 凭证 | `app.native.im` |
 | Web 私聊（文本与富媒体） | ✅ TIM 权威 | 文字优先 TIM SDK、TIM REST 兜底；图片、语音、视频和文件走 TIM SDK；闪图走原 APK 接口 |
 | Web 资料、关系、在线/附近、匹配与动态 | ✅ 原 APK 接口权威 | Web BFF 只做鉴权、参数归一和结果展示，不以 PostgreSQL 本地实现替代产品接口 |
+| v162 聊天记录导出 | ✅ | `POST /api/im/export`（`ExportChatRecord`，CSV） |
 | PostgreSQL / Redis / 私有 R2 | ✅ 辅助存储 | Session、缓存、聊天归档、权限镜像、历史兼容媒体及 Agent 数据；不作为产品社交与消息权威 |
 | 与 APK 账号互通 | ✅ 依赖原服务 | 资料、关系、发现、匹配和动态依赖 Banghua/APK 服务；私聊依赖 TIM，外部服务不可用时不切换到 Web 本地权威 |
 | 刷脸实名 | ⚠️ 仅 HTTP 编排 | `app.native.face` · 活体靠阿里云 |

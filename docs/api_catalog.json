@@ -1,13 +1,15 @@
 {
   "counts": {
-    "do": 314,
+    "do": 315,
     "short_startHttp": 95,
     "dynamic_do_reconciled": 2,
-    "full_urls": 328,
-    "all_actions": 405,
+    "full_urls": 329,
+    "all_actions": 406,
     "active_in_v154": 398,
     "deprecated": 7,
-    "new_in_v154": 1
+    "new_in_v154": 1,
+    "active_in_v162": 399,
+    "new_in_v162": 1
   },
   "categories": {
     "other": [
@@ -367,6 +369,7 @@
       "user_delete"
     ],
     "im": [
+      "ExportChatRecord",
       "GetAllStickersWithFavorite",
       "GetflashphotoTencent",
       "SendTencentFlashPhoto",
@@ -438,6 +441,7 @@
     "Alipayaddorder2svipXBXX",
     "Alipayaddorder2vipXBXX",
     "DeleteFriendsapply",
+    "ExportChatRecord",
     "Friendsapply0",
     "Game_drawguess",
     "Game_fivechess",
@@ -857,7 +861,7 @@
     "https://applet.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=supervisorApply&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=uploadAudioFileWithCheck&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=888&c=entry&a=webapp&do=uploadVideoFile&m=socialchat",
-    "https://applet.banghua.xin/app/index.php?i=888&c=entry&do=About_app&m=socialchat&version=154",
+    "https://applet.banghua.xin/app/index.php?i=888&c=entry&do=About_app&m=socialchat&version=162",
     "https://applet.banghua.xin/app/index.php?i=888&c=entry&do=Hot_task&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=888&c=entry&do=Lottery_ninegrid&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=888&c=entry&do=Mbti28&m=socialchat",
@@ -883,6 +887,7 @@
     "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=AddFriendLeaveWord&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=Alipayaddorder2vipXBXX&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=DeleteFriendsapply&m=socialchat",
+    "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=ExportChatRecord&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=Friendsapply0&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=Payunifiedorder2svipXBXX&m=socialchat",
     "https://applet.banghua.xin/app/index.php?i=999999&c=entry&a=webapp&do=Payunifiedorder2vipXBXX&m=socialchat",
@@ -1178,14 +1183,14 @@
     "SigninOneKeyLogin1",
     "signin0"
   ],
-  "dynamic_do_note": "v154 登录流程运行时拼接 do=；仅扫描明文 URL/startHttp 字面量会漏掉这两个仍在使用的 action，已人工按当前调用链补录。",
+  "dynamic_do_note": "v162 登录流程运行时拼接 do=；仅扫描明文 URL/startHttp 字面量会漏掉这两个仍在使用的 action，已人工按当前调用链补录。",
   "method_hints": {},
   "apk_version": {
     "previous": 148,
-    "current": 154,
+    "current": 162,
     "source_apk": "xbly.apk",
     "compared_against": "beibeiwu.apk",
-    "catalog_scope": "405 为 v154 活跃 action 与 7 个 v148 历史下线 action 的并集；当前 v154 活跃数为 398。"
+    "catalog_scope": "v162 APK static endpoint catalog; ExportChatRecord newly added."
   },
   "deprecated_actions": {
     "since_apk": 154,
@@ -1205,6 +1210,13 @@
     "actions": [
       "Id2MetaVerifyRequest"
     ],
-    "note": "Id2MetaVerifyRequest present in v154; needs real params (401 without)"
+    "note": "Id2MetaVerifyRequest present in xbly.apk v154 and retained in v162; needs real params."
+  },
+  "new_actions_v162": {
+    "since_apk": 162,
+    "actions": [
+      "ExportChatRecord"
+    ],
+    "note": "ExportChatRecord introduced in xbly.apk v162; POST fields to_account, page, page_size, export; response is UTF-8 CSV."
   }
 }

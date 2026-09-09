@@ -1,7 +1,7 @@
 # 文档索引
 
 **项目根：** 仓库根目录（`bbw_protocol` / `bbw_web` / `docs` / `tools`）  
-**客户端版本：** 154（`xbly.apk`）  
+**客户端版本：** 162（`xbly.apk`）
 **原则：** 分析结论落盘；真实密钥与本地 session 不提交 Git。生产 Session 按部署文档写入 PostgreSQL/Redis。
 
 ---
@@ -18,6 +18,7 @@
 8. 内置 BYOK 模型运行器、账号动作与受控无人值守 Agent：[18](./18_BYOK_MODEL_RUNNER.md)
 9. Z 属性关系优先聊天 Agent 设计：[19](./19_Z_RELATIONSHIP_AGENT_DESIGN.md)
 10. 专题：实名 [08](./08_RP_VERIFY_BYPASS_ANALYSIS.md) / 游客 [09](./09_GUEST_CAPABILITY_MATRIX.md) / 覆盖 [11](./11_FEATURE_REALNAME_AND_COVERAGE.md) / 原生 [12](./12_NATIVE_INTEGRATION.md) / v154 [13](./13_APK_V154_DIFF.md)
+11. v162 更新：[20](./20_APK_V162_DIFF.md)
 
 ---
 
@@ -39,6 +40,7 @@
 | [11_FEATURE_REALNAME_AND_COVERAGE.md](./11_FEATURE_REALNAME_AND_COVERAGE.md) | 实名门槛与覆盖 |
 | [12_NATIVE_INTEGRATION.md](./12_NATIVE_INTEGRATION.md) | IM / 刷脸 / RoomKit 与只读会员权益 |
 | [13_APK_V154_DIFF.md](./13_APK_V154_DIFF.md) | 148→154 差异 |
+| [20_APK_V162_DIFF.md](./20_APK_V162_DIFF.md) | 162 导出与举报适配 |
 | [14_PRODUCTION_DEPLOYMENT.md](./14_PRODUCTION_DEPLOYMENT.md) | Docker、PostgreSQL、Redis、R2、管理端、安全与运维 |
 | [15_APK_SECURITY_AUDIT.md](./15_APK_SECURITY_AUDIT.md) | APK 安全审计补充记录 |
 | [16_PERFORMANCE_OPTIMIZATION.md](./16_PERFORMANCE_OPTIMIZATION.md) | Web 首屏、数据链路、后台任务与流畅度优化 |
