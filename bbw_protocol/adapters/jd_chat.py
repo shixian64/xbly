@@ -12,6 +12,9 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
+import asyncio
+import json
+import urllib.parse
 
 
 JD_CHAT_BASE = "https://test.banghua.xin"
@@ -95,6 +98,37 @@ class JdChatClient:
             "POST", "/api/im/messages/send",
             json_body={"senderId": sender, "receiverId": receiver, "content": text},
         )
+
+    def send_text_ws(self, sender_id: str, receiver_id: str, content: str, *, device_id: str = "web") -> JdChatResult:
+        """Send through the same WebSocket path used by APK v162."""
+        token = str(getattr(self.session, "token", "") or self.token).strip()
+        try:
+            sender, receiver = int(str(sender_id)), int(str(receiver_id))
+        except (TypeError, ValueError):
+            return JdChatResult(False, error_info="聊天用户 ID 必须是数字")
+        if not token or not str(content or "").strip():
+            return JdChatResult(False, error_info="聊天凭证或消息内容为空")
+        message = {
+            "messageId": __import__("uuid").uuid4().hex,
+            "fromUserId": sender, "toUserId": receiver,
+            "content": str(content).strip(), "type": "TEXT",
+            "timestamp": int(__import__("time").time() * 1000), "status": "SENT",
+        }
+        url = "wss://testchat.banghua.xin/ws/chat?token=" + urllib.parse.quote(token, safe="") + "&deviceId=" + urllib.parse.quote(str(device_id or "web"), safe="")
+        async def run() -> Any:
+            import websockets
+            async with websockets.connect(url, extra_headers={"Authorization": f"Bearer {token}"}, ping_interval=30, close_timeout=2) as ws:
+                await ws.send(json.dumps(message, ensure_ascii=False, separators=(",", ":")))
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=3)
+                    return json.loads(raw) if isinstance(raw, str) else raw
+                except Exception:
+                    return None
+        try:
+            ack = asyncio.run(run())
+            return JdChatResult(True, 200, {"data": message, "ack": ack})
+        except Exception as exc:
+            return JdChatResult(False, error_info=str(exc))
 
     def history(self, *, peer_id: str, limit: int = 50, before: Optional[int] = None, before_seq: Optional[int] = None) -> JdChatResult:
         """Fetch a C2C history page (partnerId is required by v162 API)."""

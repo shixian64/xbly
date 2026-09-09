@@ -5033,9 +5033,17 @@ class Handler(BaseHTTPRequestHandler):
                 jd_chat = getattr(u.native, "jd_chat", None)
                 if jd_chat is not None and callable(getattr(jd_chat, "send_text", None)):
                     try:
-                        jd_result = jd_chat.send_text(from_uid, to_uid, text)
+                        jd_result = jd_chat.send_text_ws(
+                            from_uid, to_uid, text,
+                            device_id=str(getattr(app.session, "device_id", "") or "web"),
+                        )
                     except Exception as exc:
                         jd_result = None
+                    if jd_result is None or not getattr(jd_result, "ok", False):
+                        try:
+                            jd_result = jd_chat.send_text(from_uid, to_uid, text)
+                        except Exception:
+                            jd_result = None
                     if jd_result is not None and getattr(jd_result, "ok", False):
                         payload = jd_result.to_dict()
                         body = payload.get("data")
