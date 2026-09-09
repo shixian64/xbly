@@ -30,6 +30,7 @@ __all__ = [
     "RoomKitCredentials",
     "JdChatClient",
     "JdChatResult",
+    "extract_collection_rows",
 ]
 
 _EXPORT_MODULES = {
@@ -43,6 +44,7 @@ _EXPORT_MODULES = {
     "RoomKitCredentials": ".roomkit",
     "JdChatClient": ".jd_chat",
     "JdChatResult": ".jd_chat",
+    "extract_collection_rows": ".jd_chat",
 }
 
 

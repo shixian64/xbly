@@ -60,6 +60,17 @@ const MESSAGE_SUMMARY_BACKGROUND_MS = 60 * 1000;
 const MESSAGE_POLICY_SYNC_MS = 60 * 1000;
 const MESSAGE_PEER_SYNC_REALTIME_MS = 90 * 1000;
 const MESSAGE_PEER_SYNC_FALLBACK_MS = 12 * 1000;
+// The provider history and the browser archive can describe the same message
+// with different ids (for example the JD message id vs. the legacy mirror
+// id).  A short compatibility window lets us reconcile those projections
+// without coalescing two unrelated messages sent much later.
+const MESSAGE_COMPATIBILITY_DEDUPE_WINDOW_MS = 15 * 1000;
+const MESSAGE_COMPATIBILITY_BUCKET_MS = 5 * 1000;
+// JD history can briefly expose the same frame twice with different UUIDs
+// (for example while a websocket echo and a database read overlap).  Only
+// coalesce a same-provider pair when the server's ordering metadata agrees;
+// repeated text sent later remains two distinct messages.
+const JD_SAME_SOURCE_DEDUPE_WINDOW_MS = 1000;
 const CONVERSATION_REFRESH_MIN_MS = 8 * 1000;
 const CONVERSATION_REFRESH_ERROR_MS = 30 * 1000;
 const ARCHIVED_CONVERSATION_TTL_MS = 30 * 1000;
@@ -3271,7 +3282,7 @@ async function loadConversationPreview(peer, activityTimestamp, { refreshList = 
     );
     const me = String(S.user?.uid || S.user?.id || "");
     const latest = itemsOf(data)
-      .map((item) => timMessageEntry({ ...item, source: "http" }, target, me))
+      .map((item) => timMessageEntry({ ...item, source: item?.source || "http" }, target, me))
       .sort(compareMessageOrder)
       .at(-1);
     if (!S.authenticated || generation !== S.sessionGeneration) return false;
@@ -4313,6 +4324,12 @@ function itemsOf(value) {
   if (!value || typeof value !== "object") return [];
   if (Array.isArray(value.items)) return value.items;
   if (Array.isArray(value.list)) return value.list;
+  // JD Chat deployments have returned both ``conversations`` and a nested
+  // ``data`` envelope.  Accept those shapes here so all message/list callers
+  // share the same tolerant parser instead of silently rendering an empty
+  // list when the provider changes its envelope.
+  if (Array.isArray(value.conversations)) return value.conversations;
+  if (value.data && value.data !== value) return itemsOf(value.data);
   return [];
 }
 
@@ -5094,14 +5111,46 @@ function formatBottleTime(value) {
 function conversationPeer(item) {
   const conversation = item && typeof item === "object" ? item : {};
   const me = String(S.user?.uid || S.user?.id || "");
-  const from = String(conversation.from_user_id || conversation.fromUserId || "");
-  const to = String(conversation.to_user_id || conversation.toUserId || "");
+  const nestedLast = conversation.lastMessage && typeof conversation.lastMessage === "object"
+    ? conversation.lastMessage
+    : conversation.last_message && typeof conversation.last_message === "object"
+      ? conversation.last_message
+      : {};
+  const nestedUser = conversation.user || conversation.user_info || conversation.userProfile || {};
+  const from = String(
+    conversation.from_user_id ||
+      conversation.fromUserId ||
+      conversation.sender_id ||
+      conversation.senderId ||
+      nestedLast.fromUserId ||
+      nestedLast.from_user_id ||
+      ""
+  );
+  const to = String(
+    conversation.to_user_id ||
+      conversation.toUserId ||
+      conversation.receiver_id ||
+      conversation.receiverId ||
+      nestedLast.toUserId ||
+      nestedLast.to_user_id ||
+      ""
+  );
   const candidates = [
     conversation.peer_id,
     conversation.conversation_user,
+    conversation.peerId,
+    conversation.partner_id,
+    conversation.partnerId,
+    conversation.target_uid,
+    conversation.targetUid,
     from && from !== me ? from : "",
     to && to !== me ? to : "",
     conversation.user_id,
+    conversation.userId,
+    nestedUser.user_id,
+    nestedUser.userId,
+    nestedUser.uid,
+    nestedUser.id,
   ];
   return String(candidates.find((value) => value != null && String(value) && String(value) !== me) || "");
 }
@@ -5411,13 +5460,30 @@ function normalizeTimConversation(item) {
   const conversation = item && typeof item === "object" ? item : {};
   const profile = conversation.userProfile || conversation.groupProfile || {};
   const conversationID = String(conversation.conversationID || "");
-  const peer = String(profile.userID || profile.groupID || conversationID.replace(/^(C2C|GROUP)/, ""));
+  const peer = String(
+    profile.userID ||
+      profile.groupID ||
+      conversation.peer_id ||
+      conversation.peerId ||
+      conversation.partnerId ||
+      conversation.partner_id ||
+      conversationID.replace(/^(C2C|GROUP)/, "")
+  );
   const conversationType = profile.groupID || conversationID.startsWith("GROUP") ? "GROUP" : "C2C";
-  const last = conversation.lastMessage || {};
+  const last = conversation.lastMessage || conversation.last_message_obj || {};
   const lastEntry = timMessageEntry(last, peer);
-  const sdkPreview = String(last.messageForShow || "").trim();
+  const sdkPreview = String(last.messageForShow || last.message_for_show || last.content || last.text || "").trim();
   const observedAt = Date.now();
-  const timestamp = last.lastTime || last.time || conversation.lastMessage?.lastTime || "";
+  const timestamp =
+    last.lastTime ||
+    last.last_time ||
+    last.time ||
+    last.timestamp ||
+    conversation.lastMessage?.lastTime ||
+    conversation.lastMessage?.timestamp ||
+    conversation.updated_at ||
+    conversation.updatedAt ||
+    "";
   const sequence = timMessageSequence(last);
   return {
     conversation_id: conversationID,
@@ -5444,7 +5510,7 @@ function normalizeTimConversation(item) {
     preview_source: "tim",
     preview_authoritative: true,
     preview_timestamp_inferred: false,
-    unread_count: conversation.unreadCount || 0,
+    unread_count: conversationUnreadCount(conversation),
     unread_observed_at: observedAt,
     unread_authoritative: true,
   };
@@ -5457,7 +5523,24 @@ function isC2CConversation(item) {
 }
 
 function conversationTimestamp(item) {
-  const raw = item?.updated_at || item?.timestamp || item?.msg_timestamp || item?.msgTimestamp || item?.time || 0;
+  const nestedLast = item?.lastMessage && typeof item.lastMessage === "object"
+    ? item.lastMessage
+    : item?.last_message && typeof item.last_message === "object"
+      ? item.last_message
+      : {};
+  const raw =
+    item?.updated_at ||
+    item?.updatedAt ||
+    item?.timestamp ||
+    item?.msg_timestamp ||
+    item?.msgTimestamp ||
+    item?.time ||
+    item?.created_at ||
+    item?.createdAt ||
+    nestedLast.timestamp ||
+    nestedLast.time ||
+    nestedLast.createdAt ||
+    0;
   const numeric = Number(raw);
   if (Number.isFinite(numeric) && numeric > 0) return String(Math.trunc(numeric)).length === 10 ? numeric * 1000 : numeric;
   const parsed = Date.parse(String(raw || ""));
@@ -5465,7 +5548,35 @@ function conversationTimestamp(item) {
 }
 
 function conversationPreview(item) {
-  return String(item?.last_message || item?.content || item?.message || item?.text || "");
+  const nested = item?.lastMessage && typeof item.lastMessage === "object"
+    ? item.lastMessage
+    : item?.last_message && typeof item.last_message === "object"
+      ? item.last_message
+      : {};
+  return String(
+    (typeof item?.last_message === "string" ? item.last_message : "") ||
+      item?.content ||
+      item?.message ||
+      item?.text ||
+      nested.messageForShow ||
+      nested.message_for_show ||
+      nested.content ||
+      nested.text ||
+      ""
+  );
+}
+
+function conversationUnreadCount(item) {
+  const raw =
+    item?.unread_count ??
+    item?.unreadCount ??
+    item?.unread ??
+    item?.UnreadCount ??
+    item?.unread_num ??
+    item?.unreadNum ??
+    0;
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
 }
 
 function conversationPreviewTimestamp(item) {
@@ -5493,7 +5604,7 @@ function conversationActivitySequence(item) {
 
 function conversationActivitySourceRank(item) {
   const source = String(item?.source || "").toLowerCase();
-  if (["tim", "tim_rest", "live", "local"].includes(source)) return 3;
+  if (["tim", "tim_rest", "live", "jd_chat", "jd-chat", "local"].includes(source)) return 3;
   if (source === "archive") return 2;
   if (source === "history") return 1;
   return 0;
@@ -5524,14 +5635,14 @@ function compareConversationPreviewRevision(left, right) {
 function conversationPreviewAuthoritative(item) {
   if (item?.preview_authoritative === true) return true;
   if (item?.preview_authoritative === false || item?.preview_timestamp_inferred === true) return false;
-  return ["tim", "tim_rest", "http", "local", "message"].includes(
+  return ["tim", "tim_rest", "http", "jd_chat", "jd-chat", "local", "message"].includes(
     String(item?.preview_source || item?.source || "").toLowerCase()
   );
 }
 
 function conversationPreviewSourceRank(item) {
   const source = String(item?.preview_source || item?.source || "").toLowerCase();
-  if (["tim", "tim_rest", "http", "local", "message"].includes(source)) return 3;
+  if (["tim", "tim_rest", "http", "jd_chat", "jd-chat", "local", "message"].includes(source)) return 3;
   if (source === "archive") return 2;
   if (source === "history") return 1;
   return 0;
@@ -5558,7 +5669,7 @@ function conversationUnreadObservedAt(item) {
 function conversationUnreadAuthoritative(item) {
   if (item?.unread_authoritative === true) return true;
   if (item?.unread_authoritative === false) return false;
-  return ["tim", "tim_rest", "live", "local"].includes(
+  return ["tim", "tim_rest", "live", "jd_chat", "jd-chat", "local"].includes(
     String(item?.source || "").toLowerCase()
   );
 }
@@ -5569,6 +5680,7 @@ function normalizeConversationSummary(item, { authority = "live", observedAt = D
   const preview = conversationPreview(conversation);
   const previewTimestamp = conversationPreviewTimestamp(conversation);
   const archive = authority === "archive" || source === "archive";
+  const observedUnreadCount = conversationUnreadCount(conversation);
   const unreadAuthoritative = archive
     ? false
     : conversation.unread_authoritative == null
@@ -5587,12 +5699,8 @@ function normalizeConversationSummary(item, { authority = "live", observedAt = D
         ? conversationPreviewAuthoritative(conversation)
         : Boolean(preview) && conversation.preview_authoritative === true,
     preview_timestamp_inferred: conversation.preview_timestamp_inferred === true,
-    unread_count: unreadAuthoritative
-      ? Math.max(0, Number(conversation.unread_count || conversation.unread || 0) || 0)
-      : 0,
-    unread: unreadAuthoritative
-      ? Math.max(0, Number(conversation.unread_count || conversation.unread || 0) || 0)
-      : 0,
+    unread_count: unreadAuthoritative ? observedUnreadCount : 0,
+    unread: unreadAuthoritative ? observedUnreadCount : 0,
     unread_observed_at: unreadAuthoritative
       ? conversation.unread_observed_at || observedAt
       : conversation.unread_observed_at || 0,
@@ -5646,9 +5754,27 @@ function mergeConversationPair(preferred, fallback) {
       if (byRevision) return byRevision;
       return conversationPreviewSourceRank(b) - conversationPreviewSourceRank(a);
     })[0];
-  const unreadWinner = [primary, secondary]
-    .filter(conversationUnreadAuthoritative)
-    .sort((a, b) => conversationUnreadObservedAt(b) - conversationUnreadObservedAt(a))[0];
+  const unreadCandidates = [primary, secondary].filter(conversationUnreadAuthoritative);
+  const unreadWinner = unreadCandidates
+    .sort((a, b) => {
+      const aCount = conversationUnreadCount(a);
+      const bCount = conversationUnreadCount(b);
+      // A fresh provider/JD summary carrying unread messages must not be
+      // hidden by a newer local ``unread=0`` optimistic snapshot.  Explicit
+      // read state is applied below by applyConversationReadOverride, so a
+      // real message newer than the read watermark still surfaces a badge.
+      if (aCount !== bCount && (aCount === 0 || bCount === 0)) {
+        const aSource = String(a?.source || a?.provider || "").toLowerCase();
+        const bSource = String(b?.source || b?.provider || "").toLowerCase();
+        const liveSources = new Set(["tim", "tim_rest", "live", "http", "jd_chat", "jd-chat"]);
+        const aLive = liveSources.has(aSource);
+        const bLive = liveSources.has(bSource);
+        if (aLive !== bLive) return aLive ? -1 : 1;
+      }
+      const byObserved = conversationUnreadObservedAt(b) - conversationUnreadObservedAt(a);
+      if (byObserved) return byObserved;
+      return conversationActivitySourceRank(b) - conversationActivitySourceRank(a);
+    })[0];
   const mergedBase = {
     ...activityFallback,
     ...activityWinner,
@@ -5661,12 +5787,8 @@ function mergeConversationPair(preferred, fallback) {
     preview_authoritative: previewWinner ? conversationPreviewAuthoritative(previewWinner) : false,
     preview_timestamp_inferred: previewWinner?.preview_timestamp_inferred === true,
     preview_stale: conversationPreviewNeedsRefresh(activityWinner, previewWinner),
-    unread_count: unreadWinner
-      ? Math.max(0, Number(unreadWinner.unread_count || unreadWinner.unread || 0) || 0)
-      : 0,
-    unread: unreadWinner
-      ? Math.max(0, Number(unreadWinner.unread_count || unreadWinner.unread || 0) || 0)
-      : 0,
+    unread_count: unreadWinner ? conversationUnreadCount(unreadWinner) : 0,
+    unread: unreadWinner ? conversationUnreadCount(unreadWinner) : 0,
     unread_observed_at: unreadWinner?.unread_observed_at || 0,
     unread_authoritative: Boolean(unreadWinner),
   };
@@ -6039,7 +6161,7 @@ function conversationCard(item) {
       conversation.time ||
       conversation.created_at
   );
-  const unread = Number(conversation.unread_count || conversation.unread || 0);
+  const unread = conversationUnreadCount(conversation);
   const active = peer && peer === S.activePeer;
   const chatAllowed = canOpenPrivateChatEntry(peer, "conversation");
   const chatDisabled = !S.conversationBatchMode && !chatAllowed;
@@ -7828,8 +7950,8 @@ function isTimAuthoritativeMessage(entry) {
   const provider = String(entry.provider || "").trim().toLowerCase();
   const source = String(entry.source || "").trim().toLowerCase();
   return (
-    ["tim", "tim-rest", "tim_rest", "rest", "http"].includes(provider) ||
-    ["tim", "tim-rest", "tim_rest", "rest", "http"].includes(source) ||
+    ["tim", "tim-rest", "tim_rest", "rest", "http", "jd-chat", "jd_chat", "jd"].includes(provider) ||
+    ["tim", "tim-rest", "tim_rest", "rest", "http", "jd-chat", "jd_chat", "jd"].includes(source) ||
     Boolean(entry.rawMessage) ||
     Boolean(entry.msgKey)
   );
@@ -8440,9 +8562,25 @@ function timMessageDirection(message, me = String(S.user?.uid || S.user?.id || "
   if (["in", "incoming", "received", "receive"].includes(explicit)) return "in";
   if (message?.type === "mine") return "out";
 
-  const sender = String(message?.from || message?.from_user_id || message?.fromUserId || message?.From_Account || "");
+  const sender = String(
+    message?.from ||
+      message?.from_user_id ||
+      message?.fromUserId ||
+      message?.sender_id ||
+      message?.senderId ||
+      message?.From_Account ||
+      ""
+  );
   if (me && sender) return sender === me ? "out" : "in";
-  const recipient = String(message?.to || message?.to_user_id || message?.toUserId || message?.To_Account || "");
+  const recipient = String(
+    message?.to ||
+      message?.to_user_id ||
+      message?.toUserId ||
+      message?.receiver_id ||
+      message?.receiverId ||
+      message?.To_Account ||
+      ""
+  );
   if (me && recipient) return recipient === me ? "in" : "out";
   const revoker = String(
     message?.revoker ??
@@ -8484,6 +8622,168 @@ function messageIdentityKey(entry) {
   return `fallback|${peer}|${direction}|${entry?.kind || "text"}|${entry?.timestamp || ""}|${entry?.text || ""}|${mediaIdentity}`;
 }
 
+function messageIsArchiveProjection(entry) {
+  const source = String(entry?.source || "").trim().toLowerCase();
+  const provider = String(entry?.provider || "").trim().toLowerCase();
+  return (
+    ["archive", "history", "local", "browser"].includes(source) ||
+    ["archive", "history", "web-local", "local", "browser"].includes(provider)
+  );
+}
+
+function messageIsProviderProjection(entry) {
+  if (messageIsArchiveProjection(entry)) return false;
+  const source = String(entry?.source || "").trim().toLowerCase();
+  const provider = String(entry?.provider || "").trim().toLowerCase();
+  return Boolean(
+    [
+      "tim",
+      "tim-rest",
+      "tim_rest",
+      "rest",
+      "http",
+      "sdk",
+      "tim_sdk",
+      "jd-chat",
+      "jd_chat",
+      "jd",
+    ].includes(source) ||
+      [
+        "tim",
+        "tim-rest",
+        "tim_rest",
+        "rest",
+        "http",
+        "sdk",
+        "tim_sdk",
+        "jd-chat",
+        "jd_chat",
+        "jd",
+      ].includes(provider)
+  );
+}
+
+function messageComparableText(entry) {
+  const kind = String(entry?.kind || "text").trim().toLowerCase();
+  if (kind !== "text") return "";
+  return String(entry?.text ?? entry?.content ?? entry?.message ?? entry?.recalledText ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function messageComparableMedia(entry) {
+  const media = entry?.media && typeof entry.media === "object" ? entry.media : {};
+  return [
+    entry?.attachmentId,
+    media.attachmentId,
+    entry?.assetId,
+    media.assetId,
+    entry?.flashId,
+    media.uuid,
+    media.url,
+    media.thumbnail,
+  ]
+    .map((value) => String(value || "").trim())
+    .find(Boolean) || "";
+}
+
+function messageCompatibilityFingerprint(entry) {
+  if (!entry || !messageIsArchiveProjection(entry) && !messageIsProviderProjection(entry)) return "";
+  const kind = String(entry?.kind || "text").trim().toLowerCase() || "text";
+  const text = messageComparableText(entry);
+  const media = messageComparableMedia(entry);
+  if (kind === "text" && !text) return "";
+  if (kind !== "text" && !media) return "";
+  const peer = String(entry?.peer || "").trim();
+  const direction = timMessageDirection(entry) || "unknown";
+  if (!peer) return "";
+  const raw = [peer, direction, kind, text, media].join("\u001f");
+  return typeof archiveHash === "function" ? archiveHash(raw) : raw.slice(0, 512);
+}
+
+function messageCompatibilityTimestamp(entry) {
+  // messageTimestampMs is declared below; function declarations are hoisted.
+  // Keep a numeric fallback for isolated contract tests and older cached
+  // bundles that may evaluate this helper without the later declaration.
+  let value =
+    typeof messageTimestampMs === "function"
+      ? messageTimestampMs(entry)
+      : Number(entry?.timestamp || entry?.time || 0);
+  if ((!Number.isFinite(value) || value <= 0) && entry) {
+    const parsed = Date.parse(String(entry.timestamp || entry.time || ""));
+    if (Number.isFinite(parsed)) value = parsed;
+  }
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function messagesShareCompatibilityProjection(left, right) {
+  if (!left || !right) return false;
+  const leftArchive = messageIsArchiveProjection(left);
+  const rightArchive = messageIsArchiveProjection(right);
+  if (leftArchive === rightArchive) return false;
+  if (!messageIsProviderProjection(left) && !messageIsProviderProjection(right)) return false;
+  const leftPeer = String(left.peer || "").trim();
+  const rightPeer = String(right.peer || "").trim();
+  if (leftPeer && rightPeer && leftPeer !== rightPeer) return false;
+  const leftDirection = timMessageDirection(left);
+  const rightDirection = timMessageDirection(right);
+  if (leftDirection && rightDirection && leftDirection !== rightDirection) return false;
+  const leftKind = String(left.kind || "text").trim().toLowerCase();
+  const rightKind = String(right.kind || "text").trim().toLowerCase();
+  if (leftKind !== rightKind) return false;
+  const leftText = messageComparableText(left);
+  const rightText = messageComparableText(right);
+  if (leftKind === "text" && (!leftText || leftText !== rightText)) return false;
+  if (leftKind !== "text") {
+    const leftMedia = messageComparableMedia(left);
+    const rightMedia = messageComparableMedia(right);
+    if (!leftMedia || !rightMedia || leftMedia !== rightMedia) return false;
+  }
+  const leftTime = messageCompatibilityTimestamp(left);
+  const rightTime = messageCompatibilityTimestamp(right);
+  if (!leftTime || !rightTime) return false;
+  return Math.abs(leftTime - rightTime) <= MESSAGE_COMPATIBILITY_DEDUPE_WINDOW_MS;
+}
+
+function messagesShareSameJdProviderDuplicate(left, right) {
+  if (!left || !right) return false;
+  if (messageIsArchiveProjection(left) || messageIsArchiveProjection(right)) return false;
+  const leftProvider = String(left.provider || left.source || "").trim().toLowerCase();
+  const rightProvider = String(right.provider || right.source || "").trim().toLowerCase();
+  const jdProviders = new Set(["jd-chat", "jd_chat", "jd"]);
+  if (!jdProviders.has(leftProvider) || !jdProviders.has(rightProvider)) return false;
+  const leftPeer = String(left.peer || "").trim();
+  const rightPeer = String(right.peer || "").trim();
+  if (!leftPeer || leftPeer !== rightPeer) return false;
+  if (timMessageDirection(left) !== timMessageDirection(right)) return false;
+  const leftKind = String(left.kind || "text").trim().toLowerCase() || "text";
+  const rightKind = String(right.kind || "text").trim().toLowerCase() || "text";
+  if (leftKind !== "text" || rightKind !== "text") return false;
+  if (messageComparableText(left) !== messageComparableText(right)) return false;
+  const leftTime = messageCompatibilityTimestamp(left);
+  const rightTime = messageCompatibilityTimestamp(right);
+  if (!leftTime || !rightTime || Math.abs(leftTime - rightTime) > JD_SAME_SOURCE_DEDUPE_WINDOW_MS) {
+    return false;
+  }
+  const leftSequence = conversationSequenceValue(left.sequence || timMessageSequence(left));
+  const rightSequence = conversationSequenceValue(right.sequence || timMessageSequence(right));
+  // Sequence is decisive: without it two legitimate quick messages with the
+  // same text must remain visible.
+  return Boolean(leftSequence && rightSequence && Math.abs(leftSequence - rightSequence) <= 1);
+}
+
+function messageCompatibilityLookupKeys(entry) {
+  const fingerprint = messageCompatibilityFingerprint(entry);
+  const timestamp = messageCompatibilityTimestamp(entry);
+  if (!fingerprint || !timestamp) return [];
+  const bucket = Math.floor(timestamp / MESSAGE_COMPATIBILITY_BUCKET_MS);
+  // Include neighbouring buckets because the archive timestamp and the JD
+  // provider timestamp are generated by different requests.
+  return [-3, -2, -1, 0, 1, 2, 3].map(
+    (offset) => `compat|${fingerprint}|${bucket + offset}`
+  );
+}
+
 function messagesReferToSameMessage(left, right) {
   if (!left || !right) return false;
   const leftPeer = String(left.peer || "");
@@ -8494,7 +8794,7 @@ function messagesReferToSameMessage(left, right) {
   if (leftDirection && rightDirection && leftDirection !== rightDirection) return false;
   const leftCanonicalID = canonicalMessageID(left);
   const rightCanonicalID = canonicalMessageID(right);
-  if (leftCanonicalID && rightCanonicalID) return leftCanonicalID === rightCanonicalID;
+  if (leftCanonicalID && rightCanonicalID && leftCanonicalID === rightCanonicalID) return true;
   const leftIdentity = messageIdentityKey(left);
   if (leftIdentity === messageIdentityKey(right) && !leftIdentity.startsWith("fallback|")) return true;
   const identities = [
@@ -8510,7 +8810,9 @@ function messagesReferToSameMessage(left, right) {
     const first = String(leftValue || "").trim();
     const second = String(rightValue || "").trim();
     return Boolean(first && second && first === second);
-  });
+  }) ||
+    messagesShareSameJdProviderDuplicate(left, right) ||
+    messagesShareCompatibilityProjection(left, right);
 }
 
 function compareMessageOrder(a, b) {
@@ -8524,9 +8826,34 @@ function compareMessageOrder(a, b) {
 function timMessagePeer(message, me = String(S.user?.uid || S.user?.id || "")) {
   const conversationID = String(message?.conversationID || "");
   const conversationPeer = conversationID.replace(/^C2C/, "");
-  const from = String(message?.from || message?.from_user_id || message?.fromUserId || message?.From_Account || "");
-  const to = String(message?.to || message?.to_user_id || message?.toUserId || message?.To_Account || "");
-  const directPeer = String(message?.peerID || message?.peer_id || message?.userID || message?.To_Account || "");
+  const from = String(
+    message?.from ||
+      message?.from_user_id ||
+      message?.fromUserId ||
+      message?.sender_id ||
+      message?.senderId ||
+      message?.From_Account ||
+      ""
+  );
+  const to = String(
+    message?.to ||
+      message?.to_user_id ||
+      message?.toUserId ||
+      message?.receiver_id ||
+      message?.receiverId ||
+      message?.To_Account ||
+      ""
+  );
+  const directPeer = String(
+    message?.peerID ||
+      message?.peer_id ||
+      message?.peerId ||
+      message?.userID ||
+      message?.userId ||
+      message?.partnerId ||
+      message?.To_Account ||
+      ""
+  );
   const direction = timMessageDirection(message, me);
   if (direction === "out") return String(to || conversationPeer || directPeer || "");
   if (direction === "in") return String(from || conversationPeer || directPeer || "");
@@ -8612,14 +8939,30 @@ function timMessageEntry(message, peer = "", me = String(S.user?.uid || S.user?.
         message?.id ||
         message?.messageID ||
         message?.messageId ||
+        message?.message_id ||
         message?.sequence ||
         message?.MsgKey ||
+        message?.msg_key ||
         message?.msg_uid ||
         ""
     ),
     canonicalMessageId: canonicalID,
-    clientMessageId: String(message?.clientMessageId || message?.client_message_id || message?.client_message_key || ""),
-    msgKey: String(message?.MsgKey || message?.msg_key || message?.messageKey || message?.message_key || ""),
+    clientMessageId: String(
+      message?.clientMessageId ||
+        message?.client_message_id ||
+        message?.clientMessageID ||
+        message?.client_message_key ||
+        ""
+    ),
+    msgKey: String(
+      message?.MsgKey ||
+        message?.msg_key ||
+        message?.messageKey ||
+        message?.message_key ||
+        message?.message_id ||
+        message?.messageId ||
+        ""
+    ),
     sequence: timMessageSequence(message),
     messageRandom: timMessageRandom(message),
     text: displayText,
@@ -9683,6 +10026,7 @@ function messageIdentityLookupKeys(entry) {
   if (messageKey) keys.add(`message-key|${messageKey}`);
   if (id) keys.add(`id-sequence|${id}`);
   if (sequence) keys.add(`id-sequence|${sequence}`);
+  messageCompatibilityLookupKeys(entry).forEach((alias) => keys.add(alias));
   return [...keys];
 }
 
@@ -9713,10 +10057,28 @@ function findIndexedMessage(identityIndex, byKey, orderByKey, entry, key) {
   messageIdentityLookupKeys(entry).forEach((alias) => {
     (identityIndex.get(alias) || []).forEach((candidateKey) => candidates.add(candidateKey));
   });
+  // A provider/archive projection may not share any explicit id.  The
+  // compatibility aliases above normally find it; retain a bounded fallback
+  // scan for older rows that have no usable timestamp/media identity.
+  if (!candidates.size && byKey.size <= 2500) {
+    byKey.forEach((_value, candidateKey) => candidates.add(candidateKey));
+  }
   return [...candidates]
-    .sort((left, right) => Number(orderByKey.get(left) || 0) - Number(orderByKey.get(right) || 0))
     .map((candidateKey) => [candidateKey, byKey.get(candidateKey)])
-    .find(([, previous]) => previous && messagesReferToSameMessage(previous, entry));
+    .filter(([, previous]) => previous && messagesReferToSameMessage(previous, entry))
+    .sort((left, right) => {
+      const leftDistance = messageCompatibilityDistance(left[1], entry);
+      const rightDistance = messageCompatibilityDistance(right[1], entry);
+      if (leftDistance !== rightDistance) return leftDistance - rightDistance;
+      return Number(orderByKey.get(left[0]) || 0) - Number(orderByKey.get(right[0]) || 0);
+    })[0];
+}
+
+function messageCompatibilityDistance(left, right) {
+  const leftTime = messageCompatibilityTimestamp(left);
+  const rightTime = messageCompatibilityTimestamp(right);
+  if (!leftTime || !rightTime) return Number.POSITIVE_INFINITY;
+  return Math.abs(leftTime - rightTime);
 }
 
 function peerMessageRevision(peer, entries = S.imMessages) {
@@ -9920,7 +10282,9 @@ async function loadConversationMessages(peer, { force = false } = {}) {
   const tasks = [
     api(`/api/im/messages?peer=${encodeURIComponent(target)}`, { timeout: 8000 }).then(({ data, ok }) => {
       if (!ok || data?.ok === false) throw new Error("服务器聊天记录暂时不可用");
-      return itemsOf(data).map((item) => timMessageEntry({ ...item, source: "http" }, target, me));
+      return itemsOf(data).map((item) =>
+        timMessageEntry({ ...item, source: item?.source || "http" }, target, me)
+      );
     }),
   ];
   if (shouldLoadArchive) {
@@ -10061,7 +10425,9 @@ async function loadOlderConversationMessages(peer, log = $("im-log")) {
       if (!ok || data?.ok === false) throw new Error("服务器聊天记录暂时不可用");
       const items = itemsOf(data);
       return {
-        entries: items.map((item) => timMessageEntry({ ...item, source: "http" }, target, me)),
+        entries: items.map((item) =>
+          timMessageEntry({ ...item, source: item?.source || "http" }, target, me)
+        ),
         hasMore: data?.has_more === true || items.length >= pageSize,
       };
     }),
@@ -10147,7 +10513,7 @@ async function loadOlderConversationMessages(peer, log = $("im-log")) {
 
 function recalculateUnreadTotal() {
   S.unreadTotal = S.conversations.reduce(
-    (sum, item) => sum + Number(item.unread_count || item.unread || 0),
+    (sum, item) => sum + conversationUnreadCount(item),
     0
   );
   updateUnreadBadges();
@@ -12575,7 +12941,18 @@ function closeChatComposerPanelForKeyboard() {
 }
 
 function updateLocalMessage(id, patch) {
-  const index = S.imMessages.findIndex((entry) => String(entry.id) === String(id));
+  const requestedId = String(id || "").trim();
+  const requestedClientId =
+    typeof patch === "object" && patch
+      ? String(patch.clientMessageId || patch.client_message_id || "").trim()
+      : "";
+  const index = S.imMessages.findIndex((entry) => {
+    if (requestedId && String(entry.id || "") === requestedId) return true;
+    return Boolean(
+      requestedClientId &&
+        String(entry.clientMessageId || entry.client_message_id || "") === requestedClientId
+    );
+  });
   if (index < 0) return null;
   const current = S.imMessages[index];
   const next = typeof patch === "function" ? patch(current) : { ...current, ...patch };
@@ -12587,7 +12964,9 @@ function updateLocalMessage(id, patch) {
       next.messageRandom || timMessageRandom(next),
       next.sequence || timMessageSequence(next),
       next.peer
-    ) || next;
+    ) ||
+    findChatMessageByClientMessageId(next.clientMessageId || next.client_message_id, next.peer) ||
+    next;
   if (!refreshChatMessageEntry(merged, { previousEntry: current })) refreshChatLog();
   return merged;
 }
@@ -12604,7 +12983,9 @@ function appendLocalMessage(entry) {
         entry.messageRandom || timMessageRandom(entry),
         entry.sequence || timMessageSequence(entry),
         entry.peer
-      ) || entry
+      ) ||
+      findChatMessageByClientMessageId(entry.clientMessageId || entry.client_message_id, entry.peer) ||
+      entry
     : entry;
   if (!refreshChatMessageEntry(merged, { forceBottom: true })) refreshChatLog({ forceBottom: true });
   return merged;
@@ -12764,6 +13145,19 @@ function findChatMessageByIdentity(id, messageRandom, messageSequence = "", peer
       if (random && String(entry.messageRandom || timMessageRandom(entry) || "") === random) return true;
       return Boolean(sequence && String(entry.sequence || timMessageSequence(entry) || "") === sequence);
     }) || null
+  );
+}
+
+function findChatMessageByClientMessageId(clientMessageId, peer = S.activePeer) {
+  const clientID = String(clientMessageId || "").trim();
+  const target = String(peer || "");
+  if (!clientID) return null;
+  return (
+    S.imMessages.find(
+      (entry) =>
+        String(entry.peer || "") === target &&
+        String(entry.clientMessageId || entry.client_message_id || "") === clientID
+    ) || null
   );
 }
 
@@ -13039,8 +13433,12 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
         direction: "out",
         peer: target,
         timestamp: timMessageTimestamp({ timestamp: response.timestamp || Date.now() }),
-        source: "rest",
-        provider: "tim-rest",
+        // Keep the provider returned by the BFF.  JD sends otherwise look
+        // like TIM/rest rows, which prevents the history echo from being
+        // reconciled with the optimistic local message and can render it
+        // twice after the next refresh.
+        source: String(response.source || "rest"),
+        provider: String(response.provider || "tim-rest"),
         rawMessage: null,
         peerRead: false,
         delivery: "sent",
@@ -20417,7 +20815,7 @@ async function handleAction(action, button) {
   if (action === "mark-all-read") {
     const sdkCanSyncRead = S.imMode === "sdk" && S.chat && typeof S.chat.setMessageRead === "function";
     const unreadPeers = S.conversations
-      .filter((item) => Number(item.unread_count || item.unread || 0) > 0)
+      .filter((item) => conversationUnreadCount(item) > 0)
       .map(conversationPeer)
       .filter(Boolean);
     if (sdkCanSyncRead) {

@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import ProviderRuntime, ProviderSession, ProviderSessionState, ProviderUnavailable
-from bbw_protocol.adapters.jd_chat import JdChatClient
 
 
 WEB_NATIVE_PROVIDER_ID = "web-native"
@@ -312,7 +311,6 @@ class WebNativeBundle:
         self.face = _WebNativeFace()
         self.roomkit = _WebNativeRoomKit()
         self.tim_rest = _WebNativeTimRest()
-        self.jd_chat = JdChatClient(str(getattr(app.session, "token", "") or ""), session=app.session)
 
     def status(self) -> dict[str, Any]:
         return {"provider": WEB_NATIVE_PROVIDER_ID, "local": True}

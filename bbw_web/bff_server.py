@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -41,7 +42,6 @@ from bbw_web.providers import (  # noqa: E402
     ProviderUpstreamInterrupted,
 )
 from bbw_web.store import SessionStore  # noqa: E402
-
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 COOKIE_NAME = "bbw_sid"
 STORE: Optional[SessionStore] = None
@@ -1663,6 +1663,555 @@ def _conversation_sequence_value(value: Any) -> int:
         return 0
 
 
+def _jd_first(mapping: Mapping[str, Any], keys: Tuple[str, ...], default: Any = "") -> Any:
+    """Read the first present (including camel/snake case) JD field."""
+    for key in keys:
+        if key in mapping:
+            value = mapping.get(key)
+            if value is not None and value != "":
+                return value
+    return default
+
+
+def _jd_uid(value: Any) -> str:
+    """Normalize a JD numeric user id without introducing ``.0`` suffixes."""
+    if value is None or value == "":
+        return ""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    raw = str(value).strip()
+    if raw.endswith(".0") and raw[:-2].isdigit():
+        raw = raw[:-2]
+    return raw
+
+
+def _jd_number(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _jd_message_text(value: Any) -> str:
+    """Extract display text from a JD TEXT/rich content value."""
+    if isinstance(value, Mapping):
+        for key in ("text", "content", "body", "message", "description", "title"):
+            if key in value and value.get(key) not in (None, ""):
+                return _jd_message_text(value.get(key))
+        return ""
+    if isinstance(value, (list, tuple)):
+        return " ".join(
+            part for part in (_jd_message_text(item) for item in value) if part
+        ).strip()
+    return str(value or "").strip()
+
+
+# Keep the BFF provider-neutral.  The concrete JD adapter has the same
+# response-shape normalizer, but importing ``bbw_protocol`` here would make
+# every web process depend on protocol-core (and violates the provider-boundary
+# contract).  JD's Retrofit endpoint currently returns a bare list while a
+# few proxies wrap it in one or more collection envelopes, so normalize those
+# shapes locally at this edge.
+_JD_COLLECTION_KEYS = (
+    "data",
+    "items",
+    "list",
+    "records",
+    "messages",
+    "conversations",
+    "content",
+    "results",
+)
+_JD_ROW_KEYS = frozenset(
+    {
+        "messageId",
+        "message_id",
+        "fromUserId",
+        "from_user_id",
+        "toUserId",
+        "to_user_id",
+        "senderId",
+        "sender_id",
+        "receiverId",
+        "receiver_id",
+        "sequence",
+        "timestamp",
+        "unreadCount",
+    }
+)
+
+
+def _jd_collection_rows(payload: Any) -> list[dict[str, Any]]:
+    """Extract JD message/conversation rows without importing protocol-core."""
+
+    seen: set[int] = set()
+
+    def walk(value: Any, depth: int = 0) -> list[dict[str, Any]]:
+        if value is None or depth > 8:
+            return []
+        if isinstance(value, str):
+            raw = value.strip()
+            if raw[:1] in {"[", "{"}:
+                try:
+                    return walk(json.loads(raw), depth + 1)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return []
+            return []
+        if isinstance(value, (list, tuple)):
+            rows: list[dict[str, Any]] = []
+            for item in value:
+                if isinstance(item, Mapping):
+                    mapping = dict(item)
+                    # A list can itself contain wrapped envelopes.  Preserve
+                    # actual rows directly and recurse into envelope objects.
+                    if {str(key) for key in mapping} & _JD_ROW_KEYS:
+                        rows.append(mapping)
+                    else:
+                        rows.extend(walk(mapping, depth + 1))
+                else:
+                    rows.extend(walk(item, depth + 1))
+            return rows
+        if not isinstance(value, Mapping):
+            return []
+        marker = id(value)
+        if marker in seen:
+            return []
+        seen.add(marker)
+        mapping = dict(value)
+        if {str(key) for key in mapping} & _JD_ROW_KEYS:
+            return [mapping]
+        for key in _JD_COLLECTION_KEYS:
+            if key not in mapping:
+                continue
+            child = mapping.get(key)
+            if isinstance(child, (list, tuple)) and not child:
+                return []
+            rows = walk(child, depth + 1)
+            if rows:
+                return rows
+            if child in (None, "", {}):
+                return []
+        return []
+
+    return walk(payload)
+
+
+def _jd_result_data(result: Any) -> Any:
+    if isinstance(result, (list, tuple)):
+        return result
+    if isinstance(result, Mapping):
+        return result.get("data", result)
+    return getattr(result, "data", None)
+
+
+def _jd_result_ok(result: Any) -> bool:
+    """Read success from a real result or a lightweight injected response.
+
+    Production ``JdChatResult`` always carries ``ok``.  Tests and a few older
+    wrappers return a bare list or ``{"data": [...]}``, neither of which has
+    an explicit success flag; those shapes are successful unless an explicit
+    error/status says otherwise.
+    """
+    if isinstance(result, (list, tuple)):
+        return True
+    if isinstance(result, Mapping):
+        for key in ("ok", "success"):
+            if key in result and result.get(key) is not None:
+                return bool(result.get(key))
+        for key in ("error", "error_info", "errorInfo", "message"):
+            value = result.get(key)
+            if value not in (None, "", False):
+                # A normal response may include a human-readable message;
+                # only classify it as failure when an explicit error field is
+                # populated or status/code is non-success below.
+                if key != "message" or result.get("status") in ("error", "failed", "fail"):
+                    return False
+        status = result.get("status_code", result.get("status"))
+        if isinstance(status, str) and status.strip().lower() in {"error", "failed", "fail"}:
+            return False
+        try:
+            if status is not None and not (200 <= int(status) < 300):
+                return False
+        except (TypeError, ValueError, OverflowError):
+            pass
+        code = result.get("code")
+        try:
+            if code is not None and int(code) >= 400:
+                return False
+        except (TypeError, ValueError, OverflowError):
+            pass
+        # Presence of a data/collection member is enough for envelope-shaped
+        # fake clients, including an authoritative empty list.
+        return any(key in result for key in ("data", "items", "list", "messages", "conversations"))
+    for key in ("ok", "success"):
+        value = getattr(result, key, None)
+        if value is not None:
+            return bool(value)
+    return False
+
+
+def _jd_result_to_dict(result: Any) -> Dict[str, Any]:
+    """Convert a JD result without requiring the concrete adapter class."""
+    if isinstance(result, Mapping):
+        return dict(result)
+    converter = getattr(result, "to_dict", None)
+    if callable(converter):
+        try:
+            converted = converter()
+            if isinstance(converted, Mapping):
+                return dict(converted)
+        except Exception:
+            pass
+    output: Dict[str, Any] = {}
+    for key in ("ok", "status", "status_code", "error", "error_info", "data"):
+        if hasattr(result, key):
+            output[key] = getattr(result, key)
+    return output
+
+
+def _jd_delivery_uncertain(result: Any) -> bool:
+    """Return true when a JD frame may already have reached the server.
+
+    ``send_text_ws`` annotates timeout, NACK and post-write transport errors
+    with ``delivery_uncertain``/``ws_sent``.  Inspect both the adapter object
+    and its serialized/nested payload so lightweight test doubles and older
+    wrappers receive the same no-retry treatment.
+    """
+
+    seen: set[int] = set()
+
+    def walk(value: Any, depth: int = 0) -> bool:
+        if value is None or depth > 5:
+            return False
+        if isinstance(value, Mapping):
+            marker = id(value)
+            if marker in seen:
+                return False
+            seen.add(marker)
+            for key in ("delivery_uncertain", "deliveryUncertain", "ws_sent", "wsSent"):
+                raw = value.get(key)
+                if raw is True or (isinstance(raw, str) and raw.strip().lower() == "true"):
+                    return True
+            for key in ("data", "result", "payload", "ack"):
+                if key in value and walk(value.get(key), depth + 1):
+                    return True
+            return False
+        for key in ("delivery_uncertain", "deliveryUncertain", "ws_sent", "wsSent"):
+            raw = getattr(value, key, None)
+            if raw is True or (isinstance(raw, str) and raw.strip().lower() == "true"):
+                return True
+        for key in ("data", "result", "payload", "ack"):
+            child = getattr(value, key, None)
+            if child is not None and walk(child, depth + 1):
+                return True
+        return False
+
+    if walk(result):
+        return True
+    # ``to_dict`` may expose markers not present as direct attributes.
+    converter = getattr(result, "to_dict", None)
+    if callable(converter):
+        try:
+            return walk(converter())
+        except Exception:
+            return False
+    return False
+
+
+def _jd_dependency_call(
+    method: Any,
+    *args: Any,
+    provider: str,
+    domain: str,
+    breakers: Any = None,
+    timeout: Optional[float] = None,
+    deadline: Any = None,
+    request_id: str = "",
+    **kwargs: Any,
+) -> Any:
+    """Call a JD read method while tolerating older injected signatures.
+
+    Production adapters accept the interactive ``timeout``/``deadline``
+    budget, but small test doubles and pre-v162 adapters often expose a
+    parameterless ``conversations()``.  Inspect the signature before passing
+    budget keywords; this avoids a spurious fallback to TIM while retaining
+    circuit-breaker accounting.
+    """
+
+    effective_timeout = timeout
+    effective_deadline = deadline
+    budget = _budget_kwargs(timeout, deadline)
+    if budget:
+        try:
+            signature = inspect.signature(method)
+            signature.bind(*args, **kwargs, **budget)
+        except TypeError:
+            effective_timeout = None
+            effective_deadline = None
+        except (ValueError, AttributeError):
+            # Builtins/proxies with no inspectable signature: do not risk a
+            # keyword mismatch; the adapter's own timeout remains in force.
+            effective_timeout = None
+            effective_deadline = None
+    return _dependency_call(
+        method,
+        *args,
+        provider=provider,
+        domain=domain,
+        breakers=breakers,
+        timeout=effective_timeout,
+        deadline=effective_deadline,
+        request_id=request_id,
+        **kwargs,
+    )
+
+
+def _jd_send_text_once(
+    method: Any,
+    sender_uid: str,
+    receiver_uid: str,
+    text: str,
+    client_message_id: str,
+) -> Any:
+    """Invoke a JD sender once, adapting old three-argument test doubles.
+
+    Signature binding happens before the call.  Retrying a live invocation
+    after catching ``TypeError`` is unsafe because the first call may already
+    have written a WebSocket frame.
+    """
+
+    try:
+        signature = inspect.signature(method)
+        signature.bind(
+            sender_uid,
+            receiver_uid,
+            text,
+            client_message_id=client_message_id,
+        )
+    except (TypeError, ValueError, AttributeError):
+        return method(sender_uid, receiver_uid, text)
+    return method(
+        sender_uid,
+        receiver_uid,
+        text,
+        client_message_id=client_message_id,
+    )
+
+
+def _jd_message_object_name(message_type: Any) -> str:
+    raw = str(message_type or "").strip()
+    lowered = raw.lower()
+    if lowered in {"text", "txt", "1"}:
+        return "TIMTextElem"
+    if lowered in {"image", "picture", "3"}:
+        return "TIMImageElem"
+    if lowered in {"audio", "voice", "sound", "4"}:
+        return "TIMSoundElem"
+    if lowered in {"video", "5"}:
+        return "TIMVideoFileElem"
+    if lowered in {"file", "6"}:
+        return "TIMFileElem"
+    return raw or "TIMTextElem"
+
+
+def _jd_recent_conversation_envelope(
+    app: Any,
+    client: Any,
+    account_uid: str,
+    profile_cache: Optional[
+        Dict[str, tuple[float, Optional[Dict[str, Any]]]]
+    ] = None,
+    *,
+    deadline: Any = None,
+    call_timeout: Optional[float] = None,
+    breakers: Any = None,
+    request_id: str = "",
+    activity_since: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Normalize the APK v162 ``/api/messages/conversations`` response.
+
+    JD returns one latest ``ChatMessage`` row per C2C peer.  The normalizer is
+    intentionally defensive because a few deployments wrap that list in
+    ``data/items/list`` envelopes.  Only rows involving the authenticated
+    account are exposed; this prevents a malformed upstream row from creating
+    a conversation for an unrelated user.
+    """
+
+    method = getattr(client, "conversations", None)
+    if not callable(method):
+        raise RuntimeError("JD conversations endpoint unavailable")
+    result = _jd_dependency_call(
+        method,
+        provider="jd-chat",
+        domain="im-read",
+        breakers=breakers,
+        timeout=call_timeout,
+        deadline=deadline,
+        request_id=request_id,
+    )
+    if not _jd_result_ok(result):
+        raise RuntimeError("JD conversations unavailable")
+
+    account = _jd_uid(account_uid)
+    if not account:
+        raise RuntimeError("authenticated JD account is missing")
+    rows = _jd_collection_rows(_jd_result_data(result))
+    observed_at = time.time()
+    normalized_since: Optional[float] = None
+    if activity_since is not None:
+        try:
+            normalized_since = float(activity_since)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("invalid conversation activity boundary") from None
+        if not math.isfinite(normalized_since) or normalized_since <= 0:
+            raise ValueError("invalid conversation activity boundary")
+
+    by_peer: Dict[str, Dict[str, Any]] = {}
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            continue
+        sender = _jd_uid(
+            _jd_first(raw, ("fromUserId", "from_user_id", "senderId", "sender_id", "from"))
+        )
+        receiver = _jd_uid(
+            _jd_first(raw, ("toUserId", "to_user_id", "receiverId", "receiver_id", "to"))
+        )
+        if sender == account:
+            peer = receiver
+        elif receiver == account:
+            peer = sender
+        else:
+            # Some cached rows omit one side but include partnerId/peerId.
+            # Accept that fallback only when it is not the authenticated user.
+            candidate = _jd_uid(
+                _jd_first(raw, ("partnerId", "partner_id", "peerId", "peer_id", "conversationUser"))
+            )
+            peer = candidate if candidate and candidate != account else ""
+        if (
+            not peer
+            or peer == account
+            or len(peer) > 128
+            or any(ord(char) < 33 for char in peer)
+        ):
+            continue
+
+        timestamp = _jd_first(
+            raw,
+            ("timestamp", "msgTimestamp", "msg_timestamp", "sentAt", "sent_at", "time"),
+            0,
+        )
+        activity_time = _conversation_summary_time(timestamp)
+        if normalized_since is not None and activity_time < normalized_since:
+            continue
+        sequence_raw = _jd_first(raw, ("sequence", "activitySequence", "activity_sequence", "seq"), "")
+        sequence = _conversation_sequence_value(sequence_raw)
+        message_id = _jd_uid(
+            _jd_first(raw, ("messageId", "message_id", "msgUID", "msg_uid", "id"))
+        )
+        message_type = _jd_first(raw, ("type", "messageType", "message_type"), "TEXT")
+        text = _jd_message_text(
+            _jd_first(raw, ("content", "text", "body", "message"), "")
+        )
+        unread = max(
+            0,
+            _jd_number(
+                _jd_first(raw, ("unreadCount", "unread_count", "unread", "unreadNum"), 0),
+                0,
+            ),
+        )
+        item: Dict[str, Any] = {
+            # Keep the conversation key stable even when the latest message id
+            # changes between refreshes.
+            "id": f"C2C{peer}",
+            "conversation_id": f"C2C{peer}",
+            "conversation_type": "C2C",
+            "conversation_user": peer,
+            "peer_id": peer,
+            "nickname": _jd_message_text(
+                _jd_first(raw, ("fromUserNickname", "nickname", "peerNickname"), "")
+            ) or peer,
+            "avatar": str(
+                _jd_first(raw, ("fromUserAvatar", "avatar", "peerAvatar"), "") or ""
+            ),
+            "content": text,
+            "last_message": text,
+            "timestamp": timestamp,
+            "preview_timestamp": timestamp,
+            "activity_sequence": str(sequence_raw or ""),
+            "preview_sequence": str(sequence_raw or ""),
+            "from_user_id": sender,
+            "to_user_id": receiver,
+            "msg_uid": message_id,
+            "message_id": message_id,
+            "message_key": message_id,
+            "msg_key": message_id,
+            "object_name": _jd_message_object_name(message_type),
+            "channel_type": "C2C",
+            "message_type": str(message_type or "TEXT"),
+            "unread_count": unread,
+            "unread_observed_at": observed_at,
+            "unread_authoritative": True,
+            "preview_source": "jd_chat",
+            "preview_authoritative": True,
+            "preview_timestamp_inferred": False,
+            "source": "jd_chat",
+            "provider": "jd-chat",
+            "status": str(_jd_first(raw, ("status", "messageStatus", "message_status"), "") or ""),
+        }
+        previous = by_peer.get(peer)
+        if previous is None:
+            by_peer[peer] = item
+            continue
+        previous_key = (
+            _conversation_summary_time(previous.get("timestamp")),
+            _conversation_sequence_value(previous.get("activity_sequence")),
+            str(previous.get("message_id") or ""),
+        )
+        current_key = (activity_time, sequence, message_id)
+        if current_key > previous_key:
+            by_peer[peer] = item
+        elif current_key == previous_key:
+            # Keep the richer preview and the largest unread snapshot when a
+            # proxy accidentally returns the same row twice.
+            if not previous.get("last_message") and text:
+                previous["last_message"] = previous["content"] = text
+            previous["unread_count"] = max(
+                int(previous.get("unread_count") or 0), unread
+            )
+
+    items = sorted(
+        by_peer.values(),
+        key=lambda item: (
+            _conversation_summary_time(item.get("timestamp")),
+            _conversation_sequence_value(item.get("activity_sequence")),
+            str(item.get("message_id") or ""),
+        ),
+        reverse=True,
+    )
+    cache = profile_cache if profile_cache is not None else {}
+    _attach_cached_conversation_profiles(app, items, cache)
+    return {
+        "ok": True,
+        "items": items,
+        "list": items,
+        "count": len(items),
+        "entity": "conversation",
+        "status": 200,
+        "source": "jd_chat",
+        "provider": "jd-chat",
+        "snapshot_complete": normalized_since is None,
+    }
+
+
+# Short alias used by a few integrations/tests that call the provider
+# normalizer directly.
+_jd_conversation_envelope = _jd_recent_conversation_envelope
+
+
 def _attach_cached_conversation_summaries(
     items: List[Dict[str, Any]],
     summaries: Mapping[str, Mapping[str, Any]],
@@ -1965,41 +2514,148 @@ def _tim_message_sort_key(item: Mapping[str, Any]) -> Tuple[float, int, str]:
 
 
 def _jd_message_envelope(result: Any, account_uid: str, peer_uid: str) -> Dict[str, Any]:
-    """Normalize v162 JD Chat history rows to the Web message envelope."""
-    payload = getattr(result, "data", None)
-    if isinstance(payload, Mapping):
-        rows = payload.get("data", payload.get("items", payload.get("list", [])))
-    else:
-        rows = payload
-    if isinstance(rows, Mapping):
-        rows = rows.get("items", rows.get("list", []))
-    rows = rows if isinstance(rows, list) else []
-    items: List[Dict[str, Any]] = []
+    """Normalize v162 JD Chat history rows to the Web message envelope.
+
+    The endpoint returns ``List<ChatMessage>`` (not TIM's ``MsgBody`` shape),
+    and some reverse proxies wrap the list in ``data``/``items``.  Preserve the
+    provider's message id as the canonical identity and expose all fields the
+    browser's TIM-compatible normalizer understands.
+    """
+
+    payload = _jd_result_data(result)
+    rows = _jd_collection_rows(payload)
+    account = _jd_uid(account_uid)
+    peer = _jd_uid(peer_uid)
+    items_by_id: Dict[str, Dict[str, Any]] = {}
     for raw in rows:
         if not isinstance(raw, Mapping):
             continue
-        sender = str(raw.get("fromUserId") or raw.get("senderId") or "")
-        receiver = str(raw.get("toUserId") or raw.get("receiverId") or "")
-        if sender not in {account_uid, peer_uid} and receiver not in {account_uid, peer_uid}:
-            continue
-        mid = str(raw.get("messageId") or raw.get("id") or "").strip()
+        sender = _jd_uid(
+            _jd_first(raw, ("fromUserId", "from_user_id", "senderId", "sender_id", "from"))
+        )
+        receiver = _jd_uid(
+            _jd_first(raw, ("toUserId", "to_user_id", "receiverId", "receiver_id", "to"))
+        )
+        # Require the row to belong to this C2C pair.  If one side is omitted
+        # by a legacy proxy, allow the explicit partner id only when it matches
+        # the requested peer.
+        if account and peer:
+            pair = {sender, receiver}
+            if account not in pair or peer not in pair:
+                partner = _jd_uid(
+                    _jd_first(raw, ("partnerId", "partner_id", "peerId", "peer_id"), "")
+                )
+                if partner != peer:
+                    continue
+        mid = _jd_uid(
+            _jd_first(
+                raw,
+                ("messageId", "message_id", "msgUID", "msg_uid", "id", "messageKey", "message_key"),
+                "",
+            )
+        )
         if not mid:
+            # A history row without a stable id cannot be safely reconciled
+            # with optimistic/archive rows; skip it rather than showing a
+            # duplicate on every refresh.
             continue
-        items.append({
-            "id": mid, "msg_key": mid, "message_id": mid,
-            "from": sender, "to": receiver,
-            "from_account": sender, "to_account": receiver,
-            "text": str(raw.get("content") or raw.get("text") or ""),
-            "timestamp": raw.get("timestamp") or raw.get("createdAt") or 0,
-            "type": "mine" if sender == account_uid else "other",
-            "direction": "out" if sender == account_uid else "in",
-            "source": "jd_chat", "provider": "jd-chat",
-            "object_name": "TIMTextElem", "message_type": "text",
-        })
-    items.sort(key=lambda x: _tim_epoch_sort_value(x.get("timestamp")))
-    return {"ok": True, "items": items, "list": items, "count": len(items),
-            "entity": "message", "status": 200, "source": "jd_chat",
-            "has_more": False, "next_before": ""}
+        timestamp = _jd_first(
+            raw,
+            ("timestamp", "msgTimestamp", "msg_timestamp", "createdAt", "created_at", "time"),
+            0,
+        )
+        sequence_raw = _jd_first(raw, ("sequence", "msgSequence", "msg_sequence", "seq"), "")
+        message_type = _jd_first(raw, ("type", "messageType", "message_type"), "TEXT")
+        object_name = _jd_message_object_name(message_type)
+        text = _jd_message_text(
+            _jd_first(raw, ("content", "text", "body", "message"), "")
+        )
+        direction = "out" if sender == account else "in" if sender else ""
+        kind = "text"
+        type_lower = str(message_type or "").strip().lower()
+        if type_lower in {"image", "picture", "3"}:
+            kind = "image"
+        elif type_lower in {"audio", "voice", "sound", "4"}:
+            kind = "audio"
+        elif type_lower in {"video", "5"}:
+            kind = "video"
+        elif type_lower in {"file", "6"}:
+            kind = "file"
+        item: Dict[str, Any] = {
+            # ``canonical_message_id`` deliberately equals the JD id.  The
+            # browser archive projection stores the same upstream id, so this
+            # makes provider/archive reconciliation deterministic.
+            "id": mid,
+            "message_id": mid,
+            "message_key": mid,
+            "msg_key": mid,
+            "msg_uid": mid,
+            "canonical_message_id": mid,
+            "sequence": str(sequence_raw or ""),
+            "msg_sequence": str(sequence_raw or ""),
+            "MsgSeq": str(sequence_raw or ""),
+            "client_message_id": str(
+                _jd_first(raw, ("clientMessageId", "client_message_id", "clientMessageKey"), "")
+                or ""
+            ),
+            "from": sender,
+            "to": receiver,
+            "from_user_id": sender,
+            "to_user_id": receiver,
+            "from_account": sender,
+            "to_account": receiver,
+            "peer_id": peer,
+            "peer": peer,
+            "text": text,
+            "content": text,
+            "body": text,
+            "timestamp": timestamp,
+            "time": timestamp,
+            # Keep native type in ``type`` for diagnostics while ``kind`` /
+            # ``message_type`` provide the browser's normalized media kind.
+            "type": str(message_type or "TEXT"),
+            "kind": kind,
+            "message_type": kind,
+            "native_type": str(message_type or "TEXT"),
+            "direction": direction,
+            "flow": direction,
+            "status": str(_jd_first(raw, ("status", "messageStatus", "message_status"), "") or ""),
+            "object_name": object_name,
+            "objectName": object_name,
+            "source": "jd_chat",
+            "provider": "jd-chat",
+            "raw_message_id": mid,
+            "rawMessageId": mid,
+            "unread_count": max(
+                0,
+                _jd_number(_jd_first(raw, ("unreadCount", "unread_count"), 0), 0),
+            ),
+        }
+        # Keep the richest row when a proxy repeats the same message id (for
+        # example, one copy with content and one copy with only status).
+        previous = items_by_id.get(mid)
+        if previous is None:
+            items_by_id[mid] = item
+        else:
+            merged = {**previous, **item}
+            if not item.get("text") and previous.get("text"):
+                merged["text"] = merged["content"] = merged["body"] = previous["text"]
+            if not item.get("sequence") and previous.get("sequence"):
+                merged["sequence"] = merged["msg_sequence"] = merged["MsgSeq"] = previous["sequence"]
+            items_by_id[mid] = merged
+    items = sorted(items_by_id.values(), key=_tim_message_sort_key)
+    return {
+        "ok": True,
+        "items": items,
+        "list": items,
+        "count": len(items),
+        "entity": "message",
+        "status": 200,
+        "source": "jd_chat",
+        "provider": "jd-chat",
+        "has_more": False,
+        "next_before": "",
+    }
 
 
 def _tim_roaming_message_envelope(
@@ -3947,18 +4603,46 @@ class Handler(BaseHTTPRequestHandler):
                         {"ok": False, "error": "会话时间范围无效"},
                         400,
                     )
+            # APK v162 moved the conversation list to the independent JD Chat
+            # service.  Prefer it whenever a valid session token is available;
+            # retain TIM as a compatibility fallback for older accounts and
+            # local test harnesses that do not expose ``jd_chat``.
+            jd_payload: Optional[Dict[str, Any]] = None
+            jd_chat = getattr(u.native, "jd_chat", None)
+            if jd_chat is not None and callable(
+                getattr(jd_chat, "conversations", None)
+            ):
+                try:
+                    jd_payload = _jd_recent_conversation_envelope(
+                        app,
+                        jd_chat,
+                        str(app.session.uid or ""),
+                        u.profile_cache,
+                        deadline=deadline,
+                        call_timeout=provider_timeout or tim_timeout or None,
+                        breakers=breakers,
+                        request_id=request_id,
+                        activity_since=activity_since,
+                    )
+                except Exception:
+                    # Do not turn a transient JD outage into a blank list when
+                    # the legacy provider is still usable.
+                    jd_payload = None
             try:
-                payload = _tim_recent_conversation_envelope(
-                    app,
-                    u.native.tim_rest,
-                    str(app.session.uid or ""),
-                    u.profile_cache,
-                    deadline=deadline,
-                    call_timeout=tim_timeout or None,
-                    breakers=breakers,
-                    request_id=request_id,
-                    activity_since=activity_since,
-                )
+                if jd_payload is not None:
+                    payload = jd_payload
+                else:
+                    payload = _tim_recent_conversation_envelope(
+                        app,
+                        u.native.tim_rest,
+                        str(app.session.uid or ""),
+                        u.profile_cache,
+                        deadline=deadline,
+                        call_timeout=tim_timeout or None,
+                        breakers=breakers,
+                        request_id=request_id,
+                        activity_since=activity_since,
+                    )
             except Exception:
                 if deadline is not None and deadline.expired:
                     return self.ok(
@@ -4126,12 +4810,19 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 jd_chat = getattr(u.native, "jd_chat", None)
                 if jd_chat is not None and callable(getattr(jd_chat, "history", None)):
-                    jd_result = jd_chat.history(
+                    jd_result = _jd_dependency_call(
+                        jd_chat.history,
                         peer_id=str(peer),
                         limit=200 if not summary_only else 50,
                         before=before_time,
+                        provider="jd-chat",
+                        domain="im-read",
+                        breakers=breakers,
+                        timeout=provider_timeout or tim_timeout or None,
+                        deadline=deadline,
+                        request_id=request_id,
                     )
-                    if getattr(jd_result, "ok", False):
+                    if _jd_result_ok(jd_result):
                         return self.ok(_jd_message_envelope(jd_result, str(app.session.uid or ""), str(peer)))
                 payload = _tim_roaming_message_envelope(
                     u.native.tim_rest,
@@ -5033,35 +5724,133 @@ class Handler(BaseHTTPRequestHandler):
                 jd_chat = getattr(u.native, "jd_chat", None)
                 if jd_chat is not None and callable(getattr(jd_chat, "send_text", None)):
                     try:
-                        jd_result = jd_chat.send_text(from_uid, to_uid, text)
+                        jd_result = _jd_send_text_once(
+                            jd_chat.send_text,
+                            from_uid,
+                            to_uid,
+                            text,
+                            client_message_id,
+                        )
                     except Exception as exc:
-                        jd_result = None
-                    if jd_result is not None and getattr(jd_result, "ok", False):
-                        payload = jd_result.to_dict()
+                        # The sender may have written a WebSocket frame before
+                        # an adapter/proxy exception escaped (for example, a
+                        # post-send decode or callback failure).  Treat every
+                        # invocation exception as an indeterminate JD
+                        # delivery instead of falling through to TIM, whose
+                        # retry would create a second real message.  The
+                        # browser can reconcile this by refreshing history.
+                        jd_result = {
+                            "ok": False,
+                            "status": 502,
+                            "error": str(exc)[:300] or "JD 消息发送结果待确认",
+                            "delivery_uncertain": True,
+                            "ws_sent": True,
+                            "client_message_id": client_message_id,
+                            "data": {
+                                "delivery_uncertain": True,
+                                "ws_sent": True,
+                                "clientMessageId": client_message_id,
+                                "client_message_id": client_message_id,
+                            },
+                        }
+                    if jd_result is not None and _jd_result_ok(jd_result):
+                        payload = _jd_result_to_dict(jd_result)
                         body = payload.get("data")
+                        message_body = (
+                            body.get("data")
+                            if isinstance(body, Mapping)
+                            and isinstance(body.get("data"), Mapping)
+                            else body
+                        )
                         if isinstance(body, dict):
-                            msg_key = str(body.get("messageId") or body.get("message_id") or "").strip()
+                            msg_key = str(
+                                body.get("messageId")
+                                or body.get("message_id")
+                                or (
+                                    message_body.get("messageId")
+                                    if isinstance(message_body, Mapping)
+                                    else ""
+                                )
+                                or (
+                                    message_body.get("message_id")
+                                    if isinstance(message_body, Mapping)
+                                    else ""
+                                )
+                                or ""
+                            ).strip()
                             if msg_key:
                                 payload["msg_key"] = msg_key
                                 payload["message_id"] = msg_key
-                        payload.update({"from": from_uid, "to": to_uid, "message": "已发送"})
-                        try:
-                            payload["history_mirror"] = R(
-                                app.im.history_message_insert(
-                                    from_id=from_uid,
-                                    to_id=to_uid,
-                                    content=text,
-                                    type="text",
-                                )
-                            )
-                        except Exception:
-                            pass
+                        # The browser archives the authoritative JD message
+                        # asynchronously through /api/archive/messages/batch.
+                        # Writing an additional legacy ``insertTencentHistory``
+                        # row here creates a second projection which is then
+                        # rendered as a duplicate on the next history load.
+                        payload.update(
+                            {
+                                "from": from_uid,
+                                "to": to_uid,
+                                "message": "已发送",
+                                "client_message_id": client_message_id,
+                                "canonical_message_id": msg_key,
+                                "source": "jd_chat",
+                                "provider": "jd-chat",
+                                "timestamp": (
+                                    body.get("timestamp")
+                                    or (
+                                        message_body.get("timestamp")
+                                        if isinstance(message_body, Mapping)
+                                        else ""
+                                    )
+                                    if isinstance(body, dict)
+                                    else ""
+                                ),
+                                "history_mirror": None,
+                            }
+                        )
                         conversation_peers = getattr(u, "conversation_message_peers", None)
                         if conversation_peers is None:
                             conversation_peers = set()
                             setattr(u, "conversation_message_peers", conversation_peers)
                         conversation_peers.add(to_uid)
                         return self.ok(payload, 200)
+
+                    # Never fall through to TIM after a JD frame was handed to
+                    # the socket.  A missing ACK/connection close is not proof
+                    # that the message was rejected; issuing a second provider
+                    # send here is exactly what produced duplicate rows in the
+                    # history view.  Let the browser refresh/reconcile the
+                    # conversation instead of displaying a backup-channel hint.
+                    if jd_result is not None and _jd_delivery_uncertain(jd_result):
+                        jd_payload = _jd_result_to_dict(jd_result)
+                        jd_body = jd_payload.get("data")
+                        if isinstance(jd_body, Mapping) and isinstance(
+                            jd_body.get("data"), Mapping
+                        ):
+                            jd_body = jd_body.get("data")
+                        canonical_id = ""
+                        if isinstance(jd_body, Mapping):
+                            canonical_id = str(
+                                jd_body.get("messageId")
+                                or jd_body.get("message_id")
+                                or jd_body.get("msg_uid")
+                                or jd_body.get("msg_key")
+                                or ""
+                            ).strip()
+                        return self.ok(
+                            {
+                                "ok": False,
+                                "code": "JD_MESSAGE_DELIVERY_UNCERTAIN",
+                                "error": "消息发送结果待确认，请刷新会话后重试",
+                                "message": "消息发送结果待确认，请刷新会话后重试",
+                                "retryable": True,
+                                "source": "jd_chat",
+                                "provider": "jd-chat",
+                                "client_message_id": client_message_id,
+                                "canonical_message_id": canonical_id,
+                            },
+                            502,
+                        )
 
                 quote_cloud_data = encode_message_quote(quote)
                 send_options = (
