@@ -1144,6 +1144,15 @@ return 1
         )
         if not account or not normalized_peers:
             raise ValueError("TIM read sync requires account and peers")
+        suspension_key = f"{self.settings.redis_prefix}:tim-rest:suspended"
+        if self.redis.get(suspension_key) is not None:
+            return {
+                "accepted_peers": normalized_peers,
+                "job_ids": [],
+                "durable": False,
+                "skipped": True,
+                "reason": "TIM service suspended",
+            }
         supplied_receipts = [
             dict(item)
             for item in list(receipt_messages)[:300]

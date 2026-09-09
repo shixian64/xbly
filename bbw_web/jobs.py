@@ -141,6 +141,7 @@ TIM_MIRROR_BACKOFF_MAX_SECONDS = 3600
 TIM_MEDIA_READ_TTL_SECONDS = 900
 TIM_RECALL_LOOKUP_MAX_PAGES = 3
 TIM_READ_SYNC_LOCK_SECONDS = 200
+TIM_SERVICE_SUSPENSION_TTL_SECONDS = 300
 WEB_NATIVE_MEDIA_CLEANUP_BATCH = 200
 WEB_NATIVE_UPLOAD_CLEANUP_GRACE_SECONDS = 60 * 60
 WEB_NATIVE_MEDIA_UNSENT_GRACE_SECONDS = 24 * 60 * 60
@@ -235,6 +236,14 @@ def sync_tim_conversation_read(state_key: str) -> dict[str, Any]:
         acquired = bool(lock.acquire(blocking=True))
         if not acquired:
             raise RuntimeError("TIM read sync is already active")
+        suspension_key = f"{settings.redis_prefix}:tim-rest:suspended"
+        if redis.get(suspension_key):
+            return {
+                "ok": False,
+                "skipped": True,
+                "reason": "TIM service suspended",
+                "retryable": True,
+            }
         client = _default_message_read_transport()
         processed: list[str] = []
         receipt_count = 0
@@ -274,6 +283,18 @@ def sync_tim_conversation_read(state_key: str) -> dict[str, Any]:
 
             conversation_result = client.mark_c2c_read(account, peer)
             if not getattr(conversation_result, "ok", False):
+                if int(getattr(conversation_result, "error_code", 0) or 0) == 60020:
+                    redis.set(
+                        suspension_key,
+                        b"60020",
+                        ex=TIM_SERVICE_SUSPENSION_TTL_SECONDS,
+                    )
+                    return {
+                        "ok": False,
+                        "skipped": True,
+                        "reason": "TIM service suspended",
+                        "retryable": True,
+                    }
                 raise RuntimeError(
                     f"TIM conversation read failed: {int(getattr(conversation_result, 'error_code', 0) or 0)}"
                 )
@@ -283,6 +304,18 @@ def sync_tim_conversation_read(state_key: str) -> dict[str, Any]:
                 messages=receipt_messages or None,
             )
             if not getattr(receipt_result, "ok", False):
+                if int(getattr(receipt_result, "error_code", 0) or 0) == 60020:
+                    redis.set(
+                        suspension_key,
+                        b"60020",
+                        ex=TIM_SERVICE_SUSPENSION_TTL_SECONDS,
+                    )
+                    return {
+                        "ok": False,
+                        "skipped": True,
+                        "reason": "TIM service suspended",
+                        "retryable": True,
+                    }
                 raise RuntimeError(
                     f"TIM receipt sync failed: {int(getattr(receipt_result, 'error_code', 0) or 0)}"
                 )
@@ -4609,6 +4642,7 @@ def sync_account_history(
     client = (transport_factory or _default_message_history_transport)()
     try:
         contact_fallback = False
+        contact_error = ""
         try:
             recent_conversations = _tim_recent_conversations(
                 client,
@@ -4618,6 +4652,7 @@ def sync_account_history(
         except Exception:
             recent_conversations = []
             contact_fallback = True
+            contact_error = "TIM recent contacts unavailable"
 
         conversations: list[dict[str, Any]] = []
         seen_peers: set[str] = set()
@@ -4629,9 +4664,6 @@ def sync_account_history(
             conversations.append(item)
             if len(conversations) >= 500:
                 break
-        if not conversations and contact_fallback:
-            raise RuntimeError("TIM recent contacts failed and no durable peers are available")
-
         if conversations:
             start = peer_offset % len(conversations)
             rotated = conversations[start:] + conversations[:start]
@@ -4724,9 +4756,6 @@ def sync_account_history(
             messages_created += int(result_summary.get("messages_created") or 0)
             messages_existing += int(result_summary.get("messages_existing") or 0)
 
-        if selected_conversations and len(peer_errors) >= len(selected_conversations):
-            raise RuntimeError("TIM roaming reconciliation failed for every selected conversation")
-
         peer_watermarks = dict(
             sorted(peer_watermarks.items(), key=lambda item: item[1], reverse=True)[:500]
         )
@@ -4738,6 +4767,7 @@ def sync_account_history(
             "next_peer_offset": next_peer_offset,
             "roaming_requests": roaming_requests,
             "contact_fallback": contact_fallback,
+            "degraded": bool(contact_error or peer_errors),
         }
         cursor_state = {**summary, "peer_watermarks": peer_watermarks}
         _save_sync_result(
@@ -4748,7 +4778,9 @@ def sync_account_history(
             succeeded=True,
             summary=cursor_state,
             watermark_at=watermark,
-            error="; ".join(peer_errors[:10]) or None,
+            error="; ".join(
+                item for item in (contact_error, *peer_errors[:10]) if item
+            ) or None,
         )
         return {"ok": True, **summary}
     except Exception as exc:
