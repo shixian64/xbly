@@ -4127,8 +4127,9 @@ class Handler(BaseHTTPRequestHandler):
                 jd_chat = getattr(u.native, "jd_chat", None)
                 if jd_chat is not None and callable(getattr(jd_chat, "history", None)):
                     jd_result = jd_chat.history(
-                        user_id=str(app.session.uid or ""), peer_id=str(peer),
+                        peer_id=str(peer),
                         limit=200 if not summary_only else 50,
+                        before=before_time,
                     )
                     if getattr(jd_result, "ok", False):
                         return self.ok(_jd_message_envelope(jd_result, str(app.session.uid or ""), str(peer)))
@@ -4909,8 +4910,8 @@ class Handler(BaseHTTPRequestHandler):
                         {
                             "ok": False,
                             "code": "MEDIA_REQUIRES_TIM_SDK",
-                            "message": "富媒体需要实时消息组件在线，文本备用通道不会上传本地文件",
-                            "error": "富媒体需要实时消息组件在线，文本备用通道不会上传本地文件",
+                            "message": "当前仅支持发送文字，请先连接消息服务",
+                            "error": "当前仅支持发送文字，请先连接消息服务",
                         },
                         409,
                     )
