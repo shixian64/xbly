@@ -15,6 +15,10 @@ import httpx
 import asyncio
 import json
 import urllib.parse
+import hashlib
+import threading
+import uuid
+import time
 
 
 JD_CHAT_BASE = "https://test.banghua.xin"
@@ -86,14 +90,17 @@ class JdChatClient:
             return JdChatResult(False, error_info=str(exc))
 
     def send_text(self, sender_id: str, receiver_id: str, content: str) -> JdChatResult:
+        """Send via the APK-compatible WebSocket, with legacy HTTP fallback."""
+        result = self.send_text_ws(sender_id, receiver_id, content)
+        if result.ok:
+            return result
         try:
-            sender = int(str(sender_id))
-            receiver = int(str(receiver_id))
+            sender, receiver = int(str(sender_id)), int(str(receiver_id))
         except (TypeError, ValueError):
-            return JdChatResult(False, error_info="聊天用户 ID 必须是数字")
+            return result
         text = str(content or "").strip()
         if not text:
-            return JdChatResult(False, error_info="消息内容不能为空")
+            return result
         return self._request(
             "POST", "/api/im/messages/send",
             json_body={"senderId": sender, "receiverId": receiver, "content": text},
@@ -109,23 +116,74 @@ class JdChatClient:
         if not token or not str(content or "").strip():
             return JdChatResult(False, error_info="聊天凭证或消息内容为空")
         message = {
-            "messageId": __import__("uuid").uuid4().hex,
+            "messageId": str(uuid.uuid4()),
             "fromUserId": sender, "toUserId": receiver,
             "content": str(content).strip(), "type": "TEXT",
-            "timestamp": int(__import__("time").time() * 1000), "status": "SENT",
+            "timestamp": int(time.time() * 1000), "status": "SENT",
         }
-        url = "wss://testchat.banghua.xin/ws/chat?token=" + urllib.parse.quote(token, safe="") + "&deviceId=" + urllib.parse.quote(str(device_id or "web"), safe="")
+        session_device = str(getattr(self.session, "device_id", "") or "").strip()
+        if not session_device:
+            seed = str(getattr(self.session, "uid", "") or sender_id or token)
+            session_device = "web-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
+            if self.session is not None:
+                try:
+                    self.session.device_id = session_device
+                except Exception:
+                    pass
+        effective_device = str(device_id or session_device or "web").strip() or session_device
+        ws_base = self.base_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+        if "test.banghua.xin" in ws_base and "testchat.banghua.xin" not in ws_base:
+            ws_base = ws_base.replace("test.banghua.xin", "testchat.banghua.xin")
+        url = ws_base.rstrip("/") + "/ws/chat?token=" + urllib.parse.quote(token, safe="") + "&deviceId=" + urllib.parse.quote(effective_device, safe="")
         async def run() -> Any:
             import websockets
-            async with websockets.connect(url, extra_headers={"Authorization": f"Bearer {token}"}, ping_interval=30, close_timeout=2) as ws:
+            headers = {"Authorization": f"Bearer {token}"}
+            try:
+                ws_cm = websockets.connect(url, additional_headers=headers, ping_interval=30, close_timeout=2)
+            except TypeError:
+                ws_cm = websockets.connect(url, extra_headers=headers, ping_interval=30, close_timeout=2)
+            async with ws_cm as ws:
                 await ws.send(json.dumps(message, ensure_ascii=False, separators=(",", ":")))
                 try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=3)
-                    return json.loads(raw) if isinstance(raw, str) else raw
-                except Exception:
-                    return None
+                    for _ in range(3):
+                        raw = await asyncio.wait_for(ws.recv(), timeout=3)
+                        item = json.loads(raw) if isinstance(raw, str) else raw
+                        if isinstance(item, dict) and str(item.get("type") or "").upper() in {"ACK", "ERROR", "NACK"}:
+                            return item
+                    return {"_timeout": True}
+                except asyncio.TimeoutError:
+                    return {"_timeout": True}
+
         try:
-            ack = asyncio.run(run())
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                ack = asyncio.run(run())
+            else:
+                box: list[Any] = []
+                errors: list[BaseException] = []
+                def worker() -> None:
+                    try:
+                        box.append(asyncio.run(run()))
+                    except BaseException as exc:
+                        errors.append(exc)
+                thread = threading.Thread(target=worker, daemon=True)
+                thread.start(); thread.join(self.timeout + 2)
+                if errors:
+                    raise errors[0]
+                if not box:
+                    raise TimeoutError("WebSocket send timed out")
+                ack = box[0]
+            if isinstance(ack, dict) and ack.get("_timeout"):
+                return JdChatResult(False, 504, {"data": message, "ack": None}, "服务器未返回消息确认")
+            if isinstance(ack, dict):
+                ack_type = str(ack.get("type") or "").upper()
+                ack_status = str(ack.get("status") or "").upper()
+                if ack_type in {"ERROR", "NACK"} or ack_status in {"ERROR", "FAILED", "FAIL", "REJECTED"}:
+                    return JdChatResult(False, 502, {"data": message, "ack": ack}, str(ack.get("content") or ack.get("message") or "消息服务器拒绝发送"))
+                ack_id = str(ack.get("content") or ack.get("messageId") or ack.get("ackMessageId") or "")
+                if ack_type != "ACK" or ack_id != message["messageId"]:
+                    return JdChatResult(False, 502, {"data": message, "ack": ack}, "服务器未确认本条消息")
             return JdChatResult(True, 200, {"data": message, "ack": ack})
         except Exception as exc:
             return JdChatResult(False, error_info=str(exc))
@@ -144,3 +202,5 @@ class JdChatClient:
 
 
 __all__ = ["JD_CHAT_BASE", "JdChatClient", "JdChatResult"]
+
+
