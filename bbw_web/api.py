@@ -355,6 +355,7 @@ class CapturingHandler(legacy.Handler):
         profile_lookup_coordinator: Any = None,
         presence_coordinator: Any = None,
         read_sync_enqueuer: Optional[Callable[..., Mapping[str, Any]]] = None,
+        moment_assist_runtime_factory: Optional[Callable[[], Any]] = None,
     ) -> None:
         # BaseHTTPRequestHandler.__init__ immediately starts reading a socket;
         # intentionally do not call it here.
@@ -391,6 +392,7 @@ class CapturingHandler(legacy.Handler):
         self._request_profile_lookup_coordinator = profile_lookup_coordinator
         self._request_presence_coordinator = presence_coordinator
         self._request_read_sync_enqueuer = read_sync_enqueuer
+        self._request_moment_assist_runtime_factory = moment_assist_runtime_factory
         self.request_version = "HTTP/1.1"
         self.close_connection = True
         self._held_user_lock = None
@@ -1848,6 +1850,15 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
             read_sync_enqueuer=(
                 getattr(persistence, "enqueue_tim_read_sync", None)
                 if identity is not None
+                else None
+            ),
+            moment_assist_runtime_factory=(
+                lambda request_identity=identity: persistence.restore_agent_web_user(
+                    request_identity.user_id,
+                    request_identity.external_account_id,
+                    expected_upstream_uid=request_identity.upstream_uid,
+                )
+                if identity is not None and getattr(identity, "auth_source", "provider") != "web-local"
                 else None
             ),
         )

@@ -114,6 +114,26 @@ class RequestGateTests(unittest.TestCase):
         self.assertFalse(state["probe_in_flight"])
 
 
+    def test_open_dependency_circuit_is_warning_logged(self) -> None:
+        breakers = DependencyCircuitBreakerRegistry(
+            failure_threshold=1,
+            failure_window_seconds=10,
+            cooldown_seconds=20,
+        )
+        breakers.before_call("beibeiwu", "presence")
+        breakers.record_failure("beibeiwu", "presence", retryable=True)
+        with patch.object(bff_server.LOGGER, "warning") as warning:
+            with self.assertRaisesRegex(RuntimeError, "dependency circuit open"):
+                bff_server._dependency_call(
+                    lambda: self.fail("open circuit should not invoke provider"),
+                    provider="beibeiwu",
+                    domain="presence",
+                    breakers=breakers,
+                )
+        self.assertEqual(json.loads(warning.call_args.args[0])["outcome"], "short_circuit")
+
+
+
 class ReadSyncPersistenceContractTests(unittest.TestCase):
     class FakeRedis:
         def __init__(self) -> None:
@@ -1556,7 +1576,7 @@ class SocialBffRoutingTests(unittest.TestCase):
         bff_server.Handler.do_POST(harness)
         return calls, harness.response
 
-    def _run_moment_view_post(self, payload: dict, app=None):
+    def _run_moment_view_post(self, payload: dict, app=None, *, runtime_factory=None, lease=None):
         calls = []
         if app is None:
             result = ApiResult(True, 200, "", data=None, kind="empty")
@@ -1572,6 +1592,8 @@ class SocialBffRoutingTests(unittest.TestCase):
 
             def __init__(self):
                 self.response = None
+                self._request_moment_assist_runtime_factory = runtime_factory
+                self._held_user_lock = lease
 
             def _check_api_origin(self):
                 return True
@@ -1749,6 +1771,58 @@ class SocialBffRoutingTests(unittest.TestCase):
         self.assertEqual(assist["remaining_before"], 5)
         self.assertEqual(assist["remaining_after"], 0)
         self.assertEqual(assist["successful_repeat_views"], 5)
+
+    def test_moment_view_task_assist_releases_account_gate_and_closes_clone(self) -> None:
+        events = []
+        result = ApiResult(True, 200, "", data=None, kind="empty")
+        app = SimpleNamespace(
+            session=SimpleNamespace(uid="42"),
+            social=SimpleNamespace(record_post_view=lambda postid: events.append(("view", postid)) or result),
+        )
+        clone = SimpleNamespace(
+            app=SimpleNamespace(
+                session=SimpleNamespace(uid="42"),
+                client=SimpleNamespace(close=lambda: events.append(("close", "clone"))),
+            ),
+            native=SimpleNamespace(),
+        )
+
+        class Lease:
+            released = False
+
+            def release(self):
+                self.released = True
+                events.append(("release", "gate"))
+
+        lease = Lease()
+
+        def factory():
+            self.assertTrue(lease.released)
+            events.append(("restore", "clone"))
+            return clone
+
+        def assist(runtime_app, postid, *, deadline):
+            self.assertIs(runtime_app, clone.app)
+            self.assertTrue(lease.released)
+            events.append(("assist", postid))
+            return {"checked": True, "task_found": False, "completed": False, "retryable": False}
+
+        with patch.object(bff_server, "_assist_moment_view_task", side_effect=assist):
+            _, response = self._run_moment_view_post(
+                {"post_id": "123", "assist_task": True},
+                app=app,
+                runtime_factory=factory,
+                lease=lease,
+            )
+        self.assertEqual(response[0], 200)
+        self.assertTrue(response[1]["task_assist"]["checked"])
+        self.assertEqual(events, [
+            ("view", "123"),
+            ("release", "gate"),
+            ("restore", "clone"),
+            ("assist", "123"),
+            ("close", "clone"),
+        ])
 
     def test_moment_view_task_assist_retries_when_progress_verification_is_delayed(self) -> None:
         view_calls = []
@@ -2887,6 +2961,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         authorizer=None,
         local_sender=None,
         authentication_source="provider",
+        jd_send=None,
     ):
         calls = []
         result = SimpleNamespace(
@@ -2905,8 +2980,9 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
             ),
             native=SimpleNamespace(
                 tim_rest=SimpleNamespace(
-                    send_text=lambda sender, peer, text: calls.append((sender, peer, text)) or result
-                )
+                    send_text=lambda sender, peer, text, **_kwargs: calls.append((sender, peer, text)) or result
+                ),
+                jd_chat=SimpleNamespace(send_text=jd_send) if jd_send is not None else None,
             ),
             match_pool_online_list_enabled=enabled,
             friend_message_peers=set(friend_peers),
@@ -3050,6 +3126,33 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(response[0], 403)
         self.assertEqual(response[1]["code"], "PRIVATE_MESSAGE_PERMISSION_REQUIRED")
+
+    def test_jd_ambiguous_send_is_pending_without_tim_fallback(self) -> None:
+        jd_calls = []
+
+        def send_jd(sender, peer, text, *, client_message_id):
+            jd_calls.append((sender, peer, text, client_message_id))
+            return {
+                "ok": False,
+                "status": 504,
+                "data": {
+                    "data": {"messageId": "jd-message-1"},
+                    "delivery_uncertain": True,
+                    "ws_sent": True,
+                },
+            }
+
+        tim_calls, response = self._run_rest_send(
+            friend_peers={"9"},
+            jd_send=send_jd,
+        )
+        self.assertEqual(jd_calls, [("42", "9", "你好", "web-client-message-1")])
+        self.assertEqual(tim_calls, [])
+        self.assertEqual(response[0], 202)
+        self.assertTrue(response[1]["ok"])
+        self.assertEqual(response[1]["delivery"], "pending")
+        self.assertFalse(response[1]["retryable"])
+        self.assertEqual(response[1]["message_id"], "jd-message-1")
 
     def test_web_local_send_commits_before_and_without_tim(self) -> None:
         local_calls = []
@@ -4367,7 +4470,7 @@ class SocialFrontendContractTests(unittest.TestCase):
         )
         self.assertIn('if path == "/api/moments/view":', server_py)
         self.assertIn("app.social.record_post_view(postid)", server_py)
-        self.assertIn('payload["task_assist"] = _assist_moment_view_task(', server_py)
+        self.assertIn('payload["task_assist"] = _assist_moment_view_task_for_request(', server_py)
         self.assertIn("deadline=assist_deadline", server_py)
         self.assertIn("MOMENT_VIEW_TASK_BATCH_SIZE", server_py)
 
@@ -6121,8 +6224,13 @@ function assert(condition, message) {
         self.assertIn("S.chat.createTextMessage(options)", send_text)
         self.assertIn("S.chat.sendMessage(message)", send_text)
         self.assertIn('api("/api/im/rest/send"', send_text)
-        self.assertIn('source: "rest"', send_text)
-        self.assertIn('provider: "tim-rest"', send_text)
+        self.assertIn('source: String(response.source || "rest")', send_text)
+        self.assertIn('provider: String(response.provider || "tim-rest")', send_text)
+        self.assertIn('pendingConfirmation = response.delivery_uncertain === true', send_text)
+        self.assertIn('delivery: pendingConfirmation ? "pending" : "sent"', send_text)
+        self.assertIn('restSendAttempted = true', send_text)
+        self.assertIn('error instanceof ApiRequestError', send_text)
+        self.assertIn('delivery: "pending"', send_text)
         self.assertIn("response.message_id", send_text)
         self.assertIn("response.msg_uid", send_text)
         self.assertNotIn("canonicalMessageID(response)", send_text)
@@ -6998,7 +7106,7 @@ if (conversationEntryDisplayName(fallbackOnly, "乐园用户", "12") !== "用户
         self.assertIn("录音需要安全网页环境或本机访问", availability)
         self.assertIn("voiceRecordingAvailability()", recording)
         self.assertIn('sendTimMediaFile("audio", file', recording)
-        self.assertIn("文本备用通道", connection_status)
+        self.assertIn("消息服务已连接", connection_status)
         self.assertNotIn("Web 本地文字和媒体可用", connection_status)
         self.assertIn("ensureTimMediaReady()", native_sender)
         self.assertIn("chat.createAudioMessage(options)", native_sender)

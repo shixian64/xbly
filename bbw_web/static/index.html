@@ -6,8 +6,8 @@
   <meta name="theme-color" content="#f8f5ff" />
   <meta name="color-scheme" content="light" />
   <title>XBLY</title>
-  <link rel="stylesheet" href="/static/app.css?v=c9c9a0287c1d75b8" />
-  <script defer src="/static/app.js?v=4c081274e3609343"></script>
+  <link rel="stylesheet" href="/static/app.css?v=abc47a4b11e9b790" />
+  <script defer src="/static/app.js?v=dbe641a58cec5cbf"></script>
 </head>
 <body>
   <div id="toast" class="toast hide" role="status" aria-live="polite" aria-atomic="true"></div>
@@ -133,6 +133,21 @@
       <button type="button" class="utility-btn" id="close-profile">关闭</button>
     </div>
     <div id="profile-dialog-body" class="profile-dialog-body ui-scrollbar"></div>
+  </dialog>
+
+  <dialog id="friend-request-dialog" class="friend-request-dialog" aria-labelledby="friend-request-title" aria-describedby="friend-request-description">
+    <form id="friend-request-form" class="friend-request-form">
+      <span class="friend-request-kicker">建立联系</span>
+      <h2 id="friend-request-title">发送好友申请</h2>
+      <p id="friend-request-description">写一句介绍，让对方更容易认识你。</p>
+      <label for="friend-request-message">申请留言</label>
+      <textarea id="friend-request-message" name="leave_word" maxlength="100" rows="4" placeholder="你好，想和你成为好友"></textarea>
+      <div class="friend-request-hint"><span>最多 100 个字符</span><output id="friend-request-count" for="friend-request-message">0 / 100</output></div>
+      <div class="friend-request-actions">
+        <button type="button" class="btn secondary" id="friend-request-cancel">取消</button>
+        <button type="submit" class="btn primary">发送申请</button>
+      </div>
+    </form>
   </dialog>
 
   <dialog id="voice-call-dialog" class="voice-call-dialog" aria-labelledby="voice-call-title" aria-describedby="voice-call-status">

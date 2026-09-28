@@ -41,7 +41,7 @@ from bbw_web.providers import (  # noqa: E402
     ProviderUnavailable,
     ProviderUpstreamInterrupted,
 )
-from bbw_web.store import SessionStore  # noqa: E402
+from bbw_web.store import SessionStore, close_web_runtime  # noqa: E402
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 COOKIE_NAME = "bbw_sid"
 STORE: Optional[SessionStore] = None
@@ -118,11 +118,11 @@ def _dependency_call(
     request_id: str = "",
     **kwargs: Any,
 ) -> Any:
-    if breakers is not None:
-        breakers.before_call(provider, domain)
     started_at = time.monotonic()
     outcome = "exception"
     try:
+        if breakers is not None:
+            breakers.before_call(provider, domain)
         result = method(
             *args,
             **kwargs,
@@ -154,7 +154,12 @@ def _dependency_call(
             breakers.record_failure(provider, domain, retryable=True)
         raise
     finally:
-        LOGGER.info(
+        log = (
+            LOGGER.warning
+            if outcome in {"short_circuit", "deadline_exceeded", "exception"}
+            else LOGGER.info
+        )
+        log(
             json.dumps(
                 {
                     "event": "interactive_dependency_call",
@@ -216,6 +221,7 @@ MOMENT_VIEW_TASK_POLL_DELAYS_SEC = (0.0, 0.25, 0.75)
 MOMENT_VIEW_TASK_DEADLINE_SEC = 55.0
 MOMENT_VIEW_TASK_MAX_REPEAT_EVENTS = 200
 MOMENT_VIEW_TASK_BATCH_SIZE = 10
+MOMENT_VIEW_TASK_ASSIST_SLOTS = threading.BoundedSemaphore(2)
 RATE_LIMIT_LOCK = threading.Lock()
 RATE_LIMIT_BUCKETS: Dict[str, List[float]] = {}
 MUTATION_LOCK = threading.Lock()
@@ -970,6 +976,52 @@ def _poll_moment_view_task_progress(
         ):
             break
     return last_available, last_tasks, last_snapshot, last_change
+
+
+def _assist_moment_view_task_for_request(
+    handler: Any,
+    web_user: Any,
+    post_id: str,
+    *,
+    deadline: float,
+) -> Dict[str, Any]:
+    runtime_factory = getattr(handler, "_request_moment_assist_runtime_factory", None)
+    if not callable(runtime_factory):
+        return _assist_moment_view_task(web_user.app, post_id, deadline=deadline)
+    if not MOMENT_VIEW_TASK_ASSIST_SLOTS.acquire(blocking=False):
+        return {
+            "checked": False,
+            "task_found": False,
+            "completed": False,
+            "retryable": True,
+            "state": "busy",
+            "requested_repeat_views": 0,
+            "successful_repeat_views": 0,
+        }
+    restored = None
+    try:
+        # The first PV has completed.  Release the account write gate before
+        # running a potentially long task-assist probe on a separate runtime.
+        # Other reads and mutations must not wait behind up to 200 PV events.
+        lease = getattr(handler, "_held_user_lock", None)
+        if lease is not None:
+            handler._held_user_lock = None
+            lease.release()
+        restored = runtime_factory()
+        original_uid = str(getattr(web_user.app.session, "uid", "") or "").strip()
+        restored_app = getattr(restored, "app", None)
+        restored_uid = str(
+            getattr(getattr(restored_app, "session", None), "uid", "") or ""
+        ).strip()
+        if not original_uid or restored_uid != original_uid:
+            raise RuntimeError("moment task assist account changed")
+        return _assist_moment_view_task(restored.app, post_id, deadline=deadline)
+    finally:
+        try:
+            if restored is not None:
+                close_web_runtime(getattr(restored, "app", None), getattr(restored, "native", None))
+        finally:
+            MOMENT_VIEW_TASK_ASSIST_SLOTS.release()
 
 
 def _assist_moment_view_task(
@@ -3225,7 +3277,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._held_user_lock = user.request_gate.acquire_write()
                 wait_ms = (time.monotonic() - started_at) * 1000
                 if mode in {"read", "write"}:
-                    LOGGER.info(
+                    log = LOGGER.warning if wait_ms >= 500 else LOGGER.info
+                    log(
                         json.dumps(
                             {
                                 "event": "request_gate_acquired",
@@ -5839,17 +5892,29 @@ class Handler(BaseHTTPRequestHandler):
                             ).strip()
                         return self.ok(
                             {
-                                "ok": False,
+                                # The JD WebSocket frame was already written.
+                                # A missing ACK only means that the final
+                                # provider result is unknown; reporting 502
+                                # makes the browser show a false failure and
+                                # invites a duplicate retry.  Keep this as an
+                                # accepted, pending operation so the client
+                                # can reconcile it from history.
+                                "ok": True,
+                                "accepted": True,
+                                "delivery": "pending",
+                                "delivery_uncertain": True,
                                 "code": "JD_MESSAGE_DELIVERY_UNCERTAIN",
-                                "error": "消息发送结果待确认，请刷新会话后重试",
-                                "message": "消息发送结果待确认，请刷新会话后重试",
-                                "retryable": True,
+                                "error": None,
+                                "message": "消息已提交，正在确认",
+                                "retryable": False,
                                 "source": "jd_chat",
                                 "provider": "jd-chat",
                                 "client_message_id": client_message_id,
                                 "canonical_message_id": canonical_id,
+                                "message_id": canonical_id,
+                                "msg_key": canonical_id,
                             },
-                            502,
+                            202,
                         )
 
                 quote_cloud_data = encode_message_quote(quote)
@@ -6261,8 +6326,9 @@ class Handler(BaseHTTPRequestHandler):
                 if assist_task:
                     if payload.get("ok"):
                         try:
-                            payload["task_assist"] = _assist_moment_view_task(
-                                app,
+                            payload["task_assist"] = _assist_moment_view_task_for_request(
+                                self,
+                                u,
                                 postid,
                                 deadline=assist_deadline,
                             )

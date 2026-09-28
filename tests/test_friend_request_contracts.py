@@ -276,3 +276,19 @@ class FriendRequestPersistenceContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FriendRequestDialogContractTests(unittest.TestCase):
+    def test_add_friend_uses_accessible_in_page_dialog(self) -> None:
+        html = (ROOT / "bbw_web" / "static" / "index.html").read_text(encoding="utf-8-sig")
+        js = (ROOT / "bbw_web" / "static" / "app.js").read_text(encoding="utf-8")
+        css = (ROOT / "bbw_web" / "static" / "app.css").read_text(encoding="utf-8")
+        add_friend = js.split('if (action === "add-friend")', 1)[1].split('if (action === "friend-apply-load-more")', 1)[0]
+
+        self.assertIn('id="friend-request-dialog"', html)
+        self.assertIn('aria-labelledby="friend-request-title"', html)
+        self.assertIn('maxlength="100"', html)
+        self.assertIn('dialog.showModal()', js)
+        self.assertIn('await requestFriendMessage()', add_friend)
+        self.assertNotIn('window.prompt', add_friend)
+        self.assertIn('.friend-request-dialog::backdrop', css)

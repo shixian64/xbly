@@ -1907,6 +1907,7 @@ function scrubAuthenticatedDom() {
     toastElement.textContent = "";
     toastElement.classList.add("hide");
   }
+  if ($("friend-request-dialog")?.open) $("friend-request-dialog").close();
   ["chat-media-viewer", "chat-flash-confirm"].forEach((id) => {
     const dialog = $(id);
     if (!dialog) return;
@@ -9056,6 +9057,7 @@ function chatMessageState(entry) {
   if (entry.type !== "mine") return "";
   if (entry.revoked) return "";
   if (entry.delivery === "failed") return { label: "发送失败", className: "is-failed", persistent: true };
+  if (entry.delivery === "pending") return { label: "等待确认", className: "is-pending", persistent: true };
   if (entry.delivery === "sending") {
     const progress = Number(entry.progress);
     return {
@@ -9087,6 +9089,7 @@ function canQuoteChatMessage(entry) {
       entry.type !== "system" &&
       !entry.revoked &&
       entry.delivery !== "sending" &&
+      entry.delivery !== "pending" &&
       entry.delivery !== "failed" &&
       String(entry.peer || "") === String(S.activePeer || "") &&
       !isSystemCustomerServicePeer(entry.peer) &&
@@ -13005,6 +13008,7 @@ function revokeActionInfo(entry) {
     entry.id &&
     !entry.revoked &&
     entry.delivery !== "sending" &&
+    entry.delivery !== "pending" &&
     entry.delivery !== "failed";
   if (!eligible) return null;
   const hasSdkMessage = Boolean(entry.rawMessage);
@@ -13337,6 +13341,16 @@ function localMessageID(prefix = "message") {
   return `local-${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function schedulePendingMessageReconciliation(peer) {
+  const generation = S.sessionGeneration;
+  [1500, 6000, 15000].forEach((delay) => {
+    setTimeout(() => {
+      if (generation !== S.sessionGeneration || !S.authenticated) return;
+      void loadConversationMessages(peer, { force: true }).catch(() => false);
+    }, delay);
+  });
+}
+
 async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "", quote = null } = {}) {
   const target = String(peer || "").trim();
   const content = String(text || "").trim();
@@ -13378,8 +13392,10 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
   });
   refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
 
+  let restSendAttempted = false;
   try {
     let sentEntry;
+    let pendingConfirmation = false;
     if (S.imConnected && S.imMode === "sdk" && S.chat && resolveTimApi()) {
       if (!S.messagePolicyReady || S.messagePolicyGeneration !== policyGeneration) {
         throw new Error("私聊安全策略已更新，请重试");
@@ -13402,6 +13418,7 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
       sentEntry.delivery = "sent";
     } else if (S.imMode === "rest" || !S.imConnected) {
       const wasDisconnected = !S.imConnected;
+      restSendAttempted = true;
       const { data, ok } = await api("/api/im/rest/send", {
         method: "POST",
         body: JSON.stringify({
@@ -13412,11 +13429,13 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
         }),
         timeout: 15000,
       });
+      restSendAttempted = false;
       const response = data && typeof data === "object" ? data : {};
       if (!ok || response.ok === false) {
         const info = errorInfo(response, "发送失败");
         throw new Error([info.title, info.detail || response.error_info].filter(Boolean).join(" · "));
       }
+      pendingConfirmation = response.delivery_uncertain === true || response.delivery === "pending";
       if (wasDisconnected) {
         S.imConnected = true;
         S.imMode = "rest";
@@ -13441,7 +13460,7 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
         provider: String(response.provider || "tim-rest"),
         rawMessage: null,
         peerRead: false,
-        delivery: "sent",
+        delivery: pendingConfirmation ? "pending" : "sent",
         quote: messageQuote,
       };
     } else {
@@ -13460,8 +13479,8 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
       type: "mine",
       peer: target,
       peerRead: sentEntry?.peerRead ?? false,
-      delivery: "sent",
-      progress: 1,
+      delivery: pendingConfirmation ? "pending" : "sent",
+      progress: pendingConfirmation ? 0 : 1,
       retryError: "",
       preview: content,
       quote: messageQuote,
@@ -13473,9 +13492,27 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
       unreadCount: 0,
     });
     refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
-    archiveMessageBestEffort(replacement, "outgoing");
+    if (pendingConfirmation) schedulePendingMessageReconciliation(target);
+    else archiveMessageBestEffort(replacement, "outgoing");
     return replacement;
   } catch (error) {
+    if (
+      restSendAttempted &&
+      error instanceof ApiRequestError &&
+      ["timeout", "network", "offline", "invalid-response"].includes(error.kind)
+    ) {
+      const unresolved = {
+        ...pending,
+        delivery: "pending",
+        progress: 0,
+        retryError: "发送结果待确认，请勿重复发送",
+      };
+      updateLocalMessage(pendingID, unresolved);
+      refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
+      schedulePendingMessageReconciliation(target);
+      toast("消息发送结果待确认，请勿重复发送", "info", 4200);
+      return unresolved;
+    }
     updateLocalMessage(pendingID, {
       ...pending,
       delivery: "failed",
@@ -20067,6 +20104,58 @@ function momentCardForButton(button) {
   return button.closest("[data-post-card]");
 }
 
+function requestFriendMessage() {
+  const dialog = $("friend-request-dialog");
+  const form = $("friend-request-form");
+  const input = $("friend-request-message");
+  const counter = $("friend-request-count");
+  const cancel = $("friend-request-cancel");
+  if (!dialog || !form || !input || !counter || !cancel) {
+    throw new Error("好友申请窗口暂不可用");
+  }
+  input.value = "你好，想和你成为好友";
+  const updateCount = () => {
+    counter.textContent = input.value.length + " / 100";
+  };
+  updateCount();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      form.removeEventListener("submit", onSubmit);
+      input.removeEventListener("input", updateCount);
+      cancel.removeEventListener("click", onCancel);
+      dialog.removeEventListener("cancel", onCancel);
+      dialog.removeEventListener("click", onBackdrop);
+      dialog.removeEventListener("close", onClose);
+      if (dialog.open) dialog.close();
+      resolve(value);
+    };
+    const onSubmit = (event) => {
+      event.preventDefault();
+      finish(input.value.trim());
+    };
+    const onCancel = (event) => {
+      event.preventDefault();
+      finish(null);
+    };
+    const onBackdrop = (event) => {
+      if (event.target === dialog) finish(null);
+    };
+    const onClose = () => finish(null);
+    form.addEventListener("submit", onSubmit);
+    input.addEventListener("input", updateCount);
+    cancel.addEventListener("click", onCancel);
+    dialog.addEventListener("cancel", onCancel);
+    dialog.addEventListener("click", onBackdrop);
+    dialog.addEventListener("close", onClose);
+    dialog.showModal();
+    input.focus({ preventScroll: true });
+    input.setSelectionRange(input.value.length, input.value.length);
+  });
+}
+
 async function handleAction(action, button) {
   if (action === "refresh-route") {
     return isMineRoute(S.route) ? switchMineTab(S.route, { force: true }) : go(S.route, { force: true });
@@ -20743,10 +20832,8 @@ async function handleAction(action, button) {
   if (action === "add-friend") {
     const uid = String(button.dataset.uid || "").trim();
     if (!uid) throw new Error("缺少对方 UID");
-    const leaveWord = window.prompt("填写好友申请留言（最多 100 个字符）", "你好，想和你成为好友");
-    if (leaveWord == null) return;
-    const normalizedLeaveWord = String(leaveWord).trim();
-    if (normalizedLeaveWord.length > 100) throw new Error("好友申请留言不能超过 100 个字符");
+    const normalizedLeaveWord = await requestFriendMessage();
+    if (normalizedLeaveWord == null) return;
     const { data } = await api("/api/social/add-friend", {
       method: "POST",
       body: JSON.stringify({ uid, leave_word: normalizedLeaveWord }),
