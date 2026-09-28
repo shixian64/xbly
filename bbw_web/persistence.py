@@ -1146,13 +1146,9 @@ return 1
             raise ValueError("TIM read sync requires account and peers")
         suspension_key = f"{self.settings.redis_prefix}:tim-rest:suspended"
         if self.redis.get(suspension_key) is not None:
-            return {
-                "accepted_peers": normalized_peers,
-                "job_ids": [],
-                "durable": False,
-                "skipped": True,
-                "reason": "TIM service suspended",
-            }
+            # No state or job has been persisted yet.  A 202 response here
+            # would falsely tell the browser that the read intent is durable.
+            raise RuntimeError("TIM service suspended")
         supplied_receipts = [
             dict(item)
             for item in list(receipt_messages)[:300]
@@ -1206,7 +1202,9 @@ return 1
                     job_timeout=210,
                     result_ttl=300,
                     failure_ttl=86400,
-                    retry=Retry(max=5, interval=[2, 5, 15, 30, 60]),
+                    # A 60020 suspension lasts five minutes.  Short retries
+                    # alone exhaust before the provider can recover.
+                    retry=Retry(max=12, interval=[5, 15, 60] + [300] * 9),
                 )
             except InvalidJobOperation:
                 if not self._tim_read_job_is_durable(

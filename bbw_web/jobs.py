@@ -238,12 +238,7 @@ def sync_tim_conversation_read(state_key: str) -> dict[str, Any]:
             raise RuntimeError("TIM read sync is already active")
         suspension_key = f"{settings.redis_prefix}:tim-rest:suspended"
         if redis.get(suspension_key):
-            return {
-                "ok": False,
-                "skipped": True,
-                "reason": "TIM service suspended",
-                "retryable": True,
-            }
+            raise RuntimeError("TIM service suspended")
         client = _default_message_read_transport()
         processed: list[str] = []
         receipt_count = 0
@@ -289,12 +284,7 @@ def sync_tim_conversation_read(state_key: str) -> dict[str, Any]:
                         b"60020",
                         ex=TIM_SERVICE_SUSPENSION_TTL_SECONDS,
                     )
-                    return {
-                        "ok": False,
-                        "skipped": True,
-                        "reason": "TIM service suspended",
-                        "retryable": True,
-                    }
+                    raise RuntimeError("TIM service suspended")
                 raise RuntimeError(
                     f"TIM conversation read failed: {int(getattr(conversation_result, 'error_code', 0) or 0)}"
                 )
@@ -310,12 +300,7 @@ def sync_tim_conversation_read(state_key: str) -> dict[str, Any]:
                         b"60020",
                         ex=TIM_SERVICE_SUSPENSION_TTL_SECONDS,
                     )
-                    return {
-                        "ok": False,
-                        "skipped": True,
-                        "reason": "TIM service suspended",
-                        "retryable": True,
-                    }
+                    raise RuntimeError("TIM service suspended")
                 raise RuntimeError(
                     f"TIM receipt sync failed: {int(getattr(receipt_result, 'error_code', 0) or 0)}"
                 )

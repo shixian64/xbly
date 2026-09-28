@@ -1928,7 +1928,7 @@ def _jd_result_to_dict(result: Any) -> Dict[str, Any]:
 def _jd_delivery_uncertain(result: Any) -> bool:
     """Return true when a JD frame may already have reached the server.
 
-    ``send_text_ws`` annotates timeout, NACK and post-write transport errors
+    ``send_text_ws`` annotates timeout and post-write transport errors
     with ``delivery_uncertain``/``ws_sent``.  Inspect both the adapter object
     and its serialized/nested payload so lightweight test doubles and older
     wrappers receive the same no-retry treatment.
@@ -1972,6 +1972,36 @@ def _jd_delivery_uncertain(result: Any) -> bool:
         except Exception:
             return False
     return False
+
+
+def _jd_delivery_rejected(result: Any) -> bool:
+    """An explicit negative ACK is a failure, not an unknown delivery."""
+    payload = _jd_result_to_dict(result)
+    data = payload.get("data")
+    return bool(
+        payload.get("delivery_rejected") is True
+        or (isinstance(data, Mapping) and data.get("delivery_rejected") is True)
+    )
+
+
+def _jd_result_message_id(result: Any) -> str:
+    payload = _jd_result_to_dict(result)
+    candidates = [payload, payload.get("data")]
+    if isinstance(candidates[-1], Mapping):
+        candidates.append(candidates[-1].get("data"))
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        value = str(
+            candidate.get("messageId")
+            or candidate.get("message_id")
+            or candidate.get("msg_uid")
+            or candidate.get("msg_key")
+            or ""
+        ).strip()
+        if value:
+            return value
+    return ""
 
 
 def _jd_dependency_call(
@@ -2794,7 +2824,10 @@ def _tim_roaming_message_envelope(
     items = sorted(by_identity.values(), key=_tim_message_sort_key)[
         -max(1, int(max_messages)):
     ]
-    if include_read_state:
+    # The peer's unread count is global to the conversation.  Subtracting it
+    # from an older, before-filtered page would falsely mark the tail of that
+    # page unread even when the unread messages are on a newer page.
+    if include_read_state and before_time is None and around_time is None:
         unread_counts = _tim_c2c_unread_counts(
             client,
             peer_uid,
@@ -4488,7 +4521,26 @@ class Handler(BaseHTTPRequestHandler):
             capabilities = Handler.web_user_capabilities(self, u)
             return Handler.deny_broad_im_credentials(self, capabilities)
         if path == "/api/im/rest/health":
-            # Proves APK-derived secret works against Tencent REST (not browser WSS).
+            # JD is the preferred conversation/send provider.  A healthy JD
+            # service must not be reported as disconnected merely because the
+            # legacy TIM compatibility API is suspended.
+            jd_chat = getattr(u.native, "jd_chat", None)
+            jd_health = getattr(jd_chat, "health", None)
+            if callable(jd_health):
+                try:
+                    jd_result = _jd_dependency_call(
+                        jd_health,
+                        provider="jd-chat",
+                        domain="im-read",
+                        timeout=4.0,
+                        breakers=getattr(self, "_request_dependency_breakers", None),
+                        request_id=str(getattr(self, "_request_id", "") or ""),
+                    )
+                    if _jd_result_ok(jd_result):
+                        return self.ok({"ok": True, "source": "jd_chat", "provider": "jd-chat"})
+                except Exception:
+                    pass
+            # Compatibility fallback proves the APK-derived TIM secret works.
             sample = str(app.session.uid or "1")
             return self.ok(u.native.tim_rest.health(sample_uid=sample))
         if path == "/api/im/rest/online":
@@ -5481,6 +5533,75 @@ class Handler(BaseHTTPRequestHandler):
                     if peer_uid not in skipped_compatibility_peers
                 ]
 
+                # JD owns the unread counters returned by the current
+                # conversation endpoint.  TIM read reports are compatibility
+                # work and cannot clear JD's authoritative badge.
+                jd_read_peers: List[str] = []
+                jd_chat = getattr(u.native, "jd_chat", None)
+                jd_read_one = getattr(jd_chat, "mark_conversation_read", None)
+                jd_read_all = getattr(jd_chat, "mark_all_conversations_read", None)
+                if remote_read_peers and callable(jd_read_one):
+                    budget_config = dict(getattr(self, "_request_budget_config", None) or {})
+                    jd_timeout = max(0.5, min(5.0, float(
+                        budget_config.get("provider_timeout_seconds") or 4.0
+                    )))
+                    breakers = getattr(self, "_request_dependency_breakers", None)
+                    request_id = str(getattr(self, "_request_id", "") or "")
+
+                    def mark_jd_peer(peer_uid: str) -> Tuple[str, bool]:
+                        try:
+                            outcome = _jd_dependency_call(
+                                jd_read_one,
+                                peer_id=peer_uid,
+                                provider="jd-chat",
+                                domain="im-read",
+                                breakers=breakers,
+                                timeout=jd_timeout,
+                                request_id=request_id,
+                            )
+                            return peer_uid, _jd_result_ok(outcome)
+                        except Exception:
+                            return peer_uid, False
+
+                    if data.get("all") is True and callable(jd_read_all):
+                        try:
+                            all_result = _jd_dependency_call(
+                                jd_read_all,
+                                provider="jd-chat",
+                                domain="im-read",
+                                breakers=breakers,
+                                timeout=jd_timeout,
+                                request_id=request_id,
+                            )
+                            jd_results = [
+                                (peer_uid, _jd_result_ok(all_result))
+                                for peer_uid in remote_read_peers
+                            ]
+                        except Exception:
+                            jd_results = [(peer_uid, False) for peer_uid in remote_read_peers]
+                    elif len(remote_read_peers) == 1:
+                        jd_results = [mark_jd_peer(remote_read_peers[0])]
+                    else:
+                        with ThreadPoolExecutor(max_workers=min(5, len(remote_read_peers))) as executor:
+                            jd_results = list(executor.map(mark_jd_peer, remote_read_peers))
+                    jd_read_peers = [peer_uid for peer_uid, ok in jd_results if ok]
+                    jd_failed_peers = [peer_uid for peer_uid, ok in jd_results if not ok]
+                    if jd_failed_peers:
+                        return self.ok(
+                            {
+                                "ok": False,
+                                "code": "JD_READ_REPORT_FAILED",
+                                "error": "消息未读状态暂时无法同步",
+                                "retryable": True,
+                                "read_peers": list(dict.fromkeys(local_read_peers + jd_read_peers)),
+                                "failed_peers": jd_failed_peers,
+                                "jd_read_peers": jd_read_peers,
+                                "local_read_peers": local_read_peers,
+                                "local_read_counts": local_read_counts,
+                            },
+                            502,
+                        )
+
                 read_sync_enqueuer = getattr(
                     self,
                     "_request_read_sync_enqueuer",
@@ -5494,15 +5615,16 @@ class Handler(BaseHTTPRequestHandler):
                             receipt_messages=receipt_messages,
                         )
                     except Exception:
-                        if set(remote_read_peers).issubset(set(local_read_peers)):
+                        if set(remote_read_peers).issubset(set(local_read_peers + jd_read_peers)):
                             return self.ok(
                                 {
                                     "ok": True,
                                     "read": True,
-                                    "read_peers": local_read_peers,
-                                    "count": len(local_read_peers),
+                                    "read_peers": list(dict.fromkeys(local_read_peers + jd_read_peers)),
+                                    "count": len(set(local_read_peers + jd_read_peers)),
                                     "local_read_peers": local_read_peers,
                                     "local_read_counts": local_read_counts,
+                                    "jd_read_peers": jd_read_peers,
                                     "compatibility_sync": "failed",
                                     "compatibility_sync_skipped_peers": skipped_compatibility_peers,
                                 }
@@ -5512,6 +5634,35 @@ class Handler(BaseHTTPRequestHandler):
                                 "ok": False,
                                 "code": "IM_READ_QUEUE_UNAVAILABLE",
                                 "error": "消息已读同步队列暂时不可用",
+                                "retryable": True,
+                                "retry_after": 2,
+                                "read_peers": local_read_peers,
+                                "failed_peers": remote_read_peers,
+                                "local_read_peers": local_read_peers,
+                                "local_read_counts": local_read_counts,
+                            },
+                            503,
+                            extra_headers={"Retry-After": "2"},
+                        )
+                    if not isinstance(queued, Mapping) or queued.get("durable") is not True:
+                        if set(remote_read_peers).issubset(set(local_read_peers + jd_read_peers)):
+                            return self.ok(
+                                {
+                                    "ok": True,
+                                    "read": True,
+                                    "read_peers": list(dict.fromkeys(local_read_peers + jd_read_peers)),
+                                    "count": len(set(local_read_peers + jd_read_peers)),
+                                    "local_read_peers": local_read_peers,
+                                    "local_read_counts": local_read_counts,
+                                    "jd_read_peers": jd_read_peers,
+                                    "compatibility_sync": "failed",
+                                }
+                            )
+                        return self.ok(
+                            {
+                                "ok": False,
+                                "code": "IM_READ_QUEUE_UNAVAILABLE",
+                                "error": "消息已读同步暂时不可用",
                                 "retryable": True,
                                 "retry_after": 2,
                                 "read_peers": local_read_peers,
@@ -5547,12 +5698,13 @@ class Handler(BaseHTTPRequestHandler):
                                 if isinstance(queued, Mapping)
                                 else True
                             ),
-                            "read_peers": local_read_peers,
+                            "read_peers": list(dict.fromkeys(local_read_peers + jd_read_peers)),
                             "accepted_peers": accepted_peers,
                             "queued_peers": queued_peers,
                             "count": len(accepted_peers),
                             "local_read_peers": local_read_peers,
                             "local_read_counts": local_read_counts,
+                            "jd_read_peers": jd_read_peers,
                             "compatibility_sync": "queued",
                             "compatibility_sync_skipped_peers": skipped_compatibility_peers,
                         },
@@ -5792,6 +5944,14 @@ class Handler(BaseHTTPRequestHandler):
                         # delivery instead of falling through to TIM, whose
                         # retry would create a second real message.  The
                         # browser can reconcile this by refreshing history.
+                        message_id_factory = getattr(jd_chat, "message_id_for_client", None)
+                        try:
+                            provider_message_id = (
+                                str(message_id_factory(from_uid, to_uid, client_message_id))
+                                if callable(message_id_factory) else ""
+                            )
+                        except Exception:
+                            provider_message_id = ""
                         jd_result = {
                             "ok": False,
                             "status": 502,
@@ -5799,11 +5959,13 @@ class Handler(BaseHTTPRequestHandler):
                             "delivery_uncertain": True,
                             "ws_sent": True,
                             "client_message_id": client_message_id,
+                            "message_id": provider_message_id,
                             "data": {
                                 "delivery_uncertain": True,
                                 "ws_sent": True,
                                 "clientMessageId": client_message_id,
                                 "client_message_id": client_message_id,
+                                "messageId": provider_message_id,
                             },
                         }
                     if jd_result is not None and _jd_result_ok(jd_result):
@@ -5868,6 +6030,21 @@ class Handler(BaseHTTPRequestHandler):
                         conversation_peers.add(to_uid)
                         return self.ok(payload, 200)
 
+                    if jd_result is not None and _jd_delivery_rejected(jd_result):
+                        return self.ok(
+                            {
+                                "ok": False,
+                                "code": "JD_MESSAGE_REJECTED",
+                                "error": "消息服务拒绝了本次发送",
+                                "retryable": False,
+                                "source": "jd_chat",
+                                "provider": "jd-chat",
+                                "client_message_id": client_message_id,
+                                "message_id": _jd_result_message_id(jd_result),
+                            },
+                            409,
+                        )
+
                     # Never fall through to TIM after a JD frame was handed to
                     # the socket.  A missing ACK/connection close is not proof
                     # that the message was rejected; issuing a second provider
@@ -5875,21 +6052,7 @@ class Handler(BaseHTTPRequestHandler):
                     # history view.  Let the browser refresh/reconcile the
                     # conversation instead of displaying a backup-channel hint.
                     if jd_result is not None and _jd_delivery_uncertain(jd_result):
-                        jd_payload = _jd_result_to_dict(jd_result)
-                        jd_body = jd_payload.get("data")
-                        if isinstance(jd_body, Mapping) and isinstance(
-                            jd_body.get("data"), Mapping
-                        ):
-                            jd_body = jd_body.get("data")
-                        canonical_id = ""
-                        if isinstance(jd_body, Mapping):
-                            canonical_id = str(
-                                jd_body.get("messageId")
-                                or jd_body.get("message_id")
-                                or jd_body.get("msg_uid")
-                                or jd_body.get("msg_key")
-                                or ""
-                            ).strip()
+                        canonical_id = _jd_result_message_id(jd_result)
                         return self.ok(
                             {
                                 # The JD WebSocket frame was already written.

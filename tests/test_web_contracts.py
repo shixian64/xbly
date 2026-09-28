@@ -3039,6 +3039,9 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         local_marker=None,
         authentication_source="provider",
         read_enqueuer=None,
+        jd_read=None,
+        jd_read_all=None,
+        mark_all=False,
     ):
         conversation_calls = []
         receipt_calls = []
@@ -3061,7 +3064,14 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
                         (account, peer, kwargs.get("messages"))
                     )
                     or receipt_result,
-                )
+                ),
+                jd_chat=(
+                    SimpleNamespace(
+                        mark_conversation_read=jd_read,
+                        mark_all_conversations_read=jd_read_all,
+                    )
+                    if jd_read is not None else None
+                ),
             ),
             match_pool_online_list_enabled=False,
             friend_message_peers=allowed_peers,
@@ -3090,7 +3100,7 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
 
             def body(self):
                 return (
-                    {"peers": peers}
+                    {"peers": peers, "all": mark_all}
                     if peers is not None
                     else {
                         "peer": "9",
@@ -3153,6 +3163,25 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         self.assertEqual(response[1]["delivery"], "pending")
         self.assertFalse(response[1]["retryable"])
         self.assertEqual(response[1]["message_id"], "jd-message-1")
+
+    def test_jd_negative_ack_is_failure_without_tim_fallback(self) -> None:
+        tim_calls, response = self._run_rest_send(
+            friend_peers={"9"},
+            jd_send=lambda *_args, **_kwargs: {
+                "ok": False,
+                "status": 502,
+                "data": {
+                    "delivery_rejected": True,
+                    "delivery_uncertain": False,
+                    "ws_sent": True,
+                    "data": {"messageId": "jd-rejected-1"},
+                },
+            },
+        )
+        self.assertEqual(tim_calls, [])
+        self.assertEqual(response[0], 409)
+        self.assertEqual(response[1]["code"], "JD_MESSAGE_REJECTED")
+        self.assertFalse(response[1]["retryable"])
 
     def test_web_local_send_commits_before_and_without_tim(self) -> None:
         local_calls = []
@@ -3301,6 +3330,78 @@ class PrivateMessagePermissionBffContractTests(unittest.TestCase):
         self.assertEqual(response[0], 503)
         self.assertEqual(response[1]["code"], "IM_READ_QUEUE_UNAVAILABLE")
         self.assertEqual(response[1]["retry_after"], 2)
+
+    def test_production_read_report_rejects_non_durable_enqueue_result(self) -> None:
+        calls, receipt_calls, response = self._run_mark_read(
+            read_enqueuer=lambda **_kwargs: {
+                "accepted_peers": ["9"],
+                "durable": False,
+                "skipped": True,
+            },
+        )
+        self.assertEqual(calls, [])
+        self.assertEqual(receipt_calls, [])
+        self.assertEqual(response[0], 503)
+        self.assertEqual(response[1]["code"], "IM_READ_QUEUE_UNAVAILABLE")
+
+    def test_local_read_is_kept_when_compatibility_enqueue_is_non_durable(self) -> None:
+        calls, receipt_calls, response = self._run_mark_read(
+            local_marker=lambda _peer: 2,
+            read_enqueuer=lambda **_kwargs: {"durable": False, "skipped": True},
+        )
+        self.assertEqual(calls, [])
+        self.assertEqual(receipt_calls, [])
+        self.assertEqual(response[0], 200)
+        self.assertEqual(response[1]["read_peers"], ["9"])
+        self.assertEqual(response[1]["compatibility_sync"], "failed")
+
+    def test_jd_read_is_applied_before_tim_compatibility_queue(self) -> None:
+        jd_calls = []
+        calls, receipt_calls, response = self._run_mark_read(
+            jd_read=lambda *, peer_id, **_kwargs: jd_calls.append(peer_id) or {"ok": True},
+            read_enqueuer=lambda **_kwargs: {"accepted_peers": ["9"], "durable": True},
+        )
+        self.assertEqual(jd_calls, ["9"])
+        self.assertEqual(calls, [])
+        self.assertEqual(receipt_calls, [])
+        self.assertEqual(response[0], 202)
+        self.assertEqual(response[1]["jd_read_peers"], ["9"])
+
+    def test_jd_read_failure_does_not_claim_read_success(self) -> None:
+        calls, receipt_calls, response = self._run_mark_read(
+            jd_read=lambda *, peer_id, **_kwargs: {"ok": False, "status": 503},
+            read_enqueuer=lambda **_kwargs: self.fail("TIM queued after JD failure"),
+        )
+        self.assertEqual(calls, [])
+        self.assertEqual(receipt_calls, [])
+        self.assertEqual(response[0], 502)
+        self.assertEqual(response[1]["code"], "JD_READ_REPORT_FAILED")
+
+    def test_jd_success_remains_read_when_tim_compatibility_queue_fails(self) -> None:
+        calls, receipt_calls, response = self._run_mark_read(
+            jd_read=lambda *, peer_id, **_kwargs: {"ok": True},
+            read_enqueuer=lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("queue down")),
+        )
+        self.assertEqual(calls, [])
+        self.assertEqual(receipt_calls, [])
+        self.assertEqual(response[0], 200)
+        self.assertTrue(response[1]["read"])
+        self.assertEqual(response[1]["compatibility_sync"], "failed")
+
+    def test_mark_all_read_uses_jd_account_endpoint_once(self) -> None:
+        calls = []
+        _, _, response = self._run_mark_read(
+            peers=["9", "10"],
+            jd_read=lambda *, peer_id, **_kwargs: self.fail("per-peer JD read"),
+            jd_read_all=lambda **_kwargs: calls.append("all") or {"ok": True},
+            mark_all=True,
+            read_enqueuer=lambda **kwargs: {
+                "accepted_peers": kwargs["peers"], "durable": True,
+            },
+        )
+        self.assertEqual(calls, ["all"])
+        self.assertEqual(response[0], 202)
+        self.assertEqual(response[1]["jd_read_peers"], ["9", "10"])
 
     def test_local_read_remains_successful_when_tim_read_sync_is_unavailable(self) -> None:
         local_calls = []
@@ -5905,6 +6006,7 @@ if (merged.profile_resolved !== false) throw new Error("partial merged profile m
             "function conversationPreview(item) { return item.last_message || ''; }\n"
             "function conversationPreviewTimestamp(item) { return Number(item.preview_timestamp || 0); }\n"
             "function conversationPreviewAuthoritative(item) { return item.preview_authoritative === true; }\n"
+            "function conversationUnreadCount(item) { return Number(item.unread_count || 0); }\n"
             "function normalizeConversationSummary"
             + normalize
             + "\n"
@@ -5944,7 +6046,12 @@ if (merged.profile_resolved !== false) throw new Error("partial merged profile m
         self.assertNotIn("webLocalDependencyMode", load_older)
         self.assertNotIn("localOnly", load_messages)
         self.assertNotIn("localOnly", load_older)
-        self.assertNotIn("markConversationRead(target)", load_messages)
+        self.assertIn("if (liveLoaded && isVisibleActiveConversation(target) &&", load_messages)
+        self.assertIn("markConversationRead(target);", load_messages)
+        self.assertLess(
+            load_messages.index("const liveLoaded ="),
+            load_messages.index("markConversationRead(target);"),
+        )
 
     def test_mobile_chat_keeps_following_the_bottom_while_layout_settles(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -6224,8 +6331,10 @@ function assert(condition, message) {
         self.assertIn("S.chat.createTextMessage(options)", send_text)
         self.assertIn("S.chat.sendMessage(message)", send_text)
         self.assertIn('api("/api/im/rest/send"', send_text)
-        self.assertIn('source: String(response.source || "rest")', send_text)
-        self.assertIn('provider: String(response.provider || "tim-rest")', send_text)
+        self.assertIn('source: pendingConfirmation && !response.message_id && !response.msg_uid', send_text)
+        self.assertIn('? "local" : String(response.source || "rest")', send_text)
+        self.assertIn('provider: pendingConfirmation && !response.message_id && !response.msg_uid', send_text)
+        self.assertIn('? "" : String(response.provider || "tim-rest")', send_text)
         self.assertIn('pendingConfirmation = response.delivery_uncertain === true', send_text)
         self.assertIn('delivery: pendingConfirmation ? "pending" : "sent"', send_text)
         self.assertIn('restSendAttempted = true', send_text)
@@ -6399,9 +6508,9 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         self.assertIn("mergePendingMessageRevocations(", message_loader)
         self.assertIn('if (!ok || data?.ok === false) throw new Error("服务器聊天记录暂时不可用")', message_loader)
         self.assertIn('if (!ok || data?.ok === false) throw new Error("归档聊天记录暂时不可用")', message_loader)
-        self.assertIn("if (!fulfilled.length) return;", message_loader)
+        self.assertIn("if (!fulfilled.length) return false;", message_loader)
         self.assertLess(
-            message_loader.index("if (!fulfilled.length) return;"),
+            message_loader.index("if (!fulfilled.length) return false;"),
             message_loader.index("mergePendingMessageRevocations("),
         )
         self.assertIn("if (!wasLoaded && S.activePeer === target) refreshChatLog();", message_loader)
@@ -6426,11 +6535,11 @@ class RichMessageFrontendContractTests(unittest.TestCase):
         )
 
         self.assertLess(
-            route_restore.index("void loadConversationMessages(S.activePeer)"),
+            route_restore.index("void loadConversationMessages(S.activePeer, {"),
             route_restore.index("refreshMessageConversationRegion("),
         )
         self.assertLess(
-            open_chat.index("void loadConversationMessages(uid)"),
+            open_chat.index("void loadConversationMessages(uid, {"),
             open_chat.index("refreshMessageConversationRegion({"),
         )
         self.assertIn("const conversation = ensureConversationForPeer(uid", open_chat)
@@ -6572,6 +6681,7 @@ function recalculateUnreadTotal() {}
 function conversationPeer(item) { return String(item?.peer_id || ""); }
 function conversationDisplayName(item) { return String(item?.nickname || ""); }
 function conversationAvatar(item) { return String(item?.avatar || ""); }
+function conversationAvatarFallback(item) { return String(item?.avatar_fallback || ""); }
 function validAvatarValue(...values) {
   return values.map((value) => String(value || "").trim()).find(Boolean) || "";
 }

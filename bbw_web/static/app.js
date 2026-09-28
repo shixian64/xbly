@@ -289,6 +289,7 @@ const S = {
   conversationBatchDeleteStage: "idle",
   readConversationPeers: new Map(),
   conversationReadReportTimers: new Map(),
+  conversationReadReportVersions: new Map(),
   sdkMessageReadReceiptTimers: new Map(),
   sdkMessageReadReceiptPending: new Set(),
   sdkMessageReadReceiptReported: new Set(),
@@ -299,6 +300,7 @@ const S = {
   imHandler: null,
   imConversationHandler: null,
   imReadHandler: null,
+  imReceiptHandler: null,
   imPresenceHandler: null,
   imModifiedHandler: null,
   imRevokedHandler: null,
@@ -4205,7 +4207,9 @@ async function activateRoute(id, { force = false } = {}) {
       if (active && !S.activePeerName) {
         S.activePeerName = active.nickname || active.peer_name || active.user?.nickname || `用户 ${S.activePeer}`;
       }
-      if (S.activePeer) void loadConversationMessages(S.activePeer);
+      if (S.activePeer) void loadConversationMessages(S.activePeer, {
+        force: conversationUnreadCount(active) > 0,
+      });
       // The cached message DOM may contain the empty placeholder from a
       // previous visit. Rebuild the pane from the current activePeer so a
       // contact/profile chat action opens the selected conversation.
@@ -8743,7 +8747,11 @@ function messagesShareCompatibilityProjection(left, right) {
   const leftTime = messageCompatibilityTimestamp(left);
   const rightTime = messageCompatibilityTimestamp(right);
   if (!leftTime || !rightTime) return false;
-  return Math.abs(leftTime - rightTime) <= MESSAGE_COMPATIBILITY_DEDUPE_WINDOW_MS;
+  const pendingProjection = [left, right].some((entry) =>
+    ["pending", "unconfirmed"].includes(String(entry?.delivery || ""))
+  );
+  return Math.abs(leftTime - rightTime) <=
+    (pendingProjection ? 3000 : MESSAGE_COMPATIBILITY_DEDUPE_WINDOW_MS);
 }
 
 function messagesShareSameJdProviderDuplicate(left, right) {
@@ -8796,6 +8804,7 @@ function messagesReferToSameMessage(left, right) {
   const leftCanonicalID = canonicalMessageID(left);
   const rightCanonicalID = canonicalMessageID(right);
   if (leftCanonicalID && rightCanonicalID && leftCanonicalID === rightCanonicalID) return true;
+  if (leftCanonicalID && rightCanonicalID) return false;
   const leftIdentity = messageIdentityKey(left);
   if (leftIdentity === messageIdentityKey(right) && !leftIdentity.startsWith("fallback|")) return true;
   const identities = [
@@ -9058,6 +9067,7 @@ function chatMessageState(entry) {
   if (entry.revoked) return "";
   if (entry.delivery === "failed") return { label: "发送失败", className: "is-failed", persistent: true };
   if (entry.delivery === "pending") return { label: "等待确认", className: "is-pending", persistent: true };
+  if (entry.delivery === "unconfirmed") return { label: "未确认，请勿重发", className: "is-pending", persistent: true };
   if (entry.delivery === "sending") {
     const progress = Number(entry.progress);
     return {
@@ -9090,6 +9100,7 @@ function canQuoteChatMessage(entry) {
       !entry.revoked &&
       entry.delivery !== "sending" &&
       entry.delivery !== "pending" &&
+      entry.delivery !== "unconfirmed" &&
       entry.delivery !== "failed" &&
       String(entry.peer || "") === String(S.activePeer || "") &&
       !isSystemCustomerServicePeer(entry.peer) &&
@@ -10275,8 +10286,8 @@ function mergePeerMessages(peer, incoming) {
 
 async function loadConversationMessages(peer, { force = false } = {}) {
   const target = String(peer || "").trim();
-  if (!target || S.imMessageLoadingPeers.has(target)) return;
-  if (!force && S.imMessageLoadedPeers.has(target)) return;
+  if (!target || S.imMessageLoadingPeers.has(target)) return false;
+  if (!force && S.imMessageLoadedPeers.has(target)) return true;
   const wasLoaded = S.imMessageLoadedPeers.has(target);
   const shouldLoadArchive = force || !S.imArchiveLoadedPeers.has(target);
   S.imMessageLoadingPeers.add(target);
@@ -10307,7 +10318,9 @@ async function loadConversationMessages(peer, { force = false } = {}) {
       )
     );
   }
+  let sdkTaskIndex = -1;
   if (S.imMode === "sdk" && S.chat && typeof S.chat.getMessageList === "function") {
+    sdkTaskIndex = tasks.length;
     tasks.push(
       withTimeout(
         S.chat.getMessageList({ conversationID: `C2C${target}`, count: 30 }),
@@ -10321,10 +10334,12 @@ async function loadConversationMessages(peer, { force = false } = {}) {
   }
   try {
     const results = await Promise.allSettled(tasks);
+    const liveLoaded = results[0]?.status === "fulfilled" ||
+      (sdkTaskIndex >= 0 && results[sdkTaskIndex]?.status === "fulfilled");
     const fulfilled = results
       .filter((result) => result.status === "fulfilled")
       .map((result) => result.value);
-    if (!fulfilled.length) return;
+    if (!fulfilled.length) return false;
     const incoming = mergePendingMessageRevocations(
       target,
       fulfilled.flat()
@@ -10342,12 +10357,19 @@ async function loadConversationMessages(peer, { force = false } = {}) {
     archiveCandidates.forEach(({ entry }) =>
       archiveMessageBestEffort(entry, entry.type === "mine" ? "outgoing" : "incoming")
     );
-    S.imMessageLoadedPeers.add(target);
+    if (liveLoaded) S.imMessageLoadedPeers.add(target);
     if (S.activePeer === target) {
       if (changed) refreshChatLog();
       scheduleSdkMessageReadReceipts(target);
       scheduleChatAssistRefresh(target, 250);
+      if (liveLoaded && isVisibleActiveConversation(target) &&
+          conversationUnreadCount(activeConversation()) > 0) {
+        markConversationRead(target);
+      } else if (!liveLoaded && !wasLoaded) {
+        toast("最新消息暂不可用，当前仅显示已归档记录", "error", 4000);
+      }
     }
+    return liveLoaded;
   } finally {
     S.imMessageLoadingPeers.delete(target);
     if (!wasLoaded && S.activePeer === target) refreshChatLog();
@@ -11388,12 +11410,11 @@ async function openPrivateConversation(
   if (Array.isArray(seedMessages) && seedMessages.length) {
     mergePeerMessages(target, seedMessages.map((entry) => ({ ...entry, peer: target })));
   }
-  markConversationRead(target);
   closeProfileDialog();
   if (S.route !== "msg") {
     go("msg", { force: true });
   } else {
-    void loadConversationMessages(target);
+    void loadConversationMessages(target, { force: true });
     refreshMessageConversationRegion({ focusComposer, refreshList });
   }
   return true;
@@ -12772,7 +12793,7 @@ async function reportSdkMessageReadReceipts(peer) {
   const target = String(peer || "").trim();
   if (
     !target ||
-    String(S.activePeer || "") !== target ||
+    !isVisibleActiveConversation(target) ||
     S.imMode !== "sdk" ||
     !S.chat ||
     typeof S.chat.sendMessageReadReceipt !== "function"
@@ -12788,7 +12809,7 @@ async function reportSdkMessageReadReceipts(peer) {
 
   let synced = true;
   for (let offset = 0; offset < candidates.length; offset += 30) {
-    if (String(S.activePeer || "") !== target) return false;
+    if (!isVisibleActiveConversation(target)) return false;
     const entries = candidates.slice(offset, offset + 30);
     const keys = entries.map(messageIdentityKey);
     keys.forEach((key) => S.sdkMessageReadReceiptPending.add(key));
@@ -12854,7 +12875,7 @@ async function reportConversationsRead(peers) {
       async () => {
         const result = await api("/api/im/read", {
           method: "POST",
-          body: JSON.stringify({ peers: batch }),
+          body: JSON.stringify({ peers: batch, all: true }),
           timeout: 7000,
         });
         const { data } = requireApiSuccess(result, "消息已读状态暂时无法保存");
@@ -12862,29 +12883,54 @@ async function reportConversationsRead(peers) {
       },
       { leaseMs: 3000 }
     );
-    if (handled === null) continue;
+    // Another tab owns this lease; its result is unknown to this tab. Do not
+    // erase local unread badges until a durable read result is observed here.
+    if (handled === null) return false;
     if (handled !== true) return false;
   }
   return true;
 }
 
-function scheduleConversationReadReport(peer, delay = 400) {
+function isVisibleActiveConversation(peer) {
+  const target = String(peer || "").trim();
+  return Boolean(
+    target && S.route === "msg" && String(S.activePeer || "") === target &&
+    !document.hidden && !S.messageSearchOpen && !document.querySelector?.("dialog[open]") &&
+    (typeof document.hasFocus !== "function" || document.hasFocus())
+  );
+}
+
+function scheduleConversationReadReport(peer, delay = 400, fallbackUnread = 1) {
   const target = String(peer || "").trim();
   if (!target) return;
   const previous = S.conversationReadReportTimers.get(target);
   if (previous) clearTimeout(previous);
-  const timer = setTimeout(() => {
+  const version = Number(S.conversationReadReportVersions.get(target) || 0) + 1;
+  S.conversationReadReportVersions.set(target, version);
+  const timer = setTimeout(async () => {
     S.conversationReadReportTimers.delete(target);
-    void reportConversationRead(target).catch(() => false);
+    const reported = await reportConversationRead(target).catch(() => false);
+    if (reported === true || S.conversationReadReportVersions.get(target) !== version) return;
+    // Do not leave an optimistic zero badge in place after a failed or
+    // non-durable report. A later explicit open can retry the read operation.
+    S.readConversationPeers.delete(target);
+    S.conversations = S.conversations.map((item) => {
+      if (conversationPeer(item) !== target) return item;
+      const unread = Math.max(conversationUnreadCount(item), fallbackUnread);
+      return { ...item, unread_count: unread, unread, unread_observed_at: Date.now() };
+    });
+    recalculateUnreadTotal();
+    if (isVisibleActiveConversation(target)) toast("已读状态同步失败，请稍后重试", "error", 3600);
   }, Math.max(0, Number(delay) || 0));
   S.conversationReadReportTimers.set(target, timer);
 }
 
 function markConversationRead(peer) {
   const target = String(peer || "").trim();
-  if (!target) return;
+  if (!isVisibleActiveConversation(target)) return false;
   const current = S.conversations.find((item) => conversationPeer(item) === target);
-  S.readConversationPeers.set(target, Math.max(conversationTimestamp(current), Date.now()));
+  const fallbackUnread = Math.max(1, conversationUnreadCount(current));
+  S.readConversationPeers.set(target, conversationTimestamp(current));
   S.conversations = S.conversations.map((item) =>
     conversationPeer(item) === target
       ? {
@@ -12899,10 +12945,13 @@ function markConversationRead(peer) {
   recalculateUnreadTotal();
   if (S.imMode === "sdk" && S.chat && typeof S.chat.setMessageRead === "function") {
     const conversationID = current?.conversation_id || `C2C${target}`;
-    void Promise.resolve(S.chat.setMessageRead({ conversationID })).catch(() => {});
+    // TIM's SDK receipt is a compatibility side effect, not proof that JD's
+    // authoritative unread counter was cleared.
+    void Promise.resolve().then(() => S.chat.setMessageRead({ conversationID })).catch(() => {});
   }
   scheduleSdkMessageReadReceipts(target);
-  scheduleConversationReadReport(target);
+  scheduleConversationReadReport(target, 400, fallbackUnread);
+  return true;
 }
 
 function refreshChatComposerKeepingText({ focus = false } = {}) {
@@ -13009,6 +13058,7 @@ function revokeActionInfo(entry) {
     !entry.revoked &&
     entry.delivery !== "sending" &&
     entry.delivery !== "pending" &&
+    entry.delivery !== "unconfirmed" &&
     entry.delivery !== "failed";
   if (!eligible) return null;
   const hasSdkMessage = Boolean(entry.rawMessage);
@@ -13341,12 +13391,22 @@ function localMessageID(prefix = "message") {
   return `local-${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function schedulePendingMessageReconciliation(peer) {
+function schedulePendingMessageReconciliation(peer, messageId) {
   const generation = S.sessionGeneration;
-  [1500, 6000, 15000].forEach((delay) => {
-    setTimeout(() => {
+  const delays = [1500, 6000, 15000, 45000];
+  delays.forEach((delay, index) => {
+    setTimeout(async () => {
       if (generation !== S.sessionGeneration || !S.authenticated) return;
-      void loadConversationMessages(peer, { force: true }).catch(() => false);
+      await loadConversationMessages(peer, { force: true }).catch(() => false);
+      if (index !== delays.length - 1) return;
+      const unresolved = findChatMessage(messageId, peer);
+      if (!unresolved || unresolved.delivery !== "pending") return;
+      updateLocalMessage(messageId, {
+        ...unresolved,
+        delivery: "unconfirmed",
+        retryError: "发送结果未确认；请先核对对方是否收到，不要直接重发",
+      });
+      if (String(S.activePeer || "") === String(peer)) refreshChatLog();
     }, delay);
   });
 }
@@ -13456,8 +13516,10 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
         // like TIM/rest rows, which prevents the history echo from being
         // reconciled with the optimistic local message and can render it
         // twice after the next refresh.
-        source: String(response.source || "rest"),
-        provider: String(response.provider || "tim-rest"),
+        source: pendingConfirmation && !response.message_id && !response.msg_uid
+          ? "local" : String(response.source || "rest"),
+        provider: pendingConfirmation && !response.message_id && !response.msg_uid
+          ? "" : String(response.provider || "tim-rest"),
         rawMessage: null,
         peerRead: false,
         delivery: pendingConfirmation ? "pending" : "sent",
@@ -13492,7 +13554,7 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
       unreadCount: 0,
     });
     refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
-    if (pendingConfirmation) schedulePendingMessageReconciliation(target);
+    if (pendingConfirmation) schedulePendingMessageReconciliation(target, replacement.id);
     else archiveMessageBestEffort(replacement, "outgoing");
     return replacement;
   } catch (error) {
@@ -13509,7 +13571,7 @@ async function sendTextMessage(peer, text, { retryMessageId = "", peerName = "",
       };
       updateLocalMessage(pendingID, unresolved);
       refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
-      schedulePendingMessageReconciliation(target);
+      schedulePendingMessageReconciliation(target, pendingID);
       toast("消息发送结果待确认，请勿重复发送", "info", 4200);
       return unresolved;
     }
@@ -16239,7 +16301,9 @@ async function pageMessages(signal) {
     S.activePeerName = active.nickname || active.peer_name || active.user?.nickname || `用户 ${S.activePeer}`;
   }
   if (S.activePeer) {
-    void loadConversationMessages(S.activePeer);
+    void loadConversationMessages(S.activePeer, {
+      force: conversationUnreadCount(active) > 0,
+    });
     void loadChatAssistStatus(S.activePeer);
   }
   return `<div class="message-page${S.activePeer ? " conversation-open" : ""}"><section class="conversation-layout${S.activePeer ? " has-active" : ""}${S.conversationListCollapsed ? " is-list-collapsed" : ""}"${S.messageSearchOpen ? ' inert aria-hidden="true"' : ""}>
@@ -19072,7 +19136,7 @@ function timEventRows(event) {
   return [data];
 }
 
-function applyPeerReadEvent(event) {
+function applyPeerReadEvent(event, { conversationLevel = false } = {}) {
   const ids = new Set();
   const readThroughByPeer = new Map();
   const readAtByPeer = new Map();
@@ -19088,15 +19152,21 @@ function applyPeerReadEvent(event) {
     }
     const peer = timMessagePeer(item);
     if (!peer) return;
-    const rawTime = item.readTime ?? item.lastReadTime ?? item.timestamp ?? item.time;
-    const numeric = Number(rawTime);
-    const readThrough = Number.isFinite(numeric) && numeric > 0
-      ? String(Math.trunc(numeric)).length === 10
-        ? numeric * 1000
-        : numeric
-      : Number.MAX_SAFE_INTEGER;
-    readThroughByPeer.set(peer, Math.max(readThroughByPeer.get(peer) || 0, readThrough));
-    readAtByPeer.set(peer, Math.max(readAtByPeer.get(peer) || 0, explicitReadAt || observedAt));
+    // A per-message receipt can carry a peer but no conversation watermark.
+    // It must never turn every outgoing message in that peer's chat to read.
+    if (conversationLevel) {
+      const rawTime = item.readTime ?? item.lastReadTime ?? item.timestamp ?? item.time;
+      const numeric = Number(rawTime);
+      const readThrough = Number.isFinite(numeric) && numeric > 0
+        ? String(Math.trunc(numeric)).length === 10
+          ? numeric * 1000
+          : numeric
+        : 0;
+      if (readThrough) {
+        readThroughByPeer.set(peer, Math.max(readThroughByPeer.get(peer) || 0, readThrough));
+        readAtByPeer.set(peer, Math.max(readAtByPeer.get(peer) || 0, explicitReadAt || observedAt));
+      }
+    }
   });
   const changedEntries = [];
   S.imMessages = S.imMessages.map((entry) => {
@@ -19269,7 +19339,7 @@ function attachTimHandlers(chat, TIM, credential) {
     (event.data || []).forEach((message) => {
       const peer = timMessagePeer(message, String(credential.userID));
       if (!peer) return;
-      const active = peer && peer === String(S.activePeer);
+      const active = isVisibleActiveConversation(peer);
       const current = S.conversations.find((item) => conversationPeer(item) === peer);
       const entry = timMessageEntry(message, peer, String(credential.userID));
       if (deferReplayedMessageRevocation(entry)) return;
@@ -19340,10 +19410,11 @@ function attachTimHandlers(chat, TIM, credential) {
     chat.on(TIM.EVENT.MESSAGE_REVOKED, S.imRevokedHandler);
   }
 
-  S.imReadHandler = (event) => applyPeerReadEvent(event);
+  S.imReadHandler = (event) => applyPeerReadEvent(event, { conversationLevel: true });
   if (TIM.EVENT?.MESSAGE_READ_BY_PEER) chat.on(TIM.EVENT.MESSAGE_READ_BY_PEER, S.imReadHandler);
   if (TIM.EVENT?.MESSAGE_READ_RECEIPT_RECEIVED) {
-    chat.on(TIM.EVENT.MESSAGE_READ_RECEIPT_RECEIVED, S.imReadHandler);
+    S.imReceiptHandler = (event) => applyPeerReadEvent(event);
+    chat.on(TIM.EVENT.MESSAGE_READ_RECEIPT_RECEIVED, S.imReceiptHandler);
   }
 
   S.imPresenceHandler = handlePeerPresenceEvent;
@@ -19826,6 +19897,7 @@ async function cleanupIM() {
     S.imHandler = null;
     S.imConversationHandler = null;
     S.imReadHandler = null;
+    S.imReceiptHandler = null;
     S.imPresenceHandler = null;
     S.imModifiedHandler = null;
     S.imRevokedHandler = null;
@@ -19845,8 +19917,8 @@ async function cleanupIM() {
     if (TIM?.EVENT?.MESSAGE_READ_BY_PEER && S.imReadHandler && typeof chat.off === "function") {
       chat.off(TIM.EVENT.MESSAGE_READ_BY_PEER, S.imReadHandler);
     }
-    if (TIM?.EVENT?.MESSAGE_READ_RECEIPT_RECEIVED && S.imReadHandler && typeof chat.off === "function") {
-      chat.off(TIM.EVENT.MESSAGE_READ_RECEIPT_RECEIVED, S.imReadHandler);
+    if (TIM?.EVENT?.MESSAGE_READ_RECEIPT_RECEIVED && S.imReceiptHandler && typeof chat.off === "function") {
+      chat.off(TIM.EVENT.MESSAGE_READ_RECEIPT_RECEIVED, S.imReceiptHandler);
     }
     if (TIM?.EVENT?.USER_STATUS_UPDATED && S.imPresenceHandler && typeof chat.off === "function") {
       chat.off(TIM.EVENT.USER_STATUS_UPDATED, S.imPresenceHandler);
@@ -19872,6 +19944,7 @@ async function cleanupIM() {
   S.imHandler = null;
   S.imConversationHandler = null;
   S.imReadHandler = null;
+  S.imReceiptHandler = null;
   S.imPresenceHandler = null;
   S.imModifiedHandler = null;
   S.imRevokedHandler = null;
@@ -20060,6 +20133,7 @@ async function logout({ notifyServer = true } = {}) {
     S.readConversationPeers.clear();
     S.conversationReadReportTimers.forEach((timer) => clearTimeout(timer));
     S.conversationReadReportTimers.clear();
+    S.conversationReadReportVersions.clear();
     S.sdkMessageReadReceiptTimers.forEach((timer) => clearTimeout(timer));
     S.sdkMessageReadReceiptTimers.clear();
     S.sdkMessageReadReceiptPending.clear();
@@ -20766,12 +20840,11 @@ async function handleAction(action, button) {
     });
     S.activePeerName = conversationEntryDisplayName(conversation, requestedName, uid);
     void loadChatAssistStatus(uid);
-    markConversationRead(uid);
     closeProfileDialog();
     if (S.route !== "msg") {
       go("msg", { force: true });
     } else {
-      void loadConversationMessages(uid);
+      void loadConversationMessages(uid, { force: true });
       refreshMessageConversationRegion({
         focusComposer: action === "select-conversation" && !usesCoarsePointer(),
         // Selecting an existing card only changes its active/read state. Keep
@@ -20916,6 +20989,11 @@ async function handleAction(action, button) {
     }
     const syncedRead =
       unreadPeers.length === 0 || (await reportConversationsRead(unreadPeers).catch(() => false));
+    if (!syncedRead) {
+      toast("部分消息已读状态同步失败，请稍后重试", "error", 3600);
+      void refreshConversationSummary({ force: true });
+      return;
+    }
     const readObservedAt = Date.now();
     S.conversations = S.conversations.map((item) => ({
       ...item,
@@ -20926,11 +21004,11 @@ async function handleAction(action, button) {
     }));
     S.conversations.forEach((item) => {
       const peer = conversationPeer(item);
-      if (peer) S.readConversationPeers.set(peer, Math.max(conversationTimestamp(item), Date.now()));
+      if (peer) S.readConversationPeers.set(peer, conversationTimestamp(item));
     });
     S.unreadTotal = 0;
     updateUnreadBadges();
-    toast(syncedRead ? "全部消息已标为已读" : "部分消息已读状态同步失败，请稍后重试");
+    toast("全部消息已标为已读");
     refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
     return;
   }
@@ -22413,6 +22491,10 @@ document.addEventListener("visibilitychange", () => {
 window.addEventListener("blur", () => {
   finishVoiceRecording(null, true);
   closeFlashViewer();
+});
+
+window.addEventListener("focus", () => {
+  if (S.authenticated && !document.hidden) void runMessageSyncCycle({ force: true });
 });
 
 window.addEventListener("pageshow", (event) => {

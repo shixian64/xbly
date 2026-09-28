@@ -137,6 +137,17 @@ class JdChatResult:
 class JdChatClient:
     """Small, token-aware client for the OpenAPI chat endpoints."""
 
+    @staticmethod
+    def message_id_for_client(sender_id: str, receiver_id: str, client_message_id: str) -> str:
+        """Keep one provider identity for one Web send attempt and its retries."""
+        client_id = str(client_message_id or "").strip()[:512]
+        if not client_id:
+            return str(uuid.uuid4())
+        return str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"bbw:jd-chat:{sender_id}:{receiver_id}:{client_id}",
+        ))
+
     def __init__(self, token: str = "", *, session: Any = None, base_url: str = JD_CHAT_BASE, timeout: float = 8.0):
         self.token = str(token or "").strip()
         self.session = session
@@ -255,6 +266,7 @@ class JdChatClient:
                 {
                     "delivery_uncertain": True,
                     "ws_sent": True,
+                    "messageId": self.message_id_for_client(sender_id, receiver_id, client_message_id),
                     "clientMessageId": str(client_message_id or ""),
                     "client_message_id": str(client_message_id or ""),
                 },
@@ -321,7 +333,7 @@ class JdChatClient:
             return JdChatResult(False, error_info="聊天凭证或消息内容为空")
         client_id = str(client_message_id or "").strip()[:512]
         message = {
-            "messageId": str(uuid.uuid4()),
+            "messageId": self.message_id_for_client(sender_id, receiver_id, client_id),
             "fromUserId": sender, "toUserId": receiver,
             "content": str(content).strip(), "type": "TEXT",
             "timestamp": int(time.time() * 1000), "status": "SENT",
@@ -526,7 +538,8 @@ class JdChatClient:
                         {
                             "data": message,
                             "ack": ack,
-                            "delivery_uncertain": True,
+                            "delivery_uncertain": False,
+                            "delivery_rejected": True,
                             "ws_sent": True,
                         },
                         str(
@@ -654,6 +667,47 @@ class JdChatClient:
             timeout=timeout,
         )
 
+    def mark_conversation_read(
+        self,
+        *,
+        peer_id: str,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
+    ) -> JdChatResult:
+        """Clear JD's authoritative unread count for one C2C conversation."""
+        del deadline
+        try:
+            partner = int(str(peer_id))
+            if partner <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return JdChatResult(False, error_info="对方用户 ID 格式不正确")
+        return self._request(
+            "POST", f"/api/messages/conversations/{partner}/read", timeout=timeout,
+        )
+
+    def mark_all_conversations_read(
+        self,
+        *,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
+    ) -> JdChatResult:
+        """Clear JD unread counts account-wide for the explicit 'read all' action."""
+        del deadline
+        return self._request(
+            "POST", "/api/messages/conversations/read-all", timeout=timeout,
+        )
+
+    def health(
+        self,
+        *,
+        timeout: Optional[float] = None,
+        deadline: Any = None,
+    ) -> JdChatResult:
+        """Probe the JD message service without exposing unread data."""
+        del deadline
+        return self._request("GET", "/api/messages/unread-count", timeout=timeout)
+
     def _access_token(self) -> str:
         session = self.session
         raw = getattr(session, "raw_user", {}) if session is not None else {}
@@ -671,5 +725,3 @@ __all__ = [
     "JdChatResult",
     "extract_collection_rows",
 ]
-
-

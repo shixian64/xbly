@@ -497,9 +497,10 @@ class FrontendMessageDeduplicationContracts(unittest.TestCase):
         self.assertIn("const canonicalID = canonicalMessageID(entry);", identity)
         self.assertIn("return `canonical|${canonicalID}`;", identity)
         self.assertIn(
-            "if (leftCanonicalID && rightCanonicalID) return leftCanonicalID === rightCanonicalID;",
+            "if (leftCanonicalID && rightCanonicalID && leftCanonicalID === rightCanonicalID) return true;",
             same_message,
         )
+        self.assertIn("if (leftCanonicalID && rightCanonicalID) return false;", same_message)
         self.assertIn("canonicalMessageId: canonicalID", entry)
         self.assertIn("clientMessageId:", entry)
         self.assertIn("compatibility_sync:", entry)

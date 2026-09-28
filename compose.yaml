@@ -351,6 +351,10 @@ services:
     environment:
       <<: *app-environment
       BBW_RQ_QUEUES: critical,default,media
+      # Read-sync and other default-queue Retry jobs use ScheduledJobRegistry.
+      # The application scheduler only enqueues periodic sync work; it does
+      # not promote RQ retries for this worker's queues.
+      BBW_RQ_WITH_SCHEDULER: "true"
       BBW_PHONE_HMAC_KEY_FILE: ""
       BBW_SESSION_HMAC_KEY_FILE: ""
       BBW_ROOMKIT_BUSINESS_TOKEN_FILE: ""
