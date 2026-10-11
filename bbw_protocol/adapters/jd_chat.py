@@ -117,6 +117,31 @@ def extract_collection_rows(payload: Any) -> list[dict[str, Any]]:
     return walk(payload)
 
 
+def _ack_message_id(
+    ack: Mapping[str, Any], expected_id: str, *, legacy_content: bool = True,
+) -> str:
+    """Resolve correlation without mistaking human-readable content for an ID."""
+    content = ack.get("content")
+    # APK-style ACKs put the original UUID in content; messageId can identify
+    # the ACK frame itself. Preserve that proven match before newer aliases.
+    if legacy_content and isinstance(content, str) and content.strip() == expected_id:
+        return expected_id
+    for source in (content, ack):
+        if not isinstance(source, Mapping):
+            continue
+        for key in (
+            "ackMessageId", "ack_message_id", "originalMessageId",
+            "original_message_id", "messageId", "message_id",
+        ):
+            value = source.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+    content = ack.get("content")
+    if legacy_content and isinstance(content, str):
+        return content.strip()
+    return ""
+
+
 @dataclass
 class JdChatResult:
     ok: bool
@@ -400,8 +425,14 @@ class JdChatClient:
                     sent = True
                     delivery_state["sent"] = True
                     try:
-                        for _ in range(3):
-                            raw = await asyncio.wait_for(ws.recv(), timeout=3)
+                        # Notifications and stale ACKs do not consume a frame
+                        # count, nor can a busy socket extend the wait forever.
+                        ack_deadline = time.monotonic() + 3.0
+                        while True:
+                            remaining = ack_deadline - time.monotonic()
+                            if remaining <= 0:
+                                return {"_timeout": True, "_sent": sent}
+                            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
                             item = json.loads(raw) if isinstance(raw, str) else raw
                             if isinstance(item, dict):
                                 kind = str(
@@ -410,17 +441,32 @@ class JdChatClient:
                                     or item.get("message_type")
                                     or ""
                                 ).upper()
+                                if kind not in {"ACK", "ERROR", "NACK"}:
+                                    nested = item.get("data")
+                                    if not isinstance(nested, dict):
+                                        continue
+                                    item = nested
+                                    kind = str(
+                                        item.get("type")
+                                        or item.get("messageType")
+                                        or item.get("message_type")
+                                        or ""
+                                    ).upper()
                                 if kind in {"ACK", "ERROR", "NACK"}:
+                                    rejected = kind in {"ERROR", "NACK"} or str(
+                                        item.get("status") or ""
+                                    ).upper() in {"ERROR", "FAILED", "FAIL", "REJECTED"}
+                                    ack_id = _ack_message_id(
+                                        item, message["messageId"], legacy_content=not rejected,
+                                    )
+                                    # Other device/replayed acknowledgements can
+                                    # precede ours. They must neither end this
+                                    # wait nor reject the current send.
+                                    if ack_id and ack_id != message["messageId"]:
+                                        continue
+                                    if not rejected and not ack_id:
+                                        continue
                                     return {"_ack": item, "_sent": sent}
-                                nested = item.get("data")
-                                if isinstance(nested, dict) and str(
-                                    nested.get("type")
-                                    or nested.get("messageType")
-                                    or nested.get("message_type")
-                                    or ""
-                                ).upper() in {"ACK", "ERROR", "NACK"}:
-                                    return {"_ack": nested, "_sent": sent}
-                        return {"_timeout": True, "_sent": sent}
                     except asyncio.TimeoutError:
                         return {"_timeout": True, "_sent": sent}
             except Exception as exc:
@@ -548,26 +594,7 @@ class JdChatClient:
                             or "消息服务器拒绝发送"
                         ),
                     )
-                ack_id = str(
-                    ack.get("content")
-                    or ack.get("messageId")
-                    or ack.get("ackMessageId")
-                    or ack.get("ack_message_id")
-                    or ack.get("originalMessageId")
-                    or ack.get("original_message_id")
-                    or ack.get("message_id")
-                    or ""
-                )
-                if isinstance(ack.get("content"), Mapping):
-                    nested_content = ack.get("content")
-                    ack_id = str(
-                        nested_content.get("messageId")
-                        or nested_content.get("message_id")
-                        or nested_content.get("originalMessageId")
-                        or nested_content.get("original_message_id")
-                        or ack_id
-                        or ""
-                    )
+                ack_id = _ack_message_id(ack, message["messageId"])
                 if ack_type != "ACK" or ack_id != message["messageId"]:
                     return JdChatResult(
                         False,

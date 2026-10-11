@@ -578,7 +578,8 @@ class FlashBffRoutingTests(unittest.TestCase):
 
         self.assertIn('window.addEventListener("storage"', app_js)
         self.assertIn("syncFlashAckAccount({ forceReload: true })", app_js)
-        self.assertIn("event.key?.startsWith(FLASH_ACK_STORAGE_PREFIX)", app_js)
+        self.assertIn("if (!S.authenticated || !event.key) return;", app_js)
+        self.assertIn("if (!event.key.startsWith(FLASH_ACK_STORAGE_PREFIX)) return;", app_js)
         self.assertNotIn("if (!storedIds.has(id)) S.flashAckPending.delete(id)", app_js)
 
     def test_flash_send_is_denied_before_upload_without_permission_or_match(self) -> None:

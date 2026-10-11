@@ -12,7 +12,7 @@ import binascii
 import hmac
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 from urllib.parse import quote_plus
@@ -190,18 +190,18 @@ def _database_url_from_env() -> str:
 @dataclass(frozen=True, slots=True)
 class Settings:
     environment: str
-    database_url: str
-    redis_url: str
-    credential_master_key: str | None
+    database_url: str = field(repr=False)
+    redis_url: str = field(repr=False)
+    credential_master_key: str | None = field(repr=False)
     credential_master_key_file: str | None
-    credential_keys_json: str | None
+    credential_keys_json: str | None = field(repr=False)
     credential_keys_file: str | None
     credential_key_version: int
-    phone_hmac_key: str | None
+    phone_hmac_key: str | None = field(repr=False)
     phone_hmac_key_file: str | None
-    session_hmac_key: str | None
+    session_hmac_key: str | None = field(repr=False)
     session_hmac_key_file: str | None
-    deployment_control_token: str | None
+    deployment_control_token: str | None = field(repr=False)
     deployment_control_token_file: str | None
     sql_echo: bool
     db_pool_size: int
@@ -705,8 +705,10 @@ _settings: Settings | None = None
 def get_settings() -> Settings:
     global _settings
     if _settings is None:
-        _settings = Settings.from_env()
-        _settings.validate()
+        candidate = Settings.from_env()
+        candidate.validate()
+        # Do not publish a rejected configuration to later callers.
+        _settings = candidate
     return _settings
 
 

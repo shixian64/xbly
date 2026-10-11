@@ -1733,9 +1733,10 @@ def mirror_tim_message_delivery(
     payload = claimed.payload
     operation = _bounded(payload.get("operation"), 16).lower() or "send"
     message_type = _bounded(payload.get("message_type"), 32).lower() or "text"
+    sender: Any = None
     try:
         enforce_state_recheck = transport is None
-        sender = transport or _default_message_send_transport()
+        sender = transport if transport is not None else _default_message_send_transport()
         if operation == "revoke":
             if not isinstance(sender, MessageMirrorTransport):
                 raise RuntimeError("TIM mirror transport cannot revoke messages")
@@ -1787,6 +1788,15 @@ def mirror_tim_message_delivery(
             "retry_after": delay if status == "retry" else 0,
             "status": status,
         }
+    finally:
+        # Only close clients owned by this job; injected transports may be shared.
+        close = getattr(sender, "close", None) if transport is None else None
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                # Cleanup must never turn an accepted send into another retry.
+                LOGGER.warning("Failed to close TIM mirror transport")
 
     upstream_message_id = _tim_mirror_upstream_id(result)
     status = _mark_tim_mirror_delivered(
@@ -4779,6 +4789,13 @@ def sync_account_history(
             error=str(exc),
         )
         raise
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                LOGGER.warning("Failed to close TIM history transport")
 
 
 def _media_hosts(settings: Settings) -> tuple[str, ...]:

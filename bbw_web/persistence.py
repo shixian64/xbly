@@ -1158,17 +1158,12 @@ return 1
         job_ids: list[str] = []
         for peer in normalized_peers:
             receipts = supplied_receipts if len(normalized_peers) == 1 else []
-            canonical = json.dumps(
-                {
-                    "account_uid": account,
-                    "peer_uid": peer,
-                    "receipt_messages": receipts,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            version = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            # Each request is a new read intent, not a content snapshot.
+            # Empty/unchanged receipt lists can accompany newly arrived messages;
+            # hashing those lists would suppress later reads for the entire
+            # synced-marker TTL. Workers still coalesce pending jobs by reading
+            # the latest state, and retries of that state retain its version.
+            version = uuid.uuid4().hex
             state_key = self._tim_read_state_key(account, peer)
             state = json.dumps(
                 {
@@ -1183,7 +1178,7 @@ return 1
             ).encode("utf-8")
             # The Redis state and RQ queue share one persistence service.  The
             # state is written first; HTTP 202 is emitted only after enqueue is
-            # confirmed (or an identical durable job already exists).
+            # confirmed (or this intent already has a durable job).
             self.redis.set(
                 state_key,
                 state,

@@ -87,7 +87,7 @@ class AdminPhoneLoginContractTests(unittest.TestCase):
         self.assertNotIn('/phone-only-login', combined_admin)
         self.assertNotIn("user.phone_only_login_changed", combined_admin)
 
-    def test_public_login_rejects_onekey_and_admin_login_rechecks_binding(self) -> None:
+    def test_public_login_rejects_onekey_and_admin_login_preserves_known_binding(self) -> None:
         services = self.read("bbw_prod/services.py")
         persistence = self.read("bbw_web/persistence.py")
         api = self.read("bbw_web/api.py")
@@ -123,8 +123,10 @@ class AdminPhoneLoginContractTests(unittest.TestCase):
         self.assertIn("by_phone.upstream_uid != upstream_uid", services)
         self.assertNotIn("phone_only_login_enabled", services)
         self.assertIn("request_authorized=True", admin_login)
-        self.assertIn("authenticated_uid != expected_uid", admin_login)
-        self.assertIn("require_existing_upstream_binding=True", admin_login)
+        self.assertIn("if expected_uid and authenticated_uid != expected_uid", admin_login)
+        self.assertIn("require_existing_upstream_binding=bool(expected_uid)", admin_login)
+        self.assertIn("replace(login_context, requires_invite=False)", admin_login)
+        self.assertNotIn("该手机号尚未绑定可确认身份的上游账号", admin_login)
         self.assertIn("clear_login_failures=False", admin_login)
         self.assertIn('action="user.admin_phone_login"', admin_login)
         self.assertIn("requires a prechecked account binding", durable_completion)

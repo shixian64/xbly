@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -329,7 +329,6 @@ def _session_from_state(state: ProviderSessionState) -> WebNativeSession:
     data = dict(state.device_data or {})
     session = WebNativeSession(
         uid=str(state.uid or "0"),
-        token=str(state.token or ""),
         phone=str(state.phone or ""),
         nickname=str(state.nickname or ""),
         user_role=str(state.user_role or ""),
@@ -365,7 +364,10 @@ class WebNativeProvider:
         self, session: ProviderSession | None = None
     ) -> ProviderRuntime:
         if isinstance(session, WebNativeSession):
-            resolved = session
+            # A network-free runtime must not retain upstream credentials,
+            # including those restored from an older snapshot. Do not mutate
+            # a session object still owned by the caller.
+            resolved = replace(session, token="", password="")
         elif session is None:
             resolved = WebNativeSession()
         else:

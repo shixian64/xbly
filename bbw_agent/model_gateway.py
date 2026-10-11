@@ -285,7 +285,7 @@ def validate_api_key(value: str) -> str:
 def _usage_value(usage: Mapping[str, Any], key: str) -> int | None:
     try:
         value = int(usage.get(key))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return value if value >= 0 else None
 
@@ -383,6 +383,7 @@ class OpenAICompatibleGateway:
                     endpoint,
                     headers={
                         "Accept": "application/json",
+                        "Accept-Encoding": "identity",
                         "Authorization": f"Bearer {key}",
                         "Content-Type": "application/json",
                         "User-Agent": "bbw-byok-model-runner/1",
@@ -416,6 +417,15 @@ class OpenAICompatibleGateway:
                     if declared > limit:
                         raise ModelGatewayError(
                             "provider_response_too_large", "模型服务返回内容超过系统限制"
+                        )
+                    # HTTPX decompresses iter_bytes() before our length check.
+                    # Refuse compression even if the provider ignores identity,
+                    # so a small response cannot allocate an unbounded body.
+                    encoding = response.headers.get("Content-Encoding", "").strip().lower()
+                    if encoding not in {"", "identity"}:
+                        raise ModelGatewayError(
+                            "provider_response_encoding_rejected",
+                            "模型服务必须返回未压缩的响应内容",
                         )
                     chunks: list[bytes] = []
                     size = 0

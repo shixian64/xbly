@@ -8,10 +8,11 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from fastapi import HTTPException, Response
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-from bbw_prod.services import ConflictError
+from bbw_prod.services import ConflictError, LoginPrecheck
 from bbw_web import admin_api
 from bbw_web.providers import (
     ProviderAuthenticationRejected,
@@ -60,9 +61,9 @@ class FakePersistence:
         if self.complete_error is not None:
             raise self.complete_error
         return SimpleNamespace(
-            user_id=self.login_context.existing_user_id,
-            external_account_id=self.login_context.existing_external_account_id,
-            upstream_uid=self.login_context.existing_upstream_uid,
+            user_id=self.login_context.existing_user_id or uuid.uuid4(),
+            external_account_id=self.login_context.existing_external_account_id or uuid.uuid4(),
+            upstream_uid=values["web_user"].app.session.uid,
         )
 
     def cancel_pending_login(self, sid: str) -> bool:
@@ -91,13 +92,17 @@ class FakeStore:
         self.drop_calls.append(sid)
 
 
-def login_context(*, upstream_uid: str | None = "42") -> object:
-    return SimpleNamespace(
+def login_context(
+    *, upstream_uid: str | None = "42", existing: bool = True, requires_invite: bool = False,
+) -> LoginPrecheck:
+    return LoginPrecheck(
+        phone_hmac="test-phone-digest",
         normalized_phone="13800138000",
-        existing_user_id=uuid.uuid4(),
-        existing_external_account_id=uuid.uuid4(),
+        existing_user_id=uuid.uuid4() if existing else None,
+        existing_external_account_id=uuid.uuid4() if existing else None,
         existing_upstream_uid=upstream_uid,
-        requires_invite=False,
+        invite_code_id=None,
+        requires_invite=requires_invite,
         local_password_available=True,
     )
 
@@ -239,16 +244,65 @@ class AdminUserLoginTests(unittest.TestCase):
         self.assertNotIn("13800138000", serialized)
         self.assertNotIn("new-user-session", serialized)
 
-    def test_missing_existing_uid_is_rejected_before_provider_authentication(self) -> None:
-        persistence = FakePersistence(login_context(upstream_uid=None))
-        store = FakeStore(web_user())
+    def test_unbound_existing_account_can_authenticate_and_bind(self) -> None:
+        for uid in (None, "", "   "):
+            with self.subTest(saved_uid=uid):
+                persistence = FakePersistence(login_context(upstream_uid=uid))
+                result, response, persistence, store, audit = self.invoke(persistence=persistence)
+                self.assertTrue(result["ok"])
+                self.assertEqual(len(store.login_calls), 1)
+                self.assertFalse(persistence.complete_calls[0]["require_existing_upstream_binding"])
+                self.assertEqual(audit.records[0]["target_user_id"], persistence.login_context.existing_user_id)
+                self.assertIn("bbw_sid=new-user-session", response.headers["set-cookie"])
 
+    def test_first_login_does_not_require_an_invite_or_mutate_the_public_precheck(self) -> None:
+        original = login_context(upstream_uid=None, existing=False, requires_invite=True)
+        persistence = FakePersistence(original)
+        result, _response, persistence, store, audit = self.invoke(persistence=persistence)
+        self.assertTrue(result["ok"])
+        completion = persistence.complete_calls[0]
+        self.assertFalse(completion["require_existing_upstream_binding"])
+        self.assertFalse(completion["login_context"].requires_invite)
+        self.assertTrue(original.requires_invite)
+        self.assertIsNotNone(audit.records[0]["target_user_id"])
+        self.assertEqual(len(store.login_calls), 1)
+
+    def test_inactive_account_and_rate_limit_still_stop_before_provider(self) -> None:
+        persistence = FakePersistence(login_context(upstream_uid=None))
+        persistence.precheck_error = PermissionError("user account is not active")
+        store = FakeStore(web_user())
         with self.assertRaises(HTTPException) as raised:
             self.invoke(persistence=persistence, store=store)
-
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(store.login_calls, [])
-        self.assertEqual(persistence.complete_calls, [])
+        persistence.precheck_error = None
+        with patch.object(persistence, "rate_limit", return_value=False):
+            with self.assertRaises(HTTPException) as raised:
+                self.invoke(persistence=persistence, store=store)
+        self.assertEqual(raised.exception.status_code, 429)
+        self.assertEqual(store.login_calls, [])
+
+    def test_http_admin_auth_origin_and_body_guards_are_preserved(self) -> None:
+        persistence = FakePersistence(login_context(upstream_uid=None, existing=False))
+        app = FastAPI()
+        app.state.settings = request_stub(persistence).app.state.settings
+        app.state.persistence = persistence
+        app.include_router(admin_api.router)
+        store = FakeStore(web_user())
+        body = {"phone": "13800138000", "reason": "管理员协助排障"}
+        with TestClient(app) as client, patch.object(admin_api.legacy, "STORE", store):
+            for headers in ({"Origin": "http://testserver"},
+                            {"Origin": "http://testserver", "Cookie": "bbw_sid=ordinary-user-session"}):
+                response = client.post("/api/admin/user-login", json=body, headers=headers)
+                self.assertEqual(response.status_code, 401)
+            app.dependency_overrides[admin_api._admin_context] = admin_context
+            response = client.post("/api/admin/user-login", json=body,
+                                   headers={"Origin": "https://other.example"})
+            self.assertEqual(response.status_code, 403)
+            response = client.post("/api/admin/user-login", json={**body, "require_invite": False},
+                                   headers={"Origin": "http://testserver"})
+            self.assertEqual(response.status_code, 422)
+        self.assertEqual(store.login_calls, [])
 
     def test_mismatched_provider_uid_is_rejected_and_runtime_is_discarded(self) -> None:
         persistence = FakePersistence(login_context(upstream_uid="42"))

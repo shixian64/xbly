@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import json
+import tempfile
 import sys
 import unittest
 from pathlib import Path
@@ -15,6 +17,7 @@ from bbw_web.providers.web_native import (  # noqa: E402
     UPSTREAM_DISABLED_CODE,
     WEB_NATIVE_PROVIDER_ID,
     WebNativeProvider,
+    WebNativeSession,
 )
 
 
@@ -62,6 +65,34 @@ class WebNativeRuntimeContractTests(unittest.TestCase):
         self.assertEqual(runtime.app.session.token, "")
         self.assertEqual(runtime.app.session.device_id, "stored-device")
         self.assertEqual(runtime.app.whoami()["nickname"], "本地用户")
+
+    def test_native_session_copy_drops_credentials_without_mutating_source(self) -> None:
+        source = WebNativeSession(
+            uid="42", token="fake-upstream-token", password="fake-upstream-password",
+            nickname="local-user", device_id="device-id",
+        )
+        runtime = WebNativeProvider().create_runtime(source)
+        self.assertEqual(runtime.app.session.token, "")
+        self.assertEqual(runtime.app.session.password, "")
+        self.assertEqual(source.token, "fake-upstream-token")
+        self.assertEqual(source.password, "fake-upstream-password")
+        self.assertEqual(runtime.app.session.device_id, "device-id")
+        self.assertTrue(runtime.app.session.logged_in)
+
+    def test_loading_native_snapshot_does_not_retain_upstream_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "session.json"
+            path.write_text(json.dumps({
+                "uid": "42", "token": "fake-upstream-token",
+                "password": "fake-upstream-password", "nickname": "local-user",
+            }), encoding="utf-8")
+            original = path.read_bytes()
+            runtime = WebNativeProvider().load_runtime(path)
+            self.assertEqual(runtime.app.session.token, "")
+            self.assertEqual(runtime.app.session.password, "")
+            self.assertEqual(runtime.app.session.nickname, "local-user")
+            self.assertTrue(runtime.app.session.logged_in)
+            self.assertEqual(path.read_bytes(), original)
 
     def test_legacy_domains_fail_immediately_with_stable_result(self) -> None:
         runtime = WebNativeProvider().create_runtime_from_state(

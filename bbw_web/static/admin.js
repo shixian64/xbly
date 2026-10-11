@@ -123,6 +123,7 @@ const ADMIN_STATE = {
   me: null,
   currentView: "overview",
   viewGeneration: 0,
+  listRequestGenerations: {},
   requestControllers: new Set(),
   pageHidden: document.hidden,
   visibilityRefreshPending: false,
@@ -593,6 +594,7 @@ function errorMessage(data, fallback = "请求未成功") {
 }
 
 async function adminApi(path, options = {}) {
+  const authGeneration = ADMIN_STATE.authGeneration;
   const {
     timeout = 15000,
     authOptional = false,
@@ -619,7 +621,20 @@ async function adminApi(path, options = {}) {
       headers,
       signal: controller.signal,
     });
+    if (authGeneration !== ADMIN_STATE.authGeneration) {
+      throw new AdminAuthExpiredError("管理员会话已变更");
+    }
+    // Authentication is determined by the status, not the format of a proxy's
+    // error page. Check it before reading or parsing the response body.
+    if (response.status === 401) {
+      if (authOptional) return null;
+      handleAuthenticationExpired();
+      throw new AdminAuthExpiredError("管理员登录已失效", 401);
+    }
     const responseText = await response.text();
+    if (authGeneration !== ADMIN_STATE.authGeneration) {
+      throw new AdminAuthExpiredError("管理员会话已变更");
+    }
     let data = {};
     if (responseText) {
       try {
@@ -628,14 +643,12 @@ async function adminApi(path, options = {}) {
         throw new AdminApiError(`服务返回了无法识别的内容，状态码 ${response.status}`, response.status);
       }
     }
-    if (response.status === 401) {
-      if (authOptional) return null;
-      handleAuthenticationExpired();
-      throw new AdminAuthExpiredError("管理员登录已失效", 401, data);
-    }
     if (!response.ok) throw new AdminApiError(errorMessage(data), response.status, data);
     return data;
   } catch (error) {
+    if (!(error instanceof AdminAuthExpiredError) && authGeneration !== ADMIN_STATE.authGeneration) {
+      throw new AdminAuthExpiredError("管理员会话已变更");
+    }
     if (error instanceof AdminApiError) throw error;
     if (error?.name === "AbortError") throw new AdminApiError("请求超时，请稍后重试");
     if (error instanceof TypeError) throw new AdminApiError("网络连接失败，请稍后重试");
@@ -670,6 +683,26 @@ async function withPending(button, task) {
 function abortAdminRequests() {
   ADMIN_STATE.requestControllers.forEach((controller) => controller.abort());
   ADMIN_STATE.requestControllers.clear();
+}
+
+function beginAdminListRequest(list) {
+  const generation = (ADMIN_STATE.listRequestGenerations[list] || 0) + 1;
+  ADMIN_STATE.listRequestGenerations[list] = generation;
+  return {
+    list,
+    generation,
+    authGeneration: ADMIN_STATE.authGeneration,
+    viewGeneration: ADMIN_STATE.viewGeneration,
+  };
+}
+
+function isCurrentAdminListRequest(request) {
+  return Boolean(
+    ADMIN_STATE.authenticated && !ADMIN_STATE.pageHidden &&
+    request.authGeneration === ADMIN_STATE.authGeneration &&
+    request.viewGeneration === ADMIN_STATE.viewGeneration &&
+    request.generation === ADMIN_STATE.listRequestGenerations[request.list]
+  );
 }
 
 function invalidateUserDetailRequests() {
@@ -1430,7 +1463,7 @@ async function loadInvites(page = ADMIN_STATE.invitePage) {
   const container = $("admin-invite-table");
   renderLoading(container);
   $("admin-invite-pagination").replaceChildren();
-  const generation = ADMIN_STATE.viewGeneration;
+  const requestState = beginAdminListRequest("invites");
   const state = $("admin-invite-status").value || "all";
   const summary = $("admin-invite-summary");
   summary.textContent = "正在统计邀请码结果";
@@ -1438,7 +1471,7 @@ async function loadInvites(page = ADMIN_STATE.invitePage) {
     const data = await adminApi(
       `${ADMIN_ENDPOINTS.invites}${queryString({ page: ADMIN_STATE.invitePage, limit: ADMIN_PAGE_LIMIT, state })}`
     );
-    if (generation !== ADMIN_STATE.viewGeneration || ADMIN_STATE.pageHidden) return;
+    if (!isCurrentAdminListRequest(requestState)) return;
     const rows = extractItems(data);
     renderTable(
       container,
@@ -1482,7 +1515,7 @@ async function loadInvites(page = ADMIN_STATE.invitePage) {
     renderPagination($("admin-invite-pagination"), meta, (nextPage) => void loadInvites(nextPage));
     markPageUpdated();
   } catch (error) {
-    if (generation === ADMIN_STATE.viewGeneration) {
+    if (isCurrentAdminListRequest(requestState)) {
       renderError(container, error);
       summary.textContent = "邀请码数据加载失败";
     }
@@ -1527,7 +1560,7 @@ async function loadUsers(page = ADMIN_STATE.userPage) {
   const container = $("admin-user-table");
   renderLoading(container);
   $("admin-user-pagination").replaceChildren();
-  const generation = ADMIN_STATE.viewGeneration;
+  const requestState = beginAdminListRequest("users");
   const q = $("admin-user-query").value.trim();
   const status = $("admin-user-status").value;
   const summary = $("admin-user-summary");
@@ -1536,7 +1569,7 @@ async function loadUsers(page = ADMIN_STATE.userPage) {
     const data = await adminApi(
       `${ADMIN_ENDPOINTS.users}${queryString({ page: ADMIN_STATE.userPage, limit: ADMIN_PAGE_LIMIT, search: q, status })}`
     );
-    if (generation !== ADMIN_STATE.viewGeneration || ADMIN_STATE.pageHidden) return;
+    if (!isCurrentAdminListRequest(requestState)) return;
     const rows = extractItems(data);
     renderTable(
       container,
@@ -1585,7 +1618,7 @@ async function loadUsers(page = ADMIN_STATE.userPage) {
     $("admin-global-search").value = q;
     markPageUpdated();
   } catch (error) {
-    if (generation === ADMIN_STATE.viewGeneration) {
+    if (isCurrentAdminListRequest(requestState)) {
       renderError(container, error);
       summary.textContent = "用户数据加载失败";
     }
@@ -3188,7 +3221,7 @@ async function loadAudits(page = ADMIN_STATE.auditPage) {
   const container = $("admin-audit-table");
   renderLoading(container);
   $("admin-audit-pagination").replaceChildren();
-  const generation = ADMIN_STATE.viewGeneration;
+  const requestState = beginAdminListRequest("audits");
   const form = new FormData($("admin-audit-filter-form"));
   const action = String(form.get("action") || "").trim();
   const targetUserId = String(form.get("target_user_id") || "").trim();
@@ -3205,7 +3238,7 @@ async function loadAudits(page = ADMIN_STATE.auditPage) {
         actor_type: actorType,
       })}`
     );
-    if (generation !== ADMIN_STATE.viewGeneration || ADMIN_STATE.pageHidden) return;
+    if (!isCurrentAdminListRequest(requestState)) return;
     const rows = extractItems(data);
     renderTable(
       container,
@@ -3242,7 +3275,7 @@ async function loadAudits(page = ADMIN_STATE.auditPage) {
     renderPagination($("admin-audit-pagination"), meta, (nextPage) => void loadAudits(nextPage));
     markPageUpdated();
   } catch (error) {
-    if (generation === ADMIN_STATE.viewGeneration) {
+    if (isCurrentAdminListRequest(requestState)) {
       renderError(container, error);
       summary.textContent = "审计数据加载失败";
     }
@@ -3871,6 +3904,7 @@ $("admin-login-form").addEventListener("submit", (event) => {
         $("admin-login-message").textContent = errorMessage(data, "登录失败");
         return;
       }
+      ADMIN_STATE.authGeneration += 1;
       ADMIN_STATE.pageHidden = false;
       ADMIN_STATE.authenticated = true;
       if (!applyAdminMe(data)) await loadAdminMe();

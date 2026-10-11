@@ -452,7 +452,7 @@ class OpportunityEnrollmentTests(unittest.TestCase):
         self.assertEqual(len(recorder.calls), 1)
         self.assertIs(account.password_encrypted, saved_ciphertext)
 
-    def test_admin_phone_login_requires_a_prebound_matching_upstream_uid(self) -> None:
+    def test_strict_prebound_login_requires_a_matching_upstream_uid(self) -> None:
         service, account, _recorder = self.make_service()
 
         account.upstream_uid = None
@@ -491,6 +491,63 @@ class OpportunityEnrollmentTests(unittest.TestCase):
             require_existing_upstream_binding=True,
         )
         self.assertIs(completion.external_account, account)
+
+    def test_provider_authenticated_login_can_fill_an_empty_binding(self) -> None:
+        for saved_uid in (None, "", "   "):
+            with self.subTest(saved_uid=saved_uid):
+                service, account, recorder = self.make_service()
+                account.upstream_uid = saved_uid
+                service.accounts.get_by_upstream_uid = lambda *_args, **_kwargs: None
+                original_password = account.password_encrypted
+                completion = service.complete_login(
+                    phone="13800138000", invite_code=None, upstream_uid="42",
+                    login_account="13800138000", password="", token="onekey-token",
+                    password_verified=False, require_invite=False,
+                )
+                self.assertFalse(completion.created)
+                self.assertIs(completion.external_account, account)
+                self.assertEqual(account.upstream_uid, "42")
+                self.assertEqual(account.token_encrypted, {"encrypted": "onekey-token"})
+                self.assertIs(account.password_encrypted, original_password)
+                self.assertEqual(recorder.calls, [])
+
+    def test_first_provider_login_can_create_an_account_without_a_public_invite(self) -> None:
+        service, _account, recorder = self.make_service()
+        service.settings = types.SimpleNamespace(
+            invite_required=True, per_user_media_quota_bytes=1024 * 1024,
+            message_retention_days=180,
+        )
+        service.accounts.get_by_phone_hmac = lambda *_args, **_kwargs: None
+        service.accounts.get_by_upstream_uid = lambda *_args, **_kwargs: None
+        values = dict(
+            phone="13800138000", invite_code=None, upstream_uid="42",
+            login_account="13800138000", password="", token="onekey-token",
+            password_verified=False,
+        )
+        with self.assertRaises(prod_services.InviteInvalid):
+            service.complete_login(**values)
+        self.assertEqual(service.db.added, [])
+        completion = service.complete_login(**values, require_invite=False)
+        self.assertTrue(completion.created)
+        self.assertEqual(completion.user.status, "active")
+        self.assertEqual(completion.external_account.user_id, completion.user.id)
+        self.assertEqual(completion.external_account.upstream_uid, "42")
+        self.assertEqual(len(service.db.added), 2)
+        self.assertEqual(recorder.calls, [])
+        self.assertTrue(service.settings.invite_required)
+
+    def test_phone_login_cannot_reassign_a_bound_upstream_account(self) -> None:
+        service, account, _recorder = self.make_service()
+        other = make_account(make_user())
+        service.accounts.get_by_upstream_uid = lambda *_args, **_kwargs: other
+        with self.assertRaises(prod_services.ConflictError):
+            service.complete_login(
+                phone="13800138000", invite_code=None, upstream_uid="42",
+                login_account="13800138000", password="", token="onekey-token",
+                require_invite=False,
+            )
+        self.assertEqual(service.db.flush_count, 0)
+        self.assertEqual(account.upstream_uid, "42")
 
 
 @unittest.skipIf(

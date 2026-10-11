@@ -177,10 +177,18 @@ class WebSessionRepository(Repository[WebSession]):
     def get_by_hash(self, sid_hash: str, *, for_update: bool = False) -> WebSession | None:
         stmt = select(WebSession).where(WebSession.sid_hash == sid_hash)
         if for_update:
-            stmt = stmt.with_for_update()
+            # A previous non-locking read may already have populated this
+            # Session's identity map before a concurrent revocation committed.
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
         return self.db.scalar(stmt)
 
-    def active_for_user(self, user_id: uuid.UUID, *, at: datetime | None = None) -> list[WebSession]:
+    def active_for_user(
+        self,
+        user_id: uuid.UUID,
+        *,
+        at: datetime | None = None,
+        for_update: bool = False,
+    ) -> list[WebSession]:
         now = at or utcnow()
         stmt = select(WebSession).where(
             WebSession.user_id == user_id,
@@ -188,6 +196,14 @@ class WebSessionRepository(Repository[WebSession]):
             WebSession.idle_expires_at > now,
             WebSession.absolute_expires_at > now,
         )
+        if for_update:
+            # Concurrent bulk revocations acquire existing sessions in one
+            # order; do not take user/account locks after these session locks.
+            stmt = (
+                stmt.order_by(WebSession.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
         return list(self.db.scalars(stmt))
 
 

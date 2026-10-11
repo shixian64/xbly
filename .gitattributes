@@ -1,0 +1,4 @@
+# Keep content-hashed web assets identical on Windows and Linux.
+bbw_web/static/*.js text eol=lf
+bbw_web/static/*.css text eol=lf
+bbw_web/static/*.html text eol=lf

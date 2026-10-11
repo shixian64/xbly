@@ -144,8 +144,12 @@ class BrowserReadReliabilityTests(unittest.TestCase):
             "function scheduleConversationReadReport", 1
         )[1].split("function markConversationRead", 1)[0]
         self.assertNotIn("sdkReadTask", report)
+        session_guard = "function isCurrentAuthenticatedSession" + source.split(
+            "function isCurrentAuthenticatedSession", 1
+        )[1].split("async function connectTIM", 1)[0]
         script = (
-            "const S = {conversationReadReportTimers: new Map(), "
+            "const S = {authenticated: true, sessionGeneration: 1, "
+            "conversationReadReportTimers: new Map(), "
             "conversationReadReportVersions: new Map(), readConversationPeers: new Map([['9', 1]]), "
             "conversations: [{peer: '9', unread_count: 0}]};\n"
             "function reportConversationRead() { return Promise.resolve(false); }\n"
@@ -154,6 +158,7 @@ class BrowserReadReliabilityTests(unittest.TestCase):
             "function recalculateUnreadTotal() {}\n"
             "function isVisibleActiveConversation() { return false; }\n"
             "function toast() {}\n"
+            + session_guard
             + report
             + "scheduleConversationReadReport('9', 0, 2);\n"
             + "setTimeout(() => { if (S.conversations[0].unread_count !== 2 || "

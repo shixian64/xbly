@@ -823,7 +823,7 @@ class CommerceRemovalContractTests(unittest.TestCase):
 
 
 class CatalogMetadataContractTests(unittest.TestCase):
-    def test_v154_catalog_counts_and_dynamic_login_actions(self) -> None:
+    def test_current_catalog_counts_and_dynamic_login_actions(self) -> None:
         catalog = json.loads(
             (ROOT / "docs" / "api_catalog.json").read_text(encoding="utf-8")
         )
@@ -838,8 +838,16 @@ class CatalogMetadataContractTests(unittest.TestCase):
         self.assertEqual(len(shorts), catalog["counts"]["short_startHttp"])
         self.assertEqual(len(actions), catalog["counts"]["all_actions"])
         self.assertEqual(len(urls), catalog["counts"]["full_urls"])
+        current_version = catalog["apk_version"]["current"]
         self.assertEqual(
-            len(actions - deprecated), catalog["counts"]["active_in_v154"]
+            len(actions - deprecated), catalog["counts"][f"active_in_v{current_version}"]
+        )
+        introduced_in_v162 = set(catalog["new_actions_v162"]["actions"])
+        self.assertTrue(introduced_in_v162 <= actions - deprecated)
+        self.assertEqual(len(introduced_in_v162), catalog["counts"]["new_in_v162"])
+        self.assertEqual(
+            len(actions - deprecated - introduced_in_v162),
+            catalog["counts"]["active_in_v154"],
         )
         self.assertEqual(set(catalog["dynamic_do_actions"]), dynamic)
         self.assertTrue(dynamic <= actions)

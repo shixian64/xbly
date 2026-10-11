@@ -435,6 +435,8 @@ class UserSessionService:
         )
 
     def recover(self, raw_sid: str, *, now: datetime | None = None) -> UserSessionState | None:
+        if not isinstance(raw_sid, str) or not raw_sid or not raw_sid.isascii():
+            return None
         current = now or utcnow()
         key = self._key(raw_sid)
         cached = self._state_from_payload(_json_loads(self.redis.get(key)) or {})
@@ -443,7 +445,12 @@ class UserSessionService:
                 return cached
             self.redis.delete(key)
 
-        row = self.repo.get_by_hash(SessionTokenManager.hash_sid(raw_sid))
+        # Serialize cache refill with single/bulk revocation until commit.
+        # Otherwise a READ COMMITTED reader can resurrect a deleted Redis key
+        # from the old database row while the revoker has not committed yet.
+        row = self.repo.get_by_hash(
+            SessionTokenManager.hash_sid(raw_sid), for_update=True
+        )
         if (
             row is None
             or row.revoked_at is not None
@@ -458,6 +465,8 @@ class UserSessionService:
     restore = recover
 
     def touch(self, raw_sid: str, *, now: datetime | None = None) -> UserSessionState | None:
+        if not isinstance(raw_sid, str) or not raw_sid or not raw_sid.isascii():
+            return None
         current = now or utcnow()
         cached = self._state_from_payload(_json_loads(self.redis.get(self._key(raw_sid))) or {})
         if (
@@ -487,6 +496,8 @@ class UserSessionService:
         return state
 
     def revoke(self, raw_sid: str, *, reason: str = "logout", now: datetime | None = None) -> bool:
+        if not isinstance(raw_sid, str) or not raw_sid or not raw_sid.isascii():
+            return False
         row = self.repo.get_by_hash(SessionTokenManager.hash_sid(raw_sid), for_update=True)
         self.redis.delete(self._key(raw_sid))
         if row is None or row.revoked_at is not None:
@@ -497,7 +508,7 @@ class UserSessionService:
         return True
 
     def revoke_all_for_user(self, user_id: uuid.UUID, *, reason: str) -> int:
-        rows = self.repo.active_for_user(user_id)
+        rows = self.repo.active_for_user(user_id, for_update=True)
         now = utcnow()
         for row in rows:
             row.revoked_at = now
@@ -1058,7 +1069,7 @@ class LoginAccountService:
                 )
             if by_uid is not None and by_uid.id != by_phone.id:
                 raise ConflictError("upstream account is already bound to another user")
-            if by_phone.upstream_uid not in (None, upstream_uid):
+            if str(by_phone.upstream_uid or "").strip() not in ("", upstream_uid):
                 raise ConflictError("phone is already bound to a different upstream account")
             user = self.users.get(by_phone.user_id, for_update=True)
             if user is None or user.status != "active":

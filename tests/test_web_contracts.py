@@ -6143,7 +6143,7 @@ if (merged.profile_resolved !== false) throw new Error("partial merged profile m
         self.assertIn("function reportSdkMessageReadReceipts(peer)", app_js)
         self.assertIn("function sdkMessageReadReceiptReport(entry)", app_js)
         self.assertIn("receipt_messages: conversationReadReceiptReports(target)", app_js)
-        self.assertIn("S.chat.sendMessageReadReceipt(entries.map((entry) => entry.rawMessage))", app_js)
+        self.assertIn("chat.sendMessageReadReceipt(entries.map((entry) => entry.rawMessage))", app_js)
         self.assertIn("scheduleSdkMessageReadReceipts(target);", app_js)
         self.assertIn("width: fit-content", app_css)
         self.assertIn("conversation-read-state", app_css)

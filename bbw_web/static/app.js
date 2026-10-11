@@ -1163,6 +1163,7 @@ function requireApiSuccess(result, fallback = "请求未成功") {
 }
 
 async function api(path, options = {}) {
+  const sessionGeneration = S.sessionGeneration;
   const requestStartedAt = performanceClockNow();
   const requestPath = performanceMetricPath(path);
   let requestStatus = 0;
@@ -1200,31 +1201,14 @@ async function api(path, options = {}) {
       headers,
       signal: controller.signal,
     });
+    // A request belongs to the account that started it, including while its
+    // response body is still arriving. Never publish it into a newer session.
+    if (sessionGeneration !== S.sessionGeneration) throw new DOMException("Aborted", "AbortError");
     requestStatus = Number(response.status || 0);
     requestServerDurationMs = serverTimingAppDuration(response.headers.get("Server-Timing"));
     requestOutcome = response.ok ? "ok" : "http-error";
     const retryAfterMs = responseRetryAfterMs(response);
     const requestId = String(response.headers.get("X-Request-ID") || "").trim();
-    const text = await response.text();
-    let data = {};
-    if (text) {
-      try {
-        data = JSON.parse(text);
-      } catch {
-        throw new ApiRequestError(`服务返回了无法识别的内容（状态码 ${response.status}）`, {
-          kind: "invalid-response",
-          status: response.status,
-          retryAfterMs,
-          requestId,
-          retryable:
-            response.status === 408 ||
-            response.status === 425 ||
-            response.status === 429 ||
-            response.status >= 500,
-        });
-      }
-    }
-
     if (response.status === 401 && !authOptional && !path.includes("/api/auth/")) {
       S.authenticated = false;
       S.sessionGeneration += 1;
@@ -1252,11 +1236,37 @@ async function api(path, options = {}) {
       scrubAuthenticatedDom();
       applyUser(null);
       if (VOICE_MATCH_ENABLED) void cleanupVoiceMatch({ disconnect: true });
-      void cleanupIM().finally(() => clearSensitiveBrowserStorage());
+      const expiredGeneration = S.sessionGeneration;
+      void cleanupIM().finally(() => {
+        if (!S.authenticated && expiredGeneration === S.sessionGeneration) {
+          return clearSensitiveBrowserStorage();
+        }
+      });
       showLogin(true, true);
       toast("登录已失效，请重新登录", "error");
       throw new AuthExpiredError("登录已失效");
     }
+    const text = await response.text();
+    if (sessionGeneration !== S.sessionGeneration) throw new DOMException("Aborted", "AbortError");
+    let data = {};
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        throw new ApiRequestError(`服务返回了无法识别的内容（状态码 ${response.status}）`, {
+          kind: "invalid-response",
+          status: response.status,
+          retryAfterMs,
+          requestId,
+          retryable:
+            response.status === 408 ||
+            response.status === 425 ||
+            response.status === 429 ||
+            response.status >= 500,
+        });
+      }
+    }
+
     return {
       status: response.status,
       data,
@@ -1268,6 +1278,10 @@ async function api(path, options = {}) {
     if (error instanceof AuthExpiredError) {
       requestOutcome = "auth-expired";
       throw error;
+    }
+    if (sessionGeneration !== S.sessionGeneration) {
+      requestOutcome = "aborted";
+      throw new DOMException("Aborted", "AbortError");
     }
     if (error instanceof ApiRequestError) {
       requestOutcome = error.kind || "request-error";
@@ -1287,6 +1301,10 @@ async function api(path, options = {}) {
       }
       requestOutcome = "aborted";
       throw new DOMException("Aborted", "AbortError");
+    }
+    if (error?.name === "AbortError") {
+      requestOutcome = "aborted";
+      throw error;
     }
     if (error instanceof TypeError || error?.name === "NetworkError") {
       requestOutcome = navigator.onLine === false ? "offline" : "network";
@@ -9449,6 +9467,7 @@ function chatLogHtml() {
 /* APK 162 parity: export the currently loaded conversation as CSV. */
 async function exportActiveChatRecord() {
   const peer = String(S.activePeer || "").trim();
+  const generation = S.sessionGeneration;
   if (!peer) throw new Error("请先选择聊天");
   // Prefer the APK 162 server export so records beyond the rendered window
   // are included; retain the local exporter as an offline/provider fallback.
@@ -9462,6 +9481,7 @@ async function exportActiveChatRecord() {
       body: JSON.stringify({ peer }),
       signal: exportController.signal,
     });
+    if (!isCurrentAuthenticatedSession(generation)) throw new DOMException("Aborted", "AbortError");
     if (response.status === 401 || response.status === 403) {
       const denied = new Error("当前无权导出聊天记录");
       denied.permission = true;
@@ -9470,6 +9490,7 @@ async function exportActiveChatRecord() {
     const contentType = String(response.headers.get("content-type") || "").toLowerCase();
     if (response.ok && contentType.includes("text/csv")) {
       const blob = await response.blob();
+      if (!isCurrentAuthenticatedSession(generation)) throw new DOMException("Aborted", "AbortError");
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;
@@ -9483,14 +9504,18 @@ async function exportActiveChatRecord() {
     }
   } catch (error) {
     // Fall through to the locally cached transcript below.
-    if (error?.permission) throw error;
+    if (error?.permission || !isCurrentAuthenticatedSession(generation)) throw error;
   } finally {
     clearTimeout(exportTimeout);
   }
   const entries = peerChatMessageEntries(peer);
   if (!entries.length) throw new Error("当前聊天没有可导出的消息");
   const csvCell = (value) => {
-    const text = String(value ?? "").replace(/\r?\n/g, "\\n");
+    // Quotes protect CSV structure, not spreadsheet formula evaluation.
+    // These columns are text even when a nickname/message starts like a formula.
+    const raw = String(value ?? "");
+    const safe = /^[\s\uFEFF]*[=+\-@]/u.test(raw) || /^[\t\r\n]/.test(raw) ? `'${raw}` : raw;
+    const text = safe.replace(/\r\n|\r|\n/g, "\\n");
     return `"${text.replace(/"/g, '""')}"`;
   };
   const rows = [
@@ -12791,8 +12816,12 @@ async function reportSdkMessageReadReceipts(peer) {
   // the conversation unread count alone only emits the legacy C2C read report,
   // which does not update TUIKit's per-message "已读/未读" indicator.
   const target = String(peer || "").trim();
+  const generation = S.sessionGeneration;
+  const chat = S.chat;
+  const requestIsCurrent = () => isCurrentAuthenticatedSession(generation) && S.chat === chat;
   if (
     !target ||
+    !requestIsCurrent() ||
     !isVisibleActiveConversation(target) ||
     S.imMode !== "sdk" ||
     !S.chat ||
@@ -12809,22 +12838,25 @@ async function reportSdkMessageReadReceipts(peer) {
 
   let synced = true;
   for (let offset = 0; offset < candidates.length; offset += 30) {
-    if (!isVisibleActiveConversation(target)) return false;
+    if (!requestIsCurrent() || !isVisibleActiveConversation(target)) return false;
     const entries = candidates.slice(offset, offset + 30);
     const keys = entries.map(messageIdentityKey);
     keys.forEach((key) => S.sdkMessageReadReceiptPending.add(key));
     try {
       await withTimeout(
-        Promise.resolve(S.chat.sendMessageReadReceipt(entries.map((entry) => entry.rawMessage))),
+        Promise.resolve(chat.sendMessageReadReceipt(entries.map((entry) => entry.rawMessage))),
         8000,
         "同步逐条消息已读回执"
       );
+      if (!requestIsCurrent()) return false;
       keys.forEach((key) => S.sdkMessageReadReceiptReported.add(key));
     } catch (error) {
       synced = false;
       console.info("[TIM read receipt]", error?.message || error);
     } finally {
-      keys.forEach((key) => S.sdkMessageReadReceiptPending.delete(key));
+      if (isCurrentAuthenticatedSession(generation)) {
+        keys.forEach((key) => S.sdkMessageReadReceiptPending.delete(key));
+      }
     }
   }
   return synced;
@@ -12903,14 +12935,19 @@ function isVisibleActiveConversation(peer) {
 function scheduleConversationReadReport(peer, delay = 400, fallbackUnread = 1) {
   const target = String(peer || "").trim();
   if (!target) return;
+  const generation = S.sessionGeneration;
   const previous = S.conversationReadReportTimers.get(target);
   if (previous) clearTimeout(previous);
   const version = Number(S.conversationReadReportVersions.get(target) || 0) + 1;
   S.conversationReadReportVersions.set(target, version);
   const timer = setTimeout(async () => {
+    if (!isCurrentAuthenticatedSession(generation)) return;
     S.conversationReadReportTimers.delete(target);
     const reported = await reportConversationRead(target).catch(() => false);
-    if (reported === true || S.conversationReadReportVersions.get(target) !== version) return;
+    if (
+      !isCurrentAuthenticatedSession(generation) ||
+      reported === true || S.conversationReadReportVersions.get(target) !== version
+    ) return;
     // Do not leave an optimistic zero badge in place after a failed or
     // non-durable report. A later explicit open can retry the read operation.
     S.readConversationPeers.delete(target);

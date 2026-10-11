@@ -194,6 +194,17 @@ class RequestBodyLimitMiddleware:
         self._slots = asyncio.Semaphore(8)
 
     @staticmethod
+    def _is_json_content_type(value: str) -> bool:
+        # FastAPI accepts application/*+json too. Missing Content-Type must
+        # not buy the larger upload budget before a route validates its body.
+        media_type = value.partition(";")[0].strip().lower()
+        return (
+            not media_type
+            or media_type == "application/json"
+            or (media_type.startswith("application/") and media_type.endswith("+json"))
+        )
+
+    @staticmethod
     async def _reject(send: Any, status_code: int, message: str) -> None:
         body = json.dumps(
             {"ok": False, "error": message}, ensure_ascii=False
@@ -228,7 +239,7 @@ class RequestBodyLimitMiddleware:
             ),
             "",
         )
-        if "application/json" in content_type:
+        if self._is_json_content_type(content_type):
             async with self._slots:
                 replay = await self._buffer_limited(scope, receive, send)
             if replay is not None:
@@ -247,16 +258,21 @@ class RequestBodyLimitMiddleware:
         self, scope: dict[str, Any], receive: Any, send: Any
     ) -> Any | None:
 
-        headers = {
-            key.decode("latin-1").lower(): value.decode("latin-1")
-            for key, value in scope.get("headers", [])
-        }
+        headers: dict[str, str] = {}
+        for key, value in scope.get("headers", []):
+            name = key.decode("latin-1").lower()
+            if name == "content-type" and name in headers:
+                # Different first/last-header interpretations must not select
+                # the upload budget here and JSON parsing in the router.
+                await self._reject(send, 400, "duplicate content type")
+                return
+            headers.setdefault(name, value.decode("latin-1"))
         scope_state = getattr(scope.get("app"), "state", None)
         settings = getattr(scope_state, "settings", None)
         max_request = int(getattr(settings, "max_request_body_bytes", 32 * 1024 * 1024))
         max_json = int(getattr(settings, "max_json_body_bytes", 256 * 1024))
         content_type = headers.get("content-type", "").lower()
-        limit = max_json if "application/json" in content_type else max_request
+        limit = max_json if self._is_json_content_type(content_type) else max_request
         if scope.get("path") in {"/admin", "/admin/"}:
             limit = min(limit, max_json)
         if scope.get("path") == "/api/im/flash/send":
@@ -307,7 +323,9 @@ class RequestBodyLimitMiddleware:
                     "body": payload,
                     "more_body": False,
                 }
-            return {"type": "http.request", "body": b"", "more_body": False}
+            # Preserve the real disconnect/wait semantics after replaying
+            # the body once; fabricated empty requests can spin listeners.
+            return await receive()
 
         return replay
 

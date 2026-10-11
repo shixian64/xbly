@@ -7,11 +7,14 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import inspect
+import io
 import json
 import logging
 import math
+import re
 import socket
 import sys
 import threading
@@ -6674,8 +6677,8 @@ class Handler(BaseHTTPRequestHandler):
                         502,
                     )
                 # ExportChatRecord returns a UTF-8 CSV body (often prefixed
-                # with BOM), not the usual JSON envelope.  Preserve it as a
-                # downloadable response so browsers can save the transcript.
+                # with BOM), not the usual JSON envelope. Neutralize formulas
+                # in untrusted message/nickname cells before serving a download.
                 raw_export = str(getattr(result, "raw", "") or "")
                 content_type = str(
                     (getattr(result, "headers", {}) or {}).get("content-type", "")
@@ -6690,7 +6693,13 @@ class Handler(BaseHTTPRequestHandler):
                         for ch in peer
                     )
                     filename = f"chat_export_{filename_peer}_{int(time.time() * 1000)}.csv"
-                    body_bytes = raw_export.encode("utf-8")
+                    try:
+                        body_bytes = _sanitize_chat_csv(raw_export)
+                    except csv.Error:
+                        return self.ok(
+                            {"ok": False, "error": "聊天记录 CSV 格式无效，请稍后重试"},
+                            502,
+                        )
                     self._send(
                         200,
                         body_bytes,
@@ -7367,6 +7376,22 @@ class Handler(BaseHTTPRequestHandler):
         else:
             cache = "public, max-age=300"
         self._send(200, data, ct, cache_control=cache)
+
+
+def _sanitize_chat_csv(raw: str) -> bytes:
+    """Keep exported chat fields as text, never spreadsheet formulas."""
+    has_bom = raw.startswith("\ufeff")
+    source = io.StringIO(raw[1:] if has_bom else raw, newline="")
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    for row in csv.reader(source, strict=True):
+        writer.writerow([
+            "'" + value
+            if re.match(r"^[\s\ufeff]*[=+\-@]|^[\t\r\n]", value)
+            else value
+            for value in row
+        ])
+    return (("\ufeff" if has_bom else "") + output.getvalue()).encode("utf-8")
 
 
 def _params(data: Dict[str, Any]) -> Dict[str, Any]:

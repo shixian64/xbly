@@ -20,7 +20,7 @@ import re
 import unicodedata
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Mapping, NoReturn
@@ -718,7 +718,10 @@ def _admin_cookie_name(request: Request) -> str:
 
 
 def _admin_cookie(request: Request) -> str:
-    return str(request.cookies.get(_admin_cookie_name(request)) or "")
+    sid = str(request.cookies.get(_admin_cookie_name(request)) or "")
+    # Cookie decoding may produce non-ASCII even from quoted ASCII headers.
+    # Treat malformed SID values as unauthenticated, including on logout.
+    return sid if sid.isascii() else ""
 
 
 def _set_admin_cookie(response: Response, request: Request, sid: str) -> None:
@@ -1819,15 +1822,9 @@ def admin_user_login(
     expected_uid = str(
         getattr(login_context, "existing_upstream_uid", "") or ""
     ).strip()
-    if (
-        getattr(login_context, "existing_user_id", None) is None
-        or getattr(login_context, "existing_external_account_id", None) is None
-        or not expected_uid
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="该手机号尚未绑定可确认身份的上游账号",
-        )
+    # 已认证管理员可以协助首次登录；上游认证成功后才建立本地账号/绑定。
+    # 不改变普通用户的邀请码要求，也不允许覆盖一个已确认的上游身份。
+    admin_login_context = replace(login_context, requires_invite=False)
 
     store = legacy.STORE
     if store is None:
@@ -1846,7 +1843,7 @@ def admin_user_login(
             request_authorized=True,
         )
         authenticated_uid = str(web_user.app.session.uid or "").strip()
-        if authenticated_uid != expected_uid:
+        if expected_uid and authenticated_uid != expected_uid:
             raise PermissionDenied(
                 "administrator phone login upstream identity does not match"
             )
@@ -1856,9 +1853,9 @@ def admin_user_login(
             invite_code=None,
             password="",
             password_verified=False,
-            require_existing_upstream_binding=True,
+            require_existing_upstream_binding=bool(expected_uid),
             clear_login_failures=False,
-            login_context=login_context,
+            login_context=admin_login_context,
             old_sid=None,
             client_ip=context.client_ip,
             user_agent=str(request.headers.get("User-Agent") or "")[:512],
