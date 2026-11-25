@@ -57,6 +57,8 @@ PRESENCE_LOCK_FREE_PATHS = frozenset(
         "/api/heartbeat/start",
         "/api/heartbeat/stop",
         "/api/heartbeat/once",
+        "/api/match/voice/cancel",
+        "/api/match/voice/finish",
     }
 )
 PEER_SCOPED_MUTATION_PATHS = frozenset({"/api/im/read"})
@@ -96,7 +98,15 @@ def _dependency_retryable(result: Any) -> bool:
             mapped_status = int(result.get("status") or 0)
         except (TypeError, ValueError, OverflowError):
             mapped_status = 0
-        return mapped_status in {-1, 408, 425, 429, 504} or mapped_status >= 500
+        try:
+            mapped_error_code = int(result.get("error_code") or 0)
+        except (TypeError, ValueError, OverflowError):
+            mapped_error_code = 0
+        return (
+            mapped_status in {-1, 408, 425, 429, 504}
+            or mapped_status >= 500
+            or mapped_error_code in {-1, 60020}
+        )
     if bool(getattr(result, "retryable", False)):
         return True
     try:
@@ -107,7 +117,12 @@ def _dependency_retryable(result: Any) -> bool:
         error_code = int(getattr(result, "error_code", 0) or 0)
     except (TypeError, ValueError, OverflowError):
         error_code = 0
-    return status == -1 or status in {408, 425, 429, 504} or status >= 500 or error_code == -1
+    return (
+        status == -1
+        or status in {408, 425, 429, 504}
+        or status >= 500
+        or error_code in {-1, 60020}
+    )
 
 
 def _dependency_call(
@@ -4527,7 +4542,20 @@ class Handler(BaseHTTPRequestHandler):
             # JD is the preferred conversation/send provider.  A healthy JD
             # service must not be reported as disconnected merely because the
             # legacy TIM compatibility API is suspended.
+            breakers = getattr(self, "_request_dependency_breakers", None)
+            budget_config = dict(getattr(self, "_request_budget_config", None) or {})
+            health_timeout = max(
+                4.0,
+                float(budget_config.get("provider_timeout_seconds") or 0),
+            )
             jd_chat = getattr(u.native, "jd_chat", None)
+            jd_live_ok = getattr(jd_chat, "is_live_connected", None)
+            if callable(jd_live_ok):
+                try:
+                    if jd_live_ok():
+                        return self.ok({"ok": True, "source": "jd_chat", "provider": "jd-chat"})
+                except Exception:
+                    pass
             jd_health = getattr(jd_chat, "health", None)
             if callable(jd_health):
                 try:
@@ -4535,8 +4563,8 @@ class Handler(BaseHTTPRequestHandler):
                         jd_health,
                         provider="jd-chat",
                         domain="im-read",
-                        timeout=4.0,
-                        breakers=getattr(self, "_request_dependency_breakers", None),
+                        timeout=health_timeout,
+                        breakers=breakers,
                         request_id=str(getattr(self, "_request_id", "") or ""),
                     )
                     if _jd_result_ok(jd_result):
@@ -4544,7 +4572,36 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             # Compatibility fallback proves the APK-derived TIM secret works.
+            if breakers is not None and breakers.retry_after("tim", "im-read") > 0:
+                return self.ok(
+                    {
+                        "ok": False,
+                        "error_code": 60020,
+                        "error_info": "TIM service unavailable",
+                        "retry_after": int(breakers.retry_after("tim", "im-read")),
+                    }
+                )
             sample = str(app.session.uid or "1")
+            if breakers is not None:
+                try:
+                    tim_health = _dependency_call(
+                        u.native.tim_rest.health,
+                        sample_uid=sample,
+                        provider="tim",
+                        domain="im-read",
+                        breakers=breakers,
+                        request_id=str(getattr(self, "_request_id", "") or ""),
+                    )
+                    return self.ok(tim_health)
+                except DependencyCircuitOpen as exc:
+                    return self.ok(
+                        {
+                            "ok": False,
+                            "error_code": 60020,
+                            "error_info": "TIM service unavailable",
+                            "retry_after": exc.retry_after,
+                        }
+                    )
             return self.ok(u.native.tim_rest.health(sample_uid=sample))
         if path == "/api/im/rest/online":
             uid = q("uid") or app.session.uid or ""
@@ -4807,8 +4864,13 @@ class Handler(BaseHTTPRequestHandler):
                         502,
                     )
                 if _is_html_protocol_result(result) or not getattr(result, "ok", False):
+                    if breakers is not None and _is_html_protocol_result(result):
+                        breakers.record_failure("beibeiwu", "im-read", retryable=True)
                     retry_after = (
-                        int(breakers.retry_after("beibeiwu", "im-read"))
+                        max(
+                            int(breakers.retry_after("beibeiwu", "im-read")),
+                            int(breakers.retry_after("jd-chat", "im-read")),
+                        )
                         if breakers is not None
                         else 0
                     )
@@ -5010,8 +5072,13 @@ class Handler(BaseHTTPRequestHandler):
                         502,
                     )
                 if _is_html_protocol_result(result) or not getattr(result, "ok", False):
+                    if breakers is not None and _is_html_protocol_result(result):
+                        breakers.record_failure("beibeiwu", "im-read", retryable=True)
                     retry_after = (
-                        int(breakers.retry_after("beibeiwu", "im-read"))
+                        max(
+                            int(breakers.retry_after("beibeiwu", "im-read")),
+                            int(breakers.retry_after("jd-chat", "im-read")),
+                        )
                         if breakers is not None
                         else 0
                     )
@@ -6947,8 +7014,23 @@ class Handler(BaseHTTPRequestHandler):
                                 **state,
                             }
                         )
-                result = app.match.cancel_voice(id_=app.session.uid)
-                remote = R(result, empty_ok=True)
+                breakers = getattr(self, "_request_dependency_breakers", None)
+                if breakers is not None:
+                    try:
+                        result = _dependency_call(
+                            app.match.cancel_voice,
+                            id_=app.session.uid,
+                            provider="beibeiwu",
+                            domain="voice-match",
+                            breakers=breakers,
+                            request_id=str(getattr(self, "_request_id", "") or ""),
+                        )
+                        remote = R(result, empty_ok=True)
+                    except DependencyCircuitOpen:
+                        remote = {"ok": False, "code": "DEPENDENCY_CIRCUIT_OPEN"}
+                else:
+                    result = app.match.cancel_voice(id_=app.session.uid)
+                    remote = R(result, empty_ok=True)
                 with u.lock:
                     state = (
                         _set_voice_match_state(u, "idle")

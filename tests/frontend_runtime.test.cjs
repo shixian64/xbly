@@ -429,3 +429,136 @@ test('storage event: conversation preference uses its separate account key witho
   assert.equal(preferences[0].options.notify, false);
   assert.equal(drains(), 0);
 });
+
+function jdLiveContext(call) {
+  const rendered = new Map();
+  let refreshes = 0;
+  const state = {
+    authenticated: true, sessionGeneration: 1, messagePolicyReady: true, messagePolicyGeneration: 1,
+    jdLiveCursor: '', jdLivePollPromise: null, jdLiveNextPollAt: 0, jdLiveConnected: false,
+    jdLiveGap: false, jdLiveGeneration: 0, user: { uid: '42' },
+    imMessages: [], conversations: [], readConversationPeers: new Map(), activePeer: '9',
+  };
+  const allowed = new Set(['9']);
+  const context = {
+    S: state, document: { hidden: false }, Date, Promise,
+    api: call, isCurrentAuthenticatedSession: generation => state.authenticated && state.sessionGeneration === generation,
+    messageSyncAccountId: () => state.user.uid,
+    canStartPrivateChat: peer => allowed.has(peer),
+    timMessageEntry: (raw, peer, me) => ({ ...raw, peer, id: raw.message_id || raw.id,
+      text: raw.text, type: raw.from === me ? 'mine' : '', timestamp: raw.timestamp }),
+    messagesReferToSameMessage: (a, b) => a.id === b.id || Boolean(a.client_message_id && a.client_message_id === b.client_message_id),
+    isVisibleActiveConversation: peer => peer === state.activePeer,
+    ensureConversationForPeer: peer => {
+      let conversation = state.conversations.find(item => item.peer_id === peer);
+      if (!conversation) { conversation = { peer_id: peer, unread_count: 0 }; state.conversations.push(conversation); }
+      return conversation;
+    },
+    addImMessage: (_text, _type, peer, entry) => {
+      const index = state.imMessages.findIndex(item => item.peer === peer && context.messagesReferToSameMessage(item, entry));
+      if (index < 0) state.imMessages.push(entry); else state.imMessages[index] = entry;
+      if (peer === state.activePeer) rendered.set(entry.id, entry.text);
+    },
+    conversationUnreadCount: conversation => Number(conversation.unread_count || 0),
+    updateConversationPreviewFromMessages: peer => {
+      const conversation = state.conversations.find(item => item.peer_id === peer);
+      const latest = state.imMessages.filter(item => item.peer === peer).at(-1);
+      if (latest) conversation.last_message = latest.text;
+    },
+    invalidateChatAssistSuggestion: () => {}, scheduleChatAssistRefresh: () => {},
+    conversationTimestamp: item => Number(item.timestamp || 0), recalculateUnreadTotal: () => {},
+    refreshMessageConversationRegion: () => { refreshes++; }, updateImConnectionStatus: () => {},
+  };
+  vm.createContext(context);
+  vm.runInContext(['resetJdLiveMessages', 'applyJdLiveMessages', 'pollJdLiveMessages'].map(name => fn(app, name)).join('\n'), context);
+  return { context, state, allowed, rendered, refreshes: () => refreshes };
+}
+function liveMessage(overrides = {}) {
+  return { id: 'jd-1', message_id: 'jd-1', from: '9', to: '42', text: 'Live message', timestamp: Date.now(), ...overrides };
+}
+
+test('JD live: an incoming message renders and creates a conversation without HTTP history or TIM', async () => {
+  const calls = [];
+  const h = jdLiveContext(async url => {
+    calls.push(url);
+    return { ok: true, data: { ok: true, connected: true, cursor: 'epoch:1', items: [liveMessage()] } };
+  });
+  assert.equal(await h.context.pollJdLiveMessages(), true);
+  assert.equal(h.rendered.get('jd-1'), 'Live message');
+  assert.equal(h.state.conversations[0].last_message, 'Live message');
+  assert.equal(h.state.jdLiveCursor, 'epoch:1');
+  assert.equal(h.state.jdLiveConnected, true);
+  assert.equal(h.refreshes(), 1);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0], /^\/api\/im\/live\?/);
+});
+
+test('JD live: replay merges once and cannot double-increment unread', () => {
+  const h = jdLiveContext();
+  h.state.activePeer = '';
+  h.context.applyJdLiveMessages([liveMessage()]);
+  h.context.applyJdLiveMessages([liveMessage()]);
+  assert.equal(h.state.imMessages.length, 1);
+  assert.equal(h.state.conversations[0].unread_count, 1);
+});
+
+test('JD live: blocked/unauthorized peers and foreign account pairs cannot render', () => {
+  const h = jdLiveContext();
+  h.allowed.clear();
+  h.context.applyJdLiveMessages([liveMessage(), liveMessage({ from: '7', to: '8' })]);
+  assert.equal(h.state.imMessages.length, 0);
+  assert.equal(h.state.conversations.length, 0);
+  assert.equal(h.rendered.size, 0);
+});
+
+test('JD live: an outgoing echo reconciles the optimistic client identity', () => {
+  const h = jdLiveContext();
+  h.state.imMessages.push({ id: 'local-1', client_message_id: 'client-1', peer: '9', text: 'Live message' });
+  h.context.applyJdLiveMessages([liveMessage({ from: '42', to: '9', client_message_id: 'client-1' })]);
+  assert.equal(h.state.imMessages.length, 1);
+  assert.equal(h.state.imMessages[0].id, 'jd-1');
+  assert.equal(h.state.conversations[0].unread_count, 0);
+});
+
+for (const change of ['account', 'policy', 'logout']) {
+  test(`JD live: a late response after ${change} cannot show messages or advance the cursor`, async () => {
+    const pending = deferred();
+    const h = jdLiveContext(() => pending.promise);
+    const poll = h.context.pollJdLiveMessages();
+    if (change === 'account') { h.state.user.uid = '7'; h.state.sessionGeneration++; }
+    if (change === 'policy') h.state.messagePolicyGeneration++;
+    if (change === 'logout') h.context.resetJdLiveMessages();
+    pending.resolve({ ok: true, data: { ok: true, connected: true, cursor: 'private-old-cursor', items: [liveMessage()] } });
+    assert.equal(await poll, false);
+    assert.equal(h.state.imMessages.length, 0);
+    assert.equal(h.state.jdLiveCursor, '');
+    assert.equal(h.state.jdLiveConnected, false);
+  });
+}
+
+test('JD live: archive/network failure retains cursor and backs off', async () => {
+  const h = jdLiveContext(async () => ({ ok: false, data: { ok: false, code: 'JD_LIVE_UNAVAILABLE' } }));
+  h.state.jdLiveCursor = 'previous';
+  assert.equal(await h.context.pollJdLiveMessages(), false);
+  assert.equal(h.state.jdLiveCursor, 'previous');
+  assert.equal(h.state.imMessages.length, 0);
+  assert.ok(h.state.jdLiveNextPollAt > Date.now() + 10000);
+});
+
+test('JD live: concurrent cycles share one request; hidden/policy-unready pages do not poll', async () => {
+  const pending = deferred();
+  let calls = 0;
+  const h = jdLiveContext(() => { calls++; return pending.promise; });
+  const first = h.context.pollJdLiveMessages();
+  const second = h.context.pollJdLiveMessages({ force: true });
+  assert.equal(first, second);
+  assert.equal(calls, 1);
+  pending.resolve({ ok: true, data: { ok: true, cursor: '', items: [] } });
+  await first;
+  h.context.document.hidden = true;
+  await h.context.pollJdLiveMessages({ force: true });
+  h.context.document.hidden = false;
+  h.state.messagePolicyReady = false;
+  await h.context.pollJdLiveMessages({ force: true });
+  assert.equal(calls, 1);
+});

@@ -3644,6 +3644,16 @@ return 1
                 observed_at=utcnow(),
             )
 
+    def archive_jd_live_messages(
+        self, identity: UserIdentity, envelopes: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Commit authenticated provider events before advancing a browser cursor."""
+        from bbw_web.jobs import ingest_history_responses_batch
+
+        return ingest_history_responses_batch(
+            str(identity.user_id), str(identity.external_account_id), envelopes,
+        )
+
     def enqueue_message_archive(
         self,
         *,

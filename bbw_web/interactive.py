@@ -8,7 +8,11 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
 
-from bbw_web.dependency_health import RequestDeadline
+from bbw_web.dependency_health import (
+    DependencyCircuitOpen,
+    DependencyDeadlineExceeded,
+    RequestDeadline,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -198,6 +202,12 @@ class PresenceCoordinator:
                 state.pending.pop(operation, None)
             try:
                 callback()
+            except (DependencyCircuitOpen, DependencyDeadlineExceeded):
+                LOGGER.debug(
+                    "presence update skipped due to degraded upstream; account=%s operation=%s",
+                    account_key[:128],
+                    operation[:64],
+                )
             except Exception:
                 LOGGER.exception(
                     "presence update failed; account=%s operation=%s",

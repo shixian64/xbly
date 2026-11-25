@@ -1163,6 +1163,16 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
                     status_code=429,
                     headers={"Retry-After": "5"},
                 )
+        elif request.method == "GET" and path == "/api/im/live":
+            # Receive polling has its own bounded bucket; it must not starve
+            # ordinary product requests or session restoration.
+            if not persistence.rate_limit(
+                f"jd-live:{limiter_identity}", limit=60, window_seconds=60
+            ):
+                return JSONResponse(
+                    {"ok": False, "code": "JD_LIVE_RATE_LIMIT", "retryable": True},
+                    status_code=429, headers={"Retry-After": "5"},
+                )
         elif not persistence.rate_limit(
             f"api:{limiter_identity}", limit=60, window_seconds=60
         ):
@@ -1193,6 +1203,16 @@ def _legacy_dispatch_sync(request: Request, raw_body: bytes) -> Response:
         restored = persistence.restore_web_user(sid)
         if restored is not None:
             legacy.STORE.put(restored)
+
+    if request.method == "GET" and path == "/api/im/live":
+        from bbw_web.jd_live import live_messages
+
+        web_user = legacy.STORE.get(sid) if sid and legacy.STORE is not None else None
+        status, payload = live_messages(
+            user=web_user, identity=identity, persistence=persistence,
+            cursor=str(request.query_params.get("cursor") or ""),
+        )
+        return JSONResponse(payload, status_code=status, headers={"Cache-Control": "no-store"})
 
     conversation_message_peers_before: set[str] | None = None
     if (

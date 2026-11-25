@@ -179,9 +179,49 @@ class JdChatClient:
         self.base_url = str(base_url or JD_CHAT_BASE).rstrip("/")
         self.timeout = float(timeout)
         self._http = httpx.Client(follow_redirects=True, verify=ssl.create_default_context())
+        self._live_lock = threading.RLock()
+        self._live_receiver = None
+        self._closed = False
 
     def close(self) -> None:
+        with self._live_lock:
+            self._closed = True
+            if self._live_receiver is not None:
+                self._live_receiver.close()
+                self._live_receiver = None
         self._http.close()
+
+    def is_live_connected(self) -> bool:
+        with self._live_lock:
+            receiver = self._live_receiver
+            return bool(
+                not self._closed
+                and receiver is not None
+                and getattr(receiver, "_connected", False) is True
+            )
+
+    def poll_live(self, cursor: str = "", *, limit: int = 50) -> dict[str, Any]:
+        """Start/reuse a receive-only stream for this authenticated runtime."""
+        from .jd_realtime import JdRealtimeReceiver
+
+        uid = str(getattr(self.session, "uid", "") or "").strip()
+        token = self._access_token()
+        if not uid.isascii() or not uid.isdecimal() or int(uid) <= 0 or token in {"", "0"}:
+            raise ValueError("JD live identity is unavailable")
+        with self._live_lock:
+            if self._closed:
+                raise RuntimeError("JD runtime is closed")
+            receiver = self._live_receiver
+            if receiver is not None and not receiver.matches(uid, token):
+                receiver.close()
+                receiver = self._live_receiver = None
+            if receiver is None:
+                receiver = JdRealtimeReceiver(
+                    uid=uid, token=token, base_url=self.base_url,
+                    device_id=str(getattr(self.session, "device_id", "") or ""),
+                )
+                self._live_receiver = receiver
+            return receiver.poll(cursor, limit=limit)
 
     def _request(
         self,
@@ -230,7 +270,7 @@ class JdChatClient:
                 error = "" if ok else raw[:500]
             return JdChatResult(ok, response.status_code, payload, error, raw)
         except Exception as exc:
-            return JdChatResult(False, error_info=str(exc))
+            return JdChatResult(False, -1, error_info=str(exc))
 
     def send_text(
         self,
@@ -397,21 +437,13 @@ class JdChatClient:
             send_started = False
             try:
                 import websockets
-                headers = {"Authorization": f"Bearer {token}"}
-                try:
-                    ws_cm = websockets.connect(
-                        url,
-                        additional_headers=headers,
-                        ping_interval=30,
-                        close_timeout=2,
-                    )
-                except TypeError:
-                    ws_cm = websockets.connect(
-                        url,
-                        extra_headers=headers,
-                        ping_interval=30,
-                        close_timeout=2,
-                    )
+                from .jd_realtime import websocket_headers
+                ws_cm = websockets.connect(
+                    url,
+                    **websocket_headers(websockets.connect, token),
+                    ping_interval=30,
+                    close_timeout=2,
+                )
                 async with ws_cm as ws:
                     # Once the frame has been handed to the socket, a timeout
                     # or malformed ACK is an *ambiguous* delivery outcome.

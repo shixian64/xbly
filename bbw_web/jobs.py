@@ -142,6 +142,10 @@ TIM_MEDIA_READ_TTL_SECONDS = 900
 TIM_RECALL_LOOKUP_MAX_PAGES = 3
 TIM_READ_SYNC_LOCK_SECONDS = 200
 TIM_SERVICE_SUSPENSION_TTL_SECONDS = 300
+
+
+class _TimServiceSuspendedError(RuntimeError):
+    pass
 WEB_NATIVE_MEDIA_CLEANUP_BATCH = 200
 WEB_NATIVE_UPLOAD_CLEANUP_GRACE_SECONDS = 60 * 60
 WEB_NATIVE_MEDIA_UNSENT_GRACE_SECONDS = 24 * 60 * 60
@@ -236,7 +240,7 @@ def sync_tim_conversation_read(state_key: str) -> dict[str, Any]:
         acquired = bool(lock.acquire(blocking=True))
         if not acquired:
             raise RuntimeError("TIM read sync is already active")
-        suspension_key = f"{settings.redis_prefix}:tim-rest:suspended"
+        suspension_key = f"{getattr(settings, 'redis_prefix', 'bbw')}:tim-rest:suspended"
         if redis.get(suspension_key):
             raise RuntimeError("TIM service suspended")
         client = _default_message_read_transport()
@@ -4336,7 +4340,12 @@ def _tim_recent_conversations(
             top_start_index=top_start_index,
         )
         if not result.ok:
-            raise RuntimeError(
+            err_cls = (
+                _TimServiceSuspendedError
+                if int(getattr(result, "error_code", 0) or 0) == 60020
+                else RuntimeError
+            )
+            raise err_cls(
                 f"TIM recent contacts failed: {result.error_code or result.error_info}"
             )
         data = result.data if isinstance(result.data, Mapping) else {}
@@ -4496,7 +4505,12 @@ def _tim_roaming_history(
             )
             request_count += 1
             if not result.ok:
-                raise RuntimeError(
+                err_cls = (
+                    _TimServiceSuspendedError
+                    if int(getattr(result, "error_code", 0) or 0) == 60020
+                    else RuntimeError
+                )
+                raise err_cls(
                     f"TIM roaming history failed: {result.error_code or result.error_info}"
                 )
             data = result.data if isinstance(result.data, Mapping) else {}
@@ -4590,8 +4604,11 @@ def sync_account_history(
         ),
     )
     now = utcnow()
+    jd_sync_profile: dict[str, Any] = {}
     with session_scope() as db:
         _user, account = _load_owner_binding(db, owner_id, account_id)
+        if _user is not None and isinstance(getattr(_user, "profile", None), Mapping):
+            jd_sync_profile = dict(_user.profile)
         if not account.sync_enabled:
             return {"ok": True, "ignored": True, "reason": "account synchronization is disabled"}
         account_uid = _bounded(account.upstream_uid, 128)
@@ -4634,20 +4651,57 @@ def sync_account_history(
         )
 
     watermark: datetime | None = previous_watermark
+    tim_suspended = False
+    suspension_key = f"{getattr(settings, 'redis_prefix', 'bbw')}:tim-rest:suspended"
+    if transport_factory is None and getattr(settings, "redis_url", ""):
+        try:
+            redis_conn = Redis.from_url(settings.redis_url)
+            try:
+                tim_suspended = bool(redis_conn.get(suspension_key))
+            finally:
+                redis_conn.close()
+        except Exception:
+            tim_suspended = False
+
+    def _mark_tim_suspended() -> None:
+        nonlocal tim_suspended
+        tim_suspended = True
+        if transport_factory is None and getattr(settings, "redis_url", ""):
+            try:
+                redis_conn = Redis.from_url(settings.redis_url)
+                try:
+                    redis_conn.set(
+                        suspension_key,
+                        b"60020",
+                        ex=TIM_SERVICE_SUSPENSION_TTL_SECONDS,
+                    )
+                finally:
+                    redis_conn.close()
+            except Exception:
+                pass
+
     client = (transport_factory or _default_message_history_transport)()
     try:
         contact_fallback = False
         contact_error = ""
-        try:
-            recent_conversations = _tim_recent_conversations(
-                client,
-                account_uid,
-                max_pages=max_pages,
-            )
-        except Exception:
+        if tim_suspended:
             recent_conversations = []
             contact_fallback = True
-            contact_error = "TIM recent contacts unavailable"
+        else:
+            try:
+                recent_conversations = _tim_recent_conversations(
+                    client,
+                    account_uid,
+                    max_pages=max_pages,
+                )
+            except _TimServiceSuspendedError:
+                _mark_tim_suspended()
+                recent_conversations = []
+                contact_fallback = True
+            except Exception:
+                recent_conversations = []
+                contact_fallback = True
+                contact_error = "TIM recent contacts unavailable"
 
         conversations: list[dict[str, Any]] = []
         seen_peers: set[str] = set()
@@ -4711,46 +4765,96 @@ def sync_account_history(
         peer_errors: list[str] = []
         now_epoch = int(now.timestamp())
         retention_floor = now_epoch - max(1, int(settings.message_retention_days)) * 86400
-        for index, conversation in enumerate(selected_conversations, 1):
-            peer = _bounded(
-                conversation.get("peer_id") or conversation.get("conversation_user"), 128
-            )
-            if not peer:
-                continue
-            previous_peer_time = _as_int(peer_watermarks.get(peer), 0, minimum=0)
-            min_time = max(retention_floor, previous_peer_time - 300) if previous_peer_time else retention_floor
+        jd_client = None
+        jd_runtime = None
+        if tim_suspended and transport_factory is None and jd_sync_profile:
             try:
-                items, request_count = _tim_roaming_history(
-                    client,
-                    account_uid=account_uid,
-                    peer_uid=peer,
-                    min_time=min_time,
-                    max_time=now_epoch + 60,
-                    max_messages=max_messages,
+                from bbw_web import bff_server as _bff
+                from bbw_web.providers.contracts import ProviderSessionState as _PSS
+                from bbw_web.providers.legacy_banghua import LegacyBanghuaProvider as _LBP
+                from bbw_web.store import close_web_runtime as _close_runtime
+
+                jd_runtime = _LBP().create_runtime_from_state(
+                    _PSS(uid=account_uid, raw_user=jd_sync_profile)
                 )
-                roaming_requests += request_count
-            except Exception as exc:
-                peer_errors.append(f"peer-{index}:{str(exc)[:300]}")
-                continue
+                _candidate_jd = getattr(jd_runtime.native, "jd_chat", None)
+                if _candidate_jd is not None and _candidate_jd._access_token():
+                    jd_client = _candidate_jd
+                else:
+                    _close_runtime(jd_runtime.app, jd_runtime.native)
+                    jd_runtime = None
+            except Exception:
+                jd_client = None
+                jd_runtime = None
 
-            peer_watermark = previous_peer_time
-            for item in items:
-                stamp = _optional_time(item.get("timestamp") or item.get("time"))
-                if stamp:
-                    peer_watermark = max(peer_watermark, int(stamp.timestamp()))
-                    if watermark is None or stamp > watermark:
-                        watermark = stamp
-            peer_watermarks[peer] = max(peer_watermark, now_epoch if not items else 0)
-            result_summary = ingest_history_response(
-                str(owner_id),
-                str(account_id),
-                "/api/im/messages",
-                {"peer": peer},
-                {"ok": True, "items": items},
-            )
-            messages_created += int(result_summary.get("messages_created") or 0)
-            messages_existing += int(result_summary.get("messages_existing") or 0)
+        try:
+            for index, conversation in enumerate(selected_conversations, 1):
+                peer = _bounded(
+                    conversation.get("peer_id") or conversation.get("conversation_user"), 128
+                )
+                if not peer:
+                    continue
+                previous_peer_time = _as_int(peer_watermarks.get(peer), 0, minimum=0)
+                min_time = max(retention_floor, previous_peer_time - 300) if previous_peer_time else retention_floor
+                if tim_suspended:
+                    if jd_client is None or index > 3:
+                        break
+                    try:
+                        jd_res = jd_client.history(
+                            peer_id=peer,
+                            limit=min(100, max(1, int(max_messages))),
+                            timeout=12.0,
+                        )
+                        roaming_requests += 1
+                        if not jd_res.ok:
+                            if jd_res.status_code in {-1, 408, 429, 504} or jd_res.status_code >= 500:
+                                break
+                            continue
+                        jd_env = _bff._jd_message_envelope(jd_res, account_uid, peer)
+                        items = list(jd_env.get("items") or [])
+                    except Exception:
+                        break
+                else:
+                    try:
+                        items, request_count = _tim_roaming_history(
+                            client,
+                            account_uid=account_uid,
+                            peer_uid=peer,
+                            min_time=min_time,
+                            max_time=now_epoch + 60,
+                            max_messages=max_messages,
+                        )
+                        roaming_requests += request_count
+                    except _TimServiceSuspendedError:
+                        _mark_tim_suspended()
+                        break
+                    except Exception as exc:
+                        peer_errors.append(f"peer-{index}:{str(exc)[:300]}")
+                        continue
 
+                peer_watermark = previous_peer_time
+                for item in items:
+                    stamp = _optional_time(item.get("timestamp") or item.get("time"))
+                    if stamp:
+                        peer_watermark = max(peer_watermark, int(stamp.timestamp()))
+                        if watermark is None or stamp > watermark:
+                            watermark = stamp
+                peer_watermarks[peer] = max(peer_watermark, now_epoch if not items else 0)
+                result_summary = ingest_history_response(
+                    str(owner_id),
+                    str(account_id),
+                    "/api/im/messages",
+                    {"peer": peer},
+                    {"ok": True, "items": items},
+                )
+                messages_created += int(result_summary.get("messages_created") or 0)
+                messages_existing += int(result_summary.get("messages_existing") or 0)
+        finally:
+            if jd_runtime is not None:
+                try:
+                    _close_runtime(jd_runtime.app, jd_runtime.native)
+                except Exception:
+                    pass
         peer_watermarks = dict(
             sorted(peer_watermarks.items(), key=lambda item: item[1], reverse=True)[:500]
         )

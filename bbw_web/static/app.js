@@ -307,6 +307,12 @@ const S = {
   imNetworkHandler: null,
   imNotReadyHandler: null,
   imKickedHandler: null,
+  jdLiveCursor: "",
+  jdLivePollPromise: null,
+  jdLiveNextPollAt: 0,
+  jdLiveConnected: false,
+  jdLiveGap: false,
+  jdLiveGeneration: 0,
   imConnected: false,
   imMode: "", // "sdk" | "rest" | ""
   imConnecting: false,
@@ -1018,6 +1024,9 @@ function ensureTimUploadPluginLoaded() {
 }
 
 function imConnectionStatusText() {
+  if (S.jdLiveConnected) return S.jdLiveGap
+    ? "实时消息已连接；断线期间的历史可能不完整"
+    : "实时消息已连接；历史消息单独同步";
   if (S.imConnecting) return "正在连接消息服务…";
   if (S.imConnected && S.imMode === "sdk") return "实时消息已连接";
   if (S.imConnected && S.imMode === "rest") return "消息服务已连接";
@@ -2913,7 +2922,7 @@ function setMessagePolicyReady(ready, fingerprint = "") {
   S.messagePolicyFingerprint = nextFingerprint;
   S.messagePolicyGeneration += 1;
   syncPrivateMessageControls();
-  if (next || !(S.imMode || S.chat || S.imConnecting || S._imConnecting)) {
+  if (next || !(S.imMode || S.chat || S.imConnecting || S._imConnecting || S.jdLiveConnected || S.jdLivePollPromise)) {
     return { readyChanged, policyChanged };
   }
   S.imLastError = "私聊安全策略暂时不可用，消息通道已暂停";
@@ -3459,6 +3468,103 @@ function refreshConversationSummary({ force = false } = {}) {
   return task;
 }
 
+function resetJdLiveMessages() {
+  S.jdLiveGeneration += 1;
+  S.jdLiveCursor = "";
+  S.jdLivePollPromise = null;
+  S.jdLiveNextPollAt = 0;
+  S.jdLiveConnected = false;
+  S.jdLiveGap = false;
+}
+
+function applyJdLiveMessages(rows) {
+  const me = String(S.user?.uid || S.user?.id || "");
+  const changedPeers = new Set();
+  (Array.isArray(rows) ? rows : []).slice(0, 50).forEach((message) => {
+    const sender = String(message?.from || "");
+    const recipient = String(message?.to || "");
+    if (!me || (sender !== me && recipient !== me) || sender === recipient) return;
+    const peer = sender === me ? recipient : sender;
+    if (!canStartPrivateChat(peer)) return;
+    const entry = timMessageEntry(message, peer, me);
+    const duplicate = S.imMessages.some((previous) =>
+      String(previous.peer || "") === peer && messagesReferToSameMessage(previous, entry)
+    );
+    const active = isVisibleActiveConversation(peer);
+    const conversation = ensureConversationForPeer(peer);
+    addImMessage(entry.text, entry.type, peer, entry);
+    if (conversation) {
+      conversation.source = "jd_chat";
+      conversation.provider = "jd-chat";
+      conversation.timestamp = Math.max(Number(conversation.timestamp || 0), Number(entry.timestamp || 0));
+      if (!duplicate && entry.type !== "mine" && !active &&
+          Number(entry.timestamp || 0) > Number(S.readConversationPeers.get(peer) || 0)) {
+        conversation.unread_count = conversationUnreadCount(conversation) + 1;
+        conversation.unread = conversation.unread_count;
+        conversation.unread_observed_at = Date.now();
+      }
+      updateConversationPreviewFromMessages(peer);
+    }
+    // The server committed this event before releasing the polling cursor.
+    // Do not issue an additional browser archive write for the same JD event.
+    if (!duplicate) {
+      changedPeers.add(peer);
+      invalidateChatAssistSuggestion(peer);
+      scheduleChatAssistRefresh(peer, 800);
+    }
+  });
+  if (changedPeers.size) {
+    S.conversations.sort((a, b) => conversationTimestamp(b) - conversationTimestamp(a));
+    recalculateUnreadTotal();
+    refreshMessageConversationRegion({ refreshList: true, refreshPane: false });
+  }
+}
+
+function pollJdLiveMessages({ force = false } = {}) {
+  if (!S.authenticated || !S.messagePolicyReady || document.hidden) return Promise.resolve(false);
+  if (S.jdLivePollPromise) return S.jdLivePollPromise;
+  if (!force && Date.now() < S.jdLiveNextPollAt) return Promise.resolve(false);
+  const session = S.sessionGeneration;
+  const policy = S.messagePolicyGeneration;
+  const generation = S.jdLiveGeneration;
+  const account = messageSyncAccountId();
+  const current = () => isCurrentAuthenticatedSession(session) && S.messagePolicyReady &&
+    S.messagePolicyGeneration === policy && S.jdLiveGeneration === generation &&
+    messageSyncAccountId() === account;
+  S.jdLiveNextPollAt = Date.now() + 5000;
+  let task;
+  task = api(`/api/im/live?cursor=${encodeURIComponent(S.jdLiveCursor)}`, { timeout: 8000 })
+    .then(({ data, ok }) => {
+      if (!current()) return false;
+      if (!ok || data?.ok !== true) {
+        S.jdLiveConnected = false;
+        S.jdLiveNextPollAt = Date.now() + 15000;
+        updateImConnectionStatus();
+        return false;
+      }
+      applyJdLiveMessages(data.items);
+      // Commit the browser cursor only after merging the whole response.
+      S.jdLiveCursor = String(data.cursor || S.jdLiveCursor);
+      S.jdLiveConnected = data.connected === true;
+      S.jdLiveGap = data.gap === true;
+      S.jdLiveNextPollAt = Date.now() + (data.has_more ? 1000 : 5000);
+      updateImConnectionStatus();
+      return true;
+    })
+    .catch((error) => {
+      if (!current()) return false;
+      S.jdLiveConnected = false;
+      S.jdLiveNextPollAt = Date.now() + Math.max(15000, Number(error?.retryAfterMs || 0));
+      updateImConnectionStatus();
+      return false;
+    })
+    .finally(() => {
+      if (S.jdLivePollPromise === task) S.jdLivePollPromise = null;
+    });
+  S.jdLivePollPromise = task;
+  return task;
+}
+
 function stopMessageSyncTimer() {
   clearInterval(S.messageSyncTimer);
   S.messageSyncTimer = null;
@@ -3486,6 +3592,7 @@ function syncMessagesInBackground({ force = false } = {}) {
   if (!S.authenticated || document.hidden) return Promise.resolve([]);
   const now = Date.now();
   const tasks = [];
+  tasks.push(pollJdLiveMessages({ force }));
   if (S.imConnected && S.imMode === "sdk" && S.chat && typeof S.chat.isReady === "function") {
     try {
       if (!S.chat.isReady()) {
@@ -3517,7 +3624,7 @@ function syncMessagesInBackground({ force = false } = {}) {
       tasks.push(loadConversationMessages(S.activePeer, { force: true }));
     }
   }
-  if (!S.imConnected && !S.imConnecting && Date.now() >= S.imNextReconnectAt) {
+  if (!S.imConnected && !S.jdLiveConnected && !S.imConnecting && Date.now() >= S.imNextReconnectAt) {
     tasks.push(ensureTimConnected({ background: true }));
   }
   return Promise.allSettled(tasks);
@@ -10391,7 +10498,9 @@ async function loadConversationMessages(peer, { force = false } = {}) {
           conversationUnreadCount(activeConversation()) > 0) {
         markConversationRead(target);
       } else if (!liveLoaded && !wasLoaded) {
-        toast("最新消息暂不可用，当前仅显示已归档记录", "error", 4000);
+        toast(S.jdLiveConnected
+          ? "历史消息暂不可用，实时新消息仍可接收"
+          : "最新消息暂不可用，当前仅显示已归档记录", "error", 4000);
       }
     }
     return liveLoaded;
@@ -19924,6 +20033,7 @@ async function ensureTimConnected({ force = false, background = false } = {}) {
 }
 
 async function cleanupIM() {
+  resetJdLiveMessages();
   const chat = S.chat;
   const TIM = resolveTimApi();
   S.imAudioSourceRefreshes.clear();
@@ -20119,6 +20229,7 @@ async function logout({ notifyServer = true } = {}) {
     clearAllViewCaches();
     S.meStats = null;
     S.meStatsAt = 0;
+    resetJdLiveMessages();
     S.imMessages = [];
     S.imPendingRevocations.clear();
     S.imMessageLoadingPeers.clear();
@@ -21794,6 +21905,7 @@ async function completeBrowserLogin(data) {
   clearAllViewCaches();
   resetMomentViewTaskAssist();
   closeMessageSyncChannel();
+  resetJdLiveMessages();
   S.imMessages = [];
   S.imPendingRevocations.clear();
   S.imMessageLoadingPeers.clear();
